@@ -1421,14 +1421,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			auto catalog_schema = catalog_value.ToString() + "." + schema_value.ToString() + ".";
 
 			ddl.push_back("create table if not exists " + catalog_schema + OpenIVMUtils::DeltaName(table_name) +
-			              " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
+			              " as select *, 1::INTEGER as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
 			              string(ivm::TIMESTAMP_COL) + " from " + catalog_schema + table_name + " limit 0");
 		}
 
 		// Delta table for the MV — based on the DATA table (has all columns)
 		string qdv = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
-		ddl.push_back("create table if not exists " + qdv + " as select *, true as " + string(ivm::MULTIPLICITY_COL) +
-		              ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " + qdt + " limit 0");
+		ddl.push_back("create table if not exists " + qdv + " as select *, 1::INTEGER as " +
+		              string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
+		              qdt + " limit 0");
 		ddl.push_back("alter table " + qdv + " alter " + string(ivm::TIMESTAMP_COL) + " set default now()");
 
 		// --- Index DDL (for aggregate group queries) ---

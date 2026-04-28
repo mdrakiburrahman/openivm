@@ -101,7 +101,7 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 	std::regex primary_key_re(R"((primary\s+key\s*\([^\)]+\)))", std::regex::icase);
 	std::regex inline_primary_key_re(R"(([^\s,]+[^\),]*\s+primary\s+key))", std::regex::icase);
 
-	std::string multiplicity_col = string(ivm::MULTIPLICITY_COL) + " boolean default true";
+	std::string multiplicity_col = string(ivm::MULTIPLICITY_COL) + " integer default 1";
 	std::string timestamp_col = "timestamp timestamp default now()";
 
 	std::smatch match;

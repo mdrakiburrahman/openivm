@@ -270,7 +270,7 @@ statement ok
 CREATE TABLE ab (id INT, val INT);
 
 statement ok
-CREATE TABLE delta_ab AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM ab LIMIT 0;
+CREATE TABLE delta_ab AS SELECT *, 1::INTEGER AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM ab LIMIT 0;
 
 statement ok
 INSERT INTO ab VALUES (1, 42);
@@ -946,7 +946,7 @@ statement ok
 CREATE TABLE agg_target (id INT, name VARCHAR, dept VARCHAR, salary INT);
 
 statement ok
-CREATE TABLE delta_agg_target AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM agg_target LIMIT 0;
+CREATE TABLE delta_agg_target AS SELECT *, 1::INTEGER AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM agg_target LIMIT 0;
 
 statement ok
 INSERT INTO agg_target SELECT 999, dept, dept, SUM(salary) FROM staff WHERE dept = 'eng' GROUP BY dept;

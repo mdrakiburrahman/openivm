@@ -758,7 +758,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				auto del_result =
 				    con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt) + " WHERE " +
 				              string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(ts_string) +
-				              "'::TIMESTAMP AND " + string(ivm::MULTIPLICITY_COL) + " = false");
+				              "'::TIMESTAMP AND " + string(ivm::MULTIPLICITY_COL) + " < 0");
 				if (!del_result->HasError() && del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
 					any_has_deletes = true;
 				}
@@ -1281,20 +1281,23 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				}
 				col_list += OpenIVMUtils::QuoteIdentifier(col);
 			}
-			string select_false, select_true;
+			// Build "snapshot" select lists: for the multiplicity column we substitute
+			// the literal Z-set weight (-1 for "old/retracted" snapshot, +1 for "new")
+			// instead of the column reference.
+			string select_old, select_new;
 			bool first = true;
 			for (auto &col : column_names) {
 				if (!first) {
-					select_false += ", ";
-					select_true += ", ";
+					select_old += ", ";
+					select_new += ", ";
 				}
 				first = false;
 				if (col == string(ivm::MULTIPLICITY_COL)) {
-					select_false += "false";
-					select_true += "true";
+					select_old += "-1";
+					select_new += "1";
 				} else {
-					select_false += OpenIVMUtils::QuoteIdentifier(col);
-					select_true += OpenIVMUtils::QuoteIdentifier(col);
+					select_old += OpenIVMUtils::QuoteIdentifier(col);
+					select_new += OpenIVMUtils::QuoteIdentifier(col);
 				}
 			}
 			// Pre: snapshot old state into temp table
@@ -1303,16 +1306,16 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
 			const string &qdt2 = data_table;
 			pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
-			// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
+			// Post: clear ALL IVM delta rows, replace with absolute -1/+1 snapshots
 			post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
 			if (!delta_ts_filter.empty()) {
 				post_companion += " AND " + delta_ts_filter;
 			}
 			post_companion += ";\n";
 			post_companion +=
-			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_false + " FROM " + qt + ";\n";
+			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_old + " FROM " + qt + ";\n";
 			post_companion +=
-			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_true + " FROM " + qdt2 + ";\n";
+			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_new + " FROM " + qdt2 + ";\n";
 			post_companion += "DROP TABLE " + qt + ";\n";
 			OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
 			OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
@@ -1337,7 +1340,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				if (keys_set.count(col)) {
 					val_list += "d." + col;
 				} else if (col == ivm::MULTIPLICITY_COL) {
-					val_list += "false";
+					// Companion delta-view row that retracts the prior aggregate value:
+					// emit weight -1 so downstream consumers subtract it.
+					val_list += "-1";
 				} else {
 					val_list += "0";
 				}
@@ -1350,7 +1355,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 
 			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
-			                  delta_view_name + " d WHERE d." + string(ivm::MULTIPLICITY_COL) + " = true";
+			                  delta_view_name + " d WHERE d." + string(ivm::MULTIPLICITY_COL) + " > 0";
 			if (!delta_ts_filter.empty()) {
 				companion_query += " AND d." + delta_ts_filter;
 			}

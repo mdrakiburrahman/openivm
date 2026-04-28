@@ -10,8 +10,11 @@
 #include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
@@ -180,7 +183,7 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 
 		// Single query: get total row count and delete count since last_update
 		auto result =
-		    con.Query("SELECT COUNT(*), COUNT(*) FILTER (WHERE " + string(ivm::MULTIPLICITY_COL) + " = false) FROM " +
+		    con.Query("SELECT COUNT(*), COUNT(*) FILTER (WHERE " + string(ivm::MULTIPLICITY_COL) + " < 0) FROM " +
 		              OpenIVMUtils::QuoteIdentifier(delta_name) + " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
 		              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP");
 		if (result->HasError()) {
@@ -419,20 +422,50 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 			}
 		}
 
-		// Combined multiplicity: XOR chain (a != b for booleans). This is the
-		// existing IVM convention — delta rows whose signs differ produce insert
-		// output, matching signs produce delete. Changed interpretation from naive
-		// Z-set product gave wrong results on the existing inner_join tests; the
-		// LEFT JOIN incorrectness is tracked separately (the fundamental issue is
-		// the Larson & Zhou MERGE doesn't handle match_count transitions across 0
-		// for the NULL-padding path, not the combined-multiplicity encoding).
-		unique_ptr<Expression> combined_mul = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
+		// Combined multiplicity: (-1)^(k-1) * ∏ w_i where k = |mask|.
+		// Z-set bilinear product times a Möbius inclusion-exclusion sign.
+		//
+		// The IE sign is required because OpenIVM's "current base" scan reads
+		// R_now = R_old + ΔR (deltas have already been applied to the source by
+		// the IvmInsertRule at DML time). Expanding
+		//   Δ(R⋈S) = (R_old+ΔR)⋈(S_old+ΔS) − R_old⋈S_old
+		// gives an inclusion-exclusion sum: terms with k delta-side leaves carry
+		// sign (-1)^(k-1) so the overcounting from "current includes pending"
+		// cancels exactly. This is NOT the textbook DBSP delta-join formula
+		// (which uses old bases and gives all-positive terms) — it is the
+		// algebraically equivalent Möbius form for OpenIVM's data layout.
+		//
+		// Equivalence to the previous BOOLEAN XOR chain (true=+1, false=-1):
+		//   k=1: w_1                 = w_1                       (no sign flip)
+		//   k=2: -w_1·w_2            = NOT(w_1 == w_2)            (XOR true,true=false=-1)
+		//   k=3: w_1·w_2·w_3         (no sign flip)
+		//   k=4: -w_1·w_2·w_3·w_4    (sign flip)
+		// — verified algebraically on all sign combinations.
+		FunctionBinder fbinder(binder);
+		unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
 		for (size_t i = 1; i < mul_bindings.size(); i++) {
-			auto next = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[i]);
-			combined_mul = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
-			                                                    std::move(combined_mul), std::move(next));
+			vector<unique_ptr<Expression>> args;
+			args.push_back(std::move(product));
+			args.push_back(make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[i]));
+			ErrorData err;
+			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true /* is_operator */);
+			if (!product) {
+				throw InternalException("IvmJoinRule: failed to bind '*' for combined multiplicity: %s",
+				                        err.RawMessage());
+			}
 		}
-		proj_exprs.push_back(std::move(combined_mul));
+		// Apply Möbius sign: (-1)^(k-1). Only flip when k is even.
+		if (mul_bindings.size() % 2 == 0) {
+			vector<unique_ptr<Expression>> args;
+			args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
+			args.push_back(std::move(product));
+			ErrorData err;
+			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
+			if (!product) {
+				throw InternalException("IvmJoinRule: failed to bind '*' for Möbius sign: %s", err.RawMessage());
+			}
+		}
+		proj_exprs.push_back(std::move(product));
 
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
 		projection->children.push_back(std::move(term));

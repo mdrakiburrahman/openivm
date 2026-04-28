@@ -96,7 +96,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	auto del_get = make_change_scan(DuckLakeScanType::SCAN_DELETIONS, binder.GenerateTableIndex());
 
 	// Helper: wrap a scan in a projection that appends a constant multiplicity column.
-	auto add_mul_projection = [&](unique_ptr<LogicalOperator> scan, bool mul_value) -> unique_ptr<LogicalProjection> {
+	// mul_value is the signed Z-set weight: +1 for inserts, -1 for deletes.
+	auto add_mul_projection = [&](unique_ptr<LogicalOperator> scan,
+	                              int32_t mul_value) -> unique_ptr<LogicalProjection> {
 		auto bindings = scan->GetColumnBindings();
 		auto types = scan->types;
 
@@ -104,7 +106,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		for (idx_t i = 0; i < bindings.size(); i++) {
 			exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
 		}
-		exprs.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(mul_value)));
+		exprs.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(mul_value)));
 
 		auto proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
 		proj->children.push_back(std::move(scan));
@@ -112,8 +114,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		return proj;
 	};
 
-	auto ins_proj = add_mul_projection(std::move(ins_get), true);
-	auto del_proj = add_mul_projection(std::move(del_get), false);
+	auto ins_proj = add_mul_projection(std::move(ins_get), 1);
+	auto del_proj = add_mul_projection(std::move(del_get), -1);
 
 	// UNION ALL the insertions and deletions.
 	auto union_types = ins_proj->types;

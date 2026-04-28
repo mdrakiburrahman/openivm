@@ -86,7 +86,7 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 		                    planner.types[i].ToString().c_str());
 	}
 
-	return_types.emplace_back(LogicalTypeId::BOOLEAN);
+	return_types.emplace_back(LogicalTypeId::INTEGER);
 	names.emplace_back(ivm::MULTIPLICITY_COL);
 
 	return std::move(result);

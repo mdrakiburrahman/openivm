@@ -394,19 +394,15 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			// Insert-only MAX: consolidate with MAX (new max can only be >= current)
 			cte_select_string += "\n\tmax(" + column + ") as " + column + ", ";
 		} else if (list_mode) {
-			cte_select_string += "\n\tlist_reduce(list(CASE WHEN " + string(ivm::MULTIPLICITY_COL) +
-			                     " = false "
-			                     "THEN list_transform(" +
-			                     column +
-			                     ", lambda x: -x) "
-			                     "ELSE " +
-			                     column +
-			                     " END), "
-			                     "lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS " +
-			                     column + ", ";
+			// Z-set bag-aware list sum: per-row scale every element by the row's weight,
+			// then list_reduce-add across the group.
+			cte_select_string +=
+			    "\n\tlist_reduce(list(list_transform(" + column + ", lambda x: " + string(ivm::MULTIPLICITY_COL) +
+			    " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS " + column + ", ";
 		} else {
-			cte_select_string = cte_select_string + "\n\tsum(case when " + string(ivm::MULTIPLICITY_COL) +
-			                    " = false then -" + column + " else " + column + " end) as " + column + ", ";
+			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
+			cte_select_string = cte_select_string + "\n\tsum(" + string(ivm::MULTIPLICITY_COL) + " * " + column +
+			                    ") as " + column + ", ";
 		}
 	}
 	cte_select_string.erase(cte_select_string.size() - 2, 2);
@@ -741,17 +737,17 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		}
 		first = false;
 		if (list_mode) {
-			cte += "list_transform(list_zip("
-			       "COALESCE(SUM(CASE WHEN " +
-			       mul + " = false THEN list_transform(" + column + ", lambda x: -x) ELSE NULL END), " + zeros_list +
-			       "), "
-			       "COALESCE(SUM(CASE WHEN " +
-			       mul + " = true THEN " + column + " ELSE NULL END), " + zeros_list +
-			       ")), lambda x: x[1] + x[2]) AS d_" + column;
+			// Z-set bag-aware list sum: per-row scale every element by w∈ℤ, then
+			// list_reduce-add. NULL-list COALESCE preserves the previous semantics
+			// for empty groups.
+			cte += "COALESCE(list_reduce(list(list_transform(" + column + ", lambda x: " + mul +
+			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])), " + zeros_list +
+			       ") AS d_" + column;
 			update_set += column + " = list_transform(list_zip(" + column + ", (SELECT d_" + column +
 			              " FROM _ivm_delta)), lambda x: x[1] + x[2])";
 		} else {
-			cte += "SUM(CASE WHEN " + mul + " = false THEN -" + column + " ELSE " + column + " END) AS d_" + column;
+			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
+			cte += "SUM(" + mul + " * " + column + ") AS d_" + column;
 			update_set +=
 			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM _ivm_delta), 0)";
 		}
@@ -809,19 +805,19 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	select_columns.erase(select_columns.size() - 2, 2);
 
 	if (insert_only) {
-		// Insert-only fast path: all deltas are inserts, just INSERT directly.
-		// No consolidation or DELETE needed.
-		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " = true" : ts_where + " AND " + mul + " = true";
+		// Insert-only fast path: all deltas are inserts (w > 0), just INSERT directly.
+		// Each row replicated |w| times for bag-correct multiplicity.
+		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " > 0" : ts_where + " AND " + mul + " > 0";
 		string insert_query = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + delta_view +
-		                      "\n" + mul_filter + ";\n";
+		                      ", generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
 		return insert_query;
 	}
 
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).
-	// _net > 0 = net insertions, _net < 0 = net deletions.
-	string cte_body = "SELECT " + select_columns + ",\n    SUM(CASE WHEN " + mul +
-	                  " THEN 1 ELSE -1 END) AS _net\n  FROM " + delta_view + ts_where + "\n  GROUP BY " +
-	                  select_columns + "\n  HAVING SUM(CASE WHEN " + mul + " THEN 1 ELSE -1 END) != 0";
+	// _net > 0 = net insertions, _net < 0 = net deletions. With integer weights this is
+	// just SUM(weight) — no CASE round-trip needed.
+	string cte_body = "SELECT " + select_columns + ",\n    SUM(" + mul + ") AS _net\n  FROM " + delta_view + ts_where +
+	                  "\n  GROUP BY " + select_columns + "\n  HAVING SUM(" + mul + ") != 0";
 
 	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER.
 	string delete_query = "WITH _ivm_net AS (\n  " + cte_body +

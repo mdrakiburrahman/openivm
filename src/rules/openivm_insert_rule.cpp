@@ -354,7 +354,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 									throw NotImplementedException("Only constant values are supported for now!");
 								}
 							}
-							values += "true, now()::timestamp),";
+							values += "1, now()::timestamp),";
 							insert_query += values;
 						}
 						insert_query.pop_back();
@@ -367,7 +367,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();
 						}
-						insert_query = prefix + " SELECT *, true, now()::timestamp FROM (" + subquery_string + ")";
+						insert_query = prefix + " SELECT *, 1, now()::timestamp FROM (" + subquery_string + ")";
 					}
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] insert_query: %s\n", insert_query.c_str());
 					{
@@ -391,8 +391,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					string prefix_csv = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_csv);
 					auto files = bind_data->file_list->GetAllFiles();
 					for (auto &file : files) {
-						auto query =
-						    prefix_csv + " SELECT *, true, now()::timestamp FROM read_csv('" + file.path + "');";
+						auto query = prefix_csv + " SELECT *, 1, now()::timestamp FROM read_csv('" + file.path + "');";
 						DeltaLockGuard guard(OpenIVMUtils::DeltaName(insert_table_name));
 						auto r = con.Query(query);
 						if (r->HasError()) {
@@ -430,7 +429,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			if (metadata.IsBaseTable(delete_table_name)) {
 				auto &delta_entry_del = delta_table_catalog_entry->Cast<TableCatalogEntry>();
 				string insert_string = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del) + " " +
-				                       BuildDeltaSelectFrom(delta_entry_del, "false", full_table_name);
+				                       BuildDeltaSelectFrom(delta_entry_del, "-1", full_table_name);
 				if (plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
 					auto filter = dynamic_cast<LogicalFilter *>(plan->children[0].get());
 					insert_string += " where ";
@@ -465,8 +464,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();
 						}
-						insert_string =
-						    prefix_del + " SELECT *, false, now()::timestamp FROM (" + subquery_string + ")";
+						insert_string = prefix_del + " SELECT *, -1, now()::timestamp FROM (" + subquery_string + ")";
 					} catch (...) {
 						throw NotImplementedException(
 						    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
@@ -556,7 +554,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 
 				auto &delta_entry_upd = delta_table_catalog_entry->Cast<TableCatalogEntry>();
 				string prefix_upd = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_upd);
-				string select_old = BuildDeltaSelectFrom(delta_entry_upd, "false", full_table_name) + where_string;
+				string select_old = BuildDeltaSelectFrom(delta_entry_upd, "-1", full_table_name) + where_string;
 				// For select_new: use the update_values map to replace modified columns
 				string select_new = "SELECT ";
 				for (auto &col : delta_entry_upd.GetColumns().Logical()) {
@@ -576,7 +574,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						}
 					}
 				}
-				select_new += "true, now()::timestamp FROM " + full_table_name + where_string;
+				select_new += "1, now()::timestamp FROM " + full_table_name + where_string;
 
 				{
 					DeltaLockGuard guard(OpenIVMUtils::DeltaName(update_table_name));

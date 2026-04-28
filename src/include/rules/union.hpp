@@ -8,6 +8,10 @@ namespace duckdb {
 class IvmUnionRule : public IvmRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
+	// UNION ALL is bag-union, which is Z-set addition — linear.
+	Linearity GetLinearity() const override {
+		return Linearity::LINEAR;
+	}
 };
 
 } // namespace duckdb
