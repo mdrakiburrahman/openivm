@@ -4,14 +4,8 @@
 
 require openivm
 
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, has_minmax BOOLEAN DEFAULT false, has_left_join BOOLEAN DEFAULT false, last_update TIMESTAMP, refresh_interval BIGINT DEFAULT NULL, refresh_in_progress BOOLEAN DEFAULT false);
-
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
-
 # ==========================================
-# Setup: base table, MV, delta tables
+# Setup: base table, MV (auto-creates system tables + delta tables)
 # ==========================================
 
 statement ok
@@ -20,25 +14,14 @@ CREATE TABLE staff (id INT, name VARCHAR, dept VARCHAR, salary INT);
 statement ok
 INSERT INTO staff VALUES (1, 'Alice', 'eng', 100), (2, 'Bob', 'sales', 200);
 
-# MV: select id, name, dept, salary from staff
-# The physical data table is _ivm_data_mv_staff; mv_staff is a view on top.
+# CREATE MATERIALIZED VIEW auto-populates _duckdb_ivm_views, _duckdb_ivm_delta_tables,
+# creates delta_staff, _ivm_data_mv_staff, delta_mv_staff, and the mv_staff view.
 statement ok
-CREATE TABLE _ivm_data_mv_staff AS SELECT id, name, dept, salary FROM staff;
+CREATE MATERIALIZED VIEW mv_staff AS SELECT id, name, dept, salary FROM staff;
 
+# Initial refresh so MV reflects the pre-seeded rows.
 statement ok
-CREATE VIEW mv_staff AS SELECT * FROM _ivm_data_mv_staff;
-
-statement ok
-CREATE TABLE delta_mv_staff AS SELECT *, true AS _duckdb_ivm_multiplicity FROM _ivm_data_mv_staff LIMIT 0;
-
-statement ok
-CREATE TABLE delta_staff AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM staff LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('mv_staff', 'select id, name, dept, salary from staff', 2, false, false, now()::timestamp, null, false);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_staff', 'delta_staff', '1970-01-01');
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 # Source table for INSERT...SELECT tests
 statement ok

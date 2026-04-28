@@ -97,6 +97,8 @@ struct Summary {
 	string cascade_mode;
 	int refresh_events = 0;
 	int dml_ops = 0;
+	int dml_errors = 0;
+	map<string, int> dml_error_samples; // error_msg -> count (up to 20 samples)
 	int checker_runs = 0;
 	int crashes = 0;
 	int correctness_failures = 0;
@@ -121,6 +123,17 @@ struct Summary {
 		o << ",\"cascade_mode\":\"" << EscapeJson(cascade_mode) << "\"";
 		o << ",\"refresh_events\":" << refresh_events;
 		o << ",\"dml_ops\":" << dml_ops;
+		o << ",\"dml_errors\":" << dml_errors;
+		o << ",\"dml_error_samples\":{";
+		{
+			bool first = true;
+			for (auto &e : dml_error_samples) {
+				if (!first) o << ",";
+				first = false;
+				o << "\"" << EscapeJson(e.first) << "\":" << e.second;
+			}
+		}
+		o << "}";
 		o << ",\"checker_runs\":" << checker_runs;
 		o << ",\"crashes\":" << crashes;
 		o << ",\"correctness_failures\":" << correctness_failures;
@@ -536,10 +549,19 @@ static void DMLThread(SubtestCtx &ctx, int interval_ms, size_t delta_start_offse
 	size_t idx = delta_start_offset;
 	while (!ctx.stop.load()) {
 		auto r = con.Query(ctx.deltas[idx % ctx.deltas.size()]);
-		(void)r;
 		{
 			lock_guard<mutex> lk(ctx.log_mu);
 			ctx.summary.dml_ops++;
+			if (!r || r->HasError()) {
+				ctx.summary.dml_errors++;
+				string msg = r ? r->GetError() : "(null result)";
+				// Truncate & bucket: keep only the first 80 chars to group similar errors.
+				if (msg.size() > 80) msg = msg.substr(0, 80);
+				auto it = ctx.summary.dml_error_samples.find(msg);
+				if (it != ctx.summary.dml_error_samples.end() || ctx.summary.dml_error_samples.size() < 20) {
+					ctx.summary.dml_error_samples[msg]++;
+				}
+			}
 		}
 		idx++;
 		this_thread::sleep_for(chrono::milliseconds(interval_ms));
@@ -1018,7 +1040,8 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		}
 		for (auto &v : ctx.mvs) {
 			if (v.base_query.empty()) continue;
-			// Trigger a final refresh to be sure
+			// Drain deltas with multiple refreshes — catches "pending after one refresh" races.
+			fin_con.Query("PRAGMA ivm('" + v.name + "')");
 			fin_con.Query("PRAGMA ivm('" + v.name + "')");
 			string q = "SELECT COUNT(*) FROM ("
 			           "  SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
@@ -1034,8 +1057,61 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				int64_t mis = r->GetValue(0, 0).GetValue<int64_t>();
 				if (mis != 0) {
 					ctx.summary.correctness_failures++;
-					ctx.summary.findings.push_back("final mismatch on " + v.name + ": " +
-					                                std::to_string(mis) + " rows");
+					// Diagnostic: what's in each delta table for this view's sources, and what's
+					// last_update. Helps diagnose whether rows are "stuck" in delta (not applied)
+					// vs the refresh applied something wrong.
+					string diag;
+					auto dt_r = fin_con.Query(
+					    "SELECT table_name, last_update FROM _duckdb_ivm_delta_tables WHERE view_name = '" +
+					    v.name + "'");
+					if (dt_r && !dt_r->HasError()) {
+						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
+							string tn = dt_r->GetValue(0, di).ToString();
+							string lu = dt_r->GetValue(1, di).IsNull() ? "NULL" : dt_r->GetValue(1, di).ToString();
+							auto cnt_r = fin_con.Query("SELECT COUNT(*) FROM delta_" + tn);
+							int64_t c = (cnt_r && !cnt_r->HasError()) ? cnt_r->GetValue(0, 0).GetValue<int64_t>() : -1;
+							auto newer_r = fin_con.Query(
+							    "SELECT COUNT(*) FROM delta_" + tn +
+							    " WHERE _duckdb_ivm_timestamp >= '" + lu + "'::TIMESTAMP");
+							int64_t nc = (newer_r && !newer_r->HasError()) ? newer_r->GetValue(0, 0).GetValue<int64_t>() : -1;
+							if (!diag.empty()) diag += ", ";
+							diag += tn + "(rows=" + std::to_string(c) + " >=last=" + std::to_string(nc) +
+							         " last_update=" + lu + ")";
+						}
+					}
+					// Capture the diff SHAPE so we can diagnose: which rows are off, and by how much.
+					// Show up to 5 rows only-in-MV and 5 rows only-in-base.
+					string only_mv_q = "SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" +
+					                    v.base_query + ") __a LIMIT 5";
+					string only_base_q = "SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " +
+					                      v.QualifiedName() + " LIMIT 5";
+					auto mv_r = fin_con.Query(only_mv_q);
+					auto base_r = fin_con.Query(only_base_q);
+					string detail = "final mismatch on " + v.name + ": " + std::to_string(mis) + " rows";
+					if (mv_r && !mv_r->HasError() && mv_r->RowCount() > 0) {
+						detail += "; only_in_mv=[";
+						for (idx_t i = 0; i < mv_r->RowCount(); i++) {
+							if (i > 0) detail += "; ";
+							for (idx_t c = 0; c < mv_r->ColumnCount(); c++) {
+								if (c > 0) detail += ",";
+								detail += mv_r->GetValue(c, i).IsNull() ? "NULL" : mv_r->GetValue(c, i).ToString();
+							}
+						}
+						detail += "]";
+					}
+					if (base_r && !base_r->HasError() && base_r->RowCount() > 0) {
+						detail += "; only_in_base=[";
+						for (idx_t i = 0; i < base_r->RowCount(); i++) {
+							if (i > 0) detail += "; ";
+							for (idx_t c = 0; c < base_r->ColumnCount(); c++) {
+								if (c > 0) detail += ",";
+								detail += base_r->GetValue(c, i).IsNull() ? "NULL" : base_r->GetValue(c, i).ToString();
+							}
+						}
+						detail += "]";
+					}
+					if (!diag.empty()) detail += "; delta_state={" + diag + "}";
+					ctx.summary.findings.push_back(detail);
 				}
 			}
 		}

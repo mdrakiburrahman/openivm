@@ -662,13 +662,20 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Build a timestamp filter for the delta_view reads in the upsert query.
 	// This prevents double-counting when chained MVs accumulate delta_view rows
 	// from multiple refresh rounds (because downstream views haven't consumed them yet).
+	//
+	// We use `last_refresh_ts` (wall-clock now() of the last refresh), NOT
+	// `last_update` (MAX(base_ts)+1us, which can be earlier than the refresh's
+	// wall-clock time). Companion rows written during a prior refresh have
+	// ts = that refresh's now(); we need last_refresh_ts >= that now() so the
+	// filter `ts > last_refresh_ts` correctly excludes them. Using last_update
+	// here would under-filter and let prior companion rows get re-processed.
 	string delta_ts_filter;
 	if (has_ts_col) {
-		auto last_update_result =
-		    con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-		              OpenIVMUtils::EscapeValue(view_name) + "' LIMIT 1");
-		if (!last_update_result->HasError() && last_update_result->RowCount() > 0) {
-			auto ts = last_update_result->GetValue(0, 0);
+		auto last_refresh_result =
+		    con.Query("SELECT COALESCE(last_refresh_ts, last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' LIMIT 1");
+		if (!last_refresh_result->HasError() && last_refresh_result->RowCount() > 0) {
+			auto ts = last_refresh_result->GetValue(0, 0);
 			if (!ts.IsNull()) {
 				delta_ts_filter = string(ivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
 			}
@@ -884,20 +891,35 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				            delta_where_right + ")";
 			}
 
-			// Source 4: NULL group — always recompute (unmatched-right changes)
-			// SQL IN doesn't match NULL, so use OR ... IS NULL
+			// NULL-safe match: `(a, b, NULL) IN ((a, b, NULL))` returns NULL, not TRUE —
+			// SQL tuple IN never matches when any component is NULL. For FULL OUTER keys
+			// produced by COALESCE over JOIN-padded NULLs, partial-NULL tuples (some keys
+			// NULL, others not) are common and would be silently skipped. Use EXISTS with
+			// IS NOT DISTINCT FROM so each column is compared NULL-safely. The all-NULL
+			// group (source 4) is also covered by this pattern as long as delta_<view> ever
+			// writes a row with all-NULL keys; to be safe we also OR the explicit IS NULL
+			// predicate so orphan all-NULL groups get re-evaluated on every refresh.
 			string null_check;
+			string ncmp_del; // NULL-safe correlation: _a.key IS NOT DISTINCT FROM <data_table>.key
+			string ncmp_ins; // NULL-safe correlation: _a.key IS NOT DISTINCT FROM _ivm_recompute.key
 			for (size_t i = 0; i < group_cols.size(); i++) {
+				string col = KeywordHelper::WriteOptionallyQuoted(group_cols[i]);
 				if (i > 0) {
 					null_check += " AND ";
+					ncmp_del += " AND ";
+					ncmp_ins += " AND ";
 				}
-				null_check += KeywordHelper::WriteOptionallyQuoted(group_cols[i]) + " IS NULL";
+				null_check += col + " IS NULL";
+				ncmp_del += "_a." + col + " IS NOT DISTINCT FROM " + data_table + "." + col;
+				ncmp_ins += "_a." + col + " IS NOT DISTINCT FROM _ivm_recompute." + col;
 			}
-
-			string where_clause = "(" + keys_tuple + ") IN (\n  " + affected + "\n) OR (" + null_check + ")";
-			upsert_query = "DELETE FROM " + data_table + " WHERE " + where_clause + ";\n" + "INSERT INTO " +
+			string where_delete =
+			    "EXISTS (SELECT 1 FROM (" + affected + "\n) _a WHERE " + ncmp_del + ") OR (" + null_check + ")";
+			string where_insert =
+			    "EXISTS (SELECT 1 FROM (" + affected + "\n) _a WHERE " + ncmp_ins + ") OR (" + null_check + ")";
+			upsert_query = "DELETE FROM " + data_table + " WHERE " + where_delete + ";\n" + "INSERT INTO " +
 			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
-			               where_clause + ";\n";
+			               where_insert + ";\n";
 		} else if (source_has_full_outer && full_outer_merge) {
 			// Zhang & Larson MERGE for FULL OUTER JOIN aggregates:
 			// Phase 1: MERGE handles matched-row changes via _ivm_match_count
@@ -1348,9 +1370,58 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// if both A and B have been refreshed (up to some timestamp)
 	// to check this, we extract the minimum timestamp from _duckdb_ivm_delta_tables
 	string delete_from_delta_table_query;
-	string update_timestamp_query = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
-	                                " SET last_update = now() WHERE view_name = '" +
-	                                OpenIVMUtils::EscapeValue(view_name) + "';\n";
+	// CONCURRENCY-SAFE TIMESTAMP ADVANCE:
+	// The next refresh's delta-scan filter uses `ts >= last_update`. If we set
+	// last_update = now() (which DuckDB evaluates at BEGIN TRANSACTION, BEFORE the
+	// snapshot is taken at first-catalog-access), a concurrent DML that commits
+	// between BEGIN and the snapshot-read would have ts > now() AND be visible in
+	// THIS refresh's snapshot — so it's processed here, but the next refresh's
+	// filter `ts >= now()` would still include it → double-apply drift.
+	//
+	// Fix: advance last_update to (max ts of rows visible in this tx's snapshot)
+	// + 1us. Any row strictly newer than that was committed AFTER our snapshot,
+	// so it wasn't processed here and will be caught by the next refresh. Any
+	// row we DID process has ts <= max → excluded from the next refresh.
+	//
+	// Fallback: if this refresh saw zero rows (delta empty), use now() as before
+	// so the cursor doesn't move backwards.
+	// Two timestamps get bumped per (view, table) at end of refresh:
+	//   - last_update     = MAX(base delta ts visible in this snapshot) + 1us
+	//                       This is the "what base-delta rows have been processed"
+	//                       cursor — always <= this refresh's snapshot time, so
+	//                       the next refresh's filter `ts >= last_update` correctly
+	//                       excludes everything we processed AND includes rows that
+	//                       committed after our snapshot (race-safe).
+	//   - last_refresh_ts = now() (transaction start wall clock)
+	//                       This is the "when was the last refresh" marker used to
+	//                       filter delta_<view> companion rows in chained MVs.
+	//                       Separated from last_update because companion rows have
+	//                       ts = refresh-time, which is typically later than
+	//                       MAX(base_ts)+1us.
+	string update_timestamp_query;
+	for (auto &dt : delta_table_names) {
+		if (metadata.IsDuckLakeTable(view_name, dt)) {
+			// DuckLake doesn't use _duckdb_ivm_timestamp; keep now() semantics.
+			update_timestamp_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+			                          " SET last_update = now(), last_refresh_ts = now() WHERE view_name = '" +
+			                          OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+			                          OpenIVMUtils::EscapeValue(dt) + "';\n";
+			continue;
+		}
+		string resolved = dt;
+		if (cross_system) {
+			resolved = attached_db_catalog_name + "." + attached_db_schema_name + "." + dt;
+		}
+		update_timestamp_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+		                          " SET last_update = COALESCE("
+		                          "(SELECT MAX(" +
+		                          string(ivm::TIMESTAMP_COL) + ") + INTERVAL '1 microsecond' FROM " +
+		                          KeywordHelper::WriteOptionallyQuoted(resolved) +
+		                          "), now()), last_refresh_ts = now()"
+		                          " WHERE view_name = '" +
+		                          OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+		                          OpenIVMUtils::EscapeValue(dt) + "';\n";
+	}
 
 	// Update DuckLake snapshot IDs so the next refresh only sees new changes.
 	// For cross-system refresh (native MV that reads from dl.*), view_catalog_name

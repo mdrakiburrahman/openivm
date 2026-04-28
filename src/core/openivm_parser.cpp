@@ -1054,7 +1054,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
 		              " (view_name varchar, table_name varchar, last_update timestamp,"
 		              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default null,"
+		              " last_refresh_ts timestamp default null,"
 		              " primary key(view_name, table_name))");
+		// Backfill for existing databases without the column (added post-release).
+		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		              " add column if not exists last_refresh_ts timestamp default null");
 
 		// Refresh history: stores execution stats for learned cost model calibration
 		ddl.push_back("create table if not exists " + string(ivm::HISTORY_TABLE) +
@@ -1324,9 +1328,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				                    meta_table_name.c_str(), snapshot_val.c_str());
 			}
 
-			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +
-			              OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" + catalog_type + "', " +
-			              snapshot_val + ")");
+			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) +
+			              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, last_refresh_ts) "
+			              "values ('" +
+			              view_name + "', '" + OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" +
+			              catalog_type + "', " + snapshot_val + ", now())");
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---

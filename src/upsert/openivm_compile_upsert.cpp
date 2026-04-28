@@ -289,6 +289,34 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		needs_group_recompute = true;
 	}
 
+	// has_minmax=true is set by TWO unrelated conditions in the classifier:
+	//   (a) the view has an actual MIN/MAX aggregate — insert-only can use
+	//       GREATEST/LEAST in MERGE (fast path), mixed needs group-recompute.
+	//   (b) the view has a LEFT/RIGHT/OUTER JOIN + a "computed" aggregate
+	//       argument (COALESCE/CASE/constant/non-BCR), which breaks the
+	//       Larson & Zhou MERGE template — group-recompute is REQUIRED for
+	//       every delta shape, including insert-only. See the classifier
+	//       comment in openivm_parser.cpp (`query_1502/1696/1746/1749`).
+	// Distinguish: case (a) has "min"/"max" in aggregate_types; case (b)
+	// does not. Force group-recompute for (b) since the MERGE path produces
+	// incorrect MV state when a new right-side row converts an existing
+	// NULL-padded LEFT JOIN row into a match.
+	{
+		bool has_real_minmax = false;
+		for (auto &t : aggregate_types) {
+			if (t == "min" || t == "max") {
+				has_real_minmax = true;
+				break;
+			}
+		}
+		if (has_minmax && !has_real_minmax) {
+			needs_group_recompute = true;
+			OPENIVM_DEBUG_PRINT(
+			    "[CompileAggregateGroups] has_minmax=true with no MIN/MAX in agg_types — LEFT JOIN + computed "
+			    "aggregate case → group-recompute\n");
+		}
+	}
+
 	// Build per-column aggregate type map from metadata (for insert-only MIN/MAX).
 	// aggregate_types aligns with aggregate expressions in the rewritten plan:
 	// one entry per BoundAggregateExpression (excludes AVG/STDDEV-derived cols which are projections).
@@ -326,18 +354,28 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
 		// the MERGE path below.
 		string keys_tuple;
+		string null_check;
 		for (size_t i = 0; i < keys.size(); i++) {
 			keys_tuple += keys[i];
 			if (i != keys.size() - 1) {
 				keys_tuple += ", ";
 			}
+			if (!null_check.empty()) {
+				null_check += " AND ";
+			}
+			null_check += keys[i] + " IS NULL";
 		}
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-		string delete_query = "delete from " + data_table + " where (" + keys_tuple + ") in (\n" +
-		                      "  select distinct " + keys_tuple + " from " + delta_view + delta_where + "\n);\n";
+		// The all-NULL group (every key column IS NULL) is unreachable via `(keys) IN (...)`
+		// because NULL IN subquery is NULL, not true. That group is produced by RIGHT/FULL
+		// OUTER JOIN unmatched-right-side rows (NULL pads the left keys). If the delta has
+		// any row with all-NULL keys, we always recompute the NULL group. This is cheap
+		// (at most one group) and correct for INNER/LEFT JOIN too (no such group exists).
+		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
+		string where = "(" + keys_tuple + ") in (\n  " + affected + "\n) OR (" + null_check + ")";
+		string delete_query = "delete from " + data_table + " where " + where + ";\n";
 		string insert_query = "insert into " + data_table + "\n" + "select * from (" + view_query_sql +
-		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from " + delta_view + delta_where + "\n);\n";
+		                      ") _ivm_recompute\n" + "where " + where + ";\n";
 		return delete_query + "\n" + insert_query;
 	}
 

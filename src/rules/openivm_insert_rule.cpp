@@ -580,16 +580,22 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 
 				{
 					DeltaLockGuard guard(OpenIVMUtils::DeltaName(update_table_name));
-					auto r = con.Query(prefix_upd + " " + select_old);
+					// ATOMIC UPDATE DELTA WRITES:
+					// The old-delete and new-insert rows MUST commit together. If they land
+					// in separate auto-commit transactions, a concurrent refresh can take a
+					// snapshot between them — seeing one but not the other. Since both rows
+					// target the same group, processing only one breaks consolidation (net
+					// count change should be 0, but ends up +1 or -1 → MV drift).
+					//
+					// Combining into a single multi-row INSERT via UNION ALL ensures both
+					// rows share one commit point and one `now()` value — either both visible
+					// in a given snapshot or neither.
+					string combined = prefix_upd + " " + "SELECT * FROM (" + select_old +
+					                  ") UNION ALL SELECT * FROM (" + select_new + ")";
+					OPENIVM_DEBUG_PRINT("[INSERT RULE] combined UPDATE delta: %s\n", combined.c_str());
+					auto r = con.Query(combined);
 					if (r->HasError()) {
-						throw Exception(ExceptionType::EXECUTOR,
-						                "Cannot insert old values in delta table after update! " + r->GetError());
-					}
-					OPENIVM_DEBUG_PRINT("[INSERT RULE] select_new: %s\n", select_new.c_str());
-					auto r2 = con.Query(prefix_upd + " " + select_new);
-					if (r2->HasError()) {
-						throw Exception(ExceptionType::EXECUTOR,
-						                "Cannot insert new values in delta table after update! " + r2->GetError());
+						throw Exception(ExceptionType::EXECUTOR, "Cannot insert UPDATE delta rows! " + r->GetError());
 					}
 				}
 			}
