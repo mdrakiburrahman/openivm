@@ -1716,7 +1716,11 @@ class QueryGenerator:
         #   - BIT_AND / BIT_OR, BOOL_AND / BOOL_OR (no inverse on delete)
         #   - FIRST / LAST / ANY_VALUE / ARBITRARY
         non_incremental_ops = {
-            "ORDER", "LIMIT", "LATERAL", "CORRELATED_SUBQUERY",
+            # Note: ORDER (top-level or inside WINDOW frames) is incrementally
+            # maintainable — top-level ORDER BY doesn't affect MV state, and
+            # window functions are handled by IvmWindowRule via partition
+            # recompute. Don't classify as non-incremental on ORDER alone.
+            "LIMIT", "LATERAL",
             "SUBQUERY_FILTER",  # IN/scalar-compare/scalar-in-SELECT — not flattened by OpenIVM
             "VALUES_ONLY",      # FROM (VALUES …) — no base table to delta
         }
