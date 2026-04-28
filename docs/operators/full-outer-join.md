@@ -1,5 +1,7 @@
 # Full outer join
 
+> Linearity: **BILINEAR** ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -55,6 +57,8 @@ Bidirectional key-based partial recompute using hidden `_ivm_left_key` and `_ivm
 1. Get affected join keys from both base delta tables.
 2. DELETE from the MV all rows where `_ivm_left_key` or `_ivm_right_key` matches an affected key.
 3. Re-INSERT from the original FULL OUTER JOIN query, filtered to those keys.
+
+The match predicate is **NULL-safe** — `EXISTS (SELECT 1 FROM affected _a WHERE _a.k IS NOT DISTINCT FROM target.k)` rather than tuple `IN`. SQL's `(a, b, NULL) IN (...)` returns NULL (not TRUE), so any partially-NULL key tuple — common when COALESCE over JOIN-padded NULLs is the GROUP BY key — would be silently skipped by tuple-IN. The all-NULL group (every key column NULL, produced by FULL OUTER unmatched-right rows) is also covered explicitly via an `OR (k1 IS NULL AND k2 IS NULL ...)` clause so it gets re-evaluated on every refresh whose delta touched it.
 
 ### Aggregate views (with GROUP BY)
 

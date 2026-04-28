@@ -15,7 +15,7 @@ Key contributions:
 - SQL-to-SQL compiler for IVM — all maintenance expressed as standard SQL, no separate engine
 - Uses DuckDB as a library for parsing/planning, outputs SQL in any dialect
 - Follows DBSP framework (Z-sets, differentiation/integration operators)
-- Multiplicity tracked as boolean column (`_duckdb_ivm_multiplicity`)
+- Multiplicity tracked as signed integer column (`_duckdb_ivm_multiplicity`: INT32, +1=insert, −1=delete) — Z-set encoding since commit `fc6dab9`
 - 4-step propagation: insert ΔV, upsert into V, delete zeroed rows, cleanup deltas
 - Supports projections, filters, GROUP BY, SUM, COUNT; joins via inclusion-exclusion
 - Cross-system: compile once, execute on any SQL engine (DuckDB, PostgreSQL, etc.)
@@ -236,7 +236,9 @@ requires full-state materialization for non-delta sides.
 Carbone et al., IEEE Data Eng. Bulletin, 2015. Flink SQL uses retraction-based IVM.
 
 **Refresh model:** Continuous streaming. 4-message changelog (+I = insert, -U = update before,
-+U = update after, -D = delete). More expressive than OpenIVM's boolean multiplicity.
++U = update after, -D = delete). Conceptually similar to OpenIVM's integer-weighted Z-set
+encoding; Flink's 4-message form is a streaming-protocol distinction (separately marking
+update-before vs update-after) rather than a difference in algebraic expressiveness.
 
 **Supported operators:** All join types (inner, outer, semi, anti, temporal, interval).
 All standard aggregates including LISTAGG, FIRST_VALUE, LAST_VALUE. Full window support

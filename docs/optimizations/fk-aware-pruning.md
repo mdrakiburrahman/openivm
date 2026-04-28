@@ -13,23 +13,25 @@ Many of these terms are redundant when foreign key constraints hold and the refe
 
 ### Standard Inclusion-Exclusion (2-table join)
 
-For a view `V = R ⋈ S`, the delta rule with current-state scans and XOR multiplicity:
+For a view `V = R ⋈ S`, the delta rule with current-state scans uses the Möbius
+inclusion-exclusion sign times the Z-set bilinear product (combined weight
+`(-1)^(k-1) × ∏ wᵢ` for a mask of size *k* — see [`inner-join.md`](../operators/inner-join.md)):
 
-    mask=01: ΔR ⋈ S_current    (mul = mul_ΔR)
-    mask=10: R_current ⋈ ΔS    (mul = mul_ΔS)
-    mask=11: ΔR ⋈ ΔS           (mul = mul_ΔR XOR mul_ΔS)
+    mask=01: ΔR ⋈ S_current    combined_w = w_ΔR
+    mask=10: R_current ⋈ ΔS    combined_w = w_ΔS
+    mask=11: ΔR ⋈ ΔS           combined_w = (-1) × w_ΔR × w_ΔS
 
-OpenIVM reads the CURRENT (post-batch) state for non-delta scans. The XOR in mask=11
-corrects for the resulting double-counting of the cross-term `ΔR ⋈ ΔS`.
+OpenIVM reads the CURRENT (post-batch) state for non-delta scans. The Möbius sign in
+mask=11 corrects for the resulting double-counting of the cross-term `ΔR ⋈ ΔS`.
 
 ### FK Constraint: R.fk → S.pk, ΔS insert-only
 
-When `R.fk` references `S.pk` and ΔS contains only inserts (ΔS⁺):
+When `R.fk` references `S.pk` and ΔS contains only inserts (ΔS⁺, all weights +1):
 
 **All terms with S's bit set cancel to zero, regardless of ΔR:**
 
     mask=10: R_current ⋈ ΔS⁺ = (R_old + ΔR) ⋈ ΔS⁺ = R_old⋈ΔS⁺ + ΔR⋈ΔS⁺
-    mask=11: ΔR ⋈ ΔS⁺ (XOR sign = -1)               = -ΔR⋈ΔS⁺
+    mask=11: ΔR ⋈ ΔS⁺ (Möbius sign = -1)            = -ΔR⋈ΔS⁺
     ─────────────────────────────────────────────────────────────
     Net:                                                R_old⋈ΔS⁺
 
@@ -83,7 +85,7 @@ A term with bitmask `mask` is pruned if:
 
 where `skip_bits` is the OR of all PK leaf bits that satisfy:
 1. The PK leaf is the referenced side of a FOREIGN KEY declared in the join
-2. The PK leaf's delta is insert-only (no `_duckdb_ivm_multiplicity = false` rows)
+2. The PK leaf's delta is insert-only (no `_duckdb_ivm_multiplicity < 0` rows)
 
 This is a single bitmask check per term — O(1).
 
@@ -108,7 +110,7 @@ build + hash join probe + UNION ALL branch.
 ## When It Does Not Apply
 
 - No FK constraints declared between join tables
-- PK-side delta contains deletes or updates (multiplicity = false)
+- PK-side delta contains deletes or updates (any row with multiplicity < 0)
 - LEFT/RIGHT joins (FK semantics don't guarantee empty results)
 - Self-referencing FKs (both sides are the same table)
 - **DuckLake tables**: DuckLake does not support `FOREIGN KEY` constraints. For DuckLake

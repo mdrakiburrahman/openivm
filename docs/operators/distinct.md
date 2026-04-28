@@ -1,5 +1,7 @@
 # DISTINCT
 
+> Linearity: **NON_LINEAR** (DBSP `δ` operator — drops duplicates; group-recompute via COUNT(*) sentinel). ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -63,11 +65,10 @@ CREATE TABLE distinct_colors AS
 The upsert is identical to [grouped aggregates](grouped-aggregates.md):
 
 ```sql
--- Consolidate deltas per distinct value
+-- Consolidate deltas per distinct value (Z-set bag-aware sum: weight × count)
 WITH ivm_cte AS (
     SELECT color,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity = false
-            THEN -_ivm_distinct_count ELSE _ivm_distinct_count END) AS _ivm_distinct_count
+        SUM(_duckdb_ivm_multiplicity * _ivm_distinct_count) AS _ivm_distinct_count
     FROM delta_distinct_colors
     GROUP BY color
 )

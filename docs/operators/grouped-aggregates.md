@@ -1,5 +1,7 @@
 # Grouped aggregates
 
+> Linearity: **LINEAR** for SUM/COUNT; **NON_LINEAR** for MIN/MAX/AVG/STDDEV/LIST (group recompute). ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -54,11 +56,12 @@ SELECT * FROM projection_2;
 ### Upsert (MERGE)
 
 ```sql
--- Consolidate delta rows: fold insertions (+) and deletions (-) into a single net delta per group
+-- Consolidate delta rows: fold insertions (+1) and deletions (-1) into a single net delta per group.
+-- With integer-weighted multiplicity, this is just SUM(_w * col) — no CASE round-trip needed.
 WITH ivm_cte AS (
     SELECT region,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -total ELSE total END) AS total,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -cnt ELSE cnt END) AS cnt
+        SUM(_duckdb_ivm_multiplicity * total) AS total,
+        SUM(_duckdb_ivm_multiplicity * cnt) AS cnt
     FROM delta_sales_summary
     GROUP BY region
 )

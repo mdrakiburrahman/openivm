@@ -17,6 +17,10 @@ anything it flags as `ivm_compatible = false` routes to `IVMType::FULL_REFRESH`.
 | `<agg>(...) FILTER (WHERE predicate)` | The filter interacts with delta rows in ways the `sum(case mult=false then -col else col end)` formula can't reproduce. Detected via `BoundAggregateExpression::filter != nullptr`. |
 | `GROUPING SETS`, `CUBE`, `ROLLUP` | Our delta pipeline groups once; can't emit the cross-grouped subtotal rows. Detected via `LogicalAggregate::grouping_sets.size() > 1`. Also note: LPTS doesn't round-trip the ROLLUP annotation, so for these views the parser substitutes the user's original SQL for both initial populate and recompute. |
 | Aggregates not in `SUPPORTED_AGGREGATES` (BOOL_OR, BOOL_AND, STRING_AGG, LISTAGG, GROUP_CONCAT, MEDIAN, percentiles, APPROX_*, QUANTILE_*, ANY_VALUE, ARG_MAX, ARG_MIN, …) | Order-dependent, holistic, or non-decomposable; no known delta formula. Supported set: `count_star, count, sum, min, max, avg, list, stddev, stddev_samp, stddev_pop, variance, var_samp, var_pop`. |
+| Correlation / regression aggregates: `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*` (`REGR_AVGX`, `REGR_AVGY`, `REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_SLOPE`, `REGR_SXX`, `REGR_SXY`, `REGR_SYY`) | LPTS does not round-trip these aggregates back to SQL, so the delta plan can't be serialised. Routed to FULL_REFRESH. |
+| `AVG` / `STDDEV` / `VARIANCE` inside a CTE that is then **joined** to another relation | The CTE's hidden SUM/COUNT decomposition can't be propagated through the join's projection map, so `LPTSPlanRewriter` can't emit a serialisable delta plan. Routed to FULL_REFRESH. |
+| `UNION` / `UNION ALL` over per-branch `AGGREGATE` (where the per-branch aggregate isn't itself the top of the view) | The DBSP `AGGREGATE_UNION` operator isn't implemented yet; deduplicating across UNION branches incrementally would require it. Routed to FULL_REFRESH. |
+| `HAVING` referencing `IS NULL` / `IS NOT NULL` / a `BOUND_AGGREGATE` directly | Detected by the HAVING rewriter; treated as group-recompute (same path as other partial-recompute HAVING views). |
 
 ### Operators
 
@@ -26,6 +30,7 @@ anything it flags as `ivm_compatible = false` routes to `IVMType::FULL_REFRESH`.
 | Unusual join types (SEMI, ANTI, MARK, etc. — anything other than INNER/LEFT/RIGHT/FULL OUTER) | No delta rewrite rule. |
 | `LIMIT` without deterministic `ORDER BY` (or with ties on the ORDER BY key) | Row selection is non-deterministic between MV creation and recompute — the MV and the base query can legitimately return different subsets, so recompute and the `EXCEPT ALL` verify diverge. Not a code bug; add a unique `ORDER BY` to make the view deterministic. |
 | Any operator the plan walk doesn't recognize (falls into the `default:` branch of the compatibility check) | Conservatively treated as unsupported until a rewrite rule lands. |
+| Any plan that LPTS (`LogicalPlanToString`) can't serialise back to SQL | Caught at refresh-plan compile time; OpenIVM falls back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM view_query`). Subsumes ordered-set aggregates and a few other corner cases — covered without per-construct enumeration. |
 
 ### Expressions
 

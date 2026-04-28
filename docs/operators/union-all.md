@@ -1,5 +1,7 @@
 # Union all
 
+> Linearity: **LINEAR** (UNION ALL is Z-set addition). ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -57,11 +59,11 @@ The UNION ALL delta is a projection (no aggregation), so the upsert uses the sam
 -- Compute the net change per distinct tuple across both branches
 WITH _ivm_net AS (
     SELECT id, product,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_all_orders
     WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, product
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 -- Delete net-removed copies
 DELETE FROM all_orders WHERE rowid IN (
@@ -78,11 +80,11 @@ DELETE FROM all_orders WHERE rowid IN (
 -- Insert net-added copies
 WITH _ivm_net AS (
     SELECT id, product,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_all_orders
     WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, product
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 INSERT INTO all_orders SELECT id, product
 FROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)

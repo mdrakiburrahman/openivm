@@ -1,5 +1,7 @@
 # Left join
 
+> Linearity: **BILINEAR** ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -81,9 +83,10 @@ join_6 = scan_4 INNER JOIN scan_5 ON (id = customer_id)
 
 -- Term 3: delta_customers ⨝ delta_orders (cross-delta correction)
 -- Left-side has deltas → keep LEFT JOIN semantics
--- XOR of multiplicities encodes the inclusion-exclusion sign
+-- Combined multiplicity = (-1)^(k-1) * w1 * w2 with k=2 → (-1) * w1 * w2
+-- (Möbius inclusion-exclusion sign × Z-set bilinear product — see inner-join.md)
 join_11 = delta_customers LEFT JOIN delta_orders ON (id = customer_id)
-projection_12 = SELECT ..., (mul1) != (mul2) AS combined_mul FROM join_11
+projection_12 = SELECT ..., (-1) * mul1 * mul2 AS combined_mul FROM join_11
 
 -- Combine all terms into a single delta stream
 union_13 = term1 UNION ALL term2 UNION ALL term3
@@ -148,4 +151,5 @@ The inclusion-exclusion generates 2^3 - 1 = 7 terms. Terms where only `bonuses` 
 
 - Partial recompute is proportional to the number of affected left keys, not the number of changed rows. If many left keys are affected, the recompute may scan a large portion of the base tables.
 - `AGGREGATE_GROUP` views with LEFT JOIN sources use group recompute (not the standard MERGE), since NULL handling in aggregate deltas is not decomposable.
+- **LEFT JOIN with a *computed* aggregate argument** (anything other than a plain bound column reference — `COALESCE`, `CASE`, an arithmetic expression, a constant) is also forced onto the group-recompute path even when the delta is insert-only. The Larson-Zhou MERGE template doesn't correctly handle the case where a new right-side row converts an existing NULL-padded row into a match for these expressions, so the classifier sets `has_minmax=true` (overloaded as a "use group-recompute" signal) and skips the MERGE fast path. See `src/upsert/openivm_compile_upsert.cpp:289–315`.
 - Maximum 16 tables in the join (same limit as [inner join](inner-join.md)).

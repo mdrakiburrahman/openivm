@@ -48,7 +48,7 @@ OpenIVM operates in two phases:
 When `CREATE MATERIALIZED VIEW <name> AS <query>` is parsed:
 
 1. **Parser extension** (`src/core/openivm_parser.cpp`) intercepts the statement
-2. Creates delta tables (`delta_<table>`) for each source table with extra columns: `_duckdb_ivm_multiplicity` (BOOLEAN) and `_duckdb_ivm_timestamp` (TIMESTAMP)
+2. Creates delta tables (`delta_<table>`) for each source table with extra columns: `_duckdb_ivm_multiplicity` (INTEGER signed Z-set weight, +1=insert, −1=delete) and `_duckdb_ivm_timestamp` (TIMESTAMP)
 3. Stores view metadata in system tables (`_duckdb_ivm_views`, `_duckdb_ivm_delta_tables`)
 4. Rewrites aggregate functions (e.g., adds COUNT alongside SUM for correct incremental maintenance)
 5. Creates a regular DuckDB view with the rewritten query
@@ -79,7 +79,7 @@ All rules inherit from `IvmRule` (`src/include/rules/ivm_rule.hpp`).
 
 For N tables, the join rule generates 2^N - 1 terms using inclusion-exclusion:
 - For each non-empty subset S of tables: replace tables in S with their delta scans, keep others as current base table scans
-- Combined multiplicity = XOR of all delta multiplicities (XOR maps ±1 sign to boolean)
+- Combined multiplicity = `(-1)^(k-1) × ∏ wᵢ` over leaves in the mask (Möbius inclusion-exclusion sign × Z-set bilinear product). The Möbius sign is required because OpenIVM's "current base" scan reads `R_now = R_old + ΔR` (deltas already merged into source by the insert rule), so the textbook DBSP all-positive delta-join formula doesn't apply directly.
 - All terms are combined with UNION ALL
 - Terms are pruned by FK-aware optimization and empty-delta skipping
 
@@ -101,7 +101,7 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 
 ### Key Architectural Rules
 
-- **Multiplicity column** (`_duckdb_ivm_multiplicity`): BOOLEAN — `true` = insert, `false` = delete
+- **Multiplicity column** (`_duckdb_ivm_multiplicity`): INTEGER signed Z-set weight — `+1` = insert, `-1` = delete. Multiplicity > 1 is encoded as repeated rows.
 - **Delta tables** are named `delta_<base_table>` and include a timestamp column for tracking when changes occurred
 - **LPTS** (LogicalPlanToString, in `third_party/lpts/`) converts logical plans back to SQL for compilation
 - **Cost model** (`src/upsert/openivm_cost_model.cpp`) compares estimated IVM cost vs full recompute cost. Includes filter selectivity estimation and learned regression from execution history (when `ivm_adaptive_refresh` is enabled)

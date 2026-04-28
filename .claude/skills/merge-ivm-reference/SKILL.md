@@ -9,6 +9,14 @@ Comprehensive reference on the SQL MERGE statement and its application to
 Incremental View Maintenance (IVM) upsert patterns, written in the context of
 the OpenIVM DuckDB extension.
 
+> **Note (post-fc6dab9 Z-set refactor):** OpenIVM's canonical aggregate consolidation is now
+> `SUM(_duckdb_ivm_multiplicity * col)` — `_duckdb_ivm_multiplicity` is a signed `INTEGER`
+> Z-set weight (+1 = insert, −1 = delete). Many templates in this skill still show the
+> earlier `SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -col ELSE col END)` form
+> — the two are mathematically equivalent and the BOOLEAN form is preserved here for
+> historical context, but new code should use the integer-weight form. Similarly,
+> `WHERE _duckdb_ivm_multiplicity = true / = false` is now `> 0` / `< 0`.
+
 ---
 
 ## 1. The MERGE Statement (SQL Standard)
@@ -566,17 +574,20 @@ ON (mv.region IS NOT DISTINCT FROM d.region
 
 ### 5.4 Handling the Multiplicity Column
 
-The `_duckdb_ivm_multiplicity` column is a BOOLEAN:
-- `true` = this delta row represents an INSERT (positive contribution)
-- `false` = this delta row represents a DELETE (negative contribution)
+The `_duckdb_ivm_multiplicity` column is a signed `INTEGER` carrying the Z-set weight
+(post-fc6dab9 refactor):
+- `+1` = this delta row represents an INSERT (positive contribution)
+- `-1` = this delta row represents a DELETE (negative contribution)
+- multiplicities >1 are encoded by repeated rows in practice
 
-The CTE consolidation converts this to signed arithmetic:
+The CTE consolidation is now direct weight arithmetic — no `CASE WHEN` round-trip:
 ```sql
-SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -agg ELSE agg END)
+SUM(_duckdb_ivm_multiplicity * agg)
 ```
 
-This is identical to the current OpenIVM approach and is preserved in the
-MERGE pattern.
+This is the current OpenIVM template; older code paths used
+`SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -agg ELSE agg END)` and have been
+replaced. The MERGE pattern is unchanged otherwise.
 
 ### 5.5 Deletion of Zeroed-Out Groups
 

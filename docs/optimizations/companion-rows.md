@@ -44,16 +44,16 @@ Suppose `sales_summary` has `(US, total=100, cnt=5)` and the IVM delta adds 50 t
 INSERT INTO delta_sales_summary VALUES ('US', 50, 2, true);
 ```
 
-The companion query inserts a false row for the existing group:
+The companion query inserts a retraction row (multiplicity `-1`) for the existing group:
 
 ```sql
--- Record that the 'US' group existed before this refresh
--- Zero-valued false row: cancels old contribution for downstream consumers
--- Only inserted for groups that already exist in the MV (not for new groups)
+-- Record that the 'US' group existed before this refresh.
+-- Zero-valued retraction row: cancels old contribution for downstream consumers.
+-- Only inserted for groups that already exist in the MV (not for new groups).
 INSERT INTO delta_sales_summary (region, total, cnt, _duckdb_ivm_multiplicity)
-SELECT d.region, 0, 0, false
+SELECT d.region, 0, 0, -1
 FROM delta_sales_summary d
-WHERE d._duckdb_ivm_multiplicity = true
+WHERE d._duckdb_ivm_multiplicity > 0
   AND EXISTS (SELECT 1 FROM sales_summary m
               WHERE m.region IS NOT DISTINCT FROM d.region);
 ```
@@ -62,10 +62,10 @@ After the MERGE upsert updates the MV to `(US, total=150, cnt=7)`, the delta vie
 
 | region | total | cnt | mul |
 |---|---|---|---|
-| US | 50 | 2 | true |
-| US | 0 | 0 | false |
+| US | 50 | 2 | +1 |
+| US | 0 | 0 | -1 |
 
-A downstream `COUNT(*)` over region sees: +1 (true) - 1 (false) = 0 net change for 'US'. Correct — the group already existed.
+A downstream `COUNT(*)` over region sees: `+1 + (-1) = 0` net change for 'US'. Correct — the group already existed.
 
 ### SIMPLE_AGGREGATE and PROJECTION Views
 

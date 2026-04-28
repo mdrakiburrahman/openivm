@@ -1,5 +1,7 @@
 # List aggregates
 
+> Linearity: **NON_LINEAR** (group recompute — list elements aren't summable so deltas can't compose). ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -48,16 +50,14 @@ SELECT sensor, all_readings, _duckdb_ivm_multiplicity FROM aggregate_1;
 ### Upsert (CTE consolidation + MERGE)
 
 ```sql
--- Consolidate deltas: negate deleted lists element-wise, then reduce via element-wise addition
--- list_transform negates each element for deletions (multiplicity = false)
--- list_reduce folds multiple lists into one by adding corresponding elements
+-- Consolidate deltas: scale each list element by the row's signed weight, then
+-- reduce via element-wise addition.
+-- list_transform multiplies each element by the integer multiplicity (+1 / -1).
+-- list_reduce folds multiple lists into one by adding corresponding elements.
 WITH ivm_cte AS (
     SELECT sensor,
         list_reduce(list(
-            CASE WHEN _duckdb_ivm_multiplicity = false
-                THEN list_transform(all_readings, lambda x: -x)
-                ELSE all_readings
-            END
+            list_transform(all_readings, lambda x: _duckdb_ivm_multiplicity * x)
         ), lambda a, b: list_transform(
             list_zip(a, b), lambda x: x[1] + x[2]
         )) AS all_readings

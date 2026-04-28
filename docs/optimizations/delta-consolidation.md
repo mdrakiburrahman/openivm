@@ -14,18 +14,18 @@ for the same logical row into a single net change.
 
 ### Projection Views
 
-Group by all projected columns and sum the multiplicity to get the net count per tuple.
+Group by all projected columns and sum the (signed integer) multiplicity to get the net count per tuple.
 
 ```sql
 -- Collapse multiple entries for the same tuple into a single net change
--- +1 for each insertion, -1 for each deletion
+-- _duckdb_ivm_multiplicity is the signed Z-set weight: +1 for insertion, -1 for deletion
 WITH consolidated AS (
     SELECT col1, col2, ...,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_table
     WHERE _duckdb_ivm_timestamp >= '{ts}'
     GROUP BY col1, col2, ...
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 -- _net > 0: net insert (the tuple gained copies)
 -- _net < 0: net delete (the tuple lost copies)
@@ -46,23 +46,23 @@ The delta table now has three rows:
 
 | id | name | price | multiplicity | timestamp |
 |---|---|---|---|---|
-| 1 | Widget | 10 | true | t1 |
-| 1 | Widget | 10 | false | t2 |
-| 1 | Widget | 15 | true | t3 |
+| 1 | Widget | 10 | +1 | t1 |
+| 1 | Widget | 10 | -1 | t2 |
+| 1 | Widget | 15 | +1 | t3 |
 
 Consolidation groups by (id, name, price):
 
 ```sql
 -- Group identical tuples and compute net change
--- (1, Widget, 10): +1 - 1 = 0 → cancelled out, removed by HAVING
--- (1, Widget, 15): +1 = 1 → net insert
+-- (1, Widget, 10): +1 + (-1) = 0 → cancelled out, removed by HAVING
+-- (1, Widget, 15): +1            = 1 → net insert
 WITH consolidated AS (
     SELECT id, name, price,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_products
     WHERE _duckdb_ivm_timestamp >= '{ts}'
     GROUP BY id, name, price
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 -- Result: only (1, Widget, 15, _net=1) survives
 -- The old price (10) fully cancelled out — no wasted work
@@ -70,14 +70,14 @@ WITH consolidated AS (
 
 ### Aggregate Views
 
-Group by the aggregation keys and fold the value using the multiplicity flag:
+Group by the aggregation keys and fold the value by multiplying the column by the signed weight:
 
 ```sql
--- Fold insertions (+) and deletions (-) into a single signed delta per group
--- This produces one row per group key, ready for MERGE into the view
+-- Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
+-- This produces one row per group key, ready for MERGE into the view.
 WITH consolidated AS (
     SELECT key1, key2,
-           SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -agg_val ELSE agg_val END) AS _net_val
+           SUM(_duckdb_ivm_multiplicity * agg_val) AS _net_val
     FROM delta_table
     WHERE _duckdb_ivm_timestamp >= '{ts}'
     GROUP BY key1, key2
@@ -85,6 +85,23 @@ WITH consolidated AS (
 -- Each row is a single signed delta: positive means the group's aggregate increased,
 -- negative means it decreased
 ```
+
+### Atomic UPDATE-delta writes
+
+A SQL `UPDATE` is decomposed into a retraction (`-1`) of the old row plus an insertion
+(`+1`) of the new row. Both rows must commit together — if a concurrent refresh snapshots
+the database between them, it sees a half-applied UPDATE and consolidation produces a
+spurious net insert or net delete. To prevent that, the insert rule emits both rows in a
+**single multi-row INSERT** with `UNION ALL` (sharing one transaction and one `now()`):
+
+```sql
+INSERT INTO delta_t (..., _duckdb_ivm_multiplicity, _duckdb_ivm_timestamp)
+SELECT * FROM (... old row select with mul=-1 ...)
+UNION ALL
+SELECT * FROM (... new row select with mul=+1 ...);
+```
+
+This is what makes UPDATE-driven consolidation safe under concurrent refresh.
 
 ### Bag Semantics
 

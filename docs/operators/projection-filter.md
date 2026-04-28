@@ -1,5 +1,7 @@
 # Projection and filter
 
+> Linearity: **LINEAR** ([what does this mean?](../internals/linearity.md))
+
 ## Example (projection)
 
 ```sql
@@ -104,11 +106,11 @@ The upsert is identical for projection and filter views. Shown here for the proj
 -- HAVING filters out tuples where inserts and deletes cancel out (_net = 0)
 WITH _ivm_net AS (
     SELECT id, name,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_emp_names
     WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, name
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 -- Step 2: delete net-removed copies
 -- ROW_NUMBER assigns a deterministic ordering within each group of identical tuples
@@ -128,11 +130,11 @@ DELETE FROM emp_names WHERE rowid IN (
 -- generate_series(1, _net) replicates the tuple _net times for bag semantics
 WITH _ivm_net AS (
     SELECT id, name,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_emp_names
     WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, name
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 INSERT INTO emp_names SELECT id, name
 FROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)

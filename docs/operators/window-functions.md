@@ -1,5 +1,7 @@
 # Window Functions
 
+> Linearity: **NON_LINEAR** (partition recompute — partition-level state required). ([what does this mean?](../internals/linearity.md))
+
 OpenIVM supports materialized views with window functions via **partition-level recompute**.
 When base data changes, only the partitions affected by the delta are deleted and
 re-inserted from the base query. Unchanged partitions are preserved.

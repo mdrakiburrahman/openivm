@@ -1,5 +1,7 @@
 # Ungrouped aggregates
 
+> Linearity: **LINEAR** for SUM/COUNT; **NON_LINEAR** for MIN/MAX/AVG/STDDEV (full single-row recompute). ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -55,11 +57,12 @@ SELECT t1_total, t1_cnt, t1__duckdb_ivm_multiplicity FROM aggregate_1;
 
 ```sql
 WITH _ivm_delta AS (
-    -- Consolidate all delta rows into a single net change per column
-    -- false multiplicities become negative (subtracted from the MV)
+    -- Consolidate all delta rows into a single net change per column.
+    -- Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM
+    -- (insertions carry +1, deletions carry −1).
     SELECT
-        SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -total ELSE total END) AS d_total,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -cnt ELSE cnt END) AS d_cnt
+        SUM(_duckdb_ivm_multiplicity * total) AS d_total,
+        SUM(_duckdb_ivm_multiplicity * cnt) AS d_cnt
     FROM delta_total_score
 )
 -- Add the net delta to the existing single-row MV

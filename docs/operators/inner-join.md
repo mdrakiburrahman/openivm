@@ -1,5 +1,7 @@
 # Inner join
 
+> Linearity: **BILINEAR** ([what does this mean?](../internals/linearity.md))
+
 ## Example
 
 ```sql
@@ -18,17 +20,25 @@ PRAGMA ivm('user_orders');
 
 ## How IVM handles it
 
-**Algebraic rule (inclusion-exclusion):**
+**Algebraic rule (Möbius inclusion-exclusion over Z-sets):**
 
-For a two-table join R ⨝ S:
+For a two-table join R ⨝ S, with current bases pointing at `R_now = R_old + ΔR` and `S_now = S_old + ΔS` (deltas already merged into the source by the insert rule):
 
 ```
-delta(R ⨝ S) = delta(R) ⨝ S
-             ∪ R ⨝ delta(S)
-             ∪ delta(R) ⨝ delta(S)   [with sign correction via XOR]
+Δ(R ⨝ S) = ΔR ⨝ S_now    [+1 sign, |mask|=1]
+         + R_now ⨝ ΔS    [+1 sign, |mask|=1]
+         − ΔR ⨝ ΔS       [−1 sign, |mask|=2 — corrects double-counting]
 ```
 
-For N tables, this generalizes to 2^N - 1 terms — one for each non-empty subset of tables replaced by their delta scans. Each term replaces a subset of tables with their delta scans and keeps the rest as current base table scans. The terms are combined with `UNION ALL`, and the multiplicity is computed as the XOR of all delta multiplicities (XOR maps the ±1 inclusion-exclusion sign to boolean).
+For N tables, this generalises to 2^N − 1 terms — one for each non-empty subset of tables replaced by their delta scans. Each term replaces a subset of tables with their delta scans and keeps the rest as current base table scans. The terms are combined with `UNION ALL`. The combined multiplicity for a term with mask size *k* is
+
+```
+combined_w = (-1)^(k-1) × ∏ wᵢ      over leaves i in the mask
+```
+
+— the **Möbius inclusion-exclusion sign** times the **Z-set bilinear product** of leaf multiplicities. The Möbius sign is required precisely because the non-delta legs read the current (post-DML) state; without it, the sum over masks double- (and quadruple-, …) counts the cross-terms.
+
+This is *not* the textbook DBSP all-positive delta-join formula, which would apply if non-delta legs read `R_old` instead of `R_now`. OpenIVM chose to read `R_now` because the insert rule has already committed the delta rows to the source — see `src/rules/join.cpp:425–467` for the full algebraic derivation and a truth-table verification against the previous BOOLEAN-XOR encoding.
 
 The maximum supported join width is 16 tables.
 
@@ -48,11 +58,13 @@ scan_5 = SELECT user_id, amount, mul FROM delta_orders WHERE ts >= '...'
 join_6 = scan_4 INNER JOIN scan_5 ON (id = user_id)
 
 -- Term 3: delta_users ⨝ delta_orders (cross-delta correction)
--- Prevents double-counting rows affected by changes to BOTH tables
--- XOR of multiplicities encodes the inclusion-exclusion sign:
---   insert ⨝ insert = true XOR true = false (subtract, because terms 1+2 already counted it)
+-- Prevents double-counting rows affected by changes to BOTH tables.
+-- Combined multiplicity = (-1)^(k-1) * w1 * w2 with k=2:
+--   insert × insert = (-1) * (+1)*(+1) = -1   (subtract — terms 1+2 already counted it)
+--   delete × insert = (-1) * (-1)*(+1) = +1
+--   delete × delete = (-1) * (-1)*(-1) = -1
 join_11 = delta_users INNER JOIN delta_orders ON (id = user_id)
-projection_12 = SELECT ..., (mul1) != (mul2) AS combined_mul FROM join_11
+projection_12 = SELECT ..., (-1) * mul1 * mul2 AS combined_mul FROM join_11
 
 -- Combine all terms into a single delta stream
 union_13 = term1 UNION ALL term2 UNION ALL term3
@@ -81,14 +93,14 @@ The join delta is a projection (no aggregation), so the upsert uses counting-bas
 
 ```sql
 -- Compute the net change per distinct tuple
--- Inserts count +1, deletes count -1; canceling pairs sum to 0 and are filtered out
+-- Inserts carry +1, deletes carry -1; canceling pairs sum to 0 and are filtered out
 WITH _ivm_net AS (
     SELECT name, amount,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_user_orders
     WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY name, amount
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 -- Delete net-removed copies using rowid + ROW_NUMBER for precise bag-semantic deletes
 DELETE FROM user_orders WHERE rowid IN (
@@ -105,11 +117,11 @@ DELETE FROM user_orders WHERE rowid IN (
 -- Insert net-added copies using generate_series for bag semantics
 WITH _ivm_net AS (
     SELECT name, amount,
-        SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS _net
+        SUM(_duckdb_ivm_multiplicity) AS _net
     FROM delta_user_orders
     WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY name, amount
-    HAVING SUM(CASE WHEN _duckdb_ivm_multiplicity THEN 1 ELSE -1 END) != 0
+    HAVING SUM(_duckdb_ivm_multiplicity) != 0
 )
 INSERT INTO user_orders SELECT name, amount
 FROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)

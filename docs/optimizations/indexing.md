@@ -17,6 +17,13 @@ The index enforces uniqueness on the GROUP BY key combination. DuckDB's `MERGE I
 statement uses hash joins internally for key matching, so the ART index primarily serves
 as a correctness guard rather than a lookup accelerator. No user action is required.
 
+**Non-unique GROUP BY keys:** OpenIVM **skips** the UNIQUE INDEX when the parser detects
+that the declared `group_columns` aren't actually unique in the view query (for example,
+`SELECT a, MAX(b) FROM t GROUP BY a, c` projects `a` and `MAX(b)` but groups by `(a, c)` —
+two MV rows can share the same `a`). Adding a UNIQUE INDEX in that case would refuse the
+upsert at runtime; the parser opts out at view creation time instead. The MERGE path still
+works correctly — it just relies on hash matching rather than the index.
+
 **DuckLake tables:** ART index creation is skipped for DuckLake-backed views because
 DuckLake does not support DuckDB-native index types. Group column identification falls
 back to metadata stored in `_duckdb_ivm_views`.

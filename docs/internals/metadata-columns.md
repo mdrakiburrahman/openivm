@@ -8,12 +8,12 @@ Delta tables have two metadata columns appended to the base table schema. See [D
 
 | Column | Type | Description |
 |---|---|---|
-| `_duckdb_ivm_multiplicity` | `BOOLEAN` | `true` = inserted row, `false` = deleted row. |
+| `_duckdb_ivm_multiplicity` | `INTEGER` | Signed Z-set weight: `+1` = inserted row, `-1` = deleted row. Multiplicity > 1 is encoded by repeated rows. |
 | `_duckdb_ivm_timestamp` | `TIMESTAMP` | When the change was recorded. Defaults to `now()`. |
 
-**Multiplicity** encodes the sign of each delta row. INSERT writes `true`, DELETE writes `false`, UPDATE writes two rows (old=`false`, new=`true`). During upsert, aggregates use `CASE WHEN mul = false THEN -value ELSE value END` to fold insertions and deletions into a net change. Projection views compute `SUM(CASE WHEN mul THEN 1 ELSE -1 END)` per distinct tuple.
+**Multiplicity** encodes the sign and count of each delta row as a signed integer (Z-set weight). INSERT writes `+1`, DELETE writes `-1`, UPDATE writes two rows (old=`-1`, new=`+1`). During upsert, aggregates fold insertions and deletions into a net change with `SUM(_duckdb_ivm_multiplicity * value)`; projection views compute `SUM(_duckdb_ivm_multiplicity)` per distinct tuple to determine the net inserts/deletes. Joins multiply weights across leaves and apply a Möbius inclusion-exclusion sign — see [`inner-join.md`](../operators/inner-join.md).
 
-**Timestamp** is set to `now()::timestamp` when the delta row is written. During refresh, only rows where `_duckdb_ivm_timestamp >= last_refresh_timestamp` are read. This lets multiple MVs share a single delta table and each consume only the changes it hasn't processed yet.
+**Timestamp** is set to `now()::timestamp` when the delta row is written. During refresh, only rows where `_duckdb_ivm_timestamp >= last_update` are read (where `last_update` is the per-(view,table) cursor in `_duckdb_ivm_delta_tables` — see [delta-tables.md](delta-tables.md)). This lets multiple MVs share a single delta table and each consume only the changes it hasn't processed yet.
 
 ## MV hidden columns
 

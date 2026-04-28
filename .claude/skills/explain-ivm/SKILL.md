@@ -648,33 +648,41 @@ Each tuple t has an integer weight w(t) in Z:
 - Order of applying deltas does not matter (commutativity of addition).
 - Naturally handles batch updates (a batch is a Z-set with multiple non-zero entries).
 
-### 3.2 Boolean Multiplicities (OpenIVM's Approach)
+### 3.2 Integer Multiplicities (OpenIVM's Approach, post-Z-set refactor)
 
-OpenIVM uses boolean multiplicities instead of integers:
-- true = insertion (+1)
-- false = deletion (-1)
+OpenIVM uses **signed-integer** multiplicities (commit `fc6dab9` switched from BOOLEAN
+to INTEGER to align with the Z-set algebra):
+- `+1` = insertion
+- `-1` = deletion
+- Larger weights are encoded by repeated rows; the cross-system insert rule still emits
+  one row per logical event today, but the column type can carry any signed weight.
 
 **Advantages:**
-- Simpler storage (1 bit per tuple instead of an integer).
-- Sufficient for the common case where each delta represents a single insert or delete.
-- Maps naturally to SQL (boolean column `_duckdb_ivm_multiplicity`).
+- Maps directly to the Z-set group structure: `SUM(_w * col)` is the consolidation
+  formula for any linear aggregate, with no `CASE WHEN` round-trip.
+- Joins multiply weights and apply a Möbius inclusion-exclusion sign (see
+  `src/rules/join.cpp:425–467`) — algebraically equivalent to the previous BOOLEAN-XOR
+  encoding but readable as standard linear algebra.
+- Compatible with future "weight > 1" deltas (e.g., a batch of N inserts represented as
+  one row with weight N) without schema change.
 
 **Limitations:**
-- Cannot represent updates directly (must be decomposed into delete + insert).
-- Cannot represent batch multiplicities (e.g., "insert 3 copies of this tuple").
-- For aggregation, boolean multiplicity alone is insufficient -- the system pairs it
-  with the aggregate value: (multiplicity_bool, aggregate_value).
+- Repeated rows are still the canonical encoding for multiplicities > 1; the upsert's
+  `generate_series(1, _w::BIGINT)` fan-out then expands them back into the data table
+  for bag semantics.
+- For LIST/STRUCT aggregates, the per-row scaling becomes
+  `list_transform(col, x: _w * x)` instead of plain `_w * col`.
 
 ### 3.3 Tradeoffs
 
-| Aspect | Z-sets (integers) | Boolean multiplicity |
-|--------|-------------------|---------------------|
-| Space per tuple | 4-8 bytes (int32/64) | 1 bit |
-| Batch updates | Native (weight = batch size) | Must enumerate |
-| Updates (modify) | Single entry: -old + new | Two entries: false + true |
-| Composition | Multiplicities multiply through joins | XOR-based for joins |
-| Consolidation | Sum weights; cancel +1/-1 | Match true/false pairs |
-| Aggregate compat | Natural (weight * value) | Needs pairing with value |
+| Aspect | Pure Z-sets (integers) | OpenIVM (INT32) | Historical BOOLEAN encoding |
+|--------|------------------------|-----------------|------------------------------|
+| Space per tuple | 4-8 bytes | 4 bytes | 1 byte |
+| Batch updates | Native | Repeated rows (weight=±1 in practice) | Must enumerate |
+| Updates (modify) | Single entry: -old + new | Two entries: -1 row + +1 row, atomic UNION ALL | Two entries: false + true |
+| Composition | Multiplicities multiply through joins | Same — `(-1)^(k-1) × ∏ wᵢ` (Möbius × bilinear) | XOR-based |
+| Consolidation | `SUM(w)` cancels +1/-1 | Same | Match true/false pairs via `CASE WHEN` |
+| Aggregate compat | Natural (`w * val`) | Same | Needed `CASE WHEN mul = false THEN -val ELSE val END` |
 
 ### 3.4 How Multiplicities Compose Through Operators
 
@@ -684,10 +692,9 @@ OpenIVM uses boolean multiplicities instead of integers:
 counting algorithm converts multiplicities to 0/1.
 
 **Join:** Multiplicities multiply. If R has (t1, w1) and S has (t2, w2) where t1 and t2
-join, the result has (t1 join t2, w1 * w2). For boolean multiplicities:
-true * true = true (insert join insert = insert);
-true * false = false (insert join delete = delete);
-false * false = true (delete join delete = insert -- cancellation via XOR).
+join, the result has (t1 join t2, w1 * w2). OpenIVM additionally applies a Möbius
+inclusion-exclusion sign `(-1)^(k-1)` per term of size k because its non-delta legs read
+the post-DML state — see [zsets](../../skills/zsets/SKILL.md) and `src/rules/join.cpp`.
 
 **Aggregation:** For SUM, the aggregate incorporates the multiplicity:
 SUM(value * multiplicity) per group.
@@ -905,8 +912,8 @@ When all tuples in a group are deleted:
 **Detection:** The __count__ hidden column reaching 0 signals group emptiness.
 
 **Implementation in OpenIVM:** After applying deltas, a cleanup step deletes rows where
-the count is 0 (or where boolean multiplicity is false and there are no remaining
-positive-multiplicity tuples).
+`COALESCE(col, 0) = 0` for every aggregate column (i.e., the group has zero net weight
+left after consolidation).
 
 
 ## 6. Efficiency Techniques
@@ -1172,4 +1179,4 @@ Use IVM for some operators and recompute for others within the same query:
 | **Noria** | Dataflow | Partially-stateful operators, eviction, upquery |
 | **Databricks** | Enzyme engine | Adaptive IVM vs recompute, supports joins + window functions |
 | **F-IVM** | Factorized higher-order | View trees, q-hierarchical queries, O(1) update for tractable class |
-| **OpenIVM** | SQL-to-SQL compilation | DuckDB extension, boolean multiplicities, DBSP-inspired |
+| **OpenIVM** | SQL-to-SQL compilation | DuckDB extension, integer-weighted multiplicities (post-Z-set refactor), DBSP-inspired |
