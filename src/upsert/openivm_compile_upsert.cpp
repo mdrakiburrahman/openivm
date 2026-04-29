@@ -290,21 +290,24 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 
 	// has_minmax=true is set by TWO unrelated conditions in the classifier:
-	//   (a) the view has an actual MIN/MAX aggregate — insert-only can use
-	//       GREATEST/LEAST in MERGE (fast path), mixed needs group-recompute.
+	//   (a) the view has an actual MIN/MAX/ARG_MIN/ARG_MAX aggregate — insert-only can use
+	//       GREATEST/LEAST in MERGE (fast path for MIN/MAX), mixed needs group-recompute.
+	//       For ARG_MIN/ARG_MAX the caller always passes insert_only=false via has_argminmax,
+	//       so (has_minmax && !insert_only) below handles group-recompute — this block
+	//       correctly stays quiet (has_real_minmax=true) to avoid double-triggering.
 	//   (b) the view has a LEFT/RIGHT/OUTER JOIN + a "computed" aggregate
 	//       argument (COALESCE/CASE/constant/non-BCR), which breaks the
 	//       Larson & Zhou MERGE template — group-recompute is REQUIRED for
 	//       every delta shape, including insert-only. See the classifier
 	//       comment in openivm_parser.cpp (`query_1502/1696/1746/1749`).
-	// Distinguish: case (a) has "min"/"max" in aggregate_types; case (b)
-	// does not. Force group-recompute for (b) since the MERGE path produces
+	// Distinguish: case (a) has "min"/"max"/"arg_min"/"arg_max" in aggregate_types;
+	// case (b) does not. Force group-recompute for (b) since the MERGE path produces
 	// incorrect MV state when a new right-side row converts an existing
 	// NULL-padded LEFT JOIN row into a match.
 	{
 		bool has_real_minmax = false;
 		for (auto &t : aggregate_types) {
-			if (t == "min" || t == "max") {
+			if (t == "min" || t == "max" || t == "arg_min" || t == "arg_max") {
 				has_real_minmax = true;
 				break;
 			}
@@ -851,16 +854,114 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	return delete_query + insert_query;
 }
 
+string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix) {
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
+	return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+}
+
+namespace {
+
+// Replace every plain occurrence of `needle` in `haystack` with `replacement`.
+// LPTS-form view queries reference base tables via fully-qualified `cat.schema.tbl` triplets,
+// so the needle is unambiguous in practice (the embedded dots prevent it from matching inside
+// any identifier or alias).
+static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
+	if (needle.empty()) {
+		return haystack;
+	}
+	size_t pos = 0;
+	while ((pos = haystack.find(needle, pos)) != string::npos) {
+		haystack.replace(pos, needle.size(), replacement);
+		pos += replacement.size();
+	}
+	return haystack;
+}
+
+} // namespace
+
+string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
+                             const vector<std::pair<string, string>> &delta_table_specs, const string &catalog_prefix,
+                             const string &lpts_table_prefix) {
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
+
+	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
+	if (group_columns.empty() || delta_table_specs.empty()) {
+		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+	}
+
+	// Quoted, comma-separated GROUP BY column list (used in SELECT DISTINCT and EXISTS).
+	string group_csv;
+	for (size_t i = 0; i < group_columns.size(); i++) {
+		if (i > 0) {
+			group_csv += ", ";
+		}
+		group_csv += Q(group_columns[i]);
+	}
+
+	// For each source table T_i, build a "view query restricted to T_i's delta" variant by
+	// substituting the qualified `cat.schema.<base>` reference with a delta-filtered subquery,
+	// then project DISTINCT group_columns. Union across sources gives the affected-keys set.
+	string affected_subquery;
+	for (size_t i = 0; i < delta_table_specs.size(); i++) {
+		const string &base = delta_table_specs[i].first;
+		const string &last_update = delta_table_specs[i].second;
+		string delta_basename = string(ivm::DELTA_PREFIX) + base;
+
+		string delta_filter;
+		if (!last_update.empty()) {
+			delta_filter = " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(last_update) +
+			               "'::TIMESTAMP";
+		}
+		string delta_subselect = "(SELECT * EXCLUDE (" + string(ivm::MULTIPLICITY_COL) + ", " +
+		                         string(ivm::TIMESTAMP_COL) + ") FROM " + catalog_prefix + Q(delta_basename) +
+		                         delta_filter + ")";
+
+		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when
+		// the catalog is the default `memory` (so `catalog_prefix` is empty for SQL output, but
+		// `lpts_table_prefix` is still `memory.main.` here). Substitute that exact form.
+		string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
+		string filtered = ReplaceAllOccurrences(view_query_sql, source_full, delta_subselect);
+
+		if (i > 0) {
+			affected_subquery += "\n  UNION\n  ";
+		} else {
+			affected_subquery += "  ";
+		}
+		affected_subquery += "SELECT DISTINCT " + group_csv + " FROM (" + filtered + ") _ivm_src_" + to_string(i);
+	}
+
+	// EXISTS-based, NULL-safe match (IS NOT DISTINCT FROM). DuckDB inlines the subquery into both
+	// the DELETE and the INSERT — the affected-keys set is computed once per usage in practice but
+	// the planner can fuse them; if profiling shows this is hot, materialize to a TEMP TABLE first.
+	string match_clause;
+	for (size_t i = 0; i < group_columns.size(); i++) {
+		if (i > 0) {
+			match_clause += " AND ";
+		}
+		string col = Q(group_columns[i]);
+		match_clause += "_ivm_aff." + col + " IS NOT DISTINCT FROM _ivm_tgt." + col;
+	}
+	string aff_block = "(\n" + affected_subquery + "\n)";
+
+	string delete_query = "DELETE FROM " + data_table + " AS _ivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + aff_block +
+	                      " AS _ivm_aff WHERE " + match_clause + "\n);\n";
+	string insert_query = "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
+	                      ") AS _ivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + aff_block + " AS _ivm_aff WHERE " +
+	                      match_clause + "\n);\n";
+
+	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas\n", group_columns.size(),
+	                    delta_table_specs.size());
+	return delete_query + "\n" + insert_query;
+}
+
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<string> &delta_table_names) {
+	if (partition_columns.empty()) {
+		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+	}
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-
-	if (partition_columns.empty()) {
-		// No PARTITION BY → full recompute (same as FULL_REFRESH but through the IVM pipeline)
-		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
-	}
 
 	// Single-table window views: identify affected partitions from the base delta table.
 	// OR-based per-column filtering handles multiple PARTITION BY columns from different

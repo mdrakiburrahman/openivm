@@ -113,6 +113,73 @@ void DemoteLeftJoins(LogicalOperator *node) {
 	}
 }
 
+// Per-LJ demote: walk the join tree and demote only the LJs that need it,
+// based on which subtree contains delta-marked leaves in the current mask.
+// Demoting indiscriminately (the original DemoteLeftJoins) drops NULL-padded
+// rows from intermediate LJs that have no delta in this mask, which breaks
+// chained-LJ correctness when only a deeper-right table has changes
+// (probe 11: base LJ d1 LJ d2, Δd2 only).
+//
+// Rules (driven by which side supplies NULLs for that join type):
+//   LEFT JOIN  — right side is NULL-supplying; demote iff right subtree has Δ.
+//   RIGHT JOIN — left side is NULL-supplying; demote iff left subtree has Δ.
+//   FULL OUTER — both sides are NULL-supplying; demote iff EITHER subtree has Δ.
+//
+// This subsumes the previous global demote conditions without over-demoting in
+// chained-LJ shapes. For FULL OUTER aggregate views the upsert MERGE relies on
+// the IE delta containing only the matched-via-Δ portion (the unmatched parts
+// are tracked separately via _ivm_match_count); failing to demote there would
+// leak phantom unmatched rows for groups untouched by the delta.
+static bool SubtreeHasDeltaLeaf(const vector<JoinLeafInfo> &leaves, uint64_t mask, const vector<size_t> &prefix) {
+	for (size_t i = 0; i < leaves.size(); i++) {
+		if (!(mask & (1ULL << i))) {
+			continue;
+		}
+		const auto &lp = leaves[i].path;
+		if (lp.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), lp.begin())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void DemoteLeftJoinsForMaskRec(LogicalOperator *node, const vector<JoinLeafInfo> &leaves, uint64_t mask,
+                                      vector<size_t> &path) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
+		if (j &&
+		    (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT || j->join_type == JoinType::OUTER)) {
+			bool demote = false;
+			path.push_back(0); // left child
+			bool left_has_delta = SubtreeHasDeltaLeaf(leaves, mask, path);
+			path.pop_back();
+			path.push_back(1); // right child
+			bool right_has_delta = SubtreeHasDeltaLeaf(leaves, mask, path);
+			path.pop_back();
+			if (j->join_type == JoinType::LEFT) {
+				demote = right_has_delta;
+			} else if (j->join_type == JoinType::RIGHT) {
+				demote = left_has_delta;
+			} else { // OUTER (FULL OUTER)
+				demote = left_has_delta || right_has_delta;
+			}
+			if (demote) {
+				j->join_type = JoinType::INNER;
+			}
+		}
+	}
+	for (size_t ci = 0; ci < node->children.size(); ci++) {
+		path.push_back(ci);
+		DemoteLeftJoinsForMaskRec(node->children[ci].get(), leaves, mask, path);
+		path.pop_back();
+	}
+}
+
+static void DemoteLeftJoinsForMask(LogicalOperator *node, const vector<JoinLeafInfo> &leaves, uint64_t mask) {
+	vector<size_t> path;
+	DemoteLeftJoinsForMaskRec(node, leaves, mask, path);
+}
+
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf) {
 	if (leaf.path.empty()) {
 		return;
@@ -365,36 +432,21 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		LogicalOperator *term_root = term.get();
 		vector<ColumnBinding> mul_bindings;
 
-		// LEFT JOIN delta rule: demote to INNER in two cases.
+		// LEFT JOIN delta rule (per-LJ): demote each LJ to INNER iff its right
+		// subtree contains a delta-marked leaf in this mask.
 		//
-		// (1) Only right-side leaves have deltas (no left-side bit set): there's
-		//     no delta on the left, so the NULL-padding semantics don't apply to
-		//     this term at all — the left rows are all already in current_A.
+		// Why per-LJ rather than whole-term: in a chain like (base LJ d1) LJ d2
+		// with mask {Δd2}, demoting *all* LJs collapses (base LJ d1) into
+		// (base IJ d1), which drops base rows unmatched in d1 — the very rows
+		// whose existing NULL-padded MV entries need to be replaced when Δd2
+		// brings in a match. Per-LJ demote keeps the inner LJ intact so those
+		// keys still flow through and reach delta_mv (and the partial-recompute
+		// DELETE+re-INSERT in the upsert layer fixes them up correctly).
 		//
-		// (2) Both a left-side AND the right-side-of-a-LEFT-JOIN bit are set.
-		//     The NULL-padding for an unmatched dA row is emitted by the
-		//     "dA LEFT JOIN current_B" term already — keeping LEFT JOIN here
-		//     would produce a second NULL-padded row (dA LJ dB for rows in dA
-		//     with no match in dB), double-counting the unmatched delta rows.
-		//     Demoting this term to INNER JOIN drops those NULL-padded rows so
-		//     only the dA IJ dB intersection remains (which is the correction
-		//     term in inclusion-exclusion).
+		// This subsumes both original cases (right-only delta, both-sides delta)
+		// without over-demoting in chained-LJ shapes.
 		if (has_left_join) {
-			bool has_left_side_delta = false;
-			bool has_right_of_lj_delta = false;
-			for (size_t i = 0; i < N; i++) {
-				if (!(mask & (1ULL << i))) {
-					continue;
-				}
-				if (!leaves[i].is_right_of_left_join) {
-					has_left_side_delta = true;
-				} else {
-					has_right_of_lj_delta = true;
-				}
-			}
-			if (!has_left_side_delta || has_right_of_lj_delta) {
-				DemoteLeftJoins(term.get());
-			}
+			DemoteLeftJoinsForMask(term.get(), leaves, mask);
 		}
 
 		// Replace delta leaves

@@ -619,3 +619,93 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# Inner DISTINCT under an outer aggregate (regression — pre-fix
+# IvmDistinctRule turned DISTINCT into GROUP BY all_cols COUNT(*),
+# which emits a +1 row for every duplicate input. A parent SUM
+# then double-counted duplicates that the underlying DISTINCT
+# would dedup. The classifier now routes such views to RECOMPUTE.)
+# ============================================================
+
+statement ok
+CREATE TABLE idist_u (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO idist_u VALUES (1, 'm1', 8), (1, 'm1', 8), (1, 'm2', 16), (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW idist_mv AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+# Initial check: dedups (1,'m1',8) → only one copy contributes.
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv
+);
+----
+0
+
+# Insert a duplicate of an existing distinct tuple — must NOT
+# affect the SUM (this is the bug case).
+statement ok
+INSERT INTO idist_u VALUES (2, 'm3', 4);
+
+statement ok
+PRAGMA ivm('idist_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+);
+----
+0
+
+# Mixed deltas in one refresh: a brand-new distinct tuple, more
+# duplicates of existing tuples, and a NULL-machine row that the
+# WHERE filter excludes.
+statement ok
+INSERT INTO idist_u VALUES (1, 'm4', 32), (1, 'm1', 8), (2, NULL, 999), (3, 'm5', 1);
+
+statement ok
+PRAGMA ivm('idist_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+);
+----
+0

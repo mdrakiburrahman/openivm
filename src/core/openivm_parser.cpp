@@ -19,6 +19,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -562,49 +563,32 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 
 				if (limit_node) {
-					// Walk inner plan (below order) to find a grouped aggregate
-					bool has_grouped_agg = false;
-					LogicalOperator *order_child =
-					    order_node->children.empty() ? nullptr : order_node->children[0].get();
-					LogicalOperator *inner = order_child;
-					while (inner) {
-						if (inner->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-							auto *agg = dynamic_cast<LogicalAggregate *>(inner);
-							if (agg && !agg->groups.empty()) {
-								has_grouped_agg = true;
-							}
-							break;
+					// Strip top-K unconditionally — data table stores the unlimited result and
+					// the user-facing VIEW applies ORDER BY ... LIMIT at read time. This works
+					// for both aggregate and projection top-K (the previous "aggregate-only"
+					// guard forced projection top-K through RECOMPUTE; we now incrementalize the
+					// underlying SIMPLE_PROJECTION instead).
+					if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
+						auto &top_n = limit_node->Cast<LogicalTopN>();
+						top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
+						select_plan = std::move(select_plan->children[0]);
+					} else {
+						// Shape (B): extract from the two separate nodes
+						auto &order_op = order_node->Cast<LogicalOrder>();
+						auto &limit_op = limit_node->Cast<LogicalLimit>();
+						idx_t lval = 0;
+						idx_t oval = 0;
+						if (limit_op.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+							lval = limit_op.limit_val.GetConstantValue();
 						}
-						if (inner->children.empty()) {
-							break;
+						if (limit_op.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+							oval = limit_op.offset_val.GetConstantValue();
 						}
-						inner = inner->children[0].get();
+						top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
+						// Strip: select_plan = LOGICAL_ORDER_BY's child
+						select_plan = std::move(select_plan->children[0]->children[0]);
 					}
-
-					if (has_grouped_agg) {
-						if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
-							auto &top_n = limit_node->Cast<LogicalTopN>();
-							top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
-							select_plan = std::move(select_plan->children[0]);
-						} else {
-							// Shape (B): extract from the two separate nodes
-							auto &order_op = order_node->Cast<LogicalOrder>();
-							auto &limit_op = limit_node->Cast<LogicalLimit>();
-							idx_t lval = 0;
-							idx_t oval = 0;
-							if (limit_op.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-								lval = limit_op.limit_val.GetConstantValue();
-							}
-							if (limit_op.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-								oval = limit_op.offset_val.GetConstantValue();
-							}
-							top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
-							// Strip: select_plan = LOGICAL_ORDER_BY's child
-							select_plan = std::move(select_plan->children[0]->children[0]);
-						}
-						OPENIVM_DEBUG_PRINT("[CREATE MV] Aggregate+top-k: stripped top-k wrapper, suffix='%s'\n",
-						                    top_k_suffix.c_str());
-					}
+					OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped top-k wrapper, suffix='%s'\n", top_k_suffix.c_str());
 				}
 			}
 
@@ -728,8 +712,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_join = analysis.found_join;
 		bool found_top_k = analysis.found_top_k;
 		bool found_grouping_sets = analysis.found_grouping_sets;
-		// COUNT(DISTINCT x) → group-recompute (delete affected groups, re-insert from original query)
+		// COUNT(DISTINCT x) and LIST aggregates → group-recompute (delete affected groups, re-insert from original
+		// query)
 		if (analysis.found_count_distinct) {
+			found_minmax = true;
+		}
+		if (analysis.found_list) {
 			found_minmax = true;
 		}
 		// Derive GROUP BY column names by walking the plan's projection above the aggregate.
@@ -1057,60 +1045,111 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
-		// AVG/STDDEV/VARIANCE need decomposition into SUM+COUNT (see DecomposeAvgStddev
-		// in ivm_plan_rewrite.cpp). Decomposition only works when the aggregate is
-		// directly below the top PROJECTION (with at most one FILTER for HAVING).
-		// If there's a JOIN sitting between the top and the aggregate (CTE pattern
-		// like `WITH agg AS (SELECT ..., AVG(x) ... GROUP BY k) SELECT ... FROM agg
-		// JOIN other ...`), the decomposition can't reach the top projection, so the
-		// stored `avg` column would get summed instead of averaged during MERGE.
-		// Fall back to full recompute for these — query_0617 is the canonical case.
+		// Detect plan shapes that can't be incrementally maintained via the standard
+		// AGGREGATE_GROUP / SIMPLE_AGGREGATE / SIMPLE_PROJECTION paths and must use
+		// RECOMPUTE (delete-and-reinsert with empty-delta skip). Three distinct cases:
+		//
+		//   (a) AVG/STDDEV/VARIANCE under a JOIN — decomposition into SUM+COUNT
+		//       only works when the aggregate is directly below the top PROJECTION.
+		//       A JOIN in between blocks decomposition (canonical: query_0617).
+		//
+		//   (b) ANY aggregate under a JOIN — the inner aggregate's delta is a
+		//       per-group change, not a per-row +1/-1, so the bilinear delta-join
+		//       formula gives wrong row counts on the outer side. Catches LEFT JOIN
+		//       with COUNT(*) GROUP BY on the right (q1628 pattern).
+		//
+		//   (c) Nested aggregation (AGG over AGG, no JOIN) — outer aggregate
+		//       reads the inner aggregate's output columns. When base-table deltas
+		//       arrive, the inner GROUP BY rows shift in ways the outer can't
+		//       reconstruct from per-row deltas. Catches `WITH a AS (SELECT ... agg
+		//       GROUP BY k) SELECT outer_agg FROM a GROUP BY ...` (q1878, q1931).
 		bool has_derived_aggregate_below_join = false;
 		{
-			std::function<bool(const LogicalOperator *)> find_derived = [&](const LogicalOperator *op) -> bool {
+			std::function<bool(const LogicalOperator *, const LogicalOperator *)> walk =
+			    [&](const LogicalOperator *op, const LogicalOperator *outer_agg_ancestor) -> bool {
+				bool under_join = false;
+				if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+				    op->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+					under_join = true;
+				}
 				if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-					auto &agg = op->Cast<LogicalAggregate>();
-					for (auto &expr : agg.expressions) {
-						if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-							continue;
-						}
-						auto &bound = expr->Cast<BoundAggregateExpression>();
-						const string &name = bound.function.name;
-						if (name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" ||
-						    name == "variance" || name == "var_samp" || name == "var_pop") {
+					// Case (b): aggregate node anywhere below an outer aggregate (no
+					// join needed) ⇒ nested aggregation.
+					if (outer_agg_ancestor) {
+						return true;
+					}
+				}
+				const LogicalOperator *next_outer = outer_agg_ancestor;
+				if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+					next_outer = op;
+				}
+				for (auto &c : op->children) {
+					// Pass under_join down via a separate walker for the join case so
+					// we keep both signals (outer agg, under join) in scope.
+					if (under_join) {
+						std::function<bool(const LogicalOperator *)> find_any_agg =
+						    [&](const LogicalOperator *n) -> bool {
+							if (n->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+								return true;
+							}
+							for (auto &cc : n->children) {
+								if (find_any_agg(cc.get())) {
+									return true;
+								}
+							}
+							return false;
+						};
+						if (find_any_agg(c.get())) {
 							return true;
 						}
 					}
-				}
-				for (auto &c : op->children) {
-					if (find_derived(c.get())) {
+					if (walk(c.get(), next_outer)) {
 						return true;
 					}
 				}
 				return false;
 			};
-			// Walk into JOIN subtrees to see if there's an AGGREGATE with AVG/STDDEV/VARIANCE
-			// that sits beneath the top plan's aggregate (or beneath a JOIN).
-			std::function<void(const LogicalOperator *, bool)> walk_for_nested = [&](const LogicalOperator *op,
-			                                                                         bool under_join) {
-				if (has_derived_aggregate_below_join) {
-					return;
-				}
+			has_derived_aggregate_below_join = walk(plan.get(), nullptr);
+		}
+
+		// FULL OUTER JOIN with aggregate (above OR below) cannot be safely maintained
+		// via inclusion-exclusion deltas: outer-side null-padded rows don't survive
+		// deletion deltas correctly, so SUM/COUNT over them drift. Force RECOMPUTE
+		// regardless of how the aggregate's expressions are structured.
+		// Catches q1353/q1355 (FULL OUTER JOIN + GROUP BY + SUM).
+		bool has_full_outer_aggregate = found_full_outer && found_aggregation;
+
+		// Materialized CTE referenced 2+ times below a JOIN: the planner emits one
+		// base-table scan inside the CTE and shares it via CTE_REF nodes, so the
+		// IvmJoinRule sees a single physical scan instead of an N-way self-join.
+		// Inclusion-exclusion can't generate the right delta terms — rows for the
+		// shared scan aren't replicated across both join sides. Route to RECOMPUTE.
+		// Catches ducklake_0240 (CTE referenced twice on both sides of an INNER JOIN).
+		bool has_cte_self_join = false;
+		{
+			std::map<idx_t, int> cte_ref_count;
+			std::function<void(const LogicalOperator *, bool)> walk_cte = [&](const LogicalOperator *op,
+			                                                                  bool under_join) {
 				if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-				    op->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+				    op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
+				    op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 					under_join = true;
 				}
-				if (under_join && op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-					if (find_derived(op)) {
-						has_derived_aggregate_below_join = true;
-						return;
-					}
+				if (under_join && op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+					auto &cte_ref = op->Cast<LogicalCTERef>();
+					cte_ref_count[cte_ref.cte_index]++;
 				}
 				for (auto &c : op->children) {
-					walk_for_nested(c.get(), under_join);
+					walk_cte(c.get(), under_join);
 				}
 			};
-			walk_for_nested(plan.get(), false);
+			walk_cte(plan.get(), false);
+			for (auto &kv : cte_ref_count) {
+				if (kv.second >= 2) {
+					has_cte_self_join = true;
+					break;
+				}
+			}
 		}
 
 		IVMType ivm_type;
@@ -1119,24 +1158,25 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
 			ivm_type = IVMType::WINDOW_PARTITION;
 		} else if (found_grouping_sets) {
-			// ROLLUP / CUBE / GROUPING SETS: full recompute per refresh, but with empty-delta skip.
-			ivm_type = IVMType::RECOMPUTE;
+			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
+			// the incremental aggregate path can't decompose them yet. Use FULL_REFRESH
+			// (always recompute, no empty-delta short-circuit) until per-grouping-set
+			// explosion lands. See plan §7.
+			ivm_type = IVMType::FULL_REFRESH;
 		} else if (!ivm_compatible) {
 			ivm_type = IVMType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
-		} else if (found_top_k) {
-			// Any LIMIT (with or without ORDER BY, with or without GROUP BY) requires full
-			// recompute — the surviving rows after a LIMIT can shift with every delta.
-			// RECOMPUTE gets empty-delta skip, unlike FULL_REFRESH.
-			ivm_type = IVMType::RECOMPUTE;
-		} else if (has_union_over_agg) {
-			// UNION / UNION ALL over aggregates: full recompute, but skip when deltas are empty.
-			ivm_type = IVMType::RECOMPUTE;
-		} else if (has_derived_aggregate_below_join) {
-			// AVG/STDDEV/VARIANCE inside a CTE joined with other tables: full recompute + empty-delta skip.
-			ivm_type = IVMType::RECOMPUTE;
+		} else if (found_distinct && !distinct_at_top && found_aggregation) {
+			// Inner DISTINCT under an aggregate cannot be Z-set-incrementalized without
+			// auxiliary count state per distinct tuple (DBSP: distinct(R)=sgn(R), Δdistinct
+			// fires only on count transitions across zero). Until that aux machinery lands,
+			// route to GROUP_RECOMPUTE: re-evaluate only the outer GROUP BY keys touched by
+			// source deltas, instead of recomputing the entire MV.
+			// See plan /home/ila/.claude/plans/we-will-put-new-fizzy-sonnet.md §5 for the
+			// full aux-state design.
+			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
@@ -1159,8 +1199,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		                    : ivm_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
 		                    : ivm_type == IVMType::FULL_REFRESH      ? "FULL_REFRESH"
 		                    : ivm_type == IVMType::WINDOW_PARTITION  ? "WINDOW_PARTITION"
-		                    : ivm_type == IVMType::TOP_K             ? "TOP_K"
-		                    : ivm_type == IVMType::RECOMPUTE         ? "RECOMPUTE"
+		                    : ivm_type == IVMType::GROUP_RECOMPUTE   ? "GROUP_RECOMPUTE"
 		                                                             : "UNKNOWN",
 		                    (int)found_aggregation, (int)found_projection, aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");

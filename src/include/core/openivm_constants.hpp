@@ -67,7 +67,8 @@ enum class IVMType : uint8_t {
 	SIMPLE_PROJECTION,
 	FULL_REFRESH,
 	AGGREGATE_HAVING,
-	WINDOW_PARTITION // window functions — partition-level recompute
+	WINDOW_PARTITION, // window functions — partition-level recompute
+	GROUP_RECOMPUTE   // inner-DISTINCT-under-AGG: DELETE+INSERT only the GROUP BY keys touched by source deltas
 };
 
 } // namespace duckdb

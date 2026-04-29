@@ -911,3 +911,140 @@ SELECT count(*) FROM (SELECT c.cid, COUNT(*), SUM(COALESCE(h.hamt, 0))::DECIMAL(
 ----
 0
 
+
+# ============================================================
+# Multi-LEFT-JOIN cascade: deeper-right delta must propagate
+# (regression — pre-fix the global DemoteLeftJoins collapsed
+# every LJ in the IE term to INNER, so a Δ in the rightmost
+# table never reached _ivm_left_key for keys whose intermediate
+# LJ produced NULL — the affected rows stayed stale.)
+# ============================================================
+
+statement ok
+CREATE TABLE mlc_base (k INT, v INT);
+
+statement ok
+CREATE TABLE mlc_d1 (k INT, x1 INT);
+
+statement ok
+CREATE TABLE mlc_d2 (k INT, x2 INT);
+
+statement ok
+CREATE TABLE mlc_d3 (k INT, x3 INT);
+
+statement ok
+INSERT INTO mlc_base VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO mlc_d1 VALUES (1, 1);
+
+statement ok
+INSERT INTO mlc_d2 VALUES (1, 2);
+
+statement ok
+INSERT INTO mlc_d3 VALUES (1, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW mlc_mv AS
+    SELECT b.k, b.v, mlc_d1.x1, mlc_d2.x2, mlc_d3.x3
+    FROM mlc_base b
+    LEFT JOIN mlc_d1 ON b.k = mlc_d1.k
+    LEFT JOIN mlc_d2 ON b.k = mlc_d2.k
+    LEFT JOIN mlc_d3 ON b.k = mlc_d3.k;
+
+# Deeper-right Δ for an existing-but-unmatched base key:
+#   k=2 has no d1/d2/d3 row → MV row was (2,20,NULL,NULL,NULL).
+#   After inserting matching rows in d2 only, MV row should
+#   become (2,20,NULL,22,NULL).
+statement ok
+INSERT INTO mlc_d2 VALUES (2, 22);
+
+statement ok
+PRAGMA ivm('mlc_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT b.k, b.v, mlc_d1.x1, mlc_d2.x2, mlc_d3.x3
+    FROM mlc_base b LEFT JOIN mlc_d1 ON b.k = mlc_d1.k
+    LEFT JOIN mlc_d2 ON b.k = mlc_d2.k LEFT JOIN mlc_d3 ON b.k = mlc_d3.k
+    EXCEPT ALL SELECT * FROM mlc_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mlc_mv
+    EXCEPT ALL
+    SELECT b.k, b.v, mlc_d1.x1, mlc_d2.x2, mlc_d3.x3
+    FROM mlc_base b LEFT JOIN mlc_d1 ON b.k = mlc_d1.k
+    LEFT JOIN mlc_d2 ON b.k = mlc_d2.k LEFT JOIN mlc_d3 ON b.k = mlc_d3.k
+);
+----
+0
+
+# Mixed Δ across multiple right-side tables in one refresh,
+# including a brand-new base key (3) and another previously
+# unmatched key (2) that picks up matches in some but not all
+# right tables.
+statement ok
+INSERT INTO mlc_base VALUES (3, 30);
+
+statement ok
+INSERT INTO mlc_d3 VALUES (3, 33);
+
+statement ok
+INSERT INTO mlc_d1 VALUES (2, 21);
+
+statement ok
+PRAGMA ivm('mlc_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT b.k, b.v, mlc_d1.x1, mlc_d2.x2, mlc_d3.x3
+    FROM mlc_base b LEFT JOIN mlc_d1 ON b.k = mlc_d1.k
+    LEFT JOIN mlc_d2 ON b.k = mlc_d2.k LEFT JOIN mlc_d3 ON b.k = mlc_d3.k
+    EXCEPT ALL SELECT * FROM mlc_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mlc_mv
+    EXCEPT ALL
+    SELECT b.k, b.v, mlc_d1.x1, mlc_d2.x2, mlc_d3.x3
+    FROM mlc_base b LEFT JOIN mlc_d1 ON b.k = mlc_d1.k
+    LEFT JOIN mlc_d2 ON b.k = mlc_d2.k LEFT JOIN mlc_d3 ON b.k = mlc_d3.k
+);
+----
+0
+
+# Delete from a deeper-right table: the matched MV row should
+# revert to NULL on that side.
+statement ok
+DELETE FROM mlc_d2 WHERE k = 1;
+
+statement ok
+PRAGMA ivm('mlc_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT b.k, b.v, mlc_d1.x1, mlc_d2.x2, mlc_d3.x3
+    FROM mlc_base b LEFT JOIN mlc_d1 ON b.k = mlc_d1.k
+    LEFT JOIN mlc_d2 ON b.k = mlc_d2.k LEFT JOIN mlc_d3 ON b.k = mlc_d3.k
+    EXCEPT ALL SELECT * FROM mlc_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mlc_mv
+    EXCEPT ALL
+    SELECT b.k, b.v, mlc_d1.x1, mlc_d2.x2, mlc_d3.x3
+    FROM mlc_base b LEFT JOIN mlc_d1 ON b.k = mlc_d1.k
+    LEFT JOIN mlc_d2 ON b.k = mlc_d2.k LEFT JOIN mlc_d3 ON b.k = mlc_d3.k
+);
+----
+0

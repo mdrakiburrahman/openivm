@@ -68,20 +68,26 @@ struct FojJoinInfo {
 
 static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
                                   bool cross_system, const string &attached_catalog = "",
-                                  const string &attached_schema = "", const string &catalog_prefix = "") {
+                                  const string &attached_schema = "", const string &catalog_prefix = "",
+                                  string *out_post_meta = nullptr) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
 	string query = "DELETE FROM " + qdt + ";\n";
 	query += "INSERT INTO " + qdt + " " + view_query_sql + ";\n\n";
 
-	// metadata.UpdateTimestamp runs on the native-catalog metadata connection immediately.
-	// For cross_system (DuckLake), do NOT include update_ts in the returned string — exec_con
-	// will have already modified dl, and writing to the physical-default catalog in the same
-	// implicit transaction is forbidden by DuckDB's cross-catalog write restriction.
-	metadata.UpdateTimestamp(view_name);
+	// Timestamp update must run AFTER the DELETE+INSERT executes so that last_update
+	// is only advanced when the recompute actually committed.
+	// - Non-cross-system: include directly in the returned SQL (same transaction as the data ops).
+	// - Cross-system (DuckLake): can't include in the data-op transaction (cross-catalog write
+	//   restriction). Append to out_post_meta so RefreshViewLocked runs it on meta_con after
+	//   exec_con.Query() succeeds.
+	string update_ts_sql = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+	                       " SET last_update = now() WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+	                       "';\n";
 	string update_ts;
 	if (!cross_system) {
-		update_ts = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
-		            OpenIVMUtils::EscapeValue(view_name) + "';\n";
+		update_ts = update_ts_sql;
+	} else if (out_post_meta != nullptr) {
+		*out_post_meta += update_ts_sql;
 	}
 
 	string delta_cleanup;
@@ -533,7 +539,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
 			metadata.SetRefreshInProgress(view_name, false);
 			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-			                           attached_db_schema_name, catalog_prefix);
+			                           attached_db_schema_name, catalog_prefix, out_post_meta);
 		}
 	}
 
@@ -576,7 +582,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 	if (force_full_refresh || view_query_type == IVMType::FULL_REFRESH) {
 		return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-		                           attached_db_schema_name, catalog_prefix);
+		                           attached_db_schema_name, catalog_prefix, out_post_meta);
 	}
 
 	// Adaptive cost model (experimental): estimate IVM vs full recompute cost.
@@ -600,7 +606,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (cost_estimate.ShouldRecompute()) {
 			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
 			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-			                           attached_db_schema_name, catalog_prefix);
+			                           attached_db_schema_name, catalog_prefix, out_post_meta);
 		}
 	}
 
@@ -701,8 +707,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
 	bool insert_only = false;
 	{
-		bool has_join =
-		    (view_query_sql.find(" JOIN ") != string::npos || view_query_sql.find(" join ") != string::npos);
+		// A view has a join if it references more than one base table (delta_table_names.size() > 1)
+		// OR if its SQL contains a JOIN keyword. The string search catches self-joins (same table
+		// referenced twice, so only one delta table registered). Case-insensitive match without
+		// space requirement handles mixed-case SQL and LPTS fallback queries.
+		bool has_join = delta_table_names.size() > 1 || view_query_sql.find("JOIN") != string::npos ||
+		                view_query_sql.find("join") != string::npos;
 
 		// Per-table analysis: is each delta empty, insert-only, or has deletes?
 		idx_t tables_with_changes = 0;
@@ -733,10 +743,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 					continue; // no changes — empty delta
 				}
 				tables_with_changes++;
-				auto del_result = con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" +
-				                            OpenIVMUtils::EscapeValue(view_catalog_name) + "', 'main', '" +
-				                            OpenIVMUtils::EscapeValue(dt) + "', " + to_string(last_snap) + ", " +
-				                            to_string(cur_snap) + ")");
+				auto del_result = con.Query(
+				    "SELECT COUNT(*) FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(view_catalog_name) +
+				    "', '" + OpenIVMUtils::EscapeValue(view_schema_name) + "', '" + OpenIVMUtils::EscapeValue(dt) +
+				    "', " + to_string(last_snap) + ", " + to_string(cur_snap) + ")");
 				if (!del_result->HasError() && del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
 					any_has_deletes = true;
 				}
@@ -807,6 +817,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	                    : view_query_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
 	                    : view_query_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
 	                    : view_query_type == IVMType::WINDOW_PARTITION  ? "WINDOW_PARTITION"
+	                    : view_query_type == IVMType::GROUP_RECOMPUTE   ? "GROUP_RECOMPUTE"
 	                                                                    : "UNKNOWN");
 	// All DML (INSERT, DELETE, UPDATE, MERGE) targets the physical data table,
 	// not the user-facing VIEW which excludes internal _ivm_* columns.
@@ -814,6 +825,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// GROUP BY columns: from index (standard) or metadata (DuckLake fallback).
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	auto agg_types = metadata.GetAggregateTypes(view_name);
+	// ARG_MIN/ARG_MAX require group-recompute even for insert-only deltas — the
+	// GREATEST/LEAST fast path used for MIN/MAX doesn't apply to these two-arg aggregates.
+	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
+	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
 		// When ivm_having_merge is enabled, the data table stores ALL groups (HAVING filter
@@ -825,7 +840,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			having_merge = having_merge_val.GetValue<bool>();
 		}
 		if (having_merge) {
-			bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
+			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 			                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
 			                                      catalog_prefix, effective_insert_only, agg_types, column_types);
@@ -926,10 +941,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			//          (same as LEFT JOIN MERGE — INNER-demoted delta view)
 			// Phase 2: Recompute groups affected by UNMATCHED changes
 			//          (left delta table + right→left join key mapping + NULL group)
-			bool effective_insert_only = skip_agg_delete;
-			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, /*has_minmax=*/false,
-			    list_mode, delta_ts_filter, group_cols, catalog_prefix, effective_insert_only, agg_types, column_types);
+			// ARG_MIN/ARG_MAX can't use the delta-sum MERGE template — force group-recompute.
+			bool effective_insert_only = has_argminmax ? false : skip_agg_delete;
+			upsert_query =
+			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+			                           /*has_minmax=*/has_argminmax, list_mode, delta_ts_filter, group_cols,
+			                           catalog_prefix, effective_insert_only, agg_types, column_types);
 
 			// Phase 2: recompute groups affected by unmatched changes
 			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
@@ -993,7 +1010,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 		} else {
 			// Standard path: MIN/MAX group-recompute or incremental MERGE
-			bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
+			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 			                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
 			                                      catalog_prefix, effective_insert_only, agg_types, column_types);
@@ -1067,8 +1084,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	}
 
 	case IVMType::SIMPLE_AGGREGATE: {
+		// ARG_MIN/ARG_MAX can't be maintained by delta-sum UPDATE even for insert-only deltas.
+		bool sa_insert_only = has_argminmax ? false : insert_only;
 		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
-		                                       delta_ts_filter, catalog_prefix, insert_only, column_types);
+		                                       delta_ts_filter, catalog_prefix, sa_insert_only, column_types);
 		if (!has_minmax) {
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {
@@ -1162,6 +1181,37 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		break;
 	}
+	case IVMType::GROUP_RECOMPUTE: {
+		// Inner-DISTINCT-under-AGG: re-evaluate only the GROUP BY tuples touched by source
+		// deltas. For each base table register a (base_name, last_update) spec; the compile
+		// helper substitutes that table's reference in the LPTS view query with a
+		// delta-filtered subselect, projects DISTINCT GROUP BY columns, unions across
+		// sources, and uses the resulting key set to scope DELETE + INSERT.
+		auto group_columns = metadata.GetGroupColumns(view_name);
+		vector<std::pair<string, string>> delta_specs;
+		for (auto &dt : delta_table_names) {
+			// dt is the delta table name (e.g. "delta_t"); strip the prefix to get the base.
+			string base = dt;
+			static const string prefix(ivm::DELTA_PREFIX);
+			if (base.size() > prefix.size() && base.rfind(prefix, 0) == 0) {
+				base = base.substr(prefix.size());
+			}
+			string ts = metadata.GetLastUpdate(view_name, dt);
+			delta_specs.emplace_back(base, ts);
+		}
+		// LPTS emits fully-qualified `cat.schema.tbl` even when the catalog is the default
+		// `memory` (where `catalog_prefix` for SQL emission is empty). Reconstruct the
+		// always-qualified prefix so the source-table substitution finds the LPTS form
+		// verbatim — DuckDB's defaults are `memory` / `main` when these come back empty.
+		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
+		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
+		string lpts_table_prefix = lpts_cat + "." + lpts_sch + ".";
+		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, catalog_prefix,
+		                                     lpts_table_prefix);
+		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources)\n",
+		                    group_columns.size(), delta_specs.size());
+		break;
+	}
 	case IVMType::FULL_REFRESH: {
 		// Should not reach here — full refresh is handled earlier via BuildRecomputeQuery.
 		throw InternalException("FULL_REFRESH views should not reach incremental upsert compilation");
@@ -1175,10 +1225,13 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string post_companion;
 	string delete_from_view_query;
 
-	if (view_query_type == IVMType::WINDOW_PARTITION) {
-		// Window views skip the DoIVM/LPTS path because LPTS doesn't support WINDOW.
-		// Partition detection uses base delta tables directly via CompileWindowRecompute.
-		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping DoIVM for WINDOW_PARTITION (LPTS limitation)\n");
+	if (view_query_type == IVMType::WINDOW_PARTITION || view_query_type == IVMType::GROUP_RECOMPUTE) {
+		// These types use a recompute path (partition-scoped or group-scoped) on the data
+		// table directly — no delta-join plan needed, so skip the DoIVM/rewrite-rule path
+		// entirely. (Running DoIVM would hit operator types that the delta rewrite rules
+		// don't handle, causing "Operator type X not supported" errors.)
+		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping DoIVM for %s\n",
+		                    view_query_type == IVMType::GROUP_RECOMPUTE ? "GROUP_RECOMPUTE" : "WINDOW_PARTITION");
 		ivm_query = "";
 	} else {
 		// splitting the query in two to make it easier to turn into string (insertions are the same)
@@ -1223,7 +1276,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			OPENIVM_DEBUG_PRINT("[UPSERT] LPTS fallback (%s) for view '%s' → full recompute\n", e.what(),
 			                    view_name.c_str());
 			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-			                           attached_db_schema_name, catalog_prefix);
+			                           attached_db_schema_name, catalog_prefix, out_post_meta);
 		}
 
 		// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp

@@ -26,6 +26,23 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
                               const vector<string> &delta_table_names = {});
+string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
+
+/// Group-level partial recompute, used by `IVMType::GROUP_RECOMPUTE` (inner-DISTINCT under
+/// aggregate). For each base table T_i with a non-empty delta, builds a "view query with T_i
+/// restricted to its delta" variant by substituting `<catalog><schema>.<T_i>` in `view_query_sql`
+/// with the delta-filtered subquery. The resulting affected-keys set drives a DELETE + INSERT
+/// scoped to only the GROUP BY tuples touched by deltas — strictly cheaper than full RECOMPUTE
+/// when the affected key set is small.
+///
+/// `delta_table_specs` carries one entry per source table: pair{base_table_name, last_update_ts}.
+/// `catalog_prefix` is the SQL prefix used for the MV's data table — empty for the default
+/// catalog, "<cat>.<schema>." otherwise. `lpts_table_prefix` is the *always-fully-qualified*
+/// prefix that LPTS used in `view_query_sql` to reference base tables ("<cat>.<schema>." even
+/// when the catalog is default), so we can substitute the exact `cat.schema.tbl` pattern.
+string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
+                             const vector<std::pair<string, string>> &delta_table_specs,
+                             const string &catalog_prefix = "", const string &lpts_table_prefix = "");
 
 } // namespace duckdb
 
