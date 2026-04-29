@@ -120,6 +120,68 @@ static const char *SumSqPrefix(const string &func_name) {
 	return ivm::SUM_SQ_COL_PREFIX; // stddev, stddev_samp
 }
 
+/// @public — also called from openivm_parser.cpp on the full CREATE plan before AnalyzePlan.
+/// Normalize AGG(x) FILTER (WHERE p) → AGG(CASE WHEN p THEN x END) before the
+/// compatibility checker sees it. The rewrite is exact in Z-set algebra: a delta row
+/// with weight w contributes w × (p ? x : NULL), which is linear. Runs before
+/// RewriteDerivedAggregates so AVG/STDDEV FILTER queries are decomposed correctly.
+///   COUNT(*) FILTER (WHERE p) → COUNT(CASE WHEN p THEN 1 END)  (count_star → count)
+///   AGG(x)   FILTER (WHERE p) → AGG(CASE WHEN p THEN x END)    (in-place child wrap)
+void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+	for (auto &child : plan->children) {
+		RewriteAggregateFilters(context, child);
+	}
+	if (plan->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return;
+	}
+	auto &agg = plan->Cast<LogicalAggregate>();
+	bool any_filter = false;
+	for (auto &expr : agg.expressions) {
+		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
+		    expr->Cast<BoundAggregateExpression>().filter) {
+			any_filter = true;
+			break;
+		}
+	}
+	if (!any_filter) {
+		return;
+	}
+	for (auto &expr : agg.expressions) {
+		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			continue;
+		}
+		auto &bound = expr->Cast<BoundAggregateExpression>();
+		if (!bound.filter) {
+			continue;
+		}
+		auto filter_expr = std::move(bound.filter); // nulls bound.filter
+		if (bound.children.empty()) {
+			// COUNT(*) FILTER (WHERE p) → COUNT(CASE WHEN p THEN 1 END)
+			string saved_alias = std::move(bound.alias);
+			auto then_expr = make_uniq<BoundConstantExpression>(Value::BIGINT(1));
+			auto else_expr = make_uniq<BoundConstantExpression>(Value(LogicalType::BIGINT));
+			auto case_expr =
+			    make_uniq<BoundCaseExpression>(std::move(filter_expr), std::move(then_expr), std::move(else_expr));
+			auto count_func = BindAggregateByName(context, "count", {LogicalType::BIGINT});
+			vector<unique_ptr<Expression>> count_args;
+			count_args.push_back(std::move(case_expr));
+			auto new_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
+			                                                    nullptr, AggregateType::NON_DISTINCT);
+			new_expr->alias = std::move(saved_alias);
+			expr = std::move(new_expr);
+		} else {
+			// AGG(x) FILTER (WHERE p) → AGG(CASE WHEN p THEN x END)
+			auto arg_type = bound.children[0]->return_type;
+			auto else_expr = make_uniq<BoundConstantExpression>(Value(arg_type)); // NULL of same type
+			bound.children[0] = make_uniq<BoundCaseExpression>(std::move(filter_expr), std::move(bound.children[0]),
+			                                                   std::move(else_expr));
+			// bound.filter already nullptr from the move above
+		}
+	}
+	agg.ResolveOperatorTypes();
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Rewrote FILTER aggregates to CASE expressions\n");
+}
+
 /// Decompose AVG and STDDEV/VARIANCE aggregates into incrementalizable components.
 /// Handles both in a SINGLE PASS to keep aggregate expression indices consistent.
 /// - AVG(x)      → SUM(x), COUNT(x) + SUM/COUNT ratio in projection
@@ -471,13 +533,15 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 }
 
 /// Inject a hidden COUNT(*) (alias `_ivm_count_star`) into AGGREGATE_GROUP
-/// aggregates that don't already have a count-family aggregate.
+/// aggregates that don't already have a reliable total-row-count aggregate.
 ///
 /// Why: the post-MERGE cleanup in CompileAggregateGroups needs a per-group
 /// cardinality column to delete rows whose group has dropped to zero tuples.
-/// Views with only SUM/MIN/MAX (no COUNT) have no such column, so groups
-/// whose total hits 0 after deletes would linger in the MV. We can't use
-/// SUM = 0 as a proxy (CASE expressions can legitimately yield 0).
+/// Views with only SUM/MIN/MAX have no such column; views with only FILTERED
+/// counts (COUNT(*) FILTER (WHERE p) → COUNT(CASE WHEN p THEN 1 END)) also
+/// lack a reliable indicator — filtered counts reach 0 when no rows match the
+/// predicate, even though the group still exists. We can't use SUM=0 either
+/// (CASE expressions can legitimately yield 0).
 ///
 /// The column is prefixed `_ivm_` so `column_hider` auto-excludes it from
 /// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
@@ -506,17 +570,37 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	if (agg.groups.empty()) {
 		return;
 	}
-	// Skip if a count/count_star aggregate is already present (explicit user
-	// COUNT(x)/COUNT(*), the DISTINCT-injected _ivm_distinct_count, or a
-	// _ivm_count_<alias> from AVG/STDDEV decomposition).
+	// Skip if a reliable group-size count is already present:
+	//   - A true COUNT(*): function name "count_star", no children, no filter.
+	//     COUNT(col) / COUNT(CASE WHEN p THEN x END) have function name "count"
+	//     (with children) and are unreliable: they return 0 when no rows match
+	//     the condition even though the group is non-empty. Do NOT skip for those.
+	//   - _ivm_count_star or _ivm_distinct_count already injected by an earlier
+	//     pass (e.g. DISTINCT rewrite).
+	bool has_argminmax = false;
 	for (auto &expr : agg.expressions) {
 		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
 			continue;
 		}
 		auto &bound = expr->Cast<BoundAggregateExpression>();
-		if (bound.function.name == "count" || bound.function.name == "count_star") {
+		// True COUNT(*): no-arg, no filter — always equals the group cardinality.
+		if (bound.function.name == "count_star" && bound.children.empty() && !bound.filter) {
 			return;
 		}
+		// Already-injected reliable hidden count.
+		if (bound.alias == ivm::COUNT_STAR_COL || bound.alias == ivm::DISTINCT_COUNT_COL) {
+			return;
+		}
+		if (bound.function.name == "arg_min" || bound.function.name == "arg_max") {
+			has_argminmax = true;
+		}
+	}
+	// ARG_MIN/ARG_MAX always use group-recompute (LPTS can't round-trip the two-arg form,
+	// so view_query_sql is the original SQL without _ivm_count_star). Skip injection so
+	// the data table schema matches. Checked after the loop so count_star / distinct_count
+	// in the same view still short-circuit correctly regardless of expression order.
+	if (has_argminmax) {
+		return;
 	}
 	auto count_star_func = CountStarFun::GetFunction();
 	vector<unique_ptr<Expression>> count_args;
@@ -960,6 +1044,7 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                     vector<string> &planner_names) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
+	RewriteAggregateFilters(context, plan);
 	bool had_distinct = plan->type == LogicalOperatorType::LOGICAL_DISTINCT ||
 	                    (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&
 	                     plan->children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT);

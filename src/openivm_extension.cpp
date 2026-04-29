@@ -146,7 +146,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_full_outer_merge",
 	                             "use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) "
 	                             "instead of group-recompute",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Learned cost model
 	db_config.AddExtensionOption("ivm_cost_decay",
@@ -317,9 +317,26 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
+		    // Query IVMType directly, same pattern as GetRefreshInterval — returns
+		    // 'unknown' on failure rather than throwing. Order MUST mirror IVMType enum
+		    // in src/include/core/openivm_constants.hpp.
+		    static const char *kTypeNames[] = {"aggregate_group", "simple_aggregate", "simple_projection",
+		                                       "full_refresh",    "aggregate_having", "window_partition",
+		                                       "group_recompute"};
+		    string strategy_str = "'unknown'";
+		    auto type_result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+		                                 OpenIVMUtils::EscapeValue(view_name) + "'");
+		    if (!type_result->HasError() && type_result->RowCount() > 0 && !type_result->GetValue(0, 0).IsNull()) {
+			    auto idx = static_cast<size_t>(type_result->GetValue(0, 0).GetValue<int8_t>());
+			    if (idx < sizeof(kTypeNames) / sizeof(kTypeNames[0])) {
+				    strategy_str = "'" + string(kTypeNames[idx]) + "'";
+			    }
+		    }
+
 		    return "SELECT '" + OpenIVMUtils::EscapeValue(view_name) + "' AS view_name, " + interval_str +
 		           " AS refresh_interval, " + last_refresh + " AS last_refresh, " + next_refresh +
-		           " AS next_refresh, " + status + " AS status, " + effective_interval + " AS effective_interval;";
+		           " AS next_refresh, " + status + " AS status, " + effective_interval + " AS effective_interval, " +
+		           strategy_str + " AS refresh_strategy;";
 	    },
 	    {LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm_status);

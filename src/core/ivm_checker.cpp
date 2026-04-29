@@ -9,15 +9,18 @@
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 
 #include <unordered_set>
 
 namespace duckdb {
 
 static const unordered_set<string> &GetSupportedAggregates() {
-	static const unordered_set<string> kSet = {"count_star", "count",    "sum",    "min",         "max",
-	                                           "avg",        "list",     "stddev", "stddev_samp", "stddev_pop",
-	                                           "variance",   "var_samp", "var_pop"};
+	static const unordered_set<string> kSet = {
+	    "count_star", "count",    "sum",      "min",     "max",      "avg",     "list",    "stddev", "stddev_samp",
+	    "stddev_pop", "variance", "var_samp", "var_pop", "bool_and", "bool_or", "arg_min", "arg_max"};
 	return kSet;
 }
 
@@ -135,9 +138,9 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		auto *agg = dynamic_cast<LogicalAggregate *>(node);
 		if (agg) {
 			// GROUPING SETS / ROLLUP / CUBE produce multiple grouping_sets entries.
-			// Our delta path groups once; can't produce the cross-grouped rows.
+			// Routed to RECOMPUTE (full DELETE+INSERT with empty-delta skip) in the parser.
 			if (agg->grouping_sets.size() > 1) {
-				result.ivm_compatible = false;
+				result.found_grouping_sets = true;
 			}
 			for (auto &expr : agg->expressions) {
 				if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
@@ -146,19 +149,20 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					if (supported.find(bound_agg.function.name) == supported.end()) {
 						result.ivm_compatible = false;
 					}
-					// COUNT(DISTINCT x) can't be maintained by summing delta counts — a
-					// delta row's value might already be in the MV (no change) or not
-					// (+1). Deciding requires auxiliary per-value state.
+					// COUNT(DISTINCT x) can't be summed from delta counts, but group-recompute
+					// (delete affected groups + re-insert from original query) is correct.
 					if (bound_agg.IsDistinct()) {
-						result.ivm_compatible = false;
+						result.found_count_distinct = true;
 					}
-					// FILTER (WHERE predicate) aggregates aren't captured by the delta
-					// path either — the FILTER predicate interacts with delta rows in
-					// ways the delta-sum formula can't reproduce.
+					// FILTER (WHERE predicate) is normalized to CASE WHEN p THEN x END
+					// by RewriteAggregateFilters before the checker runs. If a FILTER reaches
+					// here it means the rewrite didn't fire (unexpected plan shape) — fall back
+					// to full refresh rather than producing wrong incremental results.
 					if (bound_agg.filter) {
 						result.ivm_compatible = false;
 					}
-					if (bound_agg.function.name == "min" || bound_agg.function.name == "max") {
+					if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
+					    bound_agg.function.name == "arg_min" || bound_agg.function.name == "arg_max") {
 						result.found_minmax = true;
 					}
 					// LIST aggregates aren't element-wise summable — different deltas
@@ -215,6 +219,40 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			}
 		}
 		break;
+	}
+
+	case LogicalOperatorType::LOGICAL_TOP_N: {
+		// LPTS disables top_n optimizer, so this only appears if LPTS is not loaded.
+		// Transparent: record presence, recurse to child.
+		auto &top_n = node->Cast<LogicalTopN>();
+		result.found_top_k = true;
+		result.top_k_limit = top_n.limit;
+		if (!node->children.empty()) {
+			AnalyzeNode(node->children[0].get(), result);
+		}
+		return;
+	}
+
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+		// Transparent: ORDER BY alone (without LIMIT) is valid and stripped at view-creation time.
+		// It does NOT mark found_top_k — a top-k pattern requires LIMIT.
+		if (!node->children.empty()) {
+			AnalyzeNode(node->children[0].get(), result);
+		}
+		return;
+
+	case LogicalOperatorType::LOGICAL_LIMIT: {
+		// LPTS disables the top_n optimizer so ORDER BY + LIMIT appear as separate nodes.
+		// LIMIT is what makes a query top-k; ORDER BY alone does not.
+		result.found_top_k = true;
+		auto *limit_node = dynamic_cast<LogicalLimit *>(node);
+		if (limit_node && limit_node->limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+			result.top_k_limit = limit_node->limit_val.GetConstantValue();
+		}
+		if (!node->children.empty()) {
+			AnalyzeNode(node->children[0].get(), result);
+		}
+		return;
 	}
 
 	default:

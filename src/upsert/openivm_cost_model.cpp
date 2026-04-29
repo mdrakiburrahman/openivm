@@ -593,7 +593,10 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: IVM=%.0fms, Recompute=%.0fms\n", ivm_predicted_ms,
 		                    recompute_predicted_ms);
 	}
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n", ivm_predicted_ms < recompute_predicted_ms ? "IVM" : "RECOMPUTE");
+	// "FULL_RECOMPUTE" is the cost-model strategy label (delete+insert the whole MV from the
+	// view query); the IVMType enum no longer has a RECOMPUTE variant — see openivm_constants.hpp.
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
+	                    ivm_predicted_ms < recompute_predicted_ms ? "IVM" : "FULL_RECOMPUTE");
 
 	IVMCostEstimate estimate;
 	estimate.ivm_compute = ivm_compute;

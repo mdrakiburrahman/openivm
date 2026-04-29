@@ -19,6 +19,10 @@ struct PlanAnalysis {
 	bool found_full_outer = false;
 	bool found_join = false;
 	bool found_window = false;
+	bool found_top_k = false;
+	bool found_count_distinct = false; // COUNT(DISTINCT x) — handled via group-recompute
+	bool found_grouping_sets = false;  // ROLLUP/CUBE/GROUPING SETS — handled via RECOMPUTE
+	idx_t top_k_limit = 0;             // constant LIMIT value from LOGICAL_TOP_N
 	vector<string> aggregate_columns;
 	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
 	vector<string> window_partition_columns; // PARTITION BY columns from window functions
