@@ -67,11 +67,13 @@ void OpenIVMUtils::ReplaceMaterializedView(string &query) {
 }
 
 string OpenIVMUtils::ExtractViewQuery(string &query) {
+	// Match only up through "AS " — then return everything after as a raw substr so
+	// multi-line CTE bodies (which contain '\n') are not truncated by regex '.' semantics.
 	std::regex rgx_create_view(
-	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+(.*))re");
+	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+)re");
 	std::smatch match;
 	if (std::regex_search(query, match, rgx_create_view)) {
-		return match[3].str();
+		return query.substr(static_cast<size_t>(match.position()) + static_cast<size_t>(match.length()));
 	}
 	return "";
 }
@@ -155,6 +157,33 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
+}
+
+void OpenIVMUtils::StripLineComments(string &query) {
+	string out;
+	out.reserve(query.size());
+	bool in_string = false;
+	for (size_t i = 0; i < query.size(); ++i) {
+		char c = query[i];
+		if (c == '\'' && !in_string) {
+			in_string = true;
+			out += c;
+		} else if (c == '\'' && in_string) {
+			in_string = false;
+			out += c;
+		} else if (!in_string && c == '-' && i + 1 < query.size() && query[i + 1] == '-') {
+			// Skip to end of line, preserve the newline so downstream \s+ collapse still works
+			while (i < query.size() && query[i] != '\n') {
+				++i;
+			}
+			if (i < query.size()) {
+				out += '\n';
+			}
+		} else {
+			out += c;
+		}
+	}
+	query = std::move(out);
 }
 
 string OpenIVMUtils::DeltaName(const string &name) {

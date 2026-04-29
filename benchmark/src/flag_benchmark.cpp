@@ -57,10 +57,9 @@ using openivm_bench::WriteAllBytes;
 // Query + workload definitions
 
 enum class Workload {
-	INSERT_ONLY,   // N rows inserted
-	MIXED,         // INSERTs + UPDATEs + DELETEs
-	EMPTY_DELTA,   // no DML (N is ignored)
-	SINGLE_SOURCE, // for joins: DML only one of the join sources
+	INSERT_ONLY, // N rows inserted
+	MIXED,       // INSERTs + UPDATEs + DELETEs
+	EMPTY_DELTA, // no DML (N is ignored)
 };
 
 static const char *WorkloadName(Workload w) {
@@ -68,26 +67,24 @@ static const char *WorkloadName(Workload w) {
 	case Workload::INSERT_ONLY: return "insert_only";
 	case Workload::MIXED: return "mixed";
 	case Workload::EMPTY_DELTA: return "empty_delta";
-	case Workload::SINGLE_SOURCE: return "single_source";
 	}
 	return "?";
 }
 
 struct QueryDef {
-	string id;                  // Q01, Q02, ...
-	string description;         // human description
-	vector<string> create_mvs;  // CREATE MATERIALIZED VIEW ...; statements, in order
-	vector<string> refresh_mvs; // order to call PRAGMA ivm() on after DML
-	vector<string> warm_tables; // base tables / delta tables to SELECT * FROM before measuring
-	vector<Workload> workloads; // workloads to run this query against
-	string single_source_table; // for SINGLE_SOURCE workloads, only DML this table (must be in warm_tables)
-	bool is_ducklake;           // runs inside dl.main
+	string id;                 // Q01, Q02, ...
+	string description;        // human description
+	vector<string> create_mvs; // CREATE MATERIALIZED VIEW ...; statements, in order
+	vector<string> refresh_mvs;
+	vector<string> warm_tables;
+	vector<Workload> workloads;
+	bool is_ducklake;
 
 	QueryDef(string id_, string desc_, vector<string> create_, vector<string> refresh_, vector<string> warm_,
-	         vector<Workload> wls_, string ssrc_, bool dl_)
+	         vector<Workload> wls_, bool dl_)
 	    : id(std::move(id_)), description(std::move(desc_)), create_mvs(std::move(create_)),
 	      refresh_mvs(std::move(refresh_)), warm_tables(std::move(warm_)), workloads(std::move(wls_)),
-	      single_source_table(std::move(ssrc_)), is_ducklake(dl_) {
+	      is_ducklake(dl_) {
 	}
 };
 
@@ -238,224 +235,104 @@ static vector<string> BuildWorkload(const string &table, int size, int scale, Wo
 // Each query exercises one or more optimization flags. See per-entry comment.
 
 static void AddQuery(vector<QueryDef> &qs, string id, string desc, vector<string> creates, vector<string> refresh,
-                     vector<string> warm, vector<Workload> wls, string ss, bool dl) {
+                     vector<string> warm, vector<Workload> wls, bool dl) {
 	qs.push_back(QueryDef(std::move(id), std::move(desc), std::move(creates), std::move(refresh), std::move(warm),
-	                       std::move(wls), std::move(ss), dl));
+	                       std::move(wls), dl));
 }
 
 static vector<QueryDef> BuildQueries(bool include_ducklake) {
 	vector<QueryDef> qs;
 
-	// Q01: SUM + GROUP BY, insert-only hits skip_aggregate_delete path;
-	//      mixed hits the normal DELETE+INSERT cleanup path.
+	// Q01: SUM+GROUP BY → skip_aggregate_delete (IO), normal path (M)
 	AddQuery(qs,
-	    "Q01", "SUM + GROUP BY on CUSTOMER",
+	    "Q01", "SUM+GROUP BY",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, SUM(C_BALANCE) AS tot FROM CUSTOMER GROUP BY C_W_ID"},
-	    {"mv_q"},
-	    {"CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "CUSTOMER", false
-	);
+	    {"mv_q"}, {"CUSTOMER"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q02: COUNT + MIN + MAX → exercises minmax_incremental for insert-only (GREATEST/LEAST fast path)
+	// Q02: MIN+MAX → minmax_incremental fast path (IO)
 	AddQuery(qs,
-	    "Q02", "COUNT+MIN+MAX GROUP BY",
+	    "Q02", "MIN+MAX GROUP BY",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, COUNT(*) AS n, MIN(C_BALANCE) AS mn, MAX(C_BALANCE) AS mx "
 	     "FROM CUSTOMER GROUP BY C_W_ID"},
-	    {"mv_q"},
-	    {"CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "CUSTOMER", false
-	);
+	    {"mv_q"}, {"CUSTOMER"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q03: HAVING → exercises having_merge
+	// Q03: HAVING → having_merge flag
 	AddQuery(qs,
 	    "Q03", "GROUP BY + HAVING",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, COUNT(*) AS n FROM CUSTOMER GROUP BY C_W_ID HAVING "
 	     "COUNT(*) > 5"},
-	    {"mv_q"},
-	    {"CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "CUSTOMER", false
-	);
+	    {"mv_q"}, {"CUSTOMER"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q04: SIMPLE_AGGREGATE (no GROUP BY) → different compile path
+	// Q04: projection → skip_projection_delete flag
 	AddQuery(qs,
-	    "Q04", "SIMPLE_AGGREGATE (no GROUP BY)",
-	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT COUNT(*) AS n, SUM(C_BALANCE) AS tot, AVG(C_BALANCE) AS av "
-	     "FROM CUSTOMER"},
-	    {"mv_q"},
-	    {"CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "CUSTOMER", false
-	);
-
-	// Q05: AVG-over-CAST(DOUBLE) — forces DecomposeAvgStddev + hidden count_star injection
-	AddQuery(qs,
-	    "Q05", "AVG over CAST DOUBLE",
-	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT S_W_ID, AVG(CAST(S_QUANTITY AS DOUBLE)) AS aq FROM STOCK GROUP "
-	     "BY S_W_ID"},
-	    {"mv_q"},
-	    {"STOCK"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "STOCK", false
-	);
-
-	// Q06: pure projection → exercises skip_projection_delete path
-	AddQuery(qs,
-	    "Q06", "pure projection",
-	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, C_D_ID, C_ID, C_BALANCE FROM CUSTOMER"},
-	    {"mv_q"},
-	    {"CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "CUSTOMER", false
-	);
-
-	// Q07: projection + filter
-	AddQuery(qs,
-	    "Q07", "projection + WHERE filter",
+	    "Q04", "projection + filter",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, C_ID, C_BALANCE FROM CUSTOMER WHERE C_BALANCE > 0"},
-	    {"mv_q"},
-	    {"CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "CUSTOMER", false
-	);
+	    {"mv_q"}, {"CUSTOMER"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q08: 2-way INNER JOIN, no aggregate
+	// Q05: 2-way INNER JOIN → skip_empty_deltas, inclusion-exclusion
 	AddQuery(qs,
-	    "Q08", "2-way INNER JOIN projection",
+	    "Q05", "2-way INNER JOIN",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID, d.D_NAME FROM WAREHOUSE w JOIN DISTRICT d ON "
 	     "w.W_ID = d.D_W_ID"},
-	    {"mv_q"},
-	    {"WAREHOUSE", "DISTRICT"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "DISTRICT", false
-	);
+	    {"mv_q"}, {"WAREHOUSE", "DISTRICT"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q09: 3-way INNER JOIN → exercises skip_empty_deltas + fk_pruning
+	// Q06: 3-way INNER JOIN → fk_pruning reduces 2^3-1=7 terms to fewer
 	AddQuery(qs,
-	    "Q09", "3-way INNER JOIN",
+	    "Q06", "3-way INNER JOIN",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID, c.C_ID FROM WAREHOUSE w JOIN DISTRICT d ON "
 	     "w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID"},
-	    {"mv_q"},
-	    {"WAREHOUSE", "DISTRICT", "CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "CUSTOMER", false
-	);
+	    {"mv_q"}, {"WAREHOUSE", "DISTRICT", "CUSTOMER"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q10: 4-way INNER JOIN (adds OORDER) → larger inclusion-exclusion blow-up w/o fk_pruning
+	// Q07: LEFT JOIN + aggregate → group-recompute path
 	AddQuery(qs,
-	    "Q10", "4-way INNER JOIN",
-	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID, c.C_ID, o.O_ID FROM WAREHOUSE w JOIN DISTRICT d "
-	     "ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID JOIN OORDER o ON "
-	     "c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID"},
-	    {"mv_q"},
-	    {"WAREHOUSE", "DISTRICT", "CUSTOMER", "OORDER"},
-	    {Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "OORDER", false
-	);
-
-	// Q11: 5-way INNER JOIN
-	AddQuery(qs,
-	    "Q11", "5-way INNER JOIN",
-	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID, c.C_ID, o.O_ID, ol.OL_NUMBER FROM WAREHOUSE w "
-	     "JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID "
-	     "JOIN OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID "
-	     "JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID"},
-	    {"mv_q"},
-	    {"WAREHOUSE", "DISTRICT", "CUSTOMER", "OORDER", "ORDER_LINE"},
-	    {Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "ORDER_LINE", false
-	);
-
-	// Q12: LEFT JOIN + COUNT
-	AddQuery(qs,
-	    "Q12", "LEFT JOIN + COUNT",
+	    "Q07", "LEFT JOIN + COUNT",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, COUNT(d.D_ID) AS nd FROM WAREHOUSE w LEFT JOIN DISTRICT "
 	     "d ON w.W_ID = d.D_W_ID GROUP BY w.W_ID"},
-	    {"mv_q"},
-	    {"WAREHOUSE", "DISTRICT"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "DISTRICT", false
-	);
+	    {"mv_q"}, {"WAREHOUSE", "DISTRICT"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q13: join + GROUP BY + SUM across FK → fk_pruning matters
+	// Q08: join + GROUP BY + SUM (FK OORDER→ORDER_LINE) → fk_pruning impact
 	AddQuery(qs,
-	    "Q13", "JOIN + GROUP BY + SUM (FK OORDER->ORDER_LINE)",
+	    "Q08", "JOIN + GROUP BY + SUM",
 	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT o.O_W_ID, SUM(ol.OL_AMOUNT) AS tot FROM OORDER o JOIN "
 	     "ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY "
 	     "o.O_W_ID"},
-	    {"mv_q"},
-	    {"OORDER", "ORDER_LINE"},
-	    {Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "ORDER_LINE", false
-	);
+	    {"mv_q"}, {"OORDER", "ORDER_LINE"},
+	    {Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
-	// Q14: INNER JOIN + HAVING (combines join + having_merge)
+	// P1: 3-level cascade pipeline — tests cascade refresh ordering
 	AddQuery(qs,
-	    "Q14", "2-way JOIN + GROUP BY + HAVING",
-	    {"CREATE MATERIALIZED VIEW mv_q AS SELECT o.O_W_ID, SUM(ol.OL_AMOUNT) AS tot FROM OORDER o JOIN "
-	     "ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY "
-	     "o.O_W_ID HAVING SUM(ol.OL_AMOUNT) > 0"},
-	    {"mv_q"},
-	    {"OORDER", "ORDER_LINE"},
-	    {Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "ORDER_LINE", false
-	);
-
-	// P1: pipeline (3-level chain over CUSTOMER aggregates)
-	AddQuery(qs,
-	    "P1", "pipeline: customer agg -> total per wid -> grand total",
+	    "P1", "cascade pipeline",
 	    {
 	        "CREATE MATERIALIZED VIEW mv_p1_a AS SELECT C_W_ID, C_D_ID, SUM(C_BALANCE) AS s FROM CUSTOMER GROUP "
 	        "BY C_W_ID, C_D_ID",
 	        "CREATE MATERIALIZED VIEW mv_p1_b AS SELECT C_W_ID, SUM(s) AS s_tot FROM mv_p1_a GROUP BY C_W_ID",
 	        "CREATE MATERIALIZED VIEW mv_p1_c AS SELECT SUM(s_tot) AS g FROM mv_p1_b",
 	    },
-	    {"mv_p1_a", "mv_p1_b", "mv_p1_c"},
-	    {"CUSTOMER"},
-	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-	    "CUSTOMER", false
-	);
-
-	// P2: pipeline (join + agg + filter chain)
-	AddQuery(qs,
-	    "P2", "pipeline: join+agg -> filter -> grand total",
-	    {
-	        "CREATE MATERIALIZED VIEW mv_p2_a AS SELECT o.O_W_ID, o.O_D_ID, SUM(ol.OL_AMOUNT) AS tot FROM OORDER "
-	        "o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID "
-	        "GROUP BY o.O_W_ID, o.O_D_ID",
-	        "CREATE MATERIALIZED VIEW mv_p2_b AS SELECT O_W_ID, SUM(tot) AS s FROM mv_p2_a WHERE tot > 0 GROUP "
-	        "BY O_W_ID",
-	        "CREATE MATERIALIZED VIEW mv_p2_c AS SELECT SUM(s) AS g FROM mv_p2_b",
-	    },
-	    {"mv_p2_a", "mv_p2_b", "mv_p2_c"},
-	    {"OORDER", "ORDER_LINE"},
-	    {Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-	    "ORDER_LINE", false
-	);
+	    {"mv_p1_a", "mv_p1_b", "mv_p1_c"}, {"CUSTOMER"},
+	    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, false);
 
 	if (include_ducklake) {
-		// DL1: DuckLake aggregate — ducklake_nterm matters
 		AddQuery(qs,
-		    "DL1", "DuckLake simple aggregate",
+		    "DL1", "DuckLake aggregate",
 		    {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, SUM(C_BALANCE) AS tot FROM dl.CUSTOMER GROUP BY "
 		     "C_W_ID"},
-		    {"mv_q"},
-		    {"dl.CUSTOMER"},
-		    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA},
-		    "CUSTOMER", true);
+		    {"mv_q"}, {"dl.CUSTOMER"},
+		    {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, true);
 
-		// DL2: DuckLake 3-way join (telescoping vs 2^N-1)
 		AddQuery(qs,
 		    "DL2", "DuckLake 3-way join",
 		    {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID, c.C_ID FROM dl.WAREHOUSE w JOIN "
 		     "dl.DISTRICT d ON w.W_ID = d.D_W_ID JOIN dl.CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = "
 		     "c.C_D_ID"},
-		    {"mv_q"},
-		    {"dl.WAREHOUSE", "dl.DISTRICT", "dl.CUSTOMER"},
-		    {Workload::MIXED, Workload::EMPTY_DELTA, Workload::SINGLE_SOURCE},
-		    "CUSTOMER", true);
+		    {"mv_q"}, {"dl.WAREHOUSE", "dl.DISTRICT", "dl.CUSTOMER"},
+		    {Workload::MIXED, Workload::EMPTY_DELTA}, true);
 	}
 
 	return qs;
@@ -656,9 +533,7 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 	int issued = 0;
 	if (wl != Workload::EMPTY_DELTA && delta_size > 0) {
 		vector<string> dml;
-		if (wl == Workload::SINGLE_SOURCE) {
-			dml = BuildWorkload(q.single_source_table, delta_size, scale, Workload::MIXED, /*pk_offset=*/0);
-		} else if (q.warm_tables.size() == 1) {
+		if (q.warm_tables.size() == 1) {
 			string t = q.warm_tables[0];
 			auto p = t.find('.');
 			if (p != string::npos) t = t.substr(p + 1);
@@ -899,7 +774,7 @@ static double Median(vector<double> v) {
 static void PrintUsage() {
 	fprintf(stderr,
 	        "flag_benchmark --scale N --db PATH --out CSV [--reps 3] [--ducklake] [--filter Q01,Q05,...]\n"
-	        "               [--sizes 0,100,1000,10000] [--timeout 120]\n");
+	        "               [--sizes 0,100,1000] [--timeout 120]\n");
 }
 
 // Sweep /tmp for orphaned per-child files left by previous crashed runs.
@@ -967,7 +842,7 @@ int main(int argc, char **argv) {
 	int reps = 3;
 	bool ducklake = false;
 	set<string> query_filter;
-	vector<int> delta_sizes = {0, 100, 1000, 10000};
+	vector<int> delta_sizes = {0, 100, 1000};
 	double timeout_s = 300.0;
 
 	for (int i = 1; i < argc; i++) {

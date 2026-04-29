@@ -22,6 +22,10 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
@@ -33,6 +37,46 @@
 #include <regex>
 
 namespace duckdb {
+
+/// Build "ORDER BY col1 ASC, col2 DESC LIMIT k [OFFSET n]".
+/// Works for both LOGICAL_TOP_N (fused) and separate LOGICAL_ORDER_BY + LOGICAL_LIMIT nodes.
+/// output_col_names is the sanitized output column list; BoundColumnRefs are resolved via
+/// their column_index into that list.
+static string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
+                              const vector<string> &output_col_names) {
+	string sql = "ORDER BY ";
+	for (size_t i = 0; i < orders.size(); i++) {
+		if (i > 0) {
+			sql += ", ";
+		}
+		auto &ord = orders[i];
+		bool resolved = false;
+		if (ord.expression->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			auto &col_ref = ord.expression->Cast<BoundColumnRefExpression>();
+			idx_t cidx = col_ref.binding.column_index;
+			if (cidx < output_col_names.size() && !output_col_names[cidx].empty()) {
+				sql += KeywordHelper::WriteOptionallyQuoted(output_col_names[cidx]);
+				resolved = true;
+			}
+		}
+		if (!resolved) {
+			const string &alias = ord.expression->alias;
+			if (!alias.empty()) {
+				sql += KeywordHelper::WriteOptionallyQuoted(alias);
+			} else {
+				sql += ord.expression->ToString();
+			}
+		}
+		sql += " " + ord.GetOrderModifier();
+	}
+	if (limit_val > 0) {
+		sql += " LIMIT " + to_string(limit_val);
+		if (offset_val > 0) {
+			sql += " OFFSET " + to_string(offset_val);
+		}
+	}
+	return sql;
+}
 
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
@@ -85,8 +129,10 @@ static void IVMDDLExecuteFunction(ClientContext &context, TableFunctionInput &da
 ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionInfo *info, const string &query) {
 	auto query_lower = OpenIVMUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
 	StringUtil::Trim(query_lower);
-
-	query_lower.erase(remove(query_lower.begin(), query_lower.end(), '\n'), query_lower.end());
+	// Strip SQL line comments (-- to end of line) before whitespace normalization.
+	// RemoveRedundantWhitespaces collapses '\n' to ' ', which would turn
+	// "-- comment\n rest" into "-- comment rest" where the rest is eaten by the comment.
+	OpenIVMUtils::StripLineComments(query_lower);
 	OpenIVMUtils::RemoveRedundantWhitespaces(query_lower);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
@@ -243,6 +289,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
+		string top_k_suffix;                     // ORDER BY … LIMIT k, appended to the CREATE VIEW
 
 		// Apply the session's active catalog to `con` so unqualified table references in the
 		// MV query resolve in the user's catalog (e.g. `dl.main`) rather than the physical
@@ -431,6 +478,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 				if ((walk->type == LogicalOperatorType::LOGICAL_ORDER_BY ||
 				     walk->type == LogicalOperatorType::LOGICAL_LIMIT ||
+				     walk->type == LogicalOperatorType::LOGICAL_TOP_N ||
 				     walk->type == LogicalOperatorType::LOGICAL_DISTINCT ||
 				     walk->type == LogicalOperatorType::LOGICAL_FILTER) &&
 				    !walk->children.empty()) {
@@ -485,6 +533,91 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// Strip HAVING filter from plan — data table stores all groups.
 			// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 			having_predicate = StripHavingFilter(select_plan, output_names);
+
+			// For aggregate+top-k: extract the ORDER BY/LIMIT suffix, then strip the top-k
+			// wrapper(s) so LPTS serializes only the inner aggregate query. The suffix is
+			// appended to the CREATE VIEW definition so ORDER BY LIMIT is applied at read
+			// time over the fully-maintained data table.
+			//
+			// Two plan shapes depending on whether top_n optimizer ran:
+			//   (A) LOGICAL_TOP_N → child  [top_n disabled by LPTS — never reached here]
+			//   (B) LOGICAL_LIMIT → LOGICAL_ORDER_BY → child  [LPTS active — common case]
+			//
+			// For projection top-k (no GROUP BY): leave the plan as-is; LPTS will fail and
+			// fall back to original_view_query (which contains ORDER BY LIMIT).
+			{
+				LogicalOperator *limit_node = nullptr;
+				LogicalOperator *order_node = nullptr;
+
+				if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_TOP_N) {
+					// Shape (A): fused top-n node
+					limit_node = select_plan.get();
+					order_node = select_plan.get(); // same node holds both orders + limit
+				} else if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_LIMIT &&
+				           !select_plan->children.empty() &&
+				           select_plan->children[0]->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
+					// Shape (B): separate LIMIT + ORDER_BY nodes
+					limit_node = select_plan.get();
+					order_node = select_plan->children[0].get();
+				}
+
+				if (limit_node) {
+					// Walk inner plan (below order) to find a grouped aggregate
+					bool has_grouped_agg = false;
+					LogicalOperator *order_child =
+					    order_node->children.empty() ? nullptr : order_node->children[0].get();
+					LogicalOperator *inner = order_child;
+					while (inner) {
+						if (inner->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+							auto *agg = dynamic_cast<LogicalAggregate *>(inner);
+							if (agg && !agg->groups.empty()) {
+								has_grouped_agg = true;
+							}
+							break;
+						}
+						if (inner->children.empty()) {
+							break;
+						}
+						inner = inner->children[0].get();
+					}
+
+					if (has_grouped_agg) {
+						if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
+							auto &top_n = limit_node->Cast<LogicalTopN>();
+							top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
+							select_plan = std::move(select_plan->children[0]);
+						} else {
+							// Shape (B): extract from the two separate nodes
+							auto &order_op = order_node->Cast<LogicalOrder>();
+							auto &limit_op = limit_node->Cast<LogicalLimit>();
+							idx_t lval = 0;
+							idx_t oval = 0;
+							if (limit_op.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+								lval = limit_op.limit_val.GetConstantValue();
+							}
+							if (limit_op.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+								oval = limit_op.offset_val.GetConstantValue();
+							}
+							top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
+							// Strip: select_plan = LOGICAL_ORDER_BY's child
+							select_plan = std::move(select_plan->children[0]->children[0]);
+						}
+						OPENIVM_DEBUG_PRINT("[CREATE MV] Aggregate+top-k: stripped top-k wrapper, suffix='%s'\n",
+						                    top_k_suffix.c_str());
+					}
+				}
+			}
+
+			// Strip a standalone ORDER_BY at the top of select_plan (e.g. DISTINCT + ORDER BY
+			// without LIMIT, or simple projection + ORDER BY). LPTS can't serialize ORDER_BY;
+			// the suffix is appended to the CREATE VIEW instead.
+			if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_ORDER_BY && top_k_suffix.empty() &&
+			    !select_plan->children.empty()) {
+				auto &order_op = select_plan->Cast<LogicalOrder>();
+				top_k_suffix = BuildTopKSuffix(order_op.orders, 0, 0, output_names);
+				select_plan = std::move(select_plan->children[0]);
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
+			}
 
 			try {
 				auto ast = LogicalPlanToAst(*con.context, select_plan);
@@ -541,14 +674,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 								    fn_name == "percentile_cont" || fn_name == "percentile_disc" ||
 								    fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
 								    fn_name == "mode" ||
-								    // Two-argument statistical aggregates whose children LPTS
-								    // re-aliases to internal `tN_col` names; the serialized SQL
-								    // refers to those names against the original FROM clause and
-								    // fails binding at CREATE-table time (see query_1888).
+								    // Two-argument aggregates whose children LPTS re-aliases to
+								    // internal `tN_col` names; the serialized SQL refers to those
+								    // names against the original FROM clause and fails binding at
+								    // CREATE-table time (see query_1888). ARG_MIN/ARG_MAX are also
+								    // two-argument and hit the same issue.
 								    fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" ||
 								    fn_name == "regr_avgx" || fn_name == "regr_avgy" || fn_name == "regr_count" ||
 								    fn_name == "regr_intercept" || fn_name == "regr_r2" || fn_name == "regr_slope" ||
-								    fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy") {
+								    fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy" ||
+								    fn_name == "arg_min" || fn_name == "arg_max") {
 									needs_original = true;
 									return;
 								}
@@ -574,6 +709,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
 
+		// Normalize FILTER aggregates in the full plan before analysis so the checker
+		// sees CASE expressions instead of raw FILTER and doesn't set ivm_compatible=false.
+		// (IVMPlanRewrite already rewrote select_plan for the LPTS view_query above.)
+		RewriteAggregateFilters(context, plan);
+
 		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
 		auto analysis = AnalyzePlan(plan.get());
 		bool ivm_compatible = analysis.ivm_compatible;
@@ -586,6 +726,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_full_outer = analysis.found_full_outer;
 		bool found_window = analysis.found_window;
 		bool found_join = analysis.found_join;
+		bool found_top_k = analysis.found_top_k;
+		bool found_grouping_sets = analysis.found_grouping_sets;
+		// COUNT(DISTINCT x) → group-recompute (delete affected groups, re-insert from original query)
+		if (analysis.found_count_distinct) {
+			found_minmax = true;
+		}
 		// Derive GROUP BY column names by walking the plan's projection above the aggregate.
 		// The projection maps GROUP BY bindings (group_index, i) to SELECT-list aliases — these
 		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
@@ -617,6 +763,24 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 		}
+		// Detect UNION / UNION ALL over aggregates once, shared by the group_cols block below
+		// (to skip key extraction) and the classification chain (to route to RECOMPUTE).
+		bool has_union_over_agg = false;
+		{
+			std::function<bool(const LogicalOperator *)> plan_has_union = [&](const LogicalOperator *op) -> bool {
+				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+					return true;
+				}
+				for (auto &c : op->children) {
+					if (plan_has_union(c.get())) {
+						return true;
+					}
+				}
+				return false;
+			};
+			has_union_over_agg = found_aggregation && plan_has_union(plan.get());
+		}
+
 		if (distinct_at_top) {
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (analysis.found_distinct && analysis.aggregate_columns.empty()) {
@@ -752,35 +916,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// columns come from multiple independent branches — collecting group keys from
 			// a single branch would return names that aren't in the MV's user-facing output
 			// (UNION ALL re-aliases them at the top). Classify as SIMPLE_AGGREGATE so the
-			// refresh path doesn't generate SQL referencing the inner alias.
-			// `has_union` is a simple "contains LOGICAL_UNION anywhere" check: we already
-			// gate on `found_aggregation`, so ANY union under the CTAS signals UNION-over-aggregate
-			// when the aggregate is reachable via a CTE_REF branch.
-			std::function<bool(LogicalOperator *)> has_union = [&](LogicalOperator *op) -> bool {
-				if (!op) {
-					return false;
-				}
-				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
-					return true;
-				}
-				for (auto &c : op->children) {
-					if (has_union(c.get())) {
-						return true;
-					}
-				}
-				return false;
-			};
-			if (has_union(plan.get())) {
+			if (has_union_over_agg) {
 				group_names_list.clear();
-				// UNION ALL of per-branch aggregates (e.g.
-				//   `SELECT a, SUM(x) FROM t1 GROUP BY a
-				//    UNION ALL SELECT a, SUM(x) FROM t2 GROUP BY a`)
-				// produces output rows keyed by both (a, branch). SIMPLE_AGGREGATE would
-				// treat all rows as one aggregate group (no GROUP BY) and SUM them into
-				// a single row — wrong. Incremental per-branch maintenance would need a
-				// new AGGREGATE_UNION IVMType with branch tagging. Until that lands, mark
-				// the view as FULL_REFRESH so results stay correct.
-				ivm_compatible = false;
+				// UNION/UNION ALL over aggregates: key extraction from a single branch is
+				// unreliable. Leave aggregate_columns empty so no unique index is created;
+				// the RECOMPUTE classification below handles refresh correctly.
 			} else {
 				find_group_cols(plan.get());
 			}
@@ -973,52 +1113,30 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			walk_for_nested(plan.get(), false);
 		}
 
-		// UNION between aggregates — e.g. `SELECT k, SUM(x) FROM t1 GROUP BY k UNION
-		// SELECT k, SUM(x) FROM t2 GROUP BY k`. Even if UNION rewrote to DISTINCT and
-		// the classifier earlier picked AGGREGATE_GROUP via distinct_at_top, UNION
-		// semantics can't be incrementally maintained by the MERGE path: a new row on
-		// one branch might duplicate a row that already exists on the other branch,
-		// and UNION's de-dup has no way to reflect this in our delta. Fall back to
-		// full recompute. The "UNION ALL of aggregates" fallback below already sets
-		// ivm_compatible=false via find_group_cols, but UNION (not UNION ALL) bypasses
-		// that because the plan wraps a DISTINCT on top — distinct_at_top fires
-		// before the union check.
-		bool has_union_over_agg = false;
-		{
-			std::function<bool(const LogicalOperator *)> has_union_below = [&](const LogicalOperator *op) -> bool {
-				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
-					return true;
-				}
-				for (auto &c : op->children) {
-					if (has_union_below(c.get())) {
-						return true;
-					}
-				}
-				return false;
-			};
-			has_union_over_agg = found_aggregation && has_union_below(plan.get());
-		}
-
 		IVMType ivm_type;
 
 		if (found_window) {
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
 			ivm_type = IVMType::WINDOW_PARTITION;
+		} else if (found_grouping_sets) {
+			// ROLLUP / CUBE / GROUPING SETS: full recompute per refresh, but with empty-delta skip.
+			ivm_type = IVMType::RECOMPUTE;
 		} else if (!ivm_compatible) {
 			ivm_type = IVMType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
+		} else if (found_top_k) {
+			// Any LIMIT (with or without ORDER BY, with or without GROUP BY) requires full
+			// recompute — the surviving rows after a LIMIT can shift with every delta.
+			// RECOMPUTE gets empty-delta skip, unlike FULL_REFRESH.
+			ivm_type = IVMType::RECOMPUTE;
 		} else if (has_union_over_agg) {
-			ivm_type = IVMType::FULL_REFRESH;
-			Printer::Print("Warning: materialized view '" + view_name +
-			               "' combines aggregates via UNION/UNION ALL. "
-			               "IVM can't deduplicate across branches incrementally; using full refresh.");
+			// UNION / UNION ALL over aggregates: full recompute, but skip when deltas are empty.
+			ivm_type = IVMType::RECOMPUTE;
 		} else if (has_derived_aggregate_below_join) {
-			ivm_type = IVMType::FULL_REFRESH;
-			Printer::Print("Warning: materialized view '" + view_name +
-			               "' has AVG/STDDEV/VARIANCE inside a CTE joined with other tables. "
-			               "IVM decomposition can't propagate through the join; using full refresh.");
+			// AVG/STDDEV/VARIANCE inside a CTE joined with other tables: full recompute + empty-delta skip.
+			ivm_type = IVMType::RECOMPUTE;
 		} else if (found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
@@ -1041,6 +1159,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		                    : ivm_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
 		                    : ivm_type == IVMType::FULL_REFRESH      ? "FULL_REFRESH"
 		                    : ivm_type == IVMType::WINDOW_PARTITION  ? "WINDOW_PARTITION"
+		                    : ivm_type == IVMType::TOP_K             ? "TOP_K"
+		                    : ivm_type == IVMType::RECOMPUTE         ? "RECOMPUTE"
 		                                                             : "UNKNOWN",
 		                    (int)found_aggregation, (int)found_projection, aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
@@ -1458,8 +1578,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 			string having_where = having_predicate.empty() ? "" : " where " + having_predicate;
+			// For aggregate+top-k the VIEW appends ORDER BY … LIMIT k after the HAVING WHERE.
+			// The data table stores ALL groups; the ORDER BY LIMIT is applied at read time.
+			string view_tail = having_where + (top_k_suffix.empty() ? "" : " " + top_k_suffix);
 			if (internal_cols.empty()) {
-				ddl.push_back("create view " + qvn + " as select * from " + qdt + having_where);
+				ddl.push_back("create view " + qvn + " as select * from " + qdt + view_tail);
 			} else {
 				string exclude_list;
 				for (size_t i = 0; i < internal_cols.size(); i++) {
@@ -1469,7 +1592,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					exclude_list += internal_cols[i];
 				}
 				ddl.push_back("create view " + qvn + " as select * exclude (" + exclude_list + ") from " + qdt +
-				              having_where);
+				              view_tail);
 			}
 		}
 

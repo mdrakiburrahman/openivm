@@ -75,7 +75,9 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 	return *current;
 }
 
-/// Verify all joins in the subtree are INNER, LEFT, RIGHT, or OUTER. Returns true if any LEFT/RIGHT/OUTER found.
+/// Verify all joins in the subtree are supported. Returns true if any LEFT/RIGHT/OUTER found.
+/// MARK/SEMI/ANTI joins (from IN-list, EXISTS, etc.) are allowed: LPTS converts MARK→LEFT JOIN,
+/// and their constant right-side (VALUES list) has no delta so inclusion-exclusion reduces trivially.
 static bool VerifyJoinTypes(LogicalOperator *node) {
 	bool has_left = false;
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
@@ -83,7 +85,9 @@ static bool VerifyJoinTypes(LogicalOperator *node) {
 		if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
 		    join->join_type == JoinType::OUTER) {
 			has_left = true;
-		} else if (join->join_type != JoinType::INNER) {
+		} else if (join->join_type != JoinType::INNER && join->join_type != JoinType::MARK &&
+		           join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI &&
+		           join->join_type != JoinType::RIGHT_SEMI && join->join_type != JoinType::RIGHT_ANTI) {
 			throw Exception(ExceptionType::OPTIMIZER,
 			                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM");
 		}
@@ -153,6 +157,14 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
 		if (!get) {
+			// Only constant nodes with no catalog backing (CHUNK_GET/VALUES) have empty delta.
+			// Other !get cases (e.g. PROJECTION wrapping a nested join) may contain real tables —
+			// don't mark those as empty or we'd incorrectly prune valid IE terms.
+			if (leaves[i].node->type == LogicalOperatorType::LOGICAL_CHUNK_GET) {
+				status.empty_mask |= (1ULL << i);
+				status.insert_only_mask |= (1ULL << i);
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (CHUNK_GET constant) has empty delta\n", i);
+			}
 			continue;
 		}
 		auto table_ref = get->GetTable();

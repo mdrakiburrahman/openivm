@@ -23,6 +23,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/parser/parser.hpp"
 
@@ -161,6 +162,18 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 		auto bindings = pw.plan->GetColumnBindings();
 		ColumnBinding mul_binding = bindings.back();
 		return {std::move(pw.plan), mul_binding};
+	}
+	case LogicalOperatorType::LOGICAL_CHUNK_GET: {
+		// CHUNK_GET is a constant in-memory VALUES node (used for IN-list MARK joins, etc.).
+		// It has no delta table. DetectDeltaStatus marks it as empty so IvmJoinRule skips all
+		// terms that include this leaf in the delta mask. If we somehow reach here anyway, return
+		// it unchanged with a dummy multiplicity binding (column 0 of the chunk).
+		auto bindings = pw.plan->GetColumnBindings();
+		if (bindings.empty()) {
+			throw NotImplementedException("CHUNK_GET has no column bindings");
+		}
+		OPENIVM_DEBUG_PRINT("[RewritePlan] CHUNK_GET leaf — returning unchanged (constant, no delta)\n");
+		return {std::move(pw.plan), bindings[0]};
 	}
 	default:
 		throw NotImplementedException("Operator type %s not supported", LogicalOperatorToString(plan->type));

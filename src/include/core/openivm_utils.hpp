@@ -21,6 +21,8 @@ public:
 	static string ExtractViewName(const string &query);
 	static string SQLToLowercase(const string &sql);
 	static void RemoveRedundantWhitespaces(string &query);
+	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
+	static void StripLineComments(string &query);
 	static string DeltaName(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);

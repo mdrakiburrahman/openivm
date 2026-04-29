@@ -8,6 +8,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
 #include "tpcc_helpers.hpp"
+#include "tpcdi_helpers.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -180,8 +181,15 @@ static string QueryName(const string &path) {
 	return fname;
 }
 
-static string FindQueriesDir() {
+static string FindQueriesDir(const string &workload = "tpcc") {
+	// Look for benchmark/queries/<workload>/ first; fall back to legacy benchmark/queries/
 	vector<string> candidates = {
+		"benchmark/queries/" + workload,
+		"queries/" + workload,
+		"../benchmark/queries/" + workload,
+		"../../benchmark/queries/" + workload,
+		"../../../benchmark/queries/" + workload,
+		// Legacy flat directory (pre-split) for backward compatibility
 		"benchmark/queries",
 		"queries",
 		"../benchmark/queries",
@@ -206,9 +214,13 @@ static string FindQueriesDir() {
 			dir = dir.substr(0, pos);
 		}
 		for (int i = 0; i < 6; ++i) {
-			string cand = dir + "/benchmark/queries";
+			string cand = dir + "/benchmark/queries/" + workload;
 			if (FileExists(cand)) {
 				return cand;
+			}
+			string cand_legacy = dir + "/benchmark/queries";
+			if (FileExists(cand_legacy)) {
+				return cand_legacy;
 			}
 			auto p2 = dir.find_last_of('/');
 			if (p2 == string::npos) break;
@@ -310,7 +322,8 @@ static string TruncateError(const string &error) {
 	return msg;
 }
 
-static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, const vector<string> &deltas) {
+static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, const vector<string> &deltas,
+                            const string &workload) {
 	try {
 		duckdb::DuckDB db(db_path);
 		duckdb::Connection con(db);
@@ -336,12 +349,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		}
 		string native_use = "USE " + native_catalog + ".main";
 
-		// Attach a DuckLake catalog alongside native tables. Queries whose filename
-		// starts with `ducklake_` will be run after `USE dl.main` so their
-		// unqualified table references resolve to the DuckLake copy of TPC-C.
-		// Fully-qualified `dl.<table>` references also work.
+		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.
 		bool ducklake_ok = false;
-		{
+		if (workload == "tpcc") {
 			string dl_path = db_path + ".ducklake.db";
 			auto inst = con.Query("INSTALL ducklake");
 			auto ld = con.Query("LOAD ducklake");
@@ -350,8 +360,6 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				auto at = con.Query(attach_sql);
 				if (at && !at->HasError()) {
 					ducklake_ok = true;
-					// Populate TPC-C tables in the DuckLake catalog on first attach.
-					// Use LOWER() to handle DuckLake's uppercase table names (e.g. 'WAREHOUSE').
 					auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables "
 					                      "WHERE table_catalog = 'dl' AND LOWER(table_name) = 'warehouse'");
 					bool needs_init =
@@ -359,15 +367,12 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					if (needs_init) {
 						con.Query("USE dl.main");
 						CreateTPCCSchema(con);
-						// Copy data from the native catalog (captured above into
-						// `native_catalog`) into DuckLake so both start identical.
 						for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER",
 						                      "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
 							con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_catalog + ".main." + t);
 						}
 						con.Query(native_use);
 					} else {
-						// Ensure we're always in the native catalog context after DuckLake check.
 						con.Query(native_use);
 					}
 				}
@@ -517,8 +522,11 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					}
 
 					if (phase_reached == 3) {
-						// Phase 2b: Check incrementability (type=3 is FULL_REFRESH, rest are incremental)
-						auto check_result = con.Query("SELECT type FROM _duckdb_ivm_views WHERE view_name = '" + mv_name + "'");
+						// Phase 2b: Check incrementability (type=3 is FULL_REFRESH, rest are incremental).
+						// Qualify with native_catalog so the lookup works both when the active catalog
+						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
+						// name = filename, never "memory").
+						auto check_result = con.Query("SELECT type FROM " + native_catalog + "._duckdb_ivm_views WHERE view_name = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t ivm_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (ivm_type != 3) ? 1 : 0;
@@ -687,6 +695,7 @@ struct ForkWorker {
 	pid_t child_pid = -1;
 	int to_child_fd = -1, from_child_fd = -1;
 	string db_path;
+	string workload = "tpcc";
 	vector<string> deltas;
 
 	uint8_t result_phase = 0;
@@ -709,7 +718,7 @@ struct ForkWorker {
 
 		if (child_pid == 0) {
 			close(to_child[1]); close(from_child[0]);
-			ChildWorkerMain(to_child[0], from_child[1], db_path, deltas);
+			ChildWorkerMain(to_child[0], from_child[1], db_path, deltas, workload);
 			_exit(0);
 		}
 
@@ -924,21 +933,25 @@ static void PrintStats(const string &label, const RewriterStats &stats, int tota
 	}
 }
 
-static vector<string> RunBenchmark(const string &queries_dir, const string &db_path, int scale_factor, double timeout_s) {
+static vector<string> RunBenchmark(const string &queries_dir, const string &db_path, int scale_factor,
+                                   double timeout_s, const string &workload = "tpcc") {
 	vector<string> csv_lines;
 	csv_lines.push_back("query_name,phase_reached,meta_is_incremental,actual_is_incremental,is_correct,time_select_ms,time_mv_ms,time_refresh_ms,time_verify_ms,error");
 
 	if (!FileExists(db_path)) {
-		Log("Creating TPC-C database: " + db_path);
-		// Fork a child to create the DB so the file lock is released when it exits
+		Log("Creating " + workload + " database: " + db_path);
 		pid_t setup_pid = fork();
 		if (setup_pid == 0) {
 			{
-				// Nested scope so DuckDB destructors run before _exit, ensuring WAL is flushed
 				duckdb::DuckDB db(db_path);
 				duckdb::Connection con(db);
-				CreateTPCCSchema(con);
-				InsertTPCCData(con, scale_factor);
+				if (workload == "tpcdi") {
+					openivm_bench::CreateTPCDISchema(con);
+					openivm_bench::InsertTPCDIData(con, scale_factor);
+				} else {
+					CreateTPCCSchema(con);
+					InsertTPCCData(con, scale_factor);
+				}
 				con.Query("PRAGMA checkpoint");
 			}
 			_exit(0);
@@ -960,7 +973,9 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 	ForkWorker worker;
 	worker.db_path = db_path;
-	worker.deltas = GenerateDeltaPool(scale_factor);
+	worker.workload = workload;
+	worker.deltas = (workload == "tpcdi") ? openivm_bench::GenerateTPCDIDeltaPool(scale_factor)
+	                                      : GenerateDeltaPool(scale_factor);
 	worker.Start();
 
 	int log_interval = std::max(1, total / 10);
@@ -1152,6 +1167,7 @@ int main(int argc, char **argv) {
 	string queries_dir;
 	string db_path;
 	string out_file;
+	string workload = "tpcc";
 	int scale_factor = 3;
 	double timeout_s = 30.0;
 
@@ -1167,16 +1183,22 @@ int main(int argc, char **argv) {
 			scale_factor = std::stoi(argv[++i]);
 		} else if (arg == "--timeout" && i + 1 < argc) {
 			timeout_s = std::stod(argv[++i]);
+		} else if (arg == "--workload" && i + 1 < argc) {
+			workload = argv[++i];
+			if (workload != "tpcc" && workload != "tpcdi") {
+				Log("Error: --workload must be 'tpcc' or 'tpcdi'");
+				return 1;
+			}
 		}
 	}
 
 	// Auto-search for queries directory if not specified
 	if (queries_dir.empty()) {
-		queries_dir = FindQueriesDir();
+		queries_dir = FindQueriesDir(workload);
 	}
 
 	if (db_path.empty()) {
-		db_path = "rewriter_benchmark_sf" + std::to_string(scale_factor) + ".db";
+		db_path = "rewriter_benchmark_" + workload + "_sf" + std::to_string(scale_factor) + ".db";
 	}
 
 	if (out_file.empty()) {
@@ -1189,7 +1211,7 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 
-		auto csv_lines = RunBenchmark(queries_dir, db_path, scale_factor, timeout_s);
+		auto csv_lines = RunBenchmark(queries_dir, db_path, scale_factor, timeout_s, workload);
 
 		// Write CSV
 		std::ofstream csv(out_file);
