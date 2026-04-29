@@ -69,11 +69,6 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
         list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
     endif()
 
-    # Benchmark executable
-    add_executable(openivm_benchmark benchmarks/openivm_benchmark.cpp)
-    target_link_libraries(openivm_benchmark ${OPENIVM_LINK_LIBS})
-    target_include_directories(openivm_benchmark PUBLIC benchmarks)
-
     # TPC-C data generation tool
     add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
     target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
