@@ -827,36 +827,25 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
 	return bindings;
 }
 
-/// Add _ivm_left_key (and _ivm_right_key for FULL OUTER) projection at the top of the plan.
-static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	auto outer_join = FindFirstOuterJoinBindings(plan.get());
-	if (!outer_join.found) {
-		return;
+static bool PlanContainsOperator(LogicalOperator *plan, LogicalOperatorType type) {
+	if (plan->type == type) {
+		return true;
 	}
+	for (auto &child : plan->children) {
+		if (PlanContainsOperator(child.get(), type)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/// Add _ivm_left_key (and _ivm_right_key for FULL OUTER) projection at the top of the plan.
+static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan, const OuterJoinBindings &outer_join) {
 	bool is_full_outer = outer_join.is_full_outer;
 	auto key_binding = outer_join.preserved_key_binding;
 	auto key_type = outer_join.preserved_key_type;
 	auto right_key_binding = outer_join.right_key_binding;
 	auto right_key_type = outer_join.right_key_type;
-
-	// Skip _ivm_left_key for plans with AGGREGATE above the LEFT JOIN.
-	// These use group-recompute (not partial LEFT JOIN recompute), so the key isn't needed
-	// and can't pass through the AGGREGATE node anyway.
-	bool has_aggregate = false;
-	std::function<void(LogicalOperator *)> check_agg = [&](LogicalOperator *n) {
-		if (n->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-			has_aggregate = true;
-		}
-		for (auto &child : n->children) {
-			if (!has_aggregate) {
-				check_agg(child.get());
-			}
-		}
-	};
-	check_agg(plan.get());
-	if (has_aggregate) {
-		return;
-	}
 
 	// Ensure types are resolved before accessing them
 	plan->ResolveOperatorTypes();
@@ -1029,11 +1018,8 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 /// For FULL OUTER JOINs, also add COUNT(left_key) AS _ivm_right_match_count.
 /// These hidden aggregates track how many rows match from each side (Larson & Zhou / Zhang & Larson).
 /// When match_count=0, aggregate columns from that side should be NULL.
-static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	auto outer_join = FindFirstOuterJoinBindings(plan.get());
-	if (!outer_join.found) {
-		return;
-	}
+static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                                      const OuterJoinBindings &outer_join) {
 	bool is_full_outer = outer_join.is_full_outer;
 	auto null_side_binding = outer_join.null_side_binding;
 	auto null_side_type = outer_join.null_side_type;
@@ -1106,6 +1092,20 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	                    is_full_outer ? " + _ivm_right_match_count" : "");
 }
 
+static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	auto outer_join = FindFirstOuterJoinBindings(plan.get());
+	if (!outer_join.found) {
+		return;
+	}
+
+	if (PlanContainsOperator(plan.get(), LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY)) {
+		RewriteLeftJoinMatchCount(context, binder, plan, outer_join);
+		return;
+	}
+
+	RewriteLeftJoinKey(binder, plan, outer_join);
+}
+
 struct PlanRewriteContext {
 	ClientContext &context;
 	Binder &binder;
@@ -1161,12 +1161,8 @@ static void RewritePassHiddenAggregatePropagation(PlanRewriteContext &rewrite_co
 	PropagateHiddenAggregateColumns(rewrite_context.plan);
 }
 
-static void RewritePassOuterJoinKey(PlanRewriteContext &rewrite_context) {
-	RewriteLeftJoinKey(rewrite_context.binder, rewrite_context.plan);
-}
-
-static void RewritePassOuterJoinMatchCount(PlanRewriteContext &rewrite_context) {
-	RewriteLeftJoinMatchCount(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
+static void RewritePassOuterJoinSupport(PlanRewriteContext &rewrite_context) {
+	RewriteOuterJoinSupport(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
 }
 
 static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
@@ -1177,8 +1173,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	    {"derived_aggregates", RewritePassDerivedAggregates},
 	    {"group_count_star", RewritePassGroupCountStar},
 	    {"hidden_aggregate_propagation", RewritePassHiddenAggregatePropagation},
-	    {"outer_join_key", RewritePassOuterJoinKey},
-	    {"outer_join_match_count", RewritePassOuterJoinMatchCount},
+	    {"outer_join_support", RewritePassOuterJoinSupport},
 	};
 
 	for (const auto &pass : passes) {
