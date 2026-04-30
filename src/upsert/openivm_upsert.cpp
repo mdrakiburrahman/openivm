@@ -66,6 +66,41 @@ struct FojJoinInfo {
 	}
 };
 
+static string JoinQuotedColumns(const vector<string> &columns) {
+	string result;
+	for (size_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += KeywordHelper::WriteOptionallyQuoted(columns[i]);
+	}
+	return result;
+}
+
+static string BuildAllNullPredicate(const vector<string> &columns) {
+	string result;
+	for (size_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " AND ";
+		}
+		result += KeywordHelper::WriteOptionallyQuoted(columns[i]) + " IS NULL";
+	}
+	return result;
+}
+
+static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
+                                        const string &right_prefix) {
+	string result;
+	for (size_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " AND ";
+		}
+		auto col = KeywordHelper::WriteOptionallyQuoted(columns[i]);
+		result += left_prefix + col + " IS NOT DISTINCT FROM " + right_prefix + col;
+	}
+	return result;
+}
+
 static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
                                   bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "", const string &catalog_prefix = "",
@@ -853,13 +888,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			// FULL OUTER JOIN aggregate group-recompute (Zhang & Larson):
 			// 4 sources of affected group keys to cover all change types.
 			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-			string keys_tuple;
-			for (size_t i = 0; i < group_cols.size(); i++) {
-				keys_tuple += KeywordHelper::WriteOptionallyQuoted(group_cols[i]);
-				if (i < group_cols.size() - 1) {
-					keys_tuple += ", ";
-				}
-			}
+			string keys_tuple = JoinQuotedColumns(group_cols);
 
 			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
 			string q_dt_left = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
@@ -911,20 +940,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			// group (source 4) is also covered by this pattern as long as delta_<view> ever
 			// writes a row with all-NULL keys; to be safe we also OR the explicit IS NULL
 			// predicate so orphan all-NULL groups get re-evaluated on every refresh.
-			string null_check;
-			string ncmp_del; // NULL-safe correlation: _a.key IS NOT DISTINCT FROM <data_table>.key
-			string ncmp_ins; // NULL-safe correlation: _a.key IS NOT DISTINCT FROM _ivm_recompute.key
-			for (size_t i = 0; i < group_cols.size(); i++) {
-				string col = KeywordHelper::WriteOptionallyQuoted(group_cols[i]);
-				if (i > 0) {
-					null_check += " AND ";
-					ncmp_del += " AND ";
-					ncmp_ins += " AND ";
-				}
-				null_check += col + " IS NULL";
-				ncmp_del += "_a." + col + " IS NOT DISTINCT FROM " + data_table + "." + col;
-				ncmp_ins += "_a." + col + " IS NOT DISTINCT FROM _ivm_recompute." + col;
-			}
+			string null_check = BuildAllNullPredicate(group_cols);
+			string ncmp_del = BuildNullSafeKeyPredicate(group_cols, "_a.", data_table + ".");
+			string ncmp_ins = BuildNullSafeKeyPredicate(group_cols, "_a.", "_ivm_recompute.");
 			string where_delete =
 			    "EXISTS (SELECT 1 FROM (" + affected + "\n) _a WHERE " + ncmp_del + ") OR (" + null_check + ")";
 			string where_insert =
@@ -947,13 +965,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 			// Phase 2: recompute groups affected by unmatched changes
 			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-			string keys_tuple;
-			for (size_t i = 0; i < group_cols.size(); i++) {
-				keys_tuple += KeywordHelper::WriteOptionallyQuoted(group_cols[i]);
-				if (i < group_cols.size() - 1) {
-					keys_tuple += ", ";
-				}
-			}
+			string keys_tuple = JoinQuotedColumns(group_cols);
 
 			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
 			// DuckLake base tables lack `_duckdb_ivm_timestamp` — see group-recompute path above.
@@ -987,13 +999,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 
 			// Build NULL check for source 4
-			string null_check;
-			for (size_t i = 0; i < group_cols.size(); i++) {
-				if (i > 0) {
-					null_check += " AND ";
-				}
-				null_check += KeywordHelper::WriteOptionallyQuoted(group_cols[i]) + " IS NULL";
-			}
+			string null_check = BuildAllNullPredicate(group_cols);
 
 			if (!unmatched_affected.empty()) {
 				string where = "(" + keys_tuple + ") IN (\n  " + unmatched_affected + "\n) OR (" + null_check + ")";
