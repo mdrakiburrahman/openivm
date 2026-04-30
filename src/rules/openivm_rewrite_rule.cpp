@@ -28,8 +28,6 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/parser/parser.hpp"
 
-#include <iostream>
-
 namespace duckdb {
 
 /// Walk a plan tree and return the highest table_index found in any column binding.
@@ -205,6 +203,9 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 #endif
 
 	auto child_get = dynamic_cast<LogicalGet *>(child);
+	if (!child_get) {
+		throw InternalException("DOIVM marker must be represented as a logical get");
+	}
 	auto view = child_get->named_parameters["view_name"].ToString();
 	auto view_catalog = child_get->named_parameters["view_catalog_name"].ToString();
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
@@ -218,12 +219,18 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: cannot read view definition for '" + view + "': " + v->GetError());
 	}
+	if (v->RowCount() == 0 || v->GetValue(0, 0).IsNull()) {
+		throw Exception(ExceptionType::CATALOG, "IVM: missing view definition for '" + view + "'");
+	}
 	string view_query = v->GetValue(0, 0).ToString();
 
 	Parser parser;
 	Planner planner(input.context);
 
 	parser.ParseQuery(view_query);
+	if (parser.statements.empty()) {
+		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
+	}
 	auto statement = parser.statements[0].get();
 
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
