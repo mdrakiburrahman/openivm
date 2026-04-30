@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Agent Guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code and Codex when working with code in this repository.
 
 ## Working with the user
 
@@ -201,4 +201,14 @@ Other style rules (from `.clang-format`, based on LLVM):
 - **Templates**: always break after `template<...>`
 - **Long arguments**: align after open bracket
 
-Run `make format-fix` to auto-format. Formatting runs automatically via hook after edits.
+Run `make format-fix` to auto-format. Claude Code also runs it automatically via hook after edits.
+
+## Codex compatibility
+
+Codex reads this file through `AGENTS.md`, which should be a symlink to `CLAUDE.md` so project memory has one source of truth.
+
+Project and shared DuckDB skills live in `.claude/skills/`. Codex sees them through symlinks in `/home/ila/.codex/skills/`; refresh those links with `.claude/sync-codex-skills.sh` after adding or renaming a skill.
+
+The `.codex` path in this checkout is a read-only runtime mount, not a project directory, so project-local Codex skills cannot live there.
+
+Claude Code runs `make format-fix` through `.claude/settings.json`. Codex does not automatically consume that hook, so run `make format-fix` explicitly after C++ edits.

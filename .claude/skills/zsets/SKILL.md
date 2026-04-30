@@ -202,7 +202,7 @@ OpenIVM compiles the DBSP view of IVM to standard SQL upserts. As of commit `fc6
 
 **Pre-`fc6dab9` divergence (now closed)**: OpenIVM previously stored multiplicity as `BOOLEAN` (`true`=insert, `false`=delete) and used `SUM(CASE WHEN mul = false THEN -col ELSE col END)` as the canonical consolidation. Joins combined leaf multiplicities with XOR. The refactor replaced both with their native Z-set forms (signed integer + bilinear product); the Möbius sign is the one OpenIVM-specific addition on top of the textbook DBSP algebra.
 
-For the operator-rule details (`IvmJoinRule` inclusion-exclusion, `IvmAggregateRule`, etc.), see `CLAUDE.md`, `explain-ivm`, and `docs/internals/linearity.md`.
+For the operator-rule details (`IvmJoinRule` inclusion-exclusion, `IvmAggregateRule`, etc.), see `AGENTS.md` or `CLAUDE.md`, `explain-ivm`, and `docs/internals/linearity.md`.
 
 ---
 
