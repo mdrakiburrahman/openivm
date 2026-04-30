@@ -7,7 +7,7 @@
 - [ ] **Recompute cost ignores processing.** `total_base_scan + mv_card` doesn't account for join or aggregate processing overhead during full recomputation.
 - [ ] **Fanout estimate is naive.** `mv_card / base_card` assumes uniform distribution — heavily skewed joins will produce wildly wrong estimates.
 - [ ] **No filter selectivity.** A view with `WHERE price > 1000` that filters 99% of rows still gets the same cost as an unfiltered view.
-- [ ] **LEFT JOIN partial recompute cost missing.** The cost model doesn't distinguish between counting-based upsert and partial recompute.
+- [ ] **Outer join and semi/anti cost detail.** The cost model should distinguish counting-based upsert, outer-join partial recompute, and semi/anti aux-state refresh.
 - [ ] **Validate with real workloads.** Run the cost model on TPC-H derived views and compare its predictions against measured refresh times.
 
 ## P1: Correctness & Robustness
@@ -36,7 +36,7 @@
 
 The current suite covers projection, filter, grouped aggregate, 2-way join, 3-way join at 1K–1M rows with 1%–50% delta ratios.
 
-- [ ] **Add missing operators.** LEFT JOIN, ungrouped aggregates, UNION ALL, chained MVs, AVG, MIN/MAX, DISTINCT.
+- [ ] **Add missing benchmark operators.** FULL OUTER JOIN, SEMI/ANTI, window views, LIST, STDDEV/VARIANCE, and mixed operator stacks.
 - [ ] **Mixed DML workload.** INSERT + DELETE + UPDATE interleaved in the same refresh cycle to stress delta consolidation.
 - [ ] **TPC-H derived queries.** Q1 (grouped aggregates + filter), Q3 (3-way join + aggregate), Q5 (multi-join + aggregate), Q6 (filter + aggregate) as materialized views with incremental refresh after base table inserts.
 - [ ] **Latency distribution.** Report p50/p95/p99 refresh times, not just median, to catch tail latency from large deltas or skewed groups.
@@ -44,8 +44,8 @@ The current suite covers projection, filter, grouped aggregate, 2-way join, 3-wa
 
 ## P5: Features
 
-- [ ] **Incremental LEFT JOIN aggregates.** Currently uses group recompute. Explore whether NULL-aware MERGE arithmetic can handle the `SUM(NULL) != SUM(0)` problem.
-- [ ] **Window functions.** Currently `FULL_REFRESH`. Investigate incremental maintenance for `PARTITION BY + simple aggregate` windows (recompute only affected partitions).
+- [ ] **Broader semi/anti support.** Extend aux-state maintenance to aggregates over SEMI/ANTI, join-chain inputs, and richer subquery shapes.
+- [ ] **Window functions over joins.** Single-table windows use partition recompute. Investigate affected-partition extraction through joins.
 - [ ] **Higher-order IVM.** For join-heavy queries (3+ tables), DBToaster-style auxiliary maps eliminate joins at update time. Evaluate whether the space-time tradeoff is worthwhile for OpenIVM's SQL-to-SQL model.
 - [ ] **Automatic refresh.** Trigger-based immediate refresh on DML, similar to pg_ivm. Currently requires explicit `PRAGMA ivm()`.
 - [ ] **DISTINCT aggregates.** `COUNT(DISTINCT x)` is not incrementally maintained. Explore approximate (HyperLogLog) or exact (auxiliary set per group) approaches.

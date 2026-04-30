@@ -1,6 +1,6 @@
 # Ungrouped aggregates
 
-> Linearity: **LINEAR** for SUM/COUNT; **NON_LINEAR** for MIN/MAX/AVG/STDDEV (full single-row recompute). ([what does this mean?](../internals/linearity.md))
+> Linearity: **LINEAR** for SUM/COUNT; **NON_LINEAR** for MIN/MAX. AVG and STDDEV/VARIANCE are decomposed into linear helper columns. ([what does this mean?](../internals/linearity.md))
 
 ## Example
 
@@ -90,10 +90,12 @@ INSERT INTO total_score SELECT MIN(val) AS min_val, COUNT(*) AS cnt FROM scores;
 | `SUM` | Incremental (UPDATE) | Net delta added to existing value. |
 | `COUNT`, `COUNT(*)` | Incremental (UPDATE) | Net delta added to existing count. |
 | `AVG` | Incremental (decomposed) | Hidden SUM + COUNT columns maintained independently; AVG recomputed as SUM / NULLIF(COUNT, 0). |
+| `STDDEV`, `VARIANCE` | Incremental (decomposed) | Hidden SUM, SUM-of-squares, and COUNT columns maintained independently; final value recomputed after UPDATE. |
 | `MIN`, `MAX` | Full recompute | Entire MV deleted and re-inserted from original query. |
-| `STDDEV`, `STRING_AGG` | Full refresh | View classified as `FULL_REFRESH` at creation time. |
+| `STRING_AGG`, `LISTAGG`, `MEDIAN`, quantiles | Full refresh | View classified as `FULL_REFRESH` at creation time. |
 
 ## Limitations
 
 - The MV is always a single row. If you delete all base table rows, the aggregates become NULL (not zero).
 - AVG decomposition adds two hidden columns (`_ivm_sum_*`, `_ivm_count_*`) to the MV table.
+- STDDEV/VARIANCE decomposition adds hidden SUM, SUM-of-squares, and COUNT columns.

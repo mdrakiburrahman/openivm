@@ -92,9 +92,9 @@ CREATE MATERIALIZED VIEW sampled AS
 
 ### Unsupported operators
 
-Views that use operators not yet supported for IVM are classified as `FULL_REFRESH` with a warning printed at creation time. Unsupported constructs include window functions (over joins) and aggregate functions outside the supported set.
+Views that use operators not yet supported for IVM are classified as `FULL_REFRESH` with a warning printed at creation time. Unsupported constructs include window functions over joins, unsupported semi/anti shapes, and aggregate functions outside the supported set.
 
-`INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN` are all supported for incremental maintenance.
+`INNER JOIN`, `CROSS JOIN`, arbitrary-predicate joins, `LEFT JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN` are supported for incremental maintenance. Supported `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` projection shapes use an aux-state path.
 
 ```sql
 -- Prints a warning; subsequent PRAGMA ivm() uses full refresh
@@ -102,4 +102,4 @@ CREATE MATERIALIZED VIEW with_unsupported AS
   SELECT MEDIAN(amount) FROM orders;
 ```
 
-Supported aggregate functions: `COUNT`, `COUNT(*)`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`.
+Supported aggregate functions include `COUNT`, `COUNT(*)`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`, `STDDEV`/`VARIANCE`, `BOOL_AND`, `BOOL_OR`, `ARG_MIN`, and `ARG_MAX`. Some use group recompute rather than pure MERGE.

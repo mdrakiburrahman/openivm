@@ -55,7 +55,7 @@ After rewriting, the parser plans the query and walks the logical plan to classi
 | `FULL_REFRESH` | 3 | Contains unsupported constructs. |
 | `AGGREGATE_HAVING` | 4 | Aggregation with GROUP BY and HAVING clause. Uses group-recompute since groups may enter/leave the result set. |
 
-The IVM compatibility checker validates the entire plan tree, flagging unsupported join types (only INNER, LEFT, and RIGHT are supported), unsupported aggregate functions (anything outside `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`), and non-deterministic functions (e.g., `RANDOM()`, `NOW()`). If any unsupported construct is found, the view is classified as `FULL_REFRESH` and a warning is printed.
+The IVM compatibility checker validates the entire plan tree, flagging unsupported join shapes, unsupported aggregate functions, and non-deterministic functions (e.g., `RANDOM()`, `NOW()`). Supported join plans include inner joins, cross products, arbitrary-predicate joins, left/right/full outer joins, and the aux-state semi/anti projection shapes. Supported aggregate functions include `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`, `STDDEV`/`VARIANCE`, `BOOL_AND`, `BOOL_OR`, `ARG_MIN`, and `ARG_MAX`. If any unsupported construct is found, the view is classified as `FULL_REFRESH` and a warning is printed.
 
 ## Generated DDL
 

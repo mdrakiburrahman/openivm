@@ -1,6 +1,6 @@
 # Grouped aggregates
 
-> Linearity: **LINEAR** for SUM/COUNT; **NON_LINEAR** for MIN/MAX/AVG/STDDEV/LIST (group recompute). ([what does this mean?](../internals/linearity.md))
+> Linearity: **LINEAR** for SUM/COUNT; **NON_LINEAR** for MIN/MAX, LIST, and non-summable output columns. AVG and STDDEV/VARIANCE are decomposed into linear helper columns. ([what does this mean?](../internals/linearity.md))
 
 ## Example
 
@@ -85,10 +85,13 @@ DELETE FROM sales_summary WHERE total = 0 AND cnt = 0;
 | `SUM` | Incremental (MERGE) | Delta added to existing value. |
 | `COUNT`, `COUNT(*)` | Incremental (MERGE) | Delta added to existing count. |
 | `AVG` | Incremental (decomposed) | Rewritten to hidden SUM + COUNT columns. MERGE updates both; AVG recomputed as SUM / NULLIF(COUNT, 0). |
+| `STDDEV`, `VARIANCE` | Incremental (decomposed) | Rewritten to hidden SUM, SUM-of-squares, and COUNT columns. The final value is recomputed after MERGE. |
 | `MIN`, `MAX` | Group recompute | Affected groups deleted and re-inserted from the original query. Deleting the current min/max requires a full group rescan. |
 | `BOOL_AND`, `BOOL_OR` | Group recompute | BOOLEAN is a non-summable type; affected groups are recomputed from the view query. Z-set correct: `BOOL_AND = false_count = 0`, `BOOL_OR = true_count > 0`. |
+| `ARG_MIN`, `ARG_MAX` | Group recompute | The winning value may change when the current extremum is deleted. |
+| `LIST` | Incremental or group recompute | Numeric list-valued expressions can use list arithmetic. `LIST(...) FILTER` and non-summable list shapes use group recompute. |
 | `HAVING` | Group recompute | Groups may enter or leave the result set after changes. |
-| `STDDEV`, `STRING_AGG` | Full refresh | Automatically detected; view uses full recompute. |
+| `STRING_AGG`, `LISTAGG`, `MEDIAN`, quantiles | Full refresh | Automatically detected; view uses full recompute. |
 
 ## FILTER (WHERE predicate)
 

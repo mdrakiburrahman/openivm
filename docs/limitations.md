@@ -18,8 +18,6 @@ anything it flags as `ivm_compatible = false` routes to `IVMType::FULL_REFRESH`.
 | `GROUPING SETS`, `CUBE`, `ROLLUP` | Our delta pipeline groups once; can't emit the cross-grouped subtotal rows. Detected via `LogicalAggregate::grouping_sets.size() > 1`. Also note: LPTS doesn't round-trip the ROLLUP annotation, so for these views the parser substitutes the user's original SQL for both initial populate and recompute. |
 | Aggregates not in `SUPPORTED_AGGREGATES` (STRING_AGG, LISTAGG, GROUP_CONCAT, MEDIAN, percentiles, APPROX_*, QUANTILE_*, ANY_VALUE, …) | Order-dependent, holistic, or non-decomposable; no known delta formula. Supported set: `count_star`, `count`, `sum`, `min`, `max`, `avg`, `list`, `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp`, `var_pop`, `bool_and`, `bool_or`, `arg_min`, and `arg_max`. |
 | Correlation / regression aggregates: `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*` (`REGR_AVGX`, `REGR_AVGY`, `REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_SLOPE`, `REGR_SXX`, `REGR_SXY`, `REGR_SYY`) | LPTS does not round-trip these aggregates back to SQL, so the delta plan can't be serialised. Routed to FULL_REFRESH. |
-| `UNION` / `UNION ALL` over per-branch `AGGREGATE` (where the per-branch aggregate isn't itself the top of the view) | Group key extraction from a single branch is unreliable when output column names come from multiple UNION branches. Classified as `SIMPLE_AGGREGATE` — the MERGE formula applies delta sums over all output columns without a per-group key index. Z-set-correct; no FULL_REFRESH. |
-| `GROUPING SETS`, `ROLLUP`, `CUBE` | One `LogicalAggregate` produces rows for multiple grouping sets; the incremental aggregate path can only consume one set at a time. Until OpenIVM rewrites these into a `UNION ALL` of single-set aggregates, they route to `FULL_REFRESH` with no empty-delta short-circuit. |
 | `HAVING` referencing `IS NULL` / `IS NOT NULL` / a `BOUND_AGGREGATE` directly | Detected by the HAVING rewriter; treated as group-recompute (same path as other partial-recompute HAVING views). |
 
 ### Operators
@@ -27,7 +25,7 @@ anything it flags as `ivm_compatible = false` routes to `IVMType::FULL_REFRESH`.
 | Construct | Why |
 |---|---|
 | Recursive CTEs | Semi-naive evaluation not yet implemented. |
-| Unusual join types (SEMI, ANTI, MARK, etc. — anything other than INNER/LEFT/RIGHT/FULL OUTER) | No delta rewrite rule. |
+| `MARK` joins and semi/anti shapes outside the aux-state extractor | SQL NULL-aware membership and complex correlated shapes need state OpenIVM does not maintain. Supported `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` projection shapes use the aux-state path; see [Semi and anti join](operators/semi-anti-join.md). |
 | `LIMIT` without deterministic `ORDER BY` (or with ties on the ORDER BY key) | Row selection is non-deterministic between MV creation and recompute — the MV and the base query can legitimately return different subsets, so recompute and the `EXCEPT ALL` verify diverge. Not a code bug; add a unique `ORDER BY` to make the view deterministic. |
 | Any operator the plan walk doesn't recognize (falls into the `default:` branch of the compatibility check) | Conservatively treated as unsupported until a rewrite rule lands. |
 | Any plan that LPTS (`LogicalPlanToString`) can't serialise back to SQL | Caught at refresh-plan compile time; OpenIVM falls back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM view_query`). Subsumes ordered-set aggregates and a few other corner cases — covered without per-construct enumeration. |
@@ -47,6 +45,7 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 |---|---|
 | `GROUP BY … ORDER BY col LIMIT k` (aggregate top-k) | Genuinely incremental O(D + G): all groups are maintained in `_ivm_data_<mv>` via the normal `AGGREGATE_GROUP` path; `ORDER BY … LIMIT k` is applied by the VIEW at read time. Empty-delta skip avoids any work when no rows changed. See [operators/top-k.md](operators/top-k.md). |
 | `SELECT cols … ORDER BY col LIMIT k` (projection top-k, no GROUP BY) | Incremental maintenance over the unlimited `SIMPLE_PROJECTION` result. The user-facing view applies `ORDER BY … LIMIT k` at read time. See [operators/top-k.md](operators/top-k.md). |
+| `UNION ALL` over per-branch aggregates | Classified as `SIMPLE_AGGREGATE` when there is no reliable single group-key set. The MERGE formula applies delta sums over all output columns without a per-group key index. Z-set-correct, but less precise than a branch-aware aggregate path. |
 | Inner `DISTINCT` directly inside a subquery feeding an outer `AGGREGATE` (e.g. `SELECT g, SUM(c) FROM (SELECT DISTINCT g, m, c FROM t) GROUP BY g`) | Two paths are available. **Default (`GROUP_RECOMPUTE`)**: for each base table with a non-empty delta, the LPTS view query is scoped to delta-touched rows; the affected-keys set drives `DELETE` + `INSERT` on `_ivm_data_<mv>`. Correct but does more work than strictly necessary. **Aux-state path (`ivm_distinct_aux_state = true`, `IVMType::DISTINCT_INCREMENTAL`)**: DBSP-correct Z-set maintenance via a per-tuple count auxiliary table `_ivm_distinct_count_<view>`. Δdistinct fires only when the input count crosses zero (`sgn(R[t])`), driving ±1 into the parent SUM/COUNT MERGE. Strictly minimal delta; only v0 (single base-table DISTINCT, single SUM aggregate). Multi-source DISTINCT demotes to `GROUP_RECOMPUTE`. |
 | Window functions (`ROW_NUMBER`, `RANK`, `NTILE`, `LAG`, `LEAD`, …) on a single table | Partition-recompute: only partitions with delta rows are re-evaluated. See [operators/window-functions.md](operators/window-functions.md). **Caveat**: NTILE / RANK / ROW_NUMBER with ties on the `ORDER BY` key are inherently non-deterministic — multiple recomputes of the same data may legitimately produce different bucket / rank assignments. |
 | Window functions over JOINs | Full recompute (partition columns may come from a joined table whose delta doesn't carry them, so we can't identify affected partitions). |
@@ -57,8 +56,9 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 ## Join limitations
 
 - Maximum **16 tables** in a single join (inclusion-exclusion bitmask limit — `ivm::MAX_JOIN_TABLES`).
-- `CROSS JOIN` is supported (treated as a join with no condition).
+- `INNER JOIN`, `CROSS JOIN`, and arbitrary-predicate joins use the inclusion-exclusion delta rule. `CROSS JOIN` is treated as a join with no condition.
 - Partial-recompute strategies for `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN` are documented in the partial-recompute table above.
+- `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` are incrementally maintained only for the projection/filter shapes documented in [Semi and anti join](operators/semi-anti-join.md). Aggregates over semi/anti output, join-chain inputs, and `IN`/`NOT IN` membership semantics fall back to full refresh.
 
 ## DuckLake-specific limitations
 
@@ -79,7 +79,7 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 | `MIN`, `MAX` | Partial | Insert-only deltas for a group: incremental via `GREATEST`/`LEAST`. Any delete touching a group: group-recompute (delete the affected groups from the data table, re-insert from the view query). |
 | `BOOL_AND`, `BOOL_OR` | Yes (via group-recompute) | BOOLEAN is a non-summable type; detected in `CompileAggregateGroups` and routed to group-recompute. Z-set correct: `BOOL_AND` = `false_count = 0`, `BOOL_OR` = `true_count > 0`. |
 | `AGG(...) FILTER (WHERE p)` | Yes | Rewritten by `RewriteAggregateFilters` to `AGG(CASE WHEN p THEN arg END)` before plan analysis. All COUNT/SUM/AVG/MIN/MAX/STDDEV variants work; group-recompute is used when the rewritten aggregate makes the column non-summable. |
-| `LIST`, `LIST(x ORDER BY y)` | Yes (via group-recompute) | Lists aren't element-wise summable (different deltas produce different lengths), so affected groups are recomputed from the view query. The intra-aggregate `ORDER BY` is preserved by LPTS. |
+| `LIST`, `LIST(x ORDER BY y)` | Yes | Numeric fixed-shape list-valued outputs can use element-wise list arithmetic. `LIST(...) FILTER` and non-summable list shapes use affected-group recompute so DuckDB's NULL-element semantics are preserved. |
 | Any visible MV column with a non-summable type (VARCHAR literal, UPPER(group_col), CASE over aggregate, BOOLEAN predicate on aggregate, LIST) | Yes (via group-recompute) | The delta `sum(case mult=false then -col else col end)` formula can't type-check for these columns; detected in `CompileAggregateGroups` via the delta-view column types and routed to group-recompute. Unified path with `LIST` and `MIN`/`MAX` above. |
 | `HAVING` | Partial | Group-recompute for affected groups; `ivm_having_merge=true` (default) uses the MERGE path when the stored data table holds all groups. |
 

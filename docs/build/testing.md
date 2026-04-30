@@ -9,7 +9,7 @@ make test
 ## Run a Single Test
 
 ```bash
-build/release/test/unittest "test/sql/ivm_join.test"
+build/release/test/unittest "test/sql/mv_inner_join.test"
 ```
 
 ## Test Files
@@ -18,15 +18,18 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 
 | Test file | Coverage |
 |---|---|
-| `ivm_aggregate.test` | SUM, COUNT, AVG, MIN/MAX aggregations |
-| `ivm_projection.test` | Column projection, expression projection |
-| `ivm_filter.test` | WHERE clause filtering |
-| `ivm_join.test` | Inner joins, multi-table joins |
-| `ivm_left_join.test` | LEFT JOIN, RIGHT JOIN, mixed INNER+LEFT, NULL keys |
-| `ivm_union.test` | UNION ALL views |
-| `ivm_chained.test` | Chained (multi-level) materialized views |
+| `mv_aggregate.test` | SUM, COUNT, AVG, MIN/MAX, STDDEV/VARIANCE aggregations |
+| `mv_projection.test` | Column projection, expression projection |
+| `mv_filter.test` | WHERE clause filtering |
+| `mv_inner_join.test` | Inner joins, cross joins, arbitrary predicates, multi-table joins |
+| `mv_left_join.test` | LEFT JOIN, RIGHT JOIN, mixed INNER+LEFT, NULL keys |
+| `mv_full_outer_join.test` | FULL OUTER JOIN projection and aggregate maintenance |
+| `mv_semi_anti_join.test` | SEMI JOIN, ANTI JOIN, EXISTS, NOT EXISTS aux-state maintenance |
+| `mv_union.test` | UNION ALL views |
+| `mv_chained.test` | Chained (multi-level) materialized views |
+| `mv_window.test` | Partition-level window recompute |
 | `ivm_checker.test` | Query constraint validation |
-| `ivm_pipeline.test` | End-to-end refresh pipeline |
+| `mv_pipeline.test` | End-to-end refresh pipeline |
 | `ivm_metadata.test` | Catalog and metadata tables |
 | `ivm_parser.test` | SQL parsing and rewriting |
 | `ivm_insert_rule.test` | Insert rules and delta generation |

@@ -1,4 +1,4 @@
-# List aggregates
+# List-valued aggregates
 
 > Linearity: **NON_LINEAR** (group recompute — list elements aren't summable so deltas can't compose). ([what does this mean?](../internals/linearity.md))
 
@@ -18,13 +18,20 @@ PRAGMA ivm('sensor_totals');
 
 ## How IVM handles it
 
-**Algebraic rule:**
+OpenIVM has two paths for list-valued aggregate output:
+
+- Numeric fixed-shape list expressions can use element-wise list arithmetic.
+- `LIST(...) FILTER` and other non-summable list shapes use affected-group recompute.
+
+**Element-wise list rule:**
 
 ```
 new_MV[key].list = elementwise_add(old_MV[key].list, delta[key].list)
 ```
 
-When LIST-typed aggregate columns are detected, OpenIVM switches to element-wise list operations. Instead of scalar addition, it uses `list_transform` + `list_zip` to add corresponding elements. Deletions negate each element with `list_transform(col, lambda x: -x)`.
+When list-typed numeric columns are safe to add, OpenIVM uses `list_transform` + `list_zip` to add corresponding elements. Deletions negate each element with `list_transform(col, lambda x: -x)`.
+
+For `LIST(...) FILTER`, DuckDB's list aggregate keeps NULL elements. Rewriting the filter to `LIST(CASE WHEN p THEN x ELSE NULL END)` would change results. OpenIVM keeps the original SQL and recomputes affected groups.
 
 ## Compiled SQL
 
@@ -89,3 +96,4 @@ WHERE list_reduce(all_readings, lambda a, b: a + b) = 0.0;
 
 ## Limitations
 - Only works with numeric list elements (element-wise negation and addition require arithmetic).
+- Filtered `LIST` aggregates use group recompute to preserve DuckDB's NULL-element semantics.

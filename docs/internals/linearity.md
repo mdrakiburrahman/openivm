@@ -27,9 +27,11 @@ state is needed and cost is proportional to `|delta|`.
 | `SUM`, `COUNT` (over linear inputs) | propagated through `IvmAggregateRule` |
 
 `IvmAggregateRule` is structurally LINEAR — it just passes the multiplicity column
-through as a group-by key. Non-linear aggregate forms (MIN, MAX, AVG, STDDEV/VARIANCE,
-LIST) are detected at compile time and routed to **group recompute** in
-`CompileAggregateGroups`, so the per-rule classification stays clean.
+through as a group-by key. AVG and STDDEV/VARIANCE are decomposed into linear helper
+columns before upsert compilation. Non-linear aggregate forms such as MIN/MAX deletes,
+LIST filters, and non-summable output columns are detected at compile time and routed
+to **group recompute** in `CompileAggregateGroups`, so the per-rule classification stays
+clean.
 
 ### BILINEAR
 
@@ -40,7 +42,8 @@ DuckLake N-term telescoping join, it's exactly N.
 
 | Operator | Rule class |
 |---|---|
-| INNER JOIN, LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN | `IvmJoinRule` |
+| INNER JOIN, CROSS JOIN, arbitrary-predicate joins | `IvmJoinRule` |
+| LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN | `IvmJoinRule` plus outer-join upsert paths |
 | DuckLake telescoping join | `BuildDuckLakeJoinTerms` |
 
 See [`operators/inner-join.md`](../operators/inner-join.md) for the algebraic derivation
@@ -51,17 +54,20 @@ of the combined-multiplicity formula.
 Neither linear nor bilinear. The delta requires the *accumulated* state of one or more
 inputs — there is no closed-form per-row rule. OpenIVM falls back to:
 
-- **Group recompute** for affected groups (DISTINCT, MIN/MAX with deletes, AVG, STDDEV)
+- **Auxiliary state** for threshold operators such as SEMI/ANTI
+- **Group recompute** for affected groups (DISTINCT, MIN/MAX with deletes, LIST filters)
 - **Partition recompute** for affected partitions (window functions)
 - **Full refresh** when neither fits
 
 | Operator | Rule class | Fallback |
 |---|---|---|
 | `DISTINCT` (δ in DBSP) | `IvmDistinctRule` | Group recompute via COUNT(*) sentinel |
+| `SEMI JOIN`, `ANTI JOIN` | `IvmJoinRule` + aux-state upsert | Match-count threshold state |
 | Window functions | `IvmWindowRule` | Partition recompute |
 
 DISTINCT is non-linear *even on positive Z-sets* — it drops duplicates, which can't be
-expressed as a sum over deltas. Window functions (ROW_NUMBER, RANK, NTILE, LAG, LEAD,
+expressed as a sum over deltas. SEMI and ANTI joins are threshold operators over
+right-side match counts. Window functions (ROW_NUMBER, RANK, NTILE, LAG, LEAD,
 running aggregates) depend on partition order; a single insert/delete can re-rank
 every row in the partition.
 

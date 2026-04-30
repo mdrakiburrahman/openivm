@@ -28,12 +28,13 @@ This means:
 
 - **CTEs** work with any supported operator inside them (aggregates, joins, filters, etc.)
 - **Scalar subqueries** are decorrelated to left joins with aggregation
-- **EXISTS / IN subqueries** are decorrelated to semi-joins
-- **NOT EXISTS / NOT IN** are decorrelated to anti-joins
+- **EXISTS** subqueries can be maintained through the [semi-join aux-state path](semi-anti-join.md)
+- **NOT EXISTS** subqueries can be maintained through the [anti-join aux-state path](semi-anti-join.md)
 
-The IVM delta rules apply to the decorrelated plan as usual.
+The IVM delta rules apply to the decorrelated plan as usual. If DuckDB decorrelates a subquery into a plan shape OpenIVM does not support, the view falls back to full refresh.
 
 ## Limitations
 
 - **Recursive CTEs** are not supported. Views with recursive CTEs fall back to full refresh.
 - **Lateral joins** that cannot be decorrelated are not supported.
+- **IN** and **NOT IN** are not documented as aux-state semi/anti support because their NULL semantics may require MARK joins. Those views are incremental only when the final decorrelated plan uses supported operators.

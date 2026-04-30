@@ -97,20 +97,23 @@ If all tables are unchanged, the refresh is skipped entirely via the [empty delt
 
 ## Supported operators
 
-All operators supported for standard DuckDB tables are also supported for DuckLake tables:
+DuckLake-backed views support the same operator families as standard DuckDB tables, with DuckLake-specific join maintenance:
 
 - Projection, filter, expressions
-- Grouped and ungrouped aggregates (SUM, COUNT, AVG, MIN/MAX)
-- Inner join (with N-term telescoping)
-- Left join
+- Grouped and ungrouped aggregates, including AVG and STDDEV/VARIANCE decomposition
+- Inner joins, cross joins, and arbitrary-predicate joins
+- DuckLake inner joins use N-term telescoping when every join leaf is a DuckLake scan
+- Left, right, and full outer joins use the standard partial-recompute/MERGE paths
 - UNION ALL
 - DISTINCT
-- CTEs and subqueries
+- Window functions on supported single-table shapes
+- CTEs and decorrelated subqueries
 - Chained/cascading materialized views
+
+Semi/anti aux-state support is currently documented for standard delta-table maintenance. DuckLake semi/anti views should be verified before relying on incremental refresh.
 
 ## Limitations
 
 - **No FK constraints.** DuckLake does not support `FOREIGN KEY` constraints, so the [FK-aware pruning](optimizations/fk-aware-pruning.md) optimization is not available. The [empty-delta term skipping](#empty-delta-term-skipping) optimization covers the most common case (unchanged dimension tables).
 - **No ART indexes.** DuckLake tables don't support ART index creation. For `AGGREGATE_GROUP` views, group column identification falls back to metadata instead of the index catalog.
 - **Single DuckLake catalog.** All base tables in a DuckLake-backed materialized view must be in the same DuckLake catalog.
-
