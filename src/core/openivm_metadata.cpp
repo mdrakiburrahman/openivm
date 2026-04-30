@@ -327,4 +327,96 @@ vector<IVMMetadata::RefreshHistoryEntry> IVMMetadata::GetRefreshHistory(const st
 	return entries;
 }
 
+namespace {
+
+// Tiny JSON parser sufficient for `distinct_aux_meta_json` — we own the writer in
+// openivm_parser.cpp, so the input always matches `{"k":"v","k2":[...]}` shape with
+// just our minimal escaping (`\"` and `\\`). Not a general parser; do not reuse.
+static bool ExtractJsonString(const string &json, const string &key, string &val) {
+	string needle = "\"" + key + "\":\"";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
+	}
+	pos += needle.size();
+	val.clear();
+	while (pos < json.size()) {
+		char c = json[pos];
+		if (c == '\\' && pos + 1 < json.size()) {
+			char esc = json[pos + 1];
+			if (esc == 'n') {
+				val += '\n';
+			} else {
+				val += esc;
+			}
+			pos += 2;
+			continue;
+		}
+		if (c == '"') {
+			return true;
+		}
+		val += c;
+		pos++;
+	}
+	return false;
+}
+
+static bool ExtractJsonStringArray(const string &json, const string &key, vector<string> &val) {
+	string needle = "\"" + key + "\":[";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
+	}
+	pos += needle.size();
+	val.clear();
+	while (pos < json.size() && json[pos] != ']') {
+		while (pos < json.size() && json[pos] != '"' && json[pos] != ']') {
+			pos++;
+		}
+		if (pos >= json.size() || json[pos] == ']') {
+			break;
+		}
+		pos++; // opening quote
+		string elem;
+		while (pos < json.size() && json[pos] != '"') {
+			if (json[pos] == '\\' && pos + 1 < json.size()) {
+				elem += json[pos + 1];
+				pos += 2;
+				continue;
+			}
+			elem += json[pos];
+			pos++;
+		}
+		if (pos < json.size()) {
+			pos++; // closing quote
+		}
+		val.push_back(std::move(elem));
+	}
+	return true;
+}
+
+} // namespace
+
+bool IVMMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
+	auto result = con.Query("SELECT distinct_aux_meta_json FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	bool ok = true;
+	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= ExtractJsonStringArray(json, "cols", out.cols);
+	ok &= ExtractJsonString(json, "input_sql", out.input_sql);
+	ok &= ExtractJsonString(json, "source", out.source);
+	// filter is optional — empty when the user didn't write a WHERE clause.
+	ExtractJsonString(json, "filter", out.filter);
+	ok &= ExtractJsonString(json, "sum_arg", out.sum_arg);
+	ok &= ExtractJsonString(json, "sum_out", out.sum_out);
+	return ok;
+}
+
 } // namespace duckdb

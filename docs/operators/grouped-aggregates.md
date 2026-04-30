@@ -84,10 +84,26 @@ DELETE FROM sales_summary WHERE total = 0 AND cnt = 0;
 |----------|----------|-------|
 | `SUM` | Incremental (MERGE) | Delta added to existing value. |
 | `COUNT`, `COUNT(*)` | Incremental (MERGE) | Delta added to existing count. |
-| `AVG` | Incremental (decomposed) | Parser rewrites to hidden SUM + COUNT columns. MERGE updates both; AVG recomputed as SUM / NULLIF(COUNT, 0). |
+| `AVG` | Incremental (decomposed) | Rewritten to hidden SUM + COUNT columns. MERGE updates both; AVG recomputed as SUM / NULLIF(COUNT, 0). |
 | `MIN`, `MAX` | Group recompute | Affected groups deleted and re-inserted from the original query. Deleting the current min/max requires a full group rescan. |
+| `BOOL_AND`, `BOOL_OR` | Group recompute | BOOLEAN is a non-summable type; affected groups are recomputed from the view query. Z-set correct: `BOOL_AND = false_count = 0`, `BOOL_OR = true_count > 0`. |
 | `HAVING` | Group recompute | Groups may enter or leave the result set after changes. |
 | `STDDEV`, `STRING_AGG` | Full refresh | Automatically detected; view uses full recompute. |
+
+## FILTER (WHERE predicate)
+
+`AGG(x) FILTER (WHERE p)` is rewritten to `AGG(CASE WHEN p THEN x END)` by the `RewriteAggregateFilters` normalisation pass before the IVM checker sees the plan. This is semantically exact under Z-set algebra: a delta row with weight `w` contributes `w × (p ? x : NULL)`, which is a linear transformation of the Z-set. All of `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV` work correctly through this rewrite.
+
+```sql
+CREATE MATERIALIZED VIEW active_stats AS
+    SELECT dept,
+        COUNT(*) FILTER (WHERE active)      AS active_cnt,
+        SUM(salary) FILTER (WHERE salary > 50000) AS high_salaries,
+        AVG(salary) FILTER (WHERE active)   AS avg_active_salary
+    FROM employees GROUP BY dept;
+```
+
+**Note**: `COUNT(DISTINCT x) FILTER (WHERE p)` still triggers full refresh — DISTINCT-aggregate variants are not supported regardless of the FILTER.
 
 ## Expressions
 

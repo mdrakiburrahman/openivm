@@ -113,6 +113,29 @@ public:
 
 	// Get the last N history entries for a given method ('incremental' or 'full').
 	vector<RefreshHistoryEntry> GetRefreshHistory(const string &view_name, const string &method, idx_t limit = 20);
+
+	// --- Aux-state DISTINCT (IVMType::DISTINCT_INCREMENTAL) ---
+
+	// Metadata captured at CREATE-MV time for the aux-state DISTINCT pipeline.
+	// `aux_table` is the per-tuple count table (e.g. `_ivm_distinct_count_<view>`);
+	// `cols` are the columns being deduplicated; `input_sql` is the DISTINCT subquery
+	// body with the DISTINCT keyword stripped; `source` is the base table referenced
+	// by `input_sql`'s FROM clause; `filter` is the WHERE predicate (empty if none);
+	// `sum_arg` and `sum_out` describe the parent aggregate's single SUM expression
+	// (`SUM(<sum_arg>) AS <sum_out>`). v0 supports exactly one SUM column.
+	struct DistinctAuxMeta {
+		string aux_table;
+		vector<string> cols;
+		string input_sql;
+		string source;
+		string filter;
+		string sum_arg;
+		string sum_out;
+	};
+
+	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL
+	// (view isn't DISTINCT_INCREMENTAL) or parsing fails.
+	bool GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out);
 };
 
 } // namespace duckdb

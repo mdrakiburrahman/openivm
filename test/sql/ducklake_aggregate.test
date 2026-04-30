@@ -288,3 +288,98 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Aggregate top-k: GROUP BY + ORDER BY + LIMIT
+# ==========================================
+
+statement ok
+CREATE TABLE dl.topk_sales (id INT, product VARCHAR, revenue INT);
+
+statement ok
+INSERT INTO dl.topk_sales VALUES
+    (1,'apple',300),(2,'banana',150),(3,'cherry',500),
+    (4,'date',80),(5,'elderberry',420);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.topk_sales_mv AS
+    SELECT product, SUM(revenue) AS total
+    FROM dl.topk_sales GROUP BY product
+    ORDER BY total DESC LIMIT 3;
+
+statement ok
+PRAGMA ivm('topk_sales_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT product, total FROM dl.topk_sales_mv
+    EXCEPT ALL
+    SELECT * FROM (SELECT product, SUM(revenue) AS total FROM dl.topk_sales GROUP BY product ORDER BY total DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (SELECT product, SUM(revenue) AS total FROM dl.topk_sales GROUP BY product ORDER BY total DESC LIMIT 3) _q
+    EXCEPT ALL
+    SELECT product, total FROM dl.topk_sales_mv
+);
+----
+0
+
+# Insert new rows (grape enters top-3, displaces banana/date)
+statement ok
+INSERT INTO dl.topk_sales VALUES (6,'grape',600);
+
+statement ok
+PRAGMA ivm('topk_sales_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT product, total FROM dl.topk_sales_mv
+    EXCEPT ALL
+    SELECT * FROM (SELECT product, SUM(revenue) AS total FROM dl.topk_sales GROUP BY product ORDER BY total DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (SELECT product, SUM(revenue) AS total FROM dl.topk_sales GROUP BY product ORDER BY total DESC LIMIT 3) _q
+    EXCEPT ALL
+    SELECT product, total FROM dl.topk_sales_mv
+);
+----
+0
+
+# Stress: conflicting INSERT + DELETE + UPDATE before single refresh
+statement ok
+INSERT INTO dl.topk_sales VALUES (7,'hazel',700),(8,'iris',10);
+
+statement ok
+DELETE FROM dl.topk_sales WHERE id = 6;
+
+statement ok
+UPDATE dl.topk_sales SET revenue = 600 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('topk_sales_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT product, total FROM dl.topk_sales_mv
+    EXCEPT ALL
+    SELECT * FROM (SELECT product, SUM(revenue) AS total FROM dl.topk_sales GROUP BY product ORDER BY total DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (SELECT product, SUM(revenue) AS total FROM dl.topk_sales GROUP BY product ORDER BY total DESC LIMIT 3) _q
+    EXCEPT ALL
+    SELECT product, total FROM dl.topk_sales_mv
+);
+----
+0

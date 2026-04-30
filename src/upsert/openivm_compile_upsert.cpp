@@ -954,6 +954,149 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	return delete_query + "\n" + insert_query;
 }
 
+string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
+                                  const string &delta_source, const string &last_update, const string &filter_sql,
+                                  const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
+                                  const string &count_star_col, const string &catalog_prefix) {
+	if (distinct_cols.empty() || group_columns.empty() || sum_arg.empty() || sum_out.empty()) {
+		// Caller should have demoted; defensive — return a no-op refresh.
+		return "-- CompileDistinctIncremental called with incomplete metadata; no-op\n";
+	}
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
+	string aux_q = catalog_prefix + Q(aux_table);
+	string delta_q = catalog_prefix + Q(delta_source);
+	string sum_arg_q = Q(sum_arg);
+	string sum_out_q = Q(sum_out);
+	string count_q = Q(count_star_col);
+
+	// Quoted comma-separated lists.
+	auto join_quoted = [](const vector<string> &cols) {
+		string s;
+		for (size_t i = 0; i < cols.size(); i++) {
+			if (i > 0) {
+				s += ", ";
+			}
+			s += Q(cols[i]);
+		}
+		return s;
+	};
+	auto join_quoted_prefixed = [](const vector<string> &cols, const string &alias) {
+		string s;
+		for (size_t i = 0; i < cols.size(); i++) {
+			if (i > 0) {
+				s += ", ";
+			}
+			s += alias + "." + Q(cols[i]);
+		}
+		return s;
+	};
+	string distinct_cols_csv = join_quoted(distinct_cols);
+	string distinct_cols_csv_i = join_quoted_prefixed(distinct_cols, "i"); // qualified for ddist SELECT
+	string group_cols_csv = join_quoted(group_columns);
+
+	// `IS NOT DISTINCT FROM` predicates so NULL columns match — distinct_cols can include
+	// NULL-bearing columns and we must treat (NULL, x) as the same tuple across refreshes.
+	auto build_match = [](const vector<string> &cols, const string &lhs_alias, const string &rhs_alias) {
+		string out;
+		for (size_t i = 0; i < cols.size(); i++) {
+			if (i > 0) {
+				out += " AND ";
+			}
+			out += lhs_alias + "." + Q(cols[i]) + " IS NOT DISTINCT FROM " + rhs_alias + "." + Q(cols[i]);
+		}
+		return out;
+	};
+	// aux match uses `_aux` alias (built inline below to avoid clashing with column names).
+	string mv_match = build_match(group_columns, "v", "d");
+
+	// Δinput temp table — `_ivm_dinput_<view>`. Each row is a distinct tuple plus its net
+	// multiplicity change since last refresh. CREATE OR REPLACE so the previous refresh's
+	// leftover (if any rolled back) is wiped first.
+	string dinput_table = "_ivm_dinput_" + view_name;
+	string ts_filter =
+	    " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP";
+	string filter_clause = filter_sql.empty() ? "" : " AND (" + filter_sql + ")";
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + Q(dinput_table) + " AS\n  SELECT " + distinct_cols_csv + ", SUM(" +
+	       string(ivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult\n  FROM " + delta_q + ts_filter + filter_clause +
+	       "\n  GROUP BY " + distinct_cols_csv + "\n  HAVING SUM(" + string(ivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
+
+	// Δdistinct + Δagg + MERGE into MV.
+	// Z-set distinct(R)[t] = sgn(R[t]); Δdistinct[t] = sgn(R+ΔR) − sgn(R), which collapses to
+	//   +1 if old==0 and dmult>0      (tuple newly enters the distinct set)
+	//   −1 if old>0 and old+dmult≤0   (tuple leaves the distinct set)
+	//    0 otherwise                  (count changed but didn't cross the existence boundary)
+	// We multiply this ±1 by sum_arg to derive the parent-aggregate delta per (group_cols).
+	// Use `_aux` (not `c`) as the LEFT-JOIN alias so it can't collide with a distinct
+	// column literally called `c` (which is a normal column name in user schemas).
+	string aux_match_aliased;
+	{
+		// Rebuild the aux match with the renamed alias.
+		for (size_t i = 0; i < distinct_cols.size(); i++) {
+			if (i > 0) {
+				aux_match_aliased += " AND ";
+			}
+			aux_match_aliased += "_aux." + Q(distinct_cols[i]) + " IS NOT DISTINCT FROM i." + Q(distinct_cols[i]);
+		}
+	}
+	string ddist_cte =
+	    "WITH ddist AS (\n  SELECT " + distinct_cols_csv_i +
+	    ", CASE WHEN COALESCE(_aux._count, 0) = 0 AND i.dmult > 0 THEN 1 "
+	    "WHEN COALESCE(_aux._count, 0) > 0 AND COALESCE(_aux._count, 0) + i.dmult <= 0 THEN -1 ELSE 0 END AS dd\n"
+	    "  FROM " +
+	    Q(dinput_table) + " i LEFT JOIN " + aux_q + " _aux ON " + aux_match_aliased + "\n),\ndagg AS (\n  SELECT " +
+	    group_cols_csv + ", SUM(" + sum_arg_q +
+	    " * dd) AS d_sum, SUM(dd)::BIGINT AS d_count\n  FROM ddist WHERE dd <> 0\n  GROUP BY " + group_cols_csv +
+	    "\n)\n";
+
+	// Build INSERT column list (group cols + sum_out + count_star_col).
+	string insert_cols = group_cols_csv + ", " + sum_out_q + ", " + count_q;
+	string insert_vals;
+	for (size_t i = 0; i < group_columns.size(); i++) {
+		if (i > 0) {
+			insert_vals += ", ";
+		}
+		insert_vals += "d." + Q(group_columns[i]);
+	}
+	insert_vals += ", d.d_sum, d.d_count";
+
+	sql += ddist_cte + "MERGE INTO " + data_table + " v USING dagg d ON " + mv_match +
+	       "\nWHEN MATCHED THEN UPDATE SET " + sum_out_q + " = COALESCE(v." + sum_out_q + ", 0) + d.d_sum, " + count_q +
+	       " = v." + count_q + " + d.d_count\nWHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (" +
+	       insert_vals + ");\n\n";
+
+	// Cull groups whose count fell to zero. The visible value column is left alone — the
+	// row is being deleted anyway. Same convention as CompileAggregateGroups' cleanup.
+	sql += "DELETE FROM " + data_table + " WHERE " + count_q + " <= 0;\n\n";
+
+	// Update the aux table. WHEN NOT MATCHED is gated on `dmult > 0` so deletes that arrive
+	// for a tuple we never saw don't accidentally insert a negative-count row.
+	// Alias `_aux` (not `c`) for the same column-name-collision reason as the ddist CTE.
+	sql += "MERGE INTO " + aux_q + " _aux USING " + Q(dinput_table) + " i ON " + aux_match_aliased +
+	       "\nWHEN MATCHED THEN UPDATE SET _count = _aux._count + i.dmult\nWHEN NOT MATCHED AND i.dmult > 0 "
+	       "THEN INSERT (" +
+	       distinct_cols_csv + ", _count) VALUES (";
+	for (size_t i = 0; i < distinct_cols.size(); i++) {
+		if (i > 0) {
+			sql += ", ";
+		}
+		sql += "i." + Q(distinct_cols[i]);
+	}
+	sql += ", i.dmult);\n\n";
+
+	sql += "DELETE FROM " + aux_q + " WHERE _count <= 0;\n\n";
+
+	// Drop the temp table to keep the per-refresh footprint tidy. Subsequent refreshes
+	// recreate it; CREATE OR REPLACE above handles failures mid-batch too.
+	sql += "DROP TABLE IF EXISTS " + Q(dinput_table) + ";\n";
+
+	OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] %zu distinct cols, %zu group cols, sum %s(%s)→%s, aux=%s\n",
+	                    distinct_cols.size(), group_columns.size(), "SUM", sum_arg.c_str(), sum_out.c_str(),
+	                    aux_table.c_str());
+	return sql;
+}
+
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<string> &delta_table_names) {

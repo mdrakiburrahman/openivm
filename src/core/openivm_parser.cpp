@@ -960,6 +960,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		size_t group_count = analysis.group_count;
 		idx_t group_index = analysis.group_index;
 		vector<string> aggregate_columns;
+		bool join_key_group_fallback = false;
 		// DISTINCT is only the MV's grouping when its targets actually appear in the MV's
 		// output columns. An inner-subquery DISTINCT (e.g. `SELECT COUNT(*) FROM (SELECT
 		// DISTINCT x FROM t)`, or a CTE like `WITH cte AS (SELECT DISTINCT x FROM t) ...`)
@@ -1192,8 +1193,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		//
 		// Use GROUP_RECOMPUTE for these views: AGGREGATE_GROUP would try to SUM pass-through
 		// attributes (e.g. W_YTD from WAREHOUSE) as if they were aggregate results.
-		bool join_key_group_fallback = false;
-		if (aggregate_columns.empty() && found_join && group_count > 0 && !has_union_over_agg) {
+		if (found_join && group_count > 0 && !has_union_over_agg) {
 			// plan root is LOGICAL_CREATE_TABLE; descend to find the outermost PROJECTION
 			// (the SELECT output list) and the outermost comparison join.
 			std::function<LogicalProjection *(LogicalOperator *)> find_outer_proj =
@@ -1259,8 +1259,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 						col_name = bcr.GetName();
 					}
 					if (!IVMTableNames::IsInternalColumn(col_name)) {
-						aggregate_columns.push_back(col_name);
-						join_key_group_fallback = true;
+						bool exists = false;
+						for (auto &existing : aggregate_columns) {
+							if (StringUtil::CIEquals(existing, col_name)) {
+								exists = true;
+								break;
+							}
+						}
+						if (!exists) {
+							aggregate_columns.push_back(col_name);
+							join_key_group_fallback = true;
+						}
 					}
 				}
 			}

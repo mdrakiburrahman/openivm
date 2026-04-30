@@ -501,13 +501,18 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# Classification: avg_under_join must NOT be FULL_REFRESH (3); the dead
-# `has_derived_aggregate_below_join` detector that used to push it to RECOMPUTE
-# was removed. Type 0 = AGGREGATE_GROUP — that's the expected landing.
+# Classification: avg_under_join must NOT be FULL_REFRESH (3). Join-over-aggregate
+# with dimension-side pass-through columns uses affected-key group recompute.
+# Type 6 = GROUP_RECOMPUTE.
 query I
 SELECT type FROM _duckdb_ivm_views WHERE view_name = 'avg_under_join';
 ----
-0
+6
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'avg_under_join';
+----
+ol_d_id,w_id
 
 # ==========================================
 # STDDEV / VARIANCE under join (CTE pattern) — same shape, exercises the other
@@ -529,7 +534,12 @@ CREATE MATERIALIZED VIEW stddev_under_join AS
 query I
 SELECT type FROM _duckdb_ivm_views WHERE view_name = 'stddev_under_join';
 ----
-0
+6
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'stddev_under_join';
+----
+ol_d_id,w_id
 
 # Cross-check initial state. STDDEV/VARIANCE on DOUBLE has 1–2 ULP drift vs
 # the base query (documented in docs/limitations.md), so round to 10 places.

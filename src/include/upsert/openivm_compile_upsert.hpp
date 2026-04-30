@@ -44,6 +44,27 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
                              const vector<std::pair<string, string>> &delta_table_specs,
                              const string &catalog_prefix = "", const string &lpts_table_prefix = "");
 
+/// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM aggregate.
+/// Generates a multi-statement SQL batch:
+///   1. Materialise Δinput per `distinct_cols` from the source delta (timestamp-filtered,
+///      WHERE-filter applied) into a temp table.
+///   2. MERGE Δagg into the data table — Δdistinct (LEFT JOIN aux + CASE → ±1) drives a
+///      per-`group_cols` SUM(<sum_arg> * dd) update, plus matching `_ivm_count_star` deltas.
+///   3. DELETE rows from the data table whose `_ivm_count_star` fell to ≤ 0.
+///   4. MERGE Δinput into the aux table (count = count + dmult); DELETE rows with count ≤ 0.
+///
+/// `aux_table`, `distinct_cols`, `delta_source` (the `delta_<source>` table name), and
+/// `last_update` come from `_duckdb_ivm_views.distinct_aux_meta_json`. `filter_sql` is the
+/// WHERE predicate of the DISTINCT body (empty if none) — applied to both Δinput (filters
+/// delta rows that wouldn't have entered the DISTINCT) and the aux MERGE source.
+/// `group_columns` is the parent aggregate's GROUP BY; `sum_arg`/`sum_out` are the single-SUM
+/// argument and output column. `count_star_col` is the auto-injected `_ivm_count_star`
+/// column name on the data table (almost always literal `_ivm_count_star`).
+string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
+                                  const string &delta_source, const string &last_update, const string &filter_sql,
+                                  const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
+                                  const string &count_star_col, const string &catalog_prefix = "");
+
 } // namespace duckdb
 
 #endif // OPENIVM_COMPILE_UPSERT_HPP
