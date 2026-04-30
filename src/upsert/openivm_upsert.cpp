@@ -118,6 +118,31 @@ static string BuildDeltaTimestampFilter(Connection &con, const string &view_name
 	return string(ivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
 }
 
+static const char *IVMTypeName(IVMType type) {
+	switch (type) {
+	case IVMType::AGGREGATE_HAVING:
+		return "AGGREGATE_HAVING";
+	case IVMType::AGGREGATE_GROUP:
+		return "AGGREGATE_GROUP";
+	case IVMType::SIMPLE_AGGREGATE:
+		return "SIMPLE_AGGREGATE";
+	case IVMType::SIMPLE_PROJECTION:
+		return "SIMPLE_PROJECTION";
+	case IVMType::WINDOW_PARTITION:
+		return "WINDOW_PARTITION";
+	case IVMType::GROUP_RECOMPUTE:
+		return "GROUP_RECOMPUTE";
+	case IVMType::DISTINCT_INCREMENTAL:
+		return "DISTINCT_INCREMENTAL";
+	case IVMType::TOP_K:
+		return "TOP_K";
+	case IVMType::FULL_REFRESH:
+		return "FULL_REFRESH";
+	default:
+		return "UNKNOWN";
+	}
+}
+
 static string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
                                          const string &attached_db_catalog_name) {
 	if (!attached_db_catalog_name.empty()) {
@@ -171,6 +196,123 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
+}
+
+static string BuildFullOuterProjectionRefresh(IVMMetadata &metadata, const string &view_name,
+                                              const vector<string> &delta_table_names, const string &data_table,
+                                              const string &view_query_sql, const string &delta_ts_filter,
+                                              const string &catalog_prefix) {
+	// FULL OUTER JOIN bidirectional partial recompute (Zhang & Larson):
+	// Metadata format: "left_table:left_col,right_table:right_col"
+	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
+	string rk = KeywordHelper::WriteOptionallyQuoted(string(ivm::RIGHT_KEY_COL));
+
+	auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
+	// DuckLake base tables lack `_duckdb_ivm_timestamp` — drop the ts filter when the
+	// delta source is a DuckLake base (delta_table_names stores the base name itself).
+	bool dt_left_is_ducklake = !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
+	bool dt_right_is_ducklake = !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
+	string delta_where_left = dt_left_is_ducklake ? "" : delta_where;
+	string delta_where_right = dt_right_is_ducklake ? "" : delta_where;
+
+	string union_parts;
+	if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
+		string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
+		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.left_col) + " AS _k FROM " + dt +
+		               delta_where_left;
+	}
+	if (!foj.dt_right_name.empty() && !foj.right_col.empty()) {
+		if (!union_parts.empty()) {
+			union_parts += "\n  UNION\n  ";
+		}
+		string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_right_name);
+		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.right_col) + " AS _k FROM " + dt +
+		               delta_where_right;
+	}
+
+	string where_clause;
+	string affected_ctes;
+	if (!union_parts.empty()) {
+		affected_ctes = "WITH _ivm_affected AS (\n  " + union_parts + "\n)\n";
+		where_clause = lk + " IN (SELECT _k FROM _ivm_affected) OR " + rk + " IN (SELECT _k FROM _ivm_affected)";
+	} else {
+		where_clause = "TRUE";
+	}
+
+	return affected_ctes + "DELETE FROM " + data_table + " WHERE " + where_clause + ";\n" + affected_ctes +
+	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_foj\nWHERE " + where_clause +
+	       ";\n";
+}
+
+static string BuildLeftJoinProjectionRefresh(const string &view_name, const string &data_table,
+                                             const string &view_query_sql, const string &delta_ts_filter,
+                                             const string &catalog_prefix) {
+	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
+	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+	string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
+	string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
+	return "DELETE FROM " + data_table + " WHERE " + affected + data_table + "." + lk + delta_where + ");\n" +
+	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_lj\nWHERE " + affected +
+	       "_ivm_lj." + lk + delta_where + ");\n";
+}
+
+static string CompileProjectionRefresh(IVMMetadata &metadata, const string &view_name,
+                                       const vector<string> &column_names, const vector<string> &delta_table_names,
+                                       const string &data_table, const string &view_query_sql,
+                                       const string &delta_ts_filter, const string &catalog_prefix, bool has_full_outer,
+                                       bool has_left_join, bool skip_proj_delete) {
+	if (has_full_outer) {
+		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
+		                                       delta_ts_filter, catalog_prefix);
+	}
+	if (has_left_join) {
+		return BuildLeftJoinProjectionRefresh(view_name, data_table, view_query_sql, delta_ts_filter, catalog_prefix);
+	}
+	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
+}
+
+static void AppendSimpleAggregateEmptySourceNulling(IVMMetadata &metadata, string &upsert_query,
+                                                    const string &view_name, const vector<string> &column_names,
+                                                    const string &data_table, const string &catalog_prefix) {
+	auto source_tables = metadata.GetDeltaTables(view_name);
+	for (auto &dt : source_tables) {
+		string base_name = StringUtil::StartsWith(dt, ivm::DELTA_PREFIX) ? dt.substr(strlen(ivm::DELTA_PREFIX)) : dt;
+		string source = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(base_name);
+		string null_cols;
+		for (auto &col : column_names) {
+			if (col == string(ivm::MULTIPLICITY_COL)) {
+				continue;
+			}
+			if (!null_cols.empty()) {
+				null_cols += ", ";
+			}
+			null_cols += KeywordHelper::WriteOptionallyQuoted(col) + " = NULL";
+		}
+		upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " + source +
+		                " LIMIT 1);\n";
+	}
+}
+
+static vector<std::pair<string, string>> BuildGroupRecomputeDeltaSpecs(IVMMetadata &metadata, const string &view_name,
+                                                                       const vector<string> &delta_table_names) {
+	vector<std::pair<string, string>> delta_specs;
+	for (auto &dt : delta_table_names) {
+		string base = dt;
+		static const string prefix(ivm::DELTA_PREFIX);
+		if (base.size() > prefix.size() && base.rfind(prefix, 0) == 0) {
+			base = base.substr(prefix.size());
+		}
+		string ts = metadata.GetLastUpdate(view_name, dt);
+		delta_specs.emplace_back(base, ts);
+	}
+	return delta_specs;
+}
+
+static string BuildLptsTablePrefix(const string &view_catalog_name, const string &view_schema_name) {
+	string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
+	string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
+	return lpts_cat + "." + lpts_sch + ".";
 }
 
 // Generate refresh SQL for a single view (no cascade logic).
@@ -862,16 +1004,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d, skip_agg_delete=%d, skip_proj_delete=%d, minmax_incremental=%d\n",
 	                    insert_only, skip_agg_delete, skip_proj_delete, minmax_incremental);
 
-	// Compile the upsert query based on view type
-	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
-	                    view_query_type == IVMType::AGGREGATE_HAVING       ? "AGGREGATE_HAVING"
-	                    : view_query_type == IVMType::AGGREGATE_GROUP      ? "AGGREGATE_GROUP"
-	                    : view_query_type == IVMType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
-	                    : view_query_type == IVMType::SIMPLE_PROJECTION    ? "SIMPLE_PROJECTION"
-	                    : view_query_type == IVMType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
-	                    : view_query_type == IVMType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
-	                    : view_query_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
-	                                                                       : "UNKNOWN");
 	// All DML (INSERT, DELETE, UPDATE, MERGE) targets the physical data table,
 	// not the user-facing VIEW which excludes internal _ivm_* columns.
 	// The compile functions receive view_name and compute data_table internally.
@@ -882,6 +1014,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// GREATEST/LEAST fast path used for MIN/MAX doesn't apply to these two-arg aggregates.
 	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
 	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
+	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", IVMTypeName(view_query_type));
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
 		// When ivm_having_merge is enabled, the data table stores ALL groups (HAVING filter
@@ -1042,68 +1175,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		break;
 	}
 	case IVMType::SIMPLE_PROJECTION: {
-		if (has_full_outer) {
-			// FULL OUTER JOIN bidirectional partial recompute (Zhang & Larson):
-			// Metadata format: "left_table:left_col,right_table:right_col"
-			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-			const string &qdt = data_table;
-			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
-			string rk = KeywordHelper::WriteOptionallyQuoted(string(ivm::RIGHT_KEY_COL));
-
-			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
-			// DuckLake base tables lack `_duckdb_ivm_timestamp` — drop the ts filter when the
-			// delta source is a DuckLake base (delta_table_names stores the base name itself).
-			bool dt_left_is_ducklake =
-			    !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
-			bool dt_right_is_ducklake =
-			    !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
-			string delta_where_left = dt_left_is_ducklake ? "" : delta_where;
-			string delta_where_right = dt_right_is_ducklake ? "" : delta_where;
-
-			// Build affected-keys CTE: query each delta table for its join column
-			string union_parts;
-			if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
-				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
-				union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.left_col) +
-				               " AS _k FROM " + dt + delta_where_left;
-			}
-			if (!foj.dt_right_name.empty() && !foj.right_col.empty()) {
-				if (!union_parts.empty()) {
-					union_parts += "\n  UNION\n  ";
-				}
-				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_right_name);
-				union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.right_col) +
-				               " AS _k FROM " + dt + delta_where_right;
-			}
-
-			string where_clause;
-			string affected_ctes;
-			if (!union_parts.empty()) {
-				affected_ctes = "WITH _ivm_affected AS (\n  " + union_parts + "\n)\n";
-				where_clause =
-				    lk + " IN (SELECT _k FROM _ivm_affected) OR " + rk + " IN (SELECT _k FROM _ivm_affected)";
-			} else {
-				// Fallback: full recompute
-				where_clause = "TRUE";
-			}
-
-			// CTEs are per-statement — include in both DELETE and INSERT
-			upsert_query = affected_ctes + "DELETE FROM " + qdt + " WHERE " + where_clause + ";\n" + affected_ctes +
-			               "INSERT INTO " + qdt + "\nSELECT * FROM (" + view_query_sql + ") _ivm_foj\nWHERE " +
-			               where_clause + ";\n";
-		} else if (has_left_join) {
-			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
-			const string &qdt = data_table;
-			string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
-			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
-			string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
-			upsert_query = "DELETE FROM " + qdt + " WHERE " + affected + qdt + "." + lk + delta_where + ");\n" +
-			               "INSERT INTO " + qdt + "\nSELECT * FROM (" + view_query_sql + ") _ivm_lj\nWHERE " +
-			               affected + "_ivm_lj." + lk + delta_where + ");\n";
-		} else {
-			upsert_query =
-			    CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
-		}
+		upsert_query =
+		    CompileProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table, view_query_sql,
+		                             delta_ts_filter, catalog_prefix, has_full_outer, has_left_join, skip_proj_delete);
 		break;
 	}
 
@@ -1113,25 +1187,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
 		                                       delta_ts_filter, catalog_prefix, sa_insert_only, column_types);
 		if (!has_minmax) {
-			auto source_tables = metadata.GetDeltaTables(view_name);
-			for (auto &dt : source_tables) {
-				// Strip "delta_" prefix to get base table name (standard tables only;
-				// DuckLake tables are stored without the prefix)
-				string base_name =
-				    StringUtil::StartsWith(dt, ivm::DELTA_PREFIX) ? dt.substr(strlen(ivm::DELTA_PREFIX)) : dt;
-				string source = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(base_name);
-				string null_cols;
-				for (auto &col : column_names) {
-					if (col != string(ivm::MULTIPLICITY_COL)) {
-						if (!null_cols.empty()) {
-							null_cols += ", ";
-						}
-						null_cols += KeywordHelper::WriteOptionallyQuoted(col) + " = NULL";
-					}
-				}
-				upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
-				                source + " LIMIT 1);\n";
-			}
+			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table,
+			                                        catalog_prefix);
 		}
 		break;
 	}
@@ -1240,24 +1297,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// delta-filtered subselect, projects DISTINCT GROUP BY columns, unions across
 		// sources, and uses the resulting key set to scope DELETE + INSERT.
 		auto group_columns = metadata.GetGroupColumns(view_name);
-		vector<std::pair<string, string>> delta_specs;
-		for (auto &dt : delta_table_names) {
-			// dt is the delta table name (e.g. "delta_t"); strip the prefix to get the base.
-			string base = dt;
-			static const string prefix(ivm::DELTA_PREFIX);
-			if (base.size() > prefix.size() && base.rfind(prefix, 0) == 0) {
-				base = base.substr(prefix.size());
-			}
-			string ts = metadata.GetLastUpdate(view_name, dt);
-			delta_specs.emplace_back(base, ts);
-		}
+		auto delta_specs = BuildGroupRecomputeDeltaSpecs(metadata, view_name, delta_table_names);
 		// LPTS emits fully-qualified `cat.schema.tbl` even when the catalog is the default
 		// `memory` (where `catalog_prefix` for SQL emission is empty). Reconstruct the
 		// always-qualified prefix so the source-table substitution finds the LPTS form
 		// verbatim — DuckDB's defaults are `memory` / `main` when these come back empty.
-		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
-		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
-		string lpts_table_prefix = lpts_cat + "." + lpts_sch + ".";
+		string lpts_table_prefix = BuildLptsTablePrefix(view_catalog_name, view_schema_name);
 		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, catalog_prefix,
 		                                     lpts_table_prefix);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources)\n",

@@ -251,6 +251,536 @@ static bool HasRepeatedCteRefUnderJoin(const LogicalOperator *plan) {
 	return false;
 }
 
+struct OpenIVMDuckLakeTableInfo {
+	string table_name;   // actual name as stored in DuckLake (case-preserved)
+	string catalog_name; // DuckLake catalog name (e.g., "dl")
+};
+
+struct MVClassificationState {
+	bool ivm_compatible;
+	bool found_aggregation;
+	bool found_projection;
+	bool found_distinct;
+	bool found_having;
+	bool found_minmax;
+	bool found_left_join;
+	bool found_full_outer;
+	bool found_window;
+	bool found_join;
+	bool found_top_k;
+	bool found_grouping_sets;
+	bool found_nested_aggregate;
+
+	explicit MVClassificationState(const PlanAnalysis &analysis)
+	    : ivm_compatible(analysis.ivm_compatible), found_aggregation(analysis.found_aggregation),
+	      found_projection(analysis.found_projection), found_distinct(analysis.found_distinct),
+	      found_having(analysis.found_having),
+	      found_minmax(analysis.found_minmax || analysis.found_count_distinct || analysis.found_list),
+	      found_left_join(analysis.found_left_join), found_full_outer(analysis.found_full_outer),
+	      found_window(analysis.found_window), found_join(analysis.found_join), found_top_k(analysis.found_top_k),
+	      found_grouping_sets(analysis.found_grouping_sets), found_nested_aggregate(analysis.found_nested_aggregate) {
+	}
+};
+
+static void CollectDuckLakeTables(LogicalOperator *op, const string &current_catalog,
+                                  unordered_map<string, OpenIVMDuckLakeTableInfo> &dl_table_info) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		if (get.function.name == "ducklake_scan" && get.function.function_info) {
+			auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
+			string lc = info.table_name;
+			std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return std::tolower(c); });
+			if (dl_table_info.find(lc) == dl_table_info.end()) {
+				// Always pull the catalog from the DuckLakeTableEntry — it's the
+				// one the `dl.ORDER_LINE` reference actually resolved to. Falling
+				// back to `current_catalog` is wrong for cross-system MVs (native
+				// MV reading from dl.*) because `current_catalog` is the physical
+				// default, not the DuckLake catalog.
+				string cat = info.table.ParentCatalog().GetName();
+				if (cat.empty()) {
+					cat = current_catalog.empty() ? "dl" : current_catalog;
+				}
+				dl_table_info[lc] = {info.table_name, cat};
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectDuckLakeTables(child.get(), current_catalog, dl_table_info);
+	}
+}
+
+static void CollectProjectionIndex(LogicalOperator *op,
+                                   unordered_map<idx_t, LogicalProjection *> &projections_by_index) {
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = op->Cast<LogicalProjection>();
+		projections_by_index[proj.table_index] = &proj;
+	}
+	for (auto &child : op->children) {
+		CollectProjectionIndex(child.get(), projections_by_index);
+	}
+}
+
+static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
+                                   const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
+                                   int depth = 0) {
+	if (depth > 16) {
+		return false;
+	}
+	if (table_index == group_index) {
+		return column_index < static_cast<idx_t>(group_count);
+	}
+	auto it = projections_by_index.find(table_index);
+	if (it == projections_by_index.end()) {
+		return false;
+	}
+	auto &proj = *it->second;
+	if (column_index >= proj.expressions.size()) {
+		return false;
+	}
+	auto &expr = proj.expressions[column_index];
+	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &bcr = expr->Cast<BoundColumnRefExpression>();
+	return ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+	                              projections_by_index, depth + 1);
+}
+
+static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
+                                   const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
+	if (!expr->alias.empty()) {
+		return expr->alias;
+	}
+	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
+	    !IVMTableNames::IsInternalColumn(output_names[expr_index])) {
+		return output_names[expr_index];
+	}
+	return bcr.GetName();
+}
+
+static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
+                                          const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
+                                          idx_t group_index, size_t group_count, const vector<string> &output_names,
+                                          vector<string> &group_names) {
+	bool matched = false;
+	for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
+		auto &expr = proj.expressions[expr_i];
+		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+		if (!ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+		                            projections_by_index)) {
+			continue;
+		}
+		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
+		if (!IVMTableNames::IsInternalColumn(col_name)) {
+			group_names.push_back(col_name);
+			matched = true;
+		}
+	}
+	return matched;
+}
+
+static bool FindGroupColumns(LogicalOperator *op, const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
+                             idx_t group_index, size_t group_count, const vector<string> &output_names,
+                             vector<string> &group_names) {
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = op->Cast<LogicalProjection>();
+		return AddGroupColumnsFromProjection(proj, projections_by_index, group_index, group_count, output_names,
+		                                     group_names);
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		if (op->children.size() >= 2) {
+			if (FindGroupColumns(op->children[1].get(), projections_by_index, group_index, group_count, output_names,
+			                     group_names)) {
+				return true;
+			}
+			return FindGroupColumns(op->children[0].get(), projections_by_index, group_index, group_count, output_names,
+			                        group_names);
+		}
+		return false;
+	}
+	for (auto &child : op->children) {
+		if (FindGroupColumns(child.get(), projections_by_index, group_index, group_count, output_names, group_names)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static vector<string> DeriveGroupColumnNames(LogicalOperator *plan, idx_t group_index, size_t group_count,
+                                             const vector<string> &output_names, bool has_union_over_agg) {
+	vector<string> group_names;
+	if (has_union_over_agg) {
+		for (size_t i = 0; i < group_count && i < output_names.size(); i++) {
+			if (!IVMTableNames::IsInternalColumn(output_names[i])) {
+				group_names.push_back(output_names[i]);
+			}
+		}
+		return group_names;
+	}
+	unordered_map<idx_t, LogicalProjection *> projections_by_index;
+	CollectProjectionIndex(plan, projections_by_index);
+	FindGroupColumns(plan, projections_by_index, group_index, group_count, output_names, group_names);
+	return group_names;
+}
+
+static string FindFirstTableName(LogicalOperator *node) {
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		auto *get = dynamic_cast<LogicalGet *>(node);
+		if (get && get->GetTable().get()) {
+			return get->GetTable().get()->name;
+		}
+	}
+	for (auto &child : node->children) {
+		string name = FindFirstTableName(child.get());
+		if (!name.empty()) {
+			return name;
+		}
+	}
+	return "";
+}
+
+static void IndexProjectionsAndGets(LogicalOperator *op, unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                    unordered_map<idx_t, LogicalGet *> &get_by_index) {
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = op->Cast<LogicalProjection>();
+		proj_by_index[proj.table_index] = &proj;
+	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		get_by_index[get.table_index] = &get;
+	}
+	for (auto &child : op->children) {
+		IndexProjectionsAndGets(child.get(), proj_by_index, get_by_index);
+	}
+}
+
+static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
+                                         const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                         const unordered_map<idx_t, LogicalGet *> &get_by_index) {
+	idx_t table_index = bcr->binding.table_index;
+	idx_t column_index = bcr->binding.column_index;
+	for (int depth = 0; depth < 16; depth++) {
+		auto get_it = get_by_index.find(table_index);
+		if (get_it != get_by_index.end()) {
+			auto *get = get_it->second;
+			auto &ids = get->GetColumnIds();
+			if (column_index < ids.size() && get->GetTable().get()) {
+				auto base_idx = ids[column_index].GetPrimaryIndex();
+				auto &cols = get->GetTable().get()->GetColumns();
+				if (base_idx < cols.LogicalColumnCount()) {
+					return cols.GetColumn(LogicalIndex(base_idx)).Name();
+				}
+			}
+			if (column_index < get->names.size()) {
+				return get->names[column_index];
+			}
+			return "";
+		}
+		auto proj_it = proj_by_index.find(table_index);
+		if (proj_it == proj_by_index.end()) {
+			return "";
+		}
+		auto *proj = proj_it->second;
+		if (column_index >= proj->expressions.size()) {
+			return "";
+		}
+		auto &expr = proj->expressions[column_index];
+		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+			return expr->alias.empty() ? expr->GetName() : expr->alias;
+		}
+		auto &next = expr->Cast<BoundColumnRefExpression>();
+		table_index = next.binding.table_index;
+		column_index = next.binding.column_index;
+	}
+	return "";
+}
+
+static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr,
+                                      const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                      const unordered_map<idx_t, LogicalGet *> &get_by_index) {
+	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		return "";
+	}
+	auto *ref = dynamic_cast<BoundColumnRefExpression *>(expr.get());
+	if (!ref) {
+		return "";
+	}
+	string col_name = ResolveBindingToBaseColumn(ref, proj_by_index, get_by_index);
+	return col_name.empty() ? ref->GetName() : col_name;
+}
+
+static bool ExtractFullOuterJoinCols(LogicalOperator *node,
+                                     const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                     const unordered_map<idx_t, LogicalGet *> &get_by_index, string &result) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+		if (join && join->join_type == JoinType::OUTER && !join->conditions.empty()) {
+			auto &condition = join->conditions[0];
+			string left_col_name = FullOuterJoinColumnName(condition.left, proj_by_index, get_by_index);
+			string right_col_name = FullOuterJoinColumnName(condition.right, proj_by_index, get_by_index);
+			string left_table = !join->children.empty() ? FindFirstTableName(join->children[0].get()) : "";
+			string right_table = join->children.size() > 1 ? FindFirstTableName(join->children[1].get()) : "";
+			if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
+				result = left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
+				return true;
+			}
+		}
+	}
+	for (auto &child : node->children) {
+		if (ExtractFullOuterJoinCols(child.get(), proj_by_index, get_by_index, result)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string ExtractFullOuterJoinMetadata(LogicalOperator *plan) {
+	unordered_map<idx_t, LogicalProjection *> proj_by_index;
+	unordered_map<idx_t, LogicalGet *> get_by_index;
+	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
+	string result;
+	ExtractFullOuterJoinCols(plan, proj_by_index, get_by_index, result);
+	return result;
+}
+
+static string SanitizeOutputName(const string &name) {
+	if (IVMTableNames::IsInternalColumn(name)) {
+		return name;
+	}
+	string clean;
+	bool last_was_underscore = false;
+	for (auto c : name) {
+		if (isalnum(c)) {
+			clean += c;
+			last_was_underscore = false;
+		} else if (!last_was_underscore && !clean.empty()) {
+			clean += '_';
+			last_was_underscore = true;
+		}
+	}
+	if (!clean.empty() && clean.back() == '_') {
+		clean.pop_back();
+	}
+	return clean.empty() ? name : clean;
+}
+
+static void SanitizeOutputNames(vector<string> &output_names) {
+	for (auto &name : output_names) {
+		name = SanitizeOutputName(name);
+	}
+}
+
+static LogicalOperator *FindTopNameSource(LogicalOperator *plan) {
+	for (auto *walk = plan; walk;) {
+		if (walk->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+		    walk->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			return walk;
+		}
+		if ((walk->type == LogicalOperatorType::LOGICAL_ORDER_BY || walk->type == LogicalOperatorType::LOGICAL_LIMIT ||
+		     walk->type == LogicalOperatorType::LOGICAL_TOP_N || walk->type == LogicalOperatorType::LOGICAL_DISTINCT ||
+		     walk->type == LogicalOperatorType::LOGICAL_FILTER) &&
+		    !walk->children.empty()) {
+			walk = walk->children[0].get();
+			continue;
+		}
+		break;
+	}
+	return nullptr;
+}
+
+static void AppendProjectionOutputNames(LogicalProjection &projection, idx_t output_count,
+                                        vector<string> &output_names) {
+	while (output_names.size() < output_count) {
+		idx_t idx = output_names.size();
+		if (idx < projection.expressions.size() && !projection.expressions[idx]->alias.empty()) {
+			output_names.push_back(projection.expressions[idx]->alias);
+		} else {
+			output_names.push_back("_ivm_col_" + to_string(idx));
+		}
+	}
+}
+
+static void AppendAggregateOutputNames(LogicalAggregate &aggregate, idx_t output_count, vector<string> &output_names) {
+	idx_t group_count = aggregate.groups.size();
+	while (output_names.size() < output_count) {
+		idx_t idx = output_names.size();
+		if (idx >= group_count) {
+			idx_t expr_idx = idx - group_count;
+			if (expr_idx < aggregate.expressions.size() && !aggregate.expressions[expr_idx]->alias.empty()) {
+				output_names.push_back(aggregate.expressions[expr_idx]->alias);
+				continue;
+			}
+		}
+		output_names.push_back("_ivm_col_" + to_string(idx));
+	}
+}
+
+static void AppendHiddenOutputNames(LogicalOperator *plan, vector<string> &output_names) {
+	auto output_count = plan->GetColumnBindings().size();
+	auto *name_source = FindTopNameSource(plan);
+	if (!name_source) {
+		return;
+	}
+	if (name_source->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		AppendProjectionOutputNames(name_source->Cast<LogicalProjection>(), output_count, output_names);
+	} else {
+		AppendAggregateOutputNames(name_source->Cast<LogicalAggregate>(), output_count, output_names);
+	}
+}
+
+static void DeduplicateOutputNames(vector<string> &output_names) {
+	unordered_set<string> seen;
+	for (auto &name : output_names) {
+		if (IVMTableNames::IsInternalColumn(name)) {
+			continue;
+		}
+		string candidate = name;
+		idx_t suffix = 1;
+		while (seen.count(candidate)) {
+			candidate = name + "_" + to_string(suffix++);
+		}
+		seen.insert(candidate);
+		name = candidate;
+	}
+}
+
+static vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names) {
+	auto output_names = planner_names;
+	SanitizeOutputNames(output_names);
+	AppendHiddenOutputNames(select_plan, output_names);
+	DeduplicateOutputNames(output_names);
+	return output_names;
+}
+
+static size_t FindKeywordToken(const string &text, const string &keyword, size_t from) {
+	size_t pos = from;
+	while (true) {
+		pos = text.find(keyword, pos);
+		if (pos == string::npos) {
+			return string::npos;
+		}
+		bool ok_left = (pos == 0) || std::isspace(static_cast<unsigned char>(text[pos - 1])) || text[pos - 1] == '(';
+		bool ok_right = (pos + keyword.size() == text.size()) ||
+		                std::isspace(static_cast<unsigned char>(text[pos + keyword.size()])) ||
+		                text[pos + keyword.size()] == '(';
+		if (ok_left && ok_right) {
+			return pos;
+		}
+		pos++;
+	}
+}
+
+static bool StartsKeywordToken(const string &text, size_t pos, const string &keyword) {
+	if (pos + keyword.size() > text.size()) {
+		return false;
+	}
+	if (text.compare(pos, keyword.size(), keyword) != 0) {
+		return false;
+	}
+	return (pos + keyword.size() == text.size()) ||
+	       !std::isalnum(static_cast<unsigned char>(text[pos + keyword.size()]));
+}
+
+static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
+	return fn_name == "quantile_cont" || fn_name == "quantile_disc" || fn_name == "percentile_cont" ||
+	       fn_name == "percentile_disc" || fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
+	       fn_name == "mode" ||
+	       // Two-argument aggregates whose children LPTS re-aliases to internal
+	       // `tN_col` names; the serialized SQL refers to those names against the
+	       // original FROM clause and fails binding at CREATE-table time.
+	       fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" || fn_name == "regr_avgx" ||
+	       fn_name == "regr_avgy" || fn_name == "regr_count" || fn_name == "regr_intercept" || fn_name == "regr_r2" ||
+	       fn_name == "regr_slope" || fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy" ||
+	       fn_name == "arg_min" || fn_name == "arg_max";
+}
+
+static bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto *agg = dynamic_cast<LogicalAggregate *>(op);
+		if (agg) {
+			if (agg->grouping_sets.size() > 1) {
+				return true;
+			}
+			for (auto &expr : agg->expressions) {
+				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+					continue;
+				}
+				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+				if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
+					return true;
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		if (PlanNeedsOriginalSqlForLpts(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static LogicalAggregate *FindOuterAggregate(LogicalOperator *op) {
+	if (!op) {
+		return nullptr;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return &op->Cast<LogicalAggregate>();
+	}
+	for (auto &child : op->children) {
+		auto *aggregate = FindOuterAggregate(child.get());
+		if (aggregate) {
+			return aggregate;
+		}
+	}
+	return nullptr;
+}
+
+static string JsonQuote(const string &value) {
+	string result = "\"";
+	for (char c : value) {
+		if (c == '"' || c == '\\') {
+			result += '\\';
+			result += c;
+		} else if (c == '\n') {
+			result += "\\n";
+		} else {
+			result += c;
+		}
+	}
+	result += "\"";
+	return result;
+}
+
+static bool IsPacLoaded(ClientContext &context) {
+	Value pac_check_val;
+	return context.TryGetCurrentSetting("pac_check", pac_check_val);
+}
+
+static void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con) {
+	if (!IsPacLoaded(context)) {
+		return;
+	}
+	for (auto &name : {"pac_mi", "pac_seed", "pac_m", "pac_noise", "pac_hash_repair", "pac_check", "pac_rewrite",
+	                   "pac_conservative_mode"}) {
+		Value val;
+		if (context.TryGetCurrentSetting(name, val) && !val.IsNull()) {
+			con.Query("SET " + string(name) + " = " + val.ToString());
+		}
+	}
+}
+
 /// Extract a `(SELECT DISTINCT cols FROM source [WHERE p])` subquery from the
 /// user's CREATE-MV SQL. Single-source v0 — succeeds only for the simple shape
 /// where the DISTINCT body has exactly one base table after FROM (joins/CTEs
@@ -271,30 +801,12 @@ static bool ExtractInnerDistinct(const string &original_sql, vector<string> &out
                                  string &out_source, string &out_filter_sql) {
 	string lower = StringUtil::Lower(original_sql);
 	// Find "select distinct" — must be a token (preceded by '(' or whitespace).
-	size_t pos = 0;
-	auto find_kw = [&](const string &kw, size_t from) -> size_t {
-		size_t p = from;
-		while (true) {
-			p = lower.find(kw, p);
-			if (p == string::npos) {
-				return string::npos;
-			}
-			bool ok_left = (p == 0) || std::isspace(static_cast<unsigned char>(lower[p - 1])) || lower[p - 1] == '(';
-			bool ok_right = (p + kw.size() == lower.size()) ||
-			                std::isspace(static_cast<unsigned char>(lower[p + kw.size()])) ||
-			                lower[p + kw.size()] == '(';
-			if (ok_left && ok_right) {
-				return p;
-			}
-			p++;
-		}
-	};
-	size_t distinct_pos = find_kw("select distinct", 0);
+	size_t distinct_pos = FindKeywordToken(lower, "select distinct", 0);
 	if (distinct_pos == string::npos) {
 		return false;
 	}
 	// Multiple DISTINCTs in the same view → unsupported in v0.
-	if (find_kw("select distinct", distinct_pos + 1) != string::npos) {
+	if (FindKeywordToken(lower, "select distinct", distinct_pos + 1) != string::npos) {
 		return false;
 	}
 
@@ -397,23 +909,14 @@ static bool ExtractInnerDistinct(const string &original_sql, vector<string> &out
 		alias_skip++;
 	}
 	// Recognised keywords that terminate the FROM section.
-	auto starts_kw = [&](size_t p, const string &kw) {
-		if (p + kw.size() > lower.size()) {
-			return false;
-		}
-		if (lower.compare(p, kw.size(), kw) != 0) {
-			return false;
-		}
-		bool ok_right =
-		    (p + kw.size() == lower.size()) || !std::isalnum(static_cast<unsigned char>(lower[p + kw.size()]));
-		return ok_right;
-	};
 	if (alias_skip < lower.size() && lower[alias_skip] != ',' && lower[alias_skip] != ')' &&
-	    !starts_kw(alias_skip, "where") && !starts_kw(alias_skip, "group") && !starts_kw(alias_skip, "order") &&
-	    !starts_kw(alias_skip, "having") && !starts_kw(alias_skip, "limit") && !starts_kw(alias_skip, "union") &&
-	    !starts_kw(alias_skip, "join") && !starts_kw(alias_skip, "left") && !starts_kw(alias_skip, "right") &&
-	    !starts_kw(alias_skip, "inner") && !starts_kw(alias_skip, "full") && !starts_kw(alias_skip, "cross") &&
-	    !starts_kw(alias_skip, "on")) {
+	    !StartsKeywordToken(lower, alias_skip, "where") && !StartsKeywordToken(lower, alias_skip, "group") &&
+	    !StartsKeywordToken(lower, alias_skip, "order") && !StartsKeywordToken(lower, alias_skip, "having") &&
+	    !StartsKeywordToken(lower, alias_skip, "limit") && !StartsKeywordToken(lower, alias_skip, "union") &&
+	    !StartsKeywordToken(lower, alias_skip, "join") && !StartsKeywordToken(lower, alias_skip, "left") &&
+	    !StartsKeywordToken(lower, alias_skip, "right") && !StartsKeywordToken(lower, alias_skip, "inner") &&
+	    !StartsKeywordToken(lower, alias_skip, "full") && !StartsKeywordToken(lower, alias_skip, "cross") &&
+	    !StartsKeywordToken(lower, alias_skip, "on")) {
 		// Treat as an alias word; consume it.
 		size_t alias_end = alias_skip;
 		while (alias_end < lower.size() &&
@@ -429,10 +932,11 @@ static bool ExtractInnerDistinct(const string &original_sql, vector<string> &out
 	}
 	size_t where_pos = string::npos;
 	if (alias_skip < lower.size()) {
-		if (starts_kw(alias_skip, "where")) {
+		if (StartsKeywordToken(lower, alias_skip, "where")) {
 			where_pos = alias_skip;
-		} else if (lower[alias_skip] != ')' && !starts_kw(alias_skip, "group") && !starts_kw(alias_skip, "order") &&
-		           !starts_kw(alias_skip, "limit") && !starts_kw(alias_skip, "union")) {
+		} else if (lower[alias_skip] != ')' && !StartsKeywordToken(lower, alias_skip, "group") &&
+		           !StartsKeywordToken(lower, alias_skip, "order") && !StartsKeywordToken(lower, alias_skip, "limit") &&
+		           !StartsKeywordToken(lower, alias_skip, "union")) {
 			return false; // unsupported shape (JOIN, comma, etc.)
 		}
 	}
@@ -451,8 +955,8 @@ static bool ExtractInnerDistinct(const string &original_sql, vector<string> &out
 				break;
 			}
 			d--;
-		} else if (d == 0 &&
-		           (starts_kw(i, "group") || starts_kw(i, "order") || starts_kw(i, "limit") || starts_kw(i, "union"))) {
+		} else if (d == 0 && (StartsKeywordToken(lower, i, "group") || StartsKeywordToken(lower, i, "order") ||
+		                      StartsKeywordToken(lower, i, "limit") || StartsKeywordToken(lower, i, "union"))) {
 			end_pos = i;
 			break;
 		}
@@ -659,21 +1163,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			return result;
 		}
 
-		// TODO: Remove PAC coupling — IVM should not need to forward PAC settings.
-		// Check if PAC extension is loaded (needed later for delta table queries).
-		// If so, forward PAC settings to the internal connection so that PAC
-		// compilation (noise, seeds, etc.) behaves the same as the user's session.
-		Value pac_check_val;
-		bool pac_loaded = context.TryGetCurrentSetting("pac_check", pac_check_val);
-		if (pac_loaded) {
-			for (auto &name : {"pac_mi", "pac_seed", "pac_m", "pac_noise", "pac_hash_repair", "pac_check",
-			                   "pac_rewrite", "pac_conservative_mode"}) {
-				Value val;
-				if (context.TryGetCurrentSetting(name, val) && !val.IsNull()) {
-					con.Query("SET " + string(name) + " = " + val.ToString());
-				}
-			}
-		}
+		// PAC compatibility boundary: internal planning uses a fresh connection, so
+		// forward PAC settings when that extension is loaded in the caller session.
+		bool pac_loaded = IsPacLoaded(context);
+		ForwardPacSettingsIfLoaded(context, con);
 
 		auto full_view_name = OpenIVMUtils::ExtractTableName(statement->query);
 		auto original_view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
@@ -767,105 +1260,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 			IVMPlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
 
-			// Sanitize column names: replace special chars with underscores, collapse runs, trim.
-			// "min(val)" → "min_val", "count_star()" → "count_star", "SUM(x) AS total" → "total"
-			output_names = select_planner.names;
-			for (auto &name : output_names) {
-				// Don't sanitize internal IVM column names — they need the _ivm_ prefix
-				if (IVMTableNames::IsInternalColumn(name)) {
-					continue;
-				}
-				string clean;
-				bool last_was_underscore = false;
-				for (auto c : name) {
-					if (isalnum(c)) {
-						clean += c;
-						last_was_underscore = false;
-					} else if (!last_was_underscore && !clean.empty()) {
-						clean += '_';
-						last_was_underscore = true;
-					}
-				}
-				// Trim trailing underscore
-				if (!clean.empty() && clean.back() == '_') {
-					clean.pop_back();
-				}
-				if (!clean.empty()) {
-					name = clean;
-				}
-			}
-			// IVMPlanRewrite may have added extra columns (_ivm_left_key, _ivm_distinct_count).
-			// Append names for these from the top-most node's expression aliases. Walk through
-			// ORDER BY / LIMIT / DISTINCT / FILTER wrappers; accept either a PROJECTION or an
-			// AGGREGATE at the top. For AGGREGATE the group-count positions reuse existing
-			// output_names (which match the original SELECT list); aggregate-expression positions
-			// after that use each aggregate's alias (e.g. `_ivm_distinct_count`).
-			auto plan_bindings = select_plan->GetColumnBindings();
-			LogicalProjection *top_proj = nullptr;
-			LogicalAggregate *top_agg = nullptr;
-			for (LogicalOperator *walk = select_plan.get(); walk;) {
-				if (walk->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					top_proj = &walk->Cast<LogicalProjection>();
-					break;
-				}
-				if (walk->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-					top_agg = &walk->Cast<LogicalAggregate>();
-					break;
-				}
-				if ((walk->type == LogicalOperatorType::LOGICAL_ORDER_BY ||
-				     walk->type == LogicalOperatorType::LOGICAL_LIMIT ||
-				     walk->type == LogicalOperatorType::LOGICAL_TOP_N ||
-				     walk->type == LogicalOperatorType::LOGICAL_DISTINCT ||
-				     walk->type == LogicalOperatorType::LOGICAL_FILTER) &&
-				    !walk->children.empty()) {
-					walk = walk->children[0].get();
-					continue;
-				}
-				break;
-			}
-			if (top_proj) {
-				while (output_names.size() < plan_bindings.size()) {
-					idx_t idx = output_names.size();
-					if (idx < top_proj->expressions.size() && !top_proj->expressions[idx]->alias.empty()) {
-						output_names.push_back(top_proj->expressions[idx]->alias);
-					} else {
-						output_names.push_back("_ivm_col_" + to_string(idx));
-					}
-				}
-			} else if (top_agg) {
-				idx_t group_count_local = top_agg->groups.size();
-				while (output_names.size() < plan_bindings.size()) {
-					idx_t idx = output_names.size();
-					if (idx >= group_count_local) {
-						idx_t expr_idx = idx - group_count_local;
-						if (expr_idx < top_agg->expressions.size() && !top_agg->expressions[expr_idx]->alias.empty()) {
-							output_names.push_back(top_agg->expressions[expr_idx]->alias);
-							continue;
-						}
-					}
-					output_names.push_back("_ivm_col_" + to_string(idx));
-				}
-			}
-			// Deduplicate output names — `SELECT W_ID, W_ID FROM …` or `SELECT col, COUNT(*), col`
-			// produce duplicate names that break `CREATE TABLE _ivm_data_mv AS <view_query>`
-			// (DuckDB rejects duplicate column names in a CREATE TABLE column list). Internal
-			// IVM columns (e.g. `_ivm_left_key`) must keep their canonical name — rewrite rules
-			// look them up by exact string.
-			{
-				unordered_set<string> seen;
-				for (auto &name : output_names) {
-					if (IVMTableNames::IsInternalColumn(name)) {
-						continue;
-					}
-					string candidate = name;
-					idx_t suffix = 1;
-					while (seen.count(candidate)) {
-						candidate = name + "_" + to_string(suffix++);
-					}
-					seen.insert(candidate);
-					name = candidate;
-				}
-			}
+			output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 			// Strip HAVING filter from plan — data table stores all groups.
 			// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 			having_predicate = StripHavingFilter(select_plan, output_names);
@@ -963,55 +1358,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// LPTS-rewritten form anyway — they're classified FULL_REFRESH and the
 			// rewriter-rule path (which needs LPTS) isn't used.
 			{
-				bool needs_original = false;
-				// Walk the plan looking for constructs LPTS can't round-trip:
-				//   - GROUPING SETS / ROLLUP / CUBE (aggregate.grouping_sets.size() > 1)
-				//   - Ordered-set aggregates (quantile_cont / quantile_disc / percentile_cont
-				//     / percentile_disc / approx_quantile) — their extra "within group" /
-				//     second-argument parameters don't survive the plan→SQL conversion.
-				std::function<void(LogicalOperator *)> walk = [&](LogicalOperator *op) {
-					if (needs_original || !op) {
-						return;
-					}
-					if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-						auto *agg = dynamic_cast<LogicalAggregate *>(op);
-						if (agg) {
-							if (agg->grouping_sets.size() > 1) {
-								needs_original = true;
-								return;
-							}
-							for (auto &expr : agg->expressions) {
-								if (expr->type != ExpressionType::BOUND_AGGREGATE) {
-									continue;
-								}
-								auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-								const string &fn_name = bound_agg.function.name;
-								if (fn_name == "quantile_cont" || fn_name == "quantile_disc" ||
-								    fn_name == "percentile_cont" || fn_name == "percentile_disc" ||
-								    fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
-								    fn_name == "mode" ||
-								    // Two-argument aggregates whose children LPTS re-aliases to
-								    // internal `tN_col` names; the serialized SQL refers to those
-								    // names against the original FROM clause and fails binding at
-								    // CREATE-table time (see query_1888). ARG_MIN/ARG_MAX are also
-								    // two-argument and hit the same issue.
-								    fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" ||
-								    fn_name == "regr_avgx" || fn_name == "regr_avgy" || fn_name == "regr_count" ||
-								    fn_name == "regr_intercept" || fn_name == "regr_r2" || fn_name == "regr_slope" ||
-								    fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy" ||
-								    fn_name == "arg_min" || fn_name == "arg_max") {
-									needs_original = true;
-									return;
-								}
-							}
-						}
-					}
-					for (auto &child : op->children) {
-						walk(child.get());
-					}
-				};
-				walk(select_plan.get());
-				if (needs_original) {
+				if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
 					view_query = original_view_query;
 					lpts_fallback = true;
 					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
@@ -1032,26 +1379,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
 		auto analysis = AnalyzePlan(plan.get());
-		bool ivm_compatible = analysis.ivm_compatible;
-		bool found_aggregation = analysis.found_aggregation;
-		bool found_projection = analysis.found_projection;
-		bool found_distinct = analysis.found_distinct;
-		bool found_having = analysis.found_having;
-		bool found_minmax = analysis.found_minmax;
-		bool found_left_join = analysis.found_left_join;
-		bool found_full_outer = analysis.found_full_outer;
-		bool found_window = analysis.found_window;
-		bool found_join = analysis.found_join;
-		bool found_top_k = analysis.found_top_k;
-		bool found_grouping_sets = analysis.found_grouping_sets;
-		// COUNT(DISTINCT x) and LIST aggregates → group-recompute (delete affected groups, re-insert from original
-		// query)
-		if (analysis.found_count_distinct) {
-			found_minmax = true;
-		}
-		if (analysis.found_list) {
-			found_minmax = true;
-		}
+		MVClassificationState classification(analysis);
 		// Derive GROUP BY column names by walking the plan's projection above the aggregate.
 		// The projection maps GROUP BY bindings (group_index, i) to SELECT-list aliases — these
 		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
@@ -1067,7 +1395,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// exposes columns that never reach the data table, so its targets can't drive
 		// AGGREGATE_GROUP classification or the unique index.
 		bool distinct_at_top = false;
-		if (analysis.found_distinct && !analysis.aggregate_columns.empty() && !output_names.empty()) {
+		if (classification.found_distinct && !analysis.aggregate_columns.empty() && !output_names.empty()) {
 			unordered_set<string> output_lc;
 			for (auto &n : output_names) {
 				string lc = n;
@@ -1089,153 +1417,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// True only when the UNION node is an ancestor of the aggregate (union-of-aggs pattern).
 		// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
 		// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
-		bool has_union_over_agg = found_aggregation && HasUnionBeforeAggregate(plan.get());
+		bool has_union_over_agg = classification.found_aggregation && HasUnionBeforeAggregate(plan.get());
 
 		if (distinct_at_top) {
 			aggregate_columns = std::move(analysis.aggregate_columns);
-		} else if (analysis.found_distinct && analysis.aggregate_columns.empty()) {
+		} else if (classification.found_distinct && analysis.aggregate_columns.empty()) {
 			// Plain DISTINCT (no explicit targets) — trust the checker.
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
-			// Walk plan to find the outermost PROJECTION that references (group_index, i) bindings.
-			// Stopping at the first PROJECTION found (rather than recursing deeper) ensures we
-			// only match the top-level aggregate — aggregates nested inside UNION branches or
-			// CTE bodies are correctly ignored.
-			// For HAVING the structure is PROJECTION→FILTER→AGGREGATE: the top PROJECTION still
-			// holds group_index refs, so this works correctly.
-			// For CTE nodes, only the outer-query child (children[1]) is visited, mirroring
-			// the same restriction applied in AnalyzeNode.
-			// Ordered list of projection expressions that reference (group_index, *).
-			// Not keyed by column_index because a column can be referenced multiple times
-			// (e.g. `SELECT w_tax, w_tax, COUNT(*) GROUP BY w_tax, w_tax` — DuckDB
-			// collapses GROUP BY w_tax, w_tax to a single group, but the projection
-			// still outputs the column twice; both positions materialize in the data
-			// table and the MERGE needs both as group keys).
-			vector<string> group_names_list;
-			// Build an index of every LOGICAL_PROJECTION in the plan, keyed by its
-			// table_index. This lets a BCR at any level be traced through a chain of
-			// pass-through projections (e.g. DecomposeAvgStddev + CTE inlining can
-			// stack 2-3 PROJECTIONs between the top SELECT and the AGGREGATE).
-			std::unordered_map<idx_t, LogicalProjection *> projections_by_index;
-			std::function<void(LogicalOperator *)> collect_projections = [&](LogicalOperator *op) {
-				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					auto &proj = op->Cast<LogicalProjection>();
-					projections_by_index[proj.table_index] = &proj;
-				}
-				for (auto &child : op->children) {
-					collect_projections(child.get());
-				}
-			};
-			collect_projections(plan.get());
-			// Resolve (tidx, cidx) through BCR pass-throughs in any projection chain.
-			// Returns true iff the binding ultimately refers to a raw group column.
-			std::function<bool(idx_t, idx_t, int)> resolves_to_group = [&](idx_t tidx, idx_t cidx, int depth) -> bool {
-				if (depth > 16) {
-					return false;
-				}
-				if (tidx == group_index) {
-					return cidx < (idx_t)group_count;
-				}
-				auto it = projections_by_index.find(tidx);
-				if (it == projections_by_index.end()) {
-					return false;
-				}
-				auto &proj = *it->second;
-				if (cidx >= proj.expressions.size()) {
-					return false;
-				}
-				auto &expr = proj.expressions[cidx];
-				if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-					return false;
-				}
-				auto &bcr = expr->Cast<BoundColumnRefExpression>();
-				return resolves_to_group(bcr.binding.table_index, bcr.binding.column_index, depth + 1);
-			};
-			std::function<bool(LogicalOperator *)> find_group_cols = [&](LogicalOperator *op) -> bool {
-				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					// Stop at the first PROJECTION. Return `matched` (true iff any expression
-					// references group_index) so the MATERIALIZED_CTE case below can tell
-					// "outer matched" from "outer missed — try body". For non-CTE plans a
-					// top-projection miss ends the search; we must NOT descend into JOIN
-					// branches where the aggregate's group key is a subquery-internal column
-					// that isn't in the MV's user-facing output — that would yield a unique
-					// index on a column absent from the data table.
-					auto &proj = op->Cast<LogicalProjection>();
-					bool matched = false;
-					for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
-						auto &expr = proj.expressions[expr_i];
-						if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
-							auto &bcr = expr->Cast<BoundColumnRefExpression>();
-							// Trace through any stack of pass-through projections — the
-							// top-level SELECT may reference the group column indirectly
-							// through 1-N intermediate projections (CTE inlining, AVG
-							// decomposition, etc.).
-							if (resolves_to_group(bcr.binding.table_index, bcr.binding.column_index, 0)) {
-								// Prefer the explicit user alias when present.
-								// When there is no alias, use output_names[expr_i] — the
-								// already-sanitized, data-table-authoritative name — rather
-								// than bcr.GetName(), which can return DuckDB-internal
-								// positional strings like "#[4.0]" for join columns resolved
-								// via GROUP BY ALL (or any future internal naming scheme).
-								// output_names[expr_i] is populated before find_group_cols is
-								// called and always matches what the CREATE TABLE AS query
-								// will produce as the column name.
-								string col_name;
-								if (!expr->alias.empty()) {
-									col_name = expr->alias;
-								} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
-								           !IVMTableNames::IsInternalColumn(output_names[expr_i])) {
-									col_name = output_names[expr_i];
-								} else {
-									col_name = bcr.GetName();
-								}
-								if (!IVMTableNames::IsInternalColumn(col_name)) {
-									group_names_list.push_back(col_name);
-									matched = true;
-								}
-							}
-						}
-					}
-					return matched;
-				}
-				// UNION mixes rows from independent aggregates — the key may repeat across
-				// branches. Refuse to populate aggregate_columns from either branch so the
-				// view drops down to SIMPLE_AGGREGATE and no unique index is installed.
-				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
-					return false;
-				}
-				if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-					// Outer first (handles outer re-aggregate / reshape); if that misses,
-					// dive into the CTE body (handles pass-through `SELECT * FROM cte`).
-					if (op->children.size() >= 2) {
-						if (find_group_cols(op->children[1].get())) {
-							return true;
-						}
-						return find_group_cols(op->children[0].get());
-					}
-					return false;
-				}
-				for (auto &child : op->children) {
-					if (find_group_cols(child.get())) {
-						return true;
-					}
-				}
-				return false;
-			};
-			// If the plan contains a LOGICAL_UNION above the aggregate(s), the MV's output
-			// columns come from multiple independent branches — collecting group keys from
-			// a single branch would return names that aren't in the MV's user-facing output
-			// (UNION ALL re-aliases them at the top). Use the first group_count output names
-			// as group keys (positional: DuckDB places GROUP BY cols before aggregates).
-			if (has_union_over_agg) {
-				for (size_t i = 0; i < group_count && i < output_names.size(); i++) {
-					if (!IVMTableNames::IsInternalColumn(output_names[i])) {
-						group_names_list.push_back(output_names[i]);
-					}
-				}
-			} else {
-				find_group_cols(plan.get());
-			}
+			auto group_names_list =
+			    DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names, has_union_over_agg);
 			for (auto &name : group_names_list) {
 				aggregate_columns.push_back(name);
 			}
@@ -1274,7 +1465,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		//
 		// Use GROUP_RECOMPUTE for these views: AGGREGATE_GROUP would try to SUM pass-through
 		// attributes (e.g. W_YTD from WAREHOUSE) as if they were aggregate results.
-		if (found_join && group_count > 0 && !has_union_over_agg) {
+		if (classification.found_join && group_count > 0 && !has_union_over_agg) {
 			// plan root is LOGICAL_CREATE_TABLE; descend to find the SELECT output
 			// projection and outermost comparison join.
 			auto *top_proj_ptr = FindFirstProjection(plan.get());
@@ -1328,7 +1519,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// doesn't have that column. We can't resolve joins at refresh time without LPTS
 		// support for WINDOW. Fall back to full recompute for window+join views.
 		// Single-table window views keep partition-level recompute.
-		if (found_window && found_join) {
+		if (classification.found_window && classification.found_join) {
 			window_partition_columns.clear();
 		}
 
@@ -1344,12 +1535,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		//   query_1502: COALESCE(SUM(ol.OL_QUANTITY), 0) AS ordered
 		//   query_1696/1699: SUM(COALESCE(h.H_AMOUNT, 0))
 		//   query_1746/1749: SUM(COALESCE(1, 0)), AVG(1)
-		if ((found_left_join || found_full_outer) && found_aggregation) {
+		if ((classification.found_left_join || classification.found_full_outer) && classification.found_aggregation) {
 			if (OuterJoinAggregateNeedsRecompute(plan.get(), analysis.group_index)) {
 				OPENIVM_DEBUG_PRINT(
 				    "[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper — "
 				    "using group-recompute (found_minmax=true)\n");
-				found_minmax = true;
+				classification.found_minmax = true;
 			}
 		}
 
@@ -1358,7 +1549,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// deletion deltas correctly, so SUM/COUNT over them drift. Force RECOMPUTE
 		// regardless of how the aggregate's expressions are structured.
 		// Catches q1353/q1355 (FULL OUTER JOIN + GROUP BY + SUM).
-		bool has_full_outer_aggregate = found_full_outer && found_aggregation;
+		bool has_full_outer_aggregate = classification.found_full_outer && classification.found_aggregation;
 
 		// Materialized CTE referenced 2+ times below a JOIN: the planner emits one
 		// base-table scan inside the CTE and shares it via CTE_REF nodes, so the
@@ -1381,29 +1572,29 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string distinct_sum_arg;
 		string distinct_sum_out;
 
-		if (found_window) {
+		if (classification.found_window) {
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
 			ivm_type = IVMType::WINDOW_PARTITION;
-		} else if (found_grouping_sets) {
+		} else if (classification.found_grouping_sets) {
 			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
 			// the incremental aggregate path can't decompose them yet. Use FULL_REFRESH
 			// (always recompute, no empty-delta short-circuit) until per-grouping-set
 			// expansion into UNION ALL lands.
 			ivm_type = IVMType::FULL_REFRESH;
-		} else if (!ivm_compatible) {
+		} else if (!classification.ivm_compatible) {
 			ivm_type = IVMType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
-		} else if (found_distinct && !distinct_at_top && found_aggregation) {
+		} else if (classification.found_distinct && !distinct_at_top && classification.found_aggregation) {
 			// Inner DISTINCT under an aggregate. Two paths:
 			//   - `ivm_distinct_aux_state = true` AND single-source body → DISTINCT_INCREMENTAL.
 			//     Maintains per-DISTINCT-tuple count auxiliary state; on refresh emits ±1
 			//     only on count transitions across zero (DBSP distinct(R)=sgn(R[t])). Strictly
 			//     fewer rows reach the parent aggregate's MERGE than GROUP_RECOMPUTE.
 			//   - Otherwise → GROUP_RECOMPUTE: re-evaluate only the outer GROUP BY keys touched
-			//     by source deltas. Correctness-equivalent fallback; multi-source views also
-			//     land here in v0 (multi-source aux-state needs IE substitution — TODO).
+			//     by source deltas. Correctness-equivalent fallback; multi-source views stay
+			//     there until the aux-state path can substitute each source independently.
 			// Read the flag from the user's ClientContext (`context`), not the local
 			// `con` — the local connection is a fresh one and doesn't inherit the
 			// caller's session settings.
@@ -1440,20 +1631,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
 			// demotes back to GROUP_RECOMPUTE.
 			if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
-				LogicalAggregate *outer_agg = nullptr;
-				std::function<void(LogicalOperator *)> find_outer = [&](LogicalOperator *op) {
-					if (outer_agg || !op) {
-						return;
-					}
-					if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-						outer_agg = &op->Cast<LogicalAggregate>();
-						return;
-					}
-					for (auto &c : op->children) {
-						find_outer(c.get());
-					}
-				};
-				find_outer(plan.get());
+				LogicalAggregate *outer_agg = FindOuterAggregate(plan.get());
 				int sum_count = 0;
 				bool unsupported_agg = false;
 				if (outer_agg) {
@@ -1497,11 +1675,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 				}
 			}
-		} else if (found_distinct && distinct_at_top && !aggregate_columns.empty()) {
+		} else if (classification.found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
-		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
+		} else if (classification.found_having && classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_HAVING;
-		} else if ((has_union_over_agg || join_key_group_fallback || analysis.found_nested_aggregate) &&
+		} else if ((has_union_over_agg || join_key_group_fallback || classification.found_nested_aggregate) &&
 		           !aggregate_columns.empty()) {
 			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.
 			// Inner-aggregate-in-join: group keys are the join-condition columns visible in the
@@ -1510,11 +1688,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// All three use GROUP_RECOMPUTE — not AGGREGATE_GROUP — because non-key output columns
 			// may be pass-through attributes or non-linear functions over inner aggregates.
 			ivm_type = IVMType::GROUP_RECOMPUTE;
-		} else if (found_aggregation && !aggregate_columns.empty()) {
+		} else if (classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
-		} else if (found_aggregation && aggregate_columns.empty()) {
+		} else if (classification.found_aggregation && aggregate_columns.empty()) {
 			ivm_type = IVMType::SIMPLE_AGGREGATE;
-		} else if (found_projection && !found_aggregation) {
+		} else if (classification.found_projection && !classification.found_aggregation) {
 			ivm_type = IVMType::SIMPLE_PROJECTION;
 		} else {
 			ivm_type = IVMType::FULL_REFRESH;
@@ -1531,7 +1709,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		                    : ivm_type == IVMType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
 		                    : ivm_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
 		                                                                : "UNKNOWN",
-		                    (int)found_aggregation, (int)found_projection, aggregate_columns.size());
+		                    (int)classification.found_aggregation, (int)classification.found_projection,
+		                    aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 		for (const auto &t : table_names) {
 			OPENIVM_DEBUG_PRINT(" %s", t.c_str());
@@ -1626,7 +1805,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// For WINDOW_PARTITION, store the PARTITION BY columns so the upsert compiler
 		// can identify affected partitions from deltas.
 		string group_cols_val = "null";
-		auto &cols_to_store = found_window ? window_partition_columns : aggregate_columns;
+		auto &cols_to_store = classification.found_window ? window_partition_columns : aggregate_columns;
 		if (!cols_to_store.empty()) {
 			group_cols_val = "'";
 			for (size_t i = 0; i < cols_to_store.size(); i++) {
@@ -1654,130 +1833,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Extract FULL OUTER JOIN condition: "left_table:left_col,right_table:right_col"
 		string full_outer_join_cols_val = "null";
-		if (found_full_outer) {
-			// Helper: find the table name from a LogicalGet in a subtree
-			std::function<string(LogicalOperator *)> find_table_name = [&](LogicalOperator *n) -> string {
-				if (n->type == LogicalOperatorType::LOGICAL_GET) {
-					auto *get = dynamic_cast<LogicalGet *>(n);
-					if (get && get->GetTable().get()) {
-						return get->GetTable().get()->name;
-					}
-				}
-				for (auto &child : n->children) {
-					string name = find_table_name(child.get());
-					if (!name.empty()) {
-						return name;
-					}
-				}
-				return "";
-			};
-
-			// Index projections and gets by table_index so we can resolve a BCR's binding
-			// down the tree. CTE inlining stacks projections between the join and the
-			// underlying scan; `BoundColumnRefExpression::GetName()` at the join level
-			// returns whatever alias was applied by the nearest projection (e.g. `w`
-			// from `SELECT O_W_ID AS w`), not the base column name. The refresh paths
-			// need the base name (`O_W_ID`) because they query the delta/base table.
-			std::unordered_map<idx_t, LogicalProjection *> foj_proj_by_index;
-			std::unordered_map<idx_t, LogicalGet *> foj_get_by_index;
-			std::function<void(LogicalOperator *)> foj_index_ops = [&](LogicalOperator *op) {
-				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					auto &proj = op->Cast<LogicalProjection>();
-					foj_proj_by_index[proj.table_index] = &proj;
-				} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
-					auto &get = op->Cast<LogicalGet>();
-					foj_get_by_index[get.table_index] = &get;
-				}
-				for (auto &child : op->children) {
-					foj_index_ops(child.get());
-				}
-			};
-			foj_index_ops(plan.get());
-			auto resolve_bcr_to_base = [&](BoundColumnRefExpression *bcr) -> string {
-				idx_t tidx = bcr->binding.table_index;
-				idx_t cidx = bcr->binding.column_index;
-				for (int depth = 0; depth < 16; depth++) {
-					auto get_it = foj_get_by_index.find(tidx);
-					if (get_it != foj_get_by_index.end()) {
-						auto *get = get_it->second;
-						// column_ids[cidx] maps the scan's cidx-th output to the base column
-						// index; fall back to `names[cidx]` when column_ids is unset.
-						auto &ids = get->GetColumnIds();
-						if (cidx < ids.size() && get->GetTable().get()) {
-							auto base_idx = ids[cidx].GetPrimaryIndex();
-							auto &cols = get->GetTable().get()->GetColumns();
-							if (base_idx < cols.LogicalColumnCount()) {
-								return cols.GetColumn(LogicalIndex(base_idx)).Name();
-							}
-						}
-						if (cidx < get->names.size()) {
-							return get->names[cidx];
-						}
-						return "";
-					}
-					auto proj_it = foj_proj_by_index.find(tidx);
-					if (proj_it == foj_proj_by_index.end()) {
-						return "";
-					}
-					auto *proj = proj_it->second;
-					if (cidx >= proj->expressions.size()) {
-						return "";
-					}
-					auto &expr = proj->expressions[cidx];
-					if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-						// Computed expression — fall back to its alias.
-						return expr->alias.empty() ? expr->GetName() : expr->alias;
-					}
-					auto &next = expr->Cast<BoundColumnRefExpression>();
-					tidx = next.binding.table_index;
-					cidx = next.binding.column_index;
-				}
-				return "";
-			};
-
-			std::function<void(LogicalOperator *)> extract_foj_cols = [&](LogicalOperator *n) {
-				if (full_outer_join_cols_val != "null") {
-					return;
-				}
-				if (n->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-					auto *join = dynamic_cast<LogicalComparisonJoin *>(n);
-					if (join && join->join_type == JoinType::OUTER && !join->conditions.empty()) {
-						auto &left_expr = join->conditions[0].left;
-						auto &right_expr = join->conditions[0].right;
-						string left_col_name, right_col_name;
-						if (left_expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-							auto *lref = dynamic_cast<BoundColumnRefExpression *>(left_expr.get());
-							if (lref) {
-								left_col_name = resolve_bcr_to_base(lref);
-								if (left_col_name.empty()) {
-									left_col_name = lref->GetName();
-								}
-							}
-						}
-						if (right_expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-							auto *rref = dynamic_cast<BoundColumnRefExpression *>(right_expr.get());
-							if (rref) {
-								right_col_name = resolve_bcr_to_base(rref);
-								if (right_col_name.empty()) {
-									right_col_name = rref->GetName();
-								}
-							}
-						}
-						// Get table names from each side of the join
-						string left_table = !join->children.empty() ? find_table_name(join->children[0].get()) : "";
-						string right_table = join->children.size() > 1 ? find_table_name(join->children[1].get()) : "";
-						if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() &&
-						    !right_table.empty()) {
-							string val = left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
-							full_outer_join_cols_val = "'" + OpenIVMUtils::EscapeSingleQuotes(val) + "'";
-						}
-					}
-				}
-				for (auto &child : n->children) {
-					extract_foj_cols(child.get());
-				}
-			};
-			extract_foj_cols(plan.get());
+		if (classification.found_full_outer) {
+			string foj_cols = ExtractFullOuterJoinMetadata(plan.get());
+			if (!foj_cols.empty()) {
+				full_outer_join_cols_val = "'" + OpenIVMUtils::EscapeSingleQuotes(foj_cols) + "'";
+			}
 		}
 
 		// 9 trailing NULLs: 8 matcher metadata columns + distinct_aux_meta_json.
@@ -1787,9 +1847,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// recognised the DISTINCT shape.
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
-		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
-		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
-		              (found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
+		              (classification.found_minmax ? "true" : "false") + ", " +
+		              (classification.found_left_join ? "true" : "false") + ", now(), " + refresh_val + ", false, " +
+		              group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
+		              (classification.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
 		              ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
 
 		Value match_flag_val;
@@ -1859,35 +1920,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			                    cols_csv;
 			ddl.push_back(aux_create);
 			// Build a JSON metadata blob that the refresh-time compile reads back.
-			auto json_quote = [](const string &s) {
-				string out = "\"";
-				for (char c : s) {
-					if (c == '"' || c == '\\') {
-						out += '\\';
-						out += c;
-					} else if (c == '\n') {
-						out += "\\n";
-					} else {
-						out += c;
-					}
-				}
-				out += "\"";
-				return out;
-			};
 			string cols_json = "[";
 			for (size_t i = 0; i < distinct_extracted_cols.size(); i++) {
 				if (i > 0) {
 					cols_json += ",";
 				}
-				cols_json += json_quote(distinct_extracted_cols[i]);
+				cols_json += JsonQuote(distinct_extracted_cols[i]);
 			}
 			cols_json += "]";
-			string meta_json = "{\"aux_table\":" + json_quote(aux_table) + ",\"cols\":" + cols_json +
-			                   ",\"input_sql\":" + json_quote(distinct_extracted_input_sql) +
-			                   ",\"source\":" + json_quote(distinct_extracted_source) +
-			                   ",\"filter\":" + json_quote(distinct_extracted_filter) +
-			                   ",\"sum_arg\":" + json_quote(distinct_sum_arg) +
-			                   ",\"sum_out\":" + json_quote(distinct_sum_out) + "}";
+			string meta_json = "{\"aux_table\":" + JsonQuote(aux_table) + ",\"cols\":" + cols_json +
+			                   ",\"input_sql\":" + JsonQuote(distinct_extracted_input_sql) +
+			                   ",\"source\":" + JsonQuote(distinct_extracted_source) +
+			                   ",\"filter\":" + JsonQuote(distinct_extracted_filter) +
+			                   ",\"sum_arg\":" + JsonQuote(distinct_sum_arg) +
+			                   ",\"sum_out\":" + JsonQuote(distinct_sum_out) + "}";
 			ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET distinct_aux_meta_json = '" +
 			              OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
 			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
@@ -1899,43 +1945,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Catalog::GetEntry inside BeginTransaction() cannot see DuckLake entries:
 		// DuckLake requires its own transaction protocol. Walk the logical plan's
 		// DUCKLAKE_SCAN nodes instead — same approach used in ducklake_join.cpp.
-		struct DuckLakeTableInfo {
-			string table_name;   // actual name as stored in DuckLake (case-preserved)
-			string catalog_name; // DuckLake catalog name (e.g., "dl")
-		};
-		unordered_map<string, DuckLakeTableInfo> dl_table_info; // keyed by lowercased name
-		{
-			std::function<void(LogicalOperator *)> collect_dl = [&](LogicalOperator *op) {
-				if (!op) {
-					return;
-				}
-				if (op->type == LogicalOperatorType::LOGICAL_GET) {
-					auto &get = op->Cast<LogicalGet>();
-					if (get.function.name == "ducklake_scan" && get.function.function_info) {
-						auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
-						string lc = info.table_name;
-						std::transform(lc.begin(), lc.end(), lc.begin(),
-						               [](unsigned char c) { return std::tolower(c); });
-						if (dl_table_info.find(lc) == dl_table_info.end()) {
-							// Always pull the catalog from the DuckLakeTableEntry — it's the
-							// one the `dl.ORDER_LINE` reference actually resolved to. Falling
-							// back to `current_catalog` is wrong for cross-system MVs (native
-							// MV reading from dl.*) because `current_catalog` is the physical
-							// default, not the DuckLake catalog.
-							string cat = info.table.ParentCatalog().GetName();
-							if (cat.empty()) {
-								cat = current_catalog.empty() ? "dl" : current_catalog;
-							}
-							dl_table_info[lc] = {info.table_name, cat};
-						}
-					}
-				}
-				for (auto &child : op->children) {
-					collect_dl(child.get());
-				}
-			};
-			collect_dl(plan.get());
-		}
+		unordered_map<string, OpenIVMDuckLakeTableInfo> dl_table_info; // keyed by lowercased name
+		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info);
 
 		unordered_set<string> ducklake_tables;
 		// Single snapshot query per DuckLake catalog (all tables share the same snapshot).

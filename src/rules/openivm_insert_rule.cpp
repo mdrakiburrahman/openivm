@@ -39,8 +39,8 @@
 
 namespace duckdb {
 
-// TODO: Remove PAC coupling — delta writes should not need to know about PAC.
-// Disable PAC extension checks if loaded (prevents PAC from interfering with delta writes).
+// PAC compatibility boundary: delta writes run through a fresh connection, so
+// disable PAC checks when that extension is loaded in the caller session.
 static void DisablePACIfLoaded(ClientContext &context, Connection &con) {
 	Value pac_val;
 	if (context.TryGetCurrentSetting("pac_check", pac_val)) {
@@ -75,6 +75,59 @@ static string BuildDeltaInsertPrefix(const string &full_delta_table_name, TableC
 static string BuildDeltaSelectFrom(TableCatalogEntry &delta_entry, const string &mul_val, const string &source) {
 	string cols = BuildDeltaDataColumns(delta_entry);
 	return "SELECT " + cols + ", " + mul_val + ", now()::timestamp FROM " + source;
+}
+
+static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, const string &col_name) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto tbl = get.GetTable();
+		if (tbl.get() && tbl->name == table_name) {
+			for (auto &cid : get.GetColumnIds()) {
+				if (get.GetColumnName(cid) == col_name) {
+					return true;
+				}
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		if (PlanReferencesColumn(*child, table_name, col_name)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string FindMVReferencingColumn(Connection &con, const string &delta_name, const string &table_name,
+                                      const string &col_name) {
+	IVMMetadata metadata(con);
+	auto mvs = con.Query("SELECT DISTINCT d.view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	                     " d WHERE d.table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+	if (mvs->HasError()) {
+		return "";
+	}
+	for (size_t i = 0; i < mvs->RowCount(); i++) {
+		string view_name = mvs->GetValue(0, i).ToString();
+		string sql = metadata.GetViewQuery(view_name);
+		if (sql.empty()) {
+			continue;
+		}
+		try {
+			con.BeginTransaction();
+			Parser p;
+			p.ParseQuery(sql);
+			Planner planner(*con.context);
+			planner.CreatePlan(p.statements[0]->Copy());
+			auto view_plan = std::move(planner.plan);
+			con.Rollback();
+
+			if (PlanReferencesColumn(*view_plan, table_name, col_name)) {
+				return view_name;
+			}
+		} catch (...) {
+			con.Rollback();
+		}
+	}
+	return "";
 }
 
 IVMInsertRule::IVMInsertRule() {
@@ -190,61 +243,6 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			return; // not an IVM-tracked table
 		}
 
-		// Helper: check if a column is referenced by any MV that depends on this base table.
-		// Plans each MV's stored query and walks LOGICAL_GET nodes for the target table.
-		auto column_referenced_by_mv = [&](const string &col_name) -> string {
-			IVMMetadata metadata(con);
-			auto mvs = con.Query("SELECT DISTINCT d.view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
-			                     " d WHERE d.table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
-			if (mvs->HasError()) {
-				return "";
-			}
-			for (size_t i = 0; i < mvs->RowCount(); i++) {
-				string view_name = mvs->GetValue(0, i).ToString();
-				string sql = metadata.GetViewQuery(view_name);
-				if (sql.empty()) {
-					continue;
-				}
-				try {
-					con.BeginTransaction();
-					Parser p;
-					p.ParseQuery(sql);
-					Planner planner(*con.context);
-					planner.CreatePlan(p.statements[0]->Copy());
-					auto view_plan = std::move(planner.plan);
-					con.Rollback();
-
-					// Walk the plan tree looking for LOGICAL_GET on the target table
-					std::function<bool(LogicalOperator &)> check_plan = [&](LogicalOperator &op) -> bool {
-						if (op.type == LogicalOperatorType::LOGICAL_GET) {
-							auto &get = op.Cast<LogicalGet>();
-							auto tbl = get.GetTable();
-							if (tbl.get() && tbl->name == table_name) {
-								for (auto &cid : get.GetColumnIds()) {
-									if (get.GetColumnName(cid) == col_name) {
-										return true;
-									}
-								}
-							}
-						}
-						for (auto &child : op.children) {
-							if (check_plan(*child)) {
-								return true;
-							}
-						}
-						return false;
-					};
-
-					if (check_plan(*view_plan)) {
-						return view_name;
-					}
-				} catch (...) {
-					con.Rollback();
-				}
-			}
-			return "";
-		};
-
 		switch (alter_info->alter_table_type) {
 		case AlterTableType::ADD_COLUMN: {
 			auto *add_info = dynamic_cast<AddColumnInfo *>(alter_info);
@@ -264,7 +262,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				break;
 			}
 			string col_name = remove_info->removed_column;
-			string referencing_mv = column_referenced_by_mv(col_name);
+			string referencing_mv = FindMVReferencingColumn(con, delta_name, table_name, col_name);
 			if (!referencing_mv.empty()) {
 				throw CatalogException("Cannot drop column '" + col_name +
 				                       "': it is referenced by materialized view '" + referencing_mv +
@@ -282,7 +280,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			}
 			string old_name = rename_info->old_name;
 			string new_name = rename_info->new_name;
-			string referencing_mv = column_referenced_by_mv(old_name);
+			string referencing_mv = FindMVReferencingColumn(con, delta_name, table_name, old_name);
 			if (!referencing_mv.empty()) {
 				throw CatalogException("Cannot rename column '" + old_name +
 				                       "': it is referenced by materialized view '" + referencing_mv +

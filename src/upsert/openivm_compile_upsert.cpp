@@ -48,6 +48,10 @@ static string BuildNullSafeMatch(const vector<string> &columns, const string &lh
 	return result;
 }
 
+static string BuildUpdatedAggregateColumn(const string &col) {
+	return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
+}
+
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
 /// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
 /// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the function type:
@@ -471,11 +475,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	auto &d_sum_sq_cols = decomp.sum_sq_cols;
 	auto &d_count_cols = decomp.count_cols;
 
-	// Helper: generate SQL to compute updated SUM from MERGE (COALESCE handles NULLs)
-	auto updated_col = [](const string &col) -> string {
-		return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
-	};
-
 	// Detect _ivm_match_count for LEFT JOIN incremental MERGE (Larson & Zhou).
 	// When present, use COALESCE(v.col, 0) for aggregate updates to handle NULL→value transitions.
 	string match_count_col;
@@ -509,7 +508,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				string sum_col = d_sum_cols.count(column) ? d_sum_cols.at(column) : "";
 				string count_col = d_count_cols.count(column) ? d_count_cols.at(column) : "";
 				if (sum_col.empty() || count_col.empty()) {
-					update_set += column + " = " + updated_col(column);
+					update_set += column + " = " + BuildUpdatedAggregateColumn(column);
 					insert_vals += "d." + column;
 					continue;
 				}
@@ -523,9 +522,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 					// INSERT+DELETE on flat-valued data where floating-point reassociation
 					// of (sum_sq - sum²/count) drifts below zero — crashing the refresh.
 					string sum_sq_col = d_sum_sq_cols.at(column);
-					string new_sum = updated_col(sum_col);
-					string new_sq = updated_col(sum_sq_col);
-					string new_n = updated_col(count_col);
+					string new_sum = BuildUpdatedAggregateColumn(sum_col);
+					string new_sq = BuildUpdatedAggregateColumn(sum_sq_col);
+					string new_n = BuildUpdatedAggregateColumn(count_col);
 					bool is_pop = decomp.is_population.count(column) && decomp.is_population.at(column);
 					bool do_sqrt = decomp.needs_sqrt.count(column) && decomp.needs_sqrt.at(column);
 					int threshold = is_pop ? 0 : 1;
@@ -548,8 +547,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 					               d_formula + " ELSE NULL END";
 				} else {
 					// AVG
-					update_set +=
-					    column + " = " + updated_col(sum_col) + "::DOUBLE / NULLIF(" + updated_col(count_col) + ", 0)";
+					update_set += column + " = " + BuildUpdatedAggregateColumn(sum_col) + "::DOUBLE / NULLIF(" +
+					              BuildUpdatedAggregateColumn(count_col) + ", 0)";
 					insert_vals += "d." + sum_col + "::DOUBLE / NULLIF(d." + count_col + ", 0)";
 				}
 			} else {
@@ -563,7 +562,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 					update_set += column + " = list_transform(list_zip(v." + column + ", d." + column +
 					              "), lambda x: x[1] + x[2])";
 				} else {
-					update_set += column + " = " + updated_col(column);
+					update_set += column + " = " + BuildUpdatedAggregateColumn(column);
 				}
 				insert_vals += "d." + column;
 			}
@@ -612,7 +611,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
 			if (agg_type == "count_star") {
 				// Left-side-driven: always update normally.
-				lj_update_set += col + " = " + updated_col(col);
+				lj_update_set += col + " = " + BuildUpdatedAggregateColumn(col);
 				continue;
 			}
 			// Determine if this column should be 0 (count-like) or NULL (sum-like) when unmatched.
@@ -632,8 +631,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			//     data is gone; reset to null_val. This remains imperfect for folded projections
 			//     (a transitioning group whose stored COALESCE'd column was 0 resets to NULL)
 			//     — a known limitation.
-			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + updated_col(col) + " WHEN COALESCE(v." +
-			                 match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val + " END";
+			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + BuildUpdatedAggregateColumn(col) +
+			                 " WHEN COALESCE(v." + match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val +
+			                 " END";
 		}
 		// INSERT values: mirror the UPDATE classification above.
 		//   count_star → d.count_star (always, no CASE)
