@@ -134,6 +134,21 @@ static bool HasUnionBeforeAggregate(const LogicalOperator *op, bool seen_agg_abo
 	return false;
 }
 
+static bool HasUnsupportedSetOperation(const LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_INTERSECT || op->type == LogicalOperatorType::LOGICAL_EXCEPT) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (HasUnsupportedSetOperation(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static LogicalProjection *FindFirstProjection(LogicalOperator *op) {
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		return &op->Cast<LogicalProjection>();
@@ -1082,6 +1097,112 @@ static string LastIdentifierPart(string ident) {
 	return ident;
 }
 
+static size_t FindTopLevelKeywordToken(const string &text, const string &keyword, size_t from) {
+	bool in_quote = false;
+	int depth = 0;
+	for (size_t i = from; i < text.size(); i++) {
+		char c = text[i];
+		if (in_quote) {
+			if (c == '\'') {
+				in_quote = false;
+			}
+			continue;
+		}
+		if (c == '\'') {
+			in_quote = true;
+			continue;
+		}
+		if (c == '(') {
+			depth++;
+			continue;
+		}
+		if (c == ')') {
+			if (depth > 0) {
+				depth--;
+			}
+			continue;
+		}
+		if (depth == 0 && StartsKeywordToken(text, i, keyword)) {
+			return i;
+		}
+	}
+	return string::npos;
+}
+
+static size_t FindMatchingParen(const string &text, size_t open_pos) {
+	if (open_pos >= text.size() || text[open_pos] != '(') {
+		return string::npos;
+	}
+	bool in_quote = false;
+	int depth = 0;
+	for (size_t i = open_pos; i < text.size(); i++) {
+		char c = text[i];
+		if (in_quote) {
+			if (c == '\'') {
+				in_quote = false;
+			}
+			continue;
+		}
+		if (c == '\'') {
+			in_quote = true;
+			continue;
+		}
+		if (c == '(') {
+			depth++;
+		} else if (c == ')') {
+			depth--;
+			if (depth == 0) {
+				return i;
+			}
+		}
+	}
+	return string::npos;
+}
+
+static bool ParseSelectOutputColumns(const string &original_sql, size_t select_pos, size_t from_pos,
+                                     vector<string> &output_cols) {
+	string select_list = original_sql.substr(select_pos + strlen("select"), from_pos - (select_pos + strlen("select")));
+	int depth = 0;
+	size_t last = 0;
+	for (size_t i = 0; i < select_list.size(); i++) {
+		if (select_list[i] == '(') {
+			depth++;
+		} else if (select_list[i] == ')') {
+			depth--;
+		} else if (depth == 0 && select_list[i] == ',') {
+			string col = LastIdentifierPart(select_list.substr(last, i - last));
+			if (col.empty() || col == "*") {
+				return false;
+			}
+			output_cols.push_back(std::move(col));
+			last = i + 1;
+		}
+	}
+	string col = LastIdentifierPart(select_list.substr(last));
+	if (col.empty() || col == "*") {
+		return false;
+	}
+	output_cols.push_back(std::move(col));
+	return true;
+}
+
+static string TrimAndConjunctions(string expr) {
+	StringUtil::Trim(expr);
+	string lower = StringUtil::Lower(expr);
+	if (lower.rfind("and ", 0) == 0) {
+		expr = expr.substr(strlen("and "));
+		StringUtil::Trim(expr);
+		lower = StringUtil::Lower(expr);
+	}
+	static const string and_suffix = " and";
+	if (lower.size() >= and_suffix.size() &&
+	    lower.compare(lower.size() - and_suffix.size(), and_suffix.size(), and_suffix) == 0) {
+		expr = expr.substr(0, expr.size() - and_suffix.size());
+		StringUtil::Trim(expr);
+	}
+	return expr;
+}
+
 static bool ExtractSemiAntiJoin(const string &original_sql, SemiAntiExtract &out) {
 	string lower = StringUtil::Lower(original_sql);
 	size_t semi_pos = FindKeywordToken(lower, "semi join", 0);
@@ -1105,29 +1226,10 @@ static bool ExtractSemiAntiJoin(const string &original_sql, SemiAntiExtract &out
 		return false;
 	}
 
-	string select_list = original_sql.substr(select_pos + strlen("select"), from_pos - (select_pos + strlen("select")));
 	vector<string> output_cols;
-	int depth = 0;
-	size_t last = 0;
-	for (size_t i = 0; i < select_list.size(); i++) {
-		if (select_list[i] == '(') {
-			depth++;
-		} else if (select_list[i] == ')') {
-			depth--;
-		} else if (depth == 0 && select_list[i] == ',') {
-			string col = LastIdentifierPart(select_list.substr(last, i - last));
-			if (col.empty() || col == "*") {
-				return false;
-			}
-			output_cols.push_back(std::move(col));
-			last = i + 1;
-		}
-	}
-	string col = LastIdentifierPart(select_list.substr(last));
-	if (col.empty() || col == "*") {
+	if (!ParseSelectOutputColumns(original_sql, select_pos, from_pos, output_cols)) {
 		return false;
 	}
-	output_cols.push_back(std::move(col));
 
 	size_t pos = from_pos + strlen("from");
 	if (!ReadIdentifierToken(original_sql, pos, out.left_table)) {
@@ -1203,6 +1305,129 @@ static bool ExtractSemiAntiJoin(const string &original_sql, SemiAntiExtract &out
 	}
 	out.output_cols = std::move(output_cols);
 	return true;
+}
+
+static bool ExtractExistsSubquery(const string &original_sql, SemiAntiExtract &out) {
+	string lower = StringUtil::Lower(original_sql);
+	size_t select_pos = FindKeywordToken(lower, "select", 0);
+	size_t from_pos = FindTopLevelKeywordToken(lower, "from", select_pos == string::npos ? 0 : select_pos);
+	if (select_pos == string::npos || from_pos == string::npos || select_pos > from_pos) {
+		return false;
+	}
+
+	vector<string> output_cols;
+	if (!ParseSelectOutputColumns(original_sql, select_pos, from_pos, output_cols)) {
+		return false;
+	}
+
+	size_t pos = from_pos + strlen("from");
+	if (!ReadIdentifierToken(original_sql, pos, out.left_table)) {
+		return false;
+	}
+	size_t alias_pos = pos;
+	string maybe_alias;
+	if (ReadIdentifierToken(original_sql, alias_pos, maybe_alias)) {
+		string maybe_lower = StringUtil::Lower(maybe_alias);
+		if (maybe_lower != "where") {
+			out.left_alias = maybe_alias;
+			pos = alias_pos;
+		}
+	}
+	if (out.left_alias.empty()) {
+		out.left_alias = LastIdentifierPart(out.left_table);
+	}
+
+	size_t where_pos = FindTopLevelKeywordToken(lower, "where", pos);
+	if (where_pos == string::npos) {
+		return false;
+	}
+	string between_left_and_where = StringUtil::Lower(original_sql.substr(pos, where_pos - pos));
+	if (FindKeywordToken(between_left_and_where, "join", 0) != string::npos ||
+	    between_left_and_where.find(',') != string::npos) {
+		return false;
+	}
+
+	size_t not_exists_pos = FindTopLevelKeywordToken(lower, "not exists", where_pos);
+	size_t exists_pos = FindTopLevelKeywordToken(lower, "exists", where_pos);
+	bool is_anti = not_exists_pos != string::npos;
+	size_t exists_kw_pos = is_anti ? not_exists_pos : exists_pos;
+	if (exists_kw_pos == string::npos || (is_anti && exists_pos != string::npos && exists_pos < not_exists_pos)) {
+		return false;
+	}
+	out.join_type = is_anti ? "anti" : "semi";
+
+	size_t after_exists = exists_kw_pos + (is_anti ? strlen("not exists") : strlen("exists"));
+	while (after_exists < original_sql.size() && std::isspace(static_cast<unsigned char>(original_sql[after_exists]))) {
+		after_exists++;
+	}
+	size_t close_pos = FindMatchingParen(original_sql, after_exists);
+	if (close_pos == string::npos) {
+		return false;
+	}
+
+	string outer_filter =
+	    original_sql.substr(where_pos + strlen("where"), exists_kw_pos - (where_pos + strlen("where")));
+	outer_filter += original_sql.substr(close_pos + 1);
+	out.post_filter = TrimAndConjunctions(outer_filter);
+
+	string subquery = original_sql.substr(after_exists + 1, close_pos - after_exists - 1);
+	string sub_lower = StringUtil::Lower(subquery);
+	size_t sub_select = FindKeywordToken(sub_lower, "select", 0);
+	size_t sub_from = FindTopLevelKeywordToken(sub_lower, "from", sub_select == string::npos ? 0 : sub_select);
+	if (sub_select == string::npos || sub_from == string::npos || sub_select > sub_from) {
+		return false;
+	}
+	size_t right_pos = sub_from + strlen("from");
+	if (!ReadIdentifierToken(subquery, right_pos, out.right_table)) {
+		return false;
+	}
+	alias_pos = right_pos;
+	maybe_alias.clear();
+	if (ReadIdentifierToken(subquery, alias_pos, maybe_alias)) {
+		string maybe_lower = StringUtil::Lower(maybe_alias);
+		if (maybe_lower != "where" && maybe_lower != "group" && maybe_lower != "order" && maybe_lower != "limit") {
+			out.right_alias = maybe_alias;
+			right_pos = alias_pos;
+		}
+	}
+	if (out.right_alias.empty()) {
+		out.right_alias = LastIdentifierPart(out.right_table);
+	}
+
+	size_t sub_where = FindTopLevelKeywordToken(sub_lower, "where", right_pos);
+	string between_right_and_filter =
+	    sub_lower.substr(right_pos, (sub_where == string::npos ? sub_lower.size() : sub_where) - right_pos);
+	if (FindKeywordToken(between_right_and_filter, "join", 0) != string::npos ||
+	    between_right_and_filter.find(',') != string::npos) {
+		return false;
+	}
+	if (sub_where == string::npos) {
+		out.predicate = "true";
+	} else {
+		size_t pred_start = sub_where + strlen("where");
+		size_t pred_end = subquery.size();
+		for (auto kw : {"group", "order", "limit", "union"}) {
+			size_t kw_pos = FindTopLevelKeywordToken(sub_lower, kw, pred_start);
+			if (kw_pos != string::npos) {
+				pred_end = std::min(pred_end, kw_pos);
+			}
+		}
+		out.predicate = subquery.substr(pred_start, pred_end - pred_start);
+		StringUtil::Trim(out.predicate);
+	}
+	if (out.predicate.empty()) {
+		return false;
+	}
+	out.output_cols = std::move(output_cols);
+	return true;
+}
+
+static bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &out) {
+	string lower = StringUtil::Lower(original_sql);
+	if (FindTopLevelKeywordToken(lower, "union", 0) != string::npos) {
+		return false;
+	}
+	return ExtractSemiAntiJoin(original_sql, out) || ExtractExistsSubquery(original_sql, out);
 }
 
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
@@ -1690,6 +1915,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		auto aggregate_types = std::move(analysis.aggregate_types);
 		auto window_partition_columns = std::move(analysis.window_partition_columns);
+		for (idx_t i = 0; i < window_partition_columns.size(); i++) {
+			idx_t output_idx = i < analysis.window_partition_column_indexes.size()
+			                       ? analysis.window_partition_column_indexes[i]
+			                       : DConstants::INVALID_INDEX;
+			if (output_idx != DConstants::INVALID_INDEX && output_idx < output_names.size() &&
+			    !output_names[output_idx].empty()) {
+				window_partition_columns[i] = output_names[output_idx] + "=" + window_partition_columns[i];
+			}
+		}
 
 		// Fallback group-key extraction for inner-aggregate-in-join patterns.
 		// When the top-level SELECT joins against a subquery/CTE that performs GROUP BY,
@@ -1808,12 +2042,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		SemiAntiExtract semi_anti_extract;
 		vector<string> semi_anti_left_cols;
 
-		if (!classification.ivm_compatible) {
-			ivm_type = IVMType::FULL_REFRESH;
-			Printer::Print("Warning: materialized view '" + view_name +
-			               "' uses constructs not supported for incremental maintenance. "
-			               "Full refresh will be used.");
-		} else if (classification.found_window) {
+		if (classification.found_window) {
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
 			ivm_type = IVMType::WINDOW_PARTITION;
 		} else if (classification.found_semi_anti_join && classification.found_aggregation) {
@@ -1823,7 +2052,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			ivm_type = IVMType::FULL_REFRESH;
 		} else if (classification.found_semi_anti_join && !classification.found_aggregation &&
 		           !classification.found_distinct) {
-			if (ExtractSemiAntiJoin(original_view_query, semi_anti_extract)) {
+			if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
 				string left_table_name = LastIdentifierPart(semi_anti_extract.left_table);
 				auto col_result =
 				    con.Query("SELECT column_name FROM information_schema.columns WHERE table_name = '" +
@@ -1846,6 +2075,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// deltas. The parser keeps the original SQL because LPTS currently drops
 			// the grouping-set annotation.
 			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
+		} else if (!classification.ivm_compatible) {
+			ivm_type = IVMType::FULL_REFRESH;
+			Printer::Print("Warning: materialized view '" + view_name +
+			               "' uses constructs not supported for incremental maintenance. "
+			               "Full refresh will be used.");
 		} else if (classification.found_filtered_list && !aggregate_columns.empty()) {
 			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_filtered_list) {

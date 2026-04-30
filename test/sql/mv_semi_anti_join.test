@@ -300,6 +300,268 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# ============================================================
+# EXISTS / NOT EXISTS subqueries lower to SEMI/ANTI joins. These
+# should use the same aux-state path, including arbitrary correlated
+# predicates and an outer filter stacked around the subquery.
+# ============================================================
+
+statement ok
+CREATE TABLE exists_l (id INT, x INT, keep BOOLEAN);
+
+statement ok
+CREATE TABLE exists_r (rid INT, y INT, active BOOLEAN);
+
+statement ok
+INSERT INTO exists_l VALUES (1, 10, true), (1, 10, true), (2, 20, true), (3, 30, false), (4, 40, true);
+
+statement ok
+INSERT INTO exists_r VALUES (10, 8, true), (11, 20, false), (12, 99, true);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_exists_semi AS
+    SELECT l.id, l.x
+    FROM exists_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM exists_r r
+        WHERE r.active AND abs(l.x - r.y) <= 2
+    );
+
+statement ok
+CREATE MATERIALIZED VIEW mv_exists_anti AS
+    SELECT l.id, l.x
+    FROM exists_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM exists_r r
+        WHERE r.active AND abs(l.x - r.y) <= 2
+    ) AND l.keep;
+
+query I
+SELECT COUNT(*) FROM _duckdb_ivm_views
+WHERE view_name IN ('mv_exists_semi', 'mv_exists_anti') AND semi_anti_aux_meta_json IS NOT NULL;
+----
+2
+
+statement ok
+UPDATE exists_r SET active = true WHERE rid = 11;
+
+statement ok
+INSERT INTO exists_r VALUES (13, 41, true), (14, 30, true);
+
+statement ok
+DELETE FROM exists_r WHERE rid = 10;
+
+statement ok
+UPDATE exists_l SET keep = true WHERE id = 3;
+
+statement ok
+INSERT INTO exists_l VALUES (5, 50, true), (6, 40, true);
+
+statement ok
+PRAGMA ivm('mv_exists_semi');
+
+statement ok
+PRAGMA ivm('mv_exists_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x
+    FROM exists_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM exists_r r
+        WHERE r.active AND abs(l.x - r.y) <= 2
+    )
+    EXCEPT ALL SELECT id, x FROM mv_exists_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_exists_semi
+    EXCEPT ALL
+    SELECT l.id, l.x
+    FROM exists_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM exists_r r
+        WHERE r.active AND abs(l.x - r.y) <= 2
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x
+    FROM exists_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM exists_r r
+        WHERE r.active AND abs(l.x - r.y) <= 2
+    ) AND l.keep
+    EXCEPT ALL SELECT id, x FROM mv_exists_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_exists_anti
+    EXCEPT ALL
+    SELECT l.id, l.x
+    FROM exists_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM exists_r r
+        WHERE r.active AND abs(l.x - r.y) <= 2
+    ) AND l.keep
+);
+----
+0
+
+# ============================================================
+# EXISTS / NOT EXISTS combined with other operators. Aggregates and
+# UNION ALL are outside the simple aux-state shape, so they must stay
+# correct through the fallback paths.
+# ============================================================
+
+statement ok
+CREATE TABLE combo_l (id INT, grp INT, x INT);
+
+statement ok
+CREATE TABLE combo_r (rid INT, y INT, active BOOLEAN);
+
+statement ok
+INSERT INTO combo_l VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50);
+
+statement ok
+INSERT INTO combo_r VALUES (10, 10, true), (11, 19, true), (12, 40, false);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_exists_group AS
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM combo_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM combo_r r
+        WHERE r.active AND abs(l.x - r.y) <= 1
+    )
+    GROUP BY l.grp;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_exists_union AS
+    SELECT l.id, l.x
+    FROM combo_l l
+    WHERE EXISTS (
+        SELECT 1 FROM combo_r r
+        WHERE r.active AND abs(l.x - r.y) <= 1
+    )
+    UNION ALL
+    SELECT l.id, l.x
+    FROM combo_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM combo_r r
+        WHERE r.active AND abs(l.x - r.y) <= 1
+    ) AND l.grp = 3;
+
+query I
+SELECT COUNT(*) FROM _duckdb_ivm_views
+WHERE view_name IN ('mv_exists_group', 'mv_exists_union') AND semi_anti_aux_meta_json IS NOT NULL;
+----
+0
+
+statement ok
+UPDATE combo_r SET active = true WHERE rid = 12;
+
+statement ok
+INSERT INTO combo_r VALUES (13, 31, true), (14, 50, true);
+
+statement ok
+DELETE FROM combo_r WHERE rid = 10;
+
+statement ok
+UPDATE combo_l SET x = 18 WHERE id = 3;
+
+statement ok
+INSERT INTO combo_l VALUES (6, 3, 60), (7, 1, 11);
+
+statement ok
+PRAGMA ivm('mv_exists_group');
+
+statement ok
+PRAGMA ivm('mv_exists_union');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM combo_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM combo_r r
+        WHERE r.active AND abs(l.x - r.y) <= 1
+    )
+    GROUP BY l.grp
+    EXCEPT ALL SELECT grp, cnt, total FROM mv_exists_group
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, cnt, total FROM mv_exists_group
+    EXCEPT ALL
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM combo_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM combo_r r
+        WHERE r.active AND abs(l.x - r.y) <= 1
+    )
+    GROUP BY l.grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        SELECT l.id, l.x
+        FROM combo_l l
+        WHERE EXISTS (
+            SELECT 1 FROM combo_r r
+            WHERE r.active AND abs(l.x - r.y) <= 1
+        )
+        UNION ALL
+        SELECT l.id, l.x
+        FROM combo_l l
+        WHERE NOT EXISTS (
+            SELECT 1 FROM combo_r r
+            WHERE r.active AND abs(l.x - r.y) <= 1
+        ) AND l.grp = 3
+    ) expected_union
+    EXCEPT ALL SELECT id, x FROM mv_exists_union
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_exists_union
+    EXCEPT ALL
+    SELECT * FROM (
+        SELECT l.id, l.x
+        FROM combo_l l
+        WHERE EXISTS (
+            SELECT 1 FROM combo_r r
+            WHERE r.active AND abs(l.x - r.y) <= 1
+        )
+        UNION ALL
+        SELECT l.id, l.x
+        FROM combo_l l
+        WHERE NOT EXISTS (
+            SELECT 1 FROM combo_r r
+            WHERE r.active AND abs(l.x - r.y) <= 1
+        ) AND l.grp = 3
+    ) expected_union
+);
+----
+0
+
 # ANTI JOIN uses the same aux table shape but the visibility transition is inverted.
 statement ok
 CREATE TABLE aaj_l (id INT, x INT);

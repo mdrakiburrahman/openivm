@@ -7,6 +7,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -90,6 +91,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_GET:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
+	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
 	case LogicalOperatorType::LOGICAL_UNNEST:
 		break;
@@ -154,6 +156,8 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
 		result.found_join = true;
@@ -161,10 +165,12 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		if (join) {
 			if (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
 			    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
-			    join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI) {
+			    join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI &&
+			    join->join_type != JoinType::MARK) {
 				result.ivm_compatible = false;
 			}
-			if (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI) {
+			if (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
+			    join->join_type == JoinType::MARK) {
 				result.found_semi_anti_join = true;
 			}
 			if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
