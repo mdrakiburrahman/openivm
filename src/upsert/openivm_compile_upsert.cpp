@@ -15,6 +15,39 @@ static string Q(const string &name) {
 	return OpenIVMUtils::QuoteIdentifier(name);
 }
 
+static string JoinQuotedColumns(const vector<string> &columns) {
+	string result;
+	for (size_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += Q(columns[i]);
+	}
+	return result;
+}
+
+static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias) {
+	string result;
+	for (size_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += alias + "." + Q(columns[i]);
+	}
+	return result;
+}
+
+static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
+	string result;
+	for (size_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " AND ";
+		}
+		result += lhs_alias + "." + Q(columns[i]) + " IS NOT DISTINCT FROM " + rhs_alias + "." + Q(columns[i]);
+	}
+	return result;
+}
+
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
 /// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
 /// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the function type:
@@ -889,14 +922,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
 	}
 
-	// Quoted, comma-separated GROUP BY column list (used in SELECT DISTINCT and EXISTS).
-	string group_csv;
-	for (size_t i = 0; i < group_columns.size(); i++) {
-		if (i > 0) {
-			group_csv += ", ";
-		}
-		group_csv += Q(group_columns[i]);
-	}
+	string group_csv = JoinQuotedColumns(group_columns);
 
 	// For each source table T_i, build a "view query restricted to T_i's delta" variant by
 	// substituting the qualified `cat.schema.<base>` reference with a delta-filtered subquery,
@@ -933,14 +959,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	// EXISTS-based, NULL-safe match (IS NOT DISTINCT FROM). DuckDB inlines the subquery into both
 	// the DELETE and the INSERT — the affected-keys set is computed once per usage in practice but
 	// the planner can fuse them; if profiling shows this is hot, materialize to a TEMP TABLE first.
-	string match_clause;
-	for (size_t i = 0; i < group_columns.size(); i++) {
-		if (i > 0) {
-			match_clause += " AND ";
-		}
-		string col = Q(group_columns[i]);
-		match_clause += "_ivm_aff." + col + " IS NOT DISTINCT FROM _ivm_tgt." + col;
-	}
+	string match_clause = BuildNullSafeMatch(group_columns, "_ivm_aff", "_ivm_tgt");
 	string aff_block = "(\n" + affected_subquery + "\n)";
 
 	string delete_query = "DELETE FROM " + data_table + " AS _ivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + aff_block +
@@ -969,45 +988,10 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	string sum_out_q = Q(sum_out);
 	string count_q = Q(count_star_col);
 
-	// Quoted comma-separated lists.
-	auto join_quoted = [](const vector<string> &cols) {
-		string s;
-		for (size_t i = 0; i < cols.size(); i++) {
-			if (i > 0) {
-				s += ", ";
-			}
-			s += Q(cols[i]);
-		}
-		return s;
-	};
-	auto join_quoted_prefixed = [](const vector<string> &cols, const string &alias) {
-		string s;
-		for (size_t i = 0; i < cols.size(); i++) {
-			if (i > 0) {
-				s += ", ";
-			}
-			s += alias + "." + Q(cols[i]);
-		}
-		return s;
-	};
-	string distinct_cols_csv = join_quoted(distinct_cols);
-	string distinct_cols_csv_i = join_quoted_prefixed(distinct_cols, "i"); // qualified for ddist SELECT
-	string group_cols_csv = join_quoted(group_columns);
-
-	// `IS NOT DISTINCT FROM` predicates so NULL columns match — distinct_cols can include
-	// NULL-bearing columns and we must treat (NULL, x) as the same tuple across refreshes.
-	auto build_match = [](const vector<string> &cols, const string &lhs_alias, const string &rhs_alias) {
-		string out;
-		for (size_t i = 0; i < cols.size(); i++) {
-			if (i > 0) {
-				out += " AND ";
-			}
-			out += lhs_alias + "." + Q(cols[i]) + " IS NOT DISTINCT FROM " + rhs_alias + "." + Q(cols[i]);
-		}
-		return out;
-	};
-	// aux match uses `_aux` alias (built inline below to avoid clashing with column names).
-	string mv_match = build_match(group_columns, "v", "d");
+	string distinct_cols_csv = JoinQuotedColumns(distinct_cols);
+	string distinct_cols_csv_i = JoinQualifiedQuotedColumns(distinct_cols, "i");
+	string group_cols_csv = JoinQuotedColumns(group_columns);
+	string mv_match = BuildNullSafeMatch(group_columns, "v", "d");
 
 	// Δinput temp table — `_ivm_dinput_<view>`. Each row is a distinct tuple plus its net
 	// multiplicity change since last refresh. CREATE OR REPLACE so the previous refresh's
@@ -1030,16 +1014,7 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	// We multiply this ±1 by sum_arg to derive the parent-aggregate delta per (group_cols).
 	// Use `_aux` (not `c`) as the LEFT-JOIN alias so it can't collide with a distinct
 	// column literally called `c` (which is a normal column name in user schemas).
-	string aux_match_aliased;
-	{
-		// Rebuild the aux match with the renamed alias.
-		for (size_t i = 0; i < distinct_cols.size(); i++) {
-			if (i > 0) {
-				aux_match_aliased += " AND ";
-			}
-			aux_match_aliased += "_aux." + Q(distinct_cols[i]) + " IS NOT DISTINCT FROM i." + Q(distinct_cols[i]);
-		}
-	}
+	string aux_match_aliased = BuildNullSafeMatch(distinct_cols, "_aux", "i");
 	string ddist_cte =
 	    "WITH ddist AS (\n  SELECT " + distinct_cols_csv_i +
 	    ", CASE WHEN COALESCE(_aux._count, 0) = 0 AND i.dmult > 0 THEN 1 "
