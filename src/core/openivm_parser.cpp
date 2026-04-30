@@ -79,6 +79,178 @@ static string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limi
 	return sql;
 }
 
+static bool PlanContainsCte(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_CTE_REF || op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (PlanContainsCte(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void RelaxMaterializedCtes(LogicalOperator *op) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		auto &cte = op->Cast<LogicalMaterializedCTE>();
+		if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
+			cte.materialize = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
+		}
+	}
+	for (auto &child : op->children) {
+		RelaxMaterializedCtes(child.get());
+	}
+}
+
+static void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	if (!PlanContainsCte(plan.get())) {
+		return;
+	}
+	RelaxMaterializedCtes(plan.get());
+	Optimizer cte_opt(binder, context);
+	CTEInlining cte_inlining(cte_opt);
+	plan = cte_inlining.Optimize(std::move(plan));
+}
+
+static bool HasUnionBeforeAggregate(const LogicalOperator *op, bool seen_agg_above = false) {
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		seen_agg_above = true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_UNION && !seen_agg_above) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (HasUnionBeforeAggregate(child.get(), seen_agg_above)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static LogicalProjection *FindFirstProjection(LogicalOperator *op) {
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		return &op->Cast<LogicalProjection>();
+	}
+	for (auto &child : op->children) {
+		auto *projection = FindFirstProjection(child.get());
+		if (projection) {
+			return projection;
+		}
+	}
+	return nullptr;
+}
+
+static LogicalComparisonJoin *FindFirstComparisonJoin(LogicalOperator *op) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return &op->Cast<LogicalComparisonJoin>();
+	}
+	for (auto &child : op->children) {
+		auto *join = FindFirstComparisonJoin(child.get());
+		if (join) {
+			return join;
+		}
+	}
+	return nullptr;
+}
+
+static void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
+                             unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols) {
+	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		return;
+	}
+	auto &bcr = expr->Cast<BoundColumnRefExpression>();
+	join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
+}
+
+static bool IsPurePassThroughExpression(const Expression *expr) {
+	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+		return true;
+	}
+	if (expr->expression_class == ExpressionClass::BOUND_CAST) {
+		auto &cast = expr->Cast<BoundCastExpression>();
+		return IsPurePassThroughExpression(cast.child.get());
+	}
+	return false;
+}
+
+static bool ExpressionReferencesNonGroupBinding(Expression *expr, idx_t group_index) {
+	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+		return bcr.binding.table_index != group_index;
+	}
+	bool refs_non_group = false;
+	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+		if (!refs_non_group && ExpressionReferencesNonGroupBinding(child.get(), group_index)) {
+			refs_non_group = true;
+		}
+	});
+	return refs_non_group;
+}
+
+static bool OuterJoinAggregateNeedsRecompute(LogicalOperator *op, idx_t group_index) {
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &agg = op->Cast<LogicalAggregate>();
+		for (auto &expr : agg.expressions) {
+			if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+				continue;
+			}
+			auto &bound = expr->Cast<BoundAggregateExpression>();
+			for (auto &child : bound.children) {
+				if (!IsPurePassThroughExpression(child.get())) {
+					return true;
+				}
+			}
+		}
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = op->Cast<LogicalProjection>();
+		for (auto &expr : proj.expressions) {
+			if (!IsPurePassThroughExpression(expr.get()) &&
+			    ExpressionReferencesNonGroupBinding(expr.get(), group_index)) {
+				return true;
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		if (OuterJoinAggregateNeedsRecompute(child.get(), group_index)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void CountCteRefsUnderJoin(const LogicalOperator *op, bool under_join, std::map<idx_t, int> &cte_ref_count) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
+	    op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		under_join = true;
+	}
+	if (under_join && op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &cte_ref = op->Cast<LogicalCTERef>();
+		cte_ref_count[cte_ref.cte_index]++;
+	}
+	for (auto &child : op->children) {
+		CountCteRefsUnderJoin(child.get(), under_join, cte_ref_count);
+	}
+}
+
+static bool HasRepeatedCteRefUnderJoin(const LogicalOperator *plan) {
+	std::map<idx_t, int> cte_ref_count;
+	CountCteRefsUnderJoin(plan, false, cte_ref_count);
+	for (auto &entry : cte_ref_count) {
+		if (entry.second >= 2) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /// Extract a `(SELECT DISTINCT cols FROM source [WHERE p])` subquery from the
 /// user's CREATE-MV SQL. Single-source v0 — succeeds only for the simple shape
 /// where the DISTINCT body has exactly one base table after FROM (joins/CTEs
@@ -559,43 +731,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// walks see the folded structure. DuckDB's binder defaults to
 		// CTE_MATERIALIZE_ALWAYS, which makes CTEInlining bail — relax to DEFAULT first.
 		// (The SELECT-only `select_plan` below does the same for LPTS serialization.)
-		{
-			std::function<bool(LogicalOperator *)> has_cte = [&](LogicalOperator *op) {
-				if (!op) {
-					return false;
-				}
-				if (op->type == LogicalOperatorType::LOGICAL_CTE_REF ||
-				    op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-					return true;
-				}
-				for (auto &c : op->children) {
-					if (has_cte(c.get())) {
-						return true;
-					}
-				}
-				return false;
-			};
-			if (has_cte(plan.get())) {
-				std::function<void(LogicalOperator *)> relax_cte = [&](LogicalOperator *op) {
-					if (!op) {
-						return;
-					}
-					if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-						auto &cte = op->Cast<LogicalMaterializedCTE>();
-						if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
-							cte.materialize = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
-						}
-					}
-					for (auto &c : op->children) {
-						relax_cte(c.get());
-					}
-				};
-				relax_cte(plan.get());
-				Optimizer outer_cte_opt(*planner.binder, context);
-				CTEInlining outer_cte_inlining(outer_cte_opt);
-				plan = outer_cte_inlining.Optimize(std::move(plan));
-			}
-		}
+		InlineCtesIfPresent(context, *planner.binder, plan);
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
@@ -617,52 +753,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// CTE reference actually appears in the plan (the optimizer isn't always
 			// a no-op on CTE-free plans — e.g. it can rewrite DISTINCT subqueries in
 			// ways that confuse the downstream structural rewrites).
-			{
-				std::function<bool(LogicalOperator *)> has_cte = [&](LogicalOperator *op) {
-					if (!op) {
-						return false;
-					}
-					if (op->type == LogicalOperatorType::LOGICAL_CTE_REF ||
-					    op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-						return true;
-					}
-					for (auto &c : op->children) {
-						if (has_cte(c.get())) {
-							return true;
-						}
-					}
-					return false;
-				};
-				if (has_cte(select_plan.get())) {
-					// DuckDB's binder sets LogicalMaterializedCTE::materialize to
-					// CTE_MATERIALIZE_ALWAYS by default. CTEInlining bails early on ALWAYS
-					// and leaves the CTE as a materialized node. IVM can't maintain views
-					// whose plan still contains LOGICAL_CTE_REF — LPTS has no serializer
-					// for it and the refresh path has no delta-consolidation rule. Relax
-					// every CTE to CTE_MATERIALIZE_DEFAULT before inlining so CTEInlining
-					// folds them into the outer plan. Single-ref CTEs always inline; multi-
-					// ref CTEs inline when they're cheap and don't end in an aggregate that
-					// would be wastefully re-materialized.
-					std::function<void(LogicalOperator *)> relax_cte = [&](LogicalOperator *op) {
-						if (!op) {
-							return;
-						}
-						if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-							auto &cte = op->Cast<LogicalMaterializedCTE>();
-							if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
-								cte.materialize = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
-							}
-						}
-						for (auto &c : op->children) {
-							relax_cte(c.get());
-						}
-					};
-					relax_cte(select_plan.get());
-					Optimizer cte_opt(*select_planner.binder, context);
-					CTEInlining cte_inlining(cte_opt);
-					select_plan = cte_inlining.Optimize(std::move(select_plan));
-				}
-			}
+			// DuckDB's binder sets LogicalMaterializedCTE::materialize to
+			// CTE_MATERIALIZE_ALWAYS by default. CTEInlining bails early on ALWAYS
+			// and leaves the CTE as a materialized node. IVM can't maintain views
+			// whose plan still contains LOGICAL_CTE_REF — LPTS has no serializer
+			// for it and the refresh path has no delta-consolidation rule. Relax
+			// every CTE to CTE_MATERIALIZE_DEFAULT before inlining so CTEInlining
+			// folds them into the outer plan. Single-ref CTEs always inline; multi-
+			// ref CTEs inline when they're cheap and don't end in an aggregate that
+			// would be wastefully re-materialized.
+			InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 			IVMPlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
@@ -986,29 +1086,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		// Detect UNION / UNION ALL over aggregates once, shared by the group_cols block below
 		// (to skip key extraction) and the classification chain (to route to RECOMPUTE).
-		bool has_union_over_agg = false;
-		{
-			// True only when the UNION node is an ancestor of the aggregate (union-of-aggs pattern).
-			// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
-			// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
-			// `seen_agg_above` tracks whether we have passed an aggregate on the way down.
-			std::function<bool(const LogicalOperator *, bool)> union_before_agg = [&](const LogicalOperator *op,
-			                                                                          bool seen_agg_above) -> bool {
-				if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-					seen_agg_above = true;
-				}
-				if (op->type == LogicalOperatorType::LOGICAL_UNION && !seen_agg_above) {
-					return true;
-				}
-				for (auto &c : op->children) {
-					if (union_before_agg(c.get(), seen_agg_above)) {
-						return true;
-					}
-				}
-				return false;
-			};
-			has_union_over_agg = found_aggregation && union_before_agg(plan.get(), false);
-		}
+		// True only when the UNION node is an ancestor of the aggregate (union-of-aggs pattern).
+		// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
+		// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
+		bool has_union_over_agg = found_aggregation && HasUnionBeforeAggregate(plan.get());
 
 		if (distinct_at_top) {
 			aggregate_columns = std::move(analysis.aggregate_columns);
@@ -1194,48 +1275,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Use GROUP_RECOMPUTE for these views: AGGREGATE_GROUP would try to SUM pass-through
 		// attributes (e.g. W_YTD from WAREHOUSE) as if they were aggregate results.
 		if (found_join && group_count > 0 && !has_union_over_agg) {
-			// plan root is LOGICAL_CREATE_TABLE; descend to find the outermost PROJECTION
-			// (the SELECT output list) and the outermost comparison join.
-			std::function<LogicalProjection *(LogicalOperator *)> find_outer_proj =
-			    [&](LogicalOperator *op) -> LogicalProjection * {
-				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					return &op->Cast<LogicalProjection>();
-				}
-				for (auto &child : op->children) {
-					auto *p = find_outer_proj(child.get());
-					if (p) {
-						return p;
-					}
-				}
-				return nullptr;
-			};
-			std::function<LogicalComparisonJoin *(LogicalOperator *)> find_outer_join =
-			    [&](LogicalOperator *op) -> LogicalComparisonJoin * {
-				if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-					return &op->Cast<LogicalComparisonJoin>();
-				}
-				for (auto &child : op->children) {
-					auto *j = find_outer_join(child.get());
-					if (j) {
-						return j;
-					}
-				}
-				return nullptr;
-			};
-			auto *top_proj_ptr = find_outer_proj(plan.get());
-			auto *cjoin = find_outer_join(plan.get());
+			// plan root is LOGICAL_CREATE_TABLE; descend to find the SELECT output
+			// projection and outermost comparison join.
+			auto *top_proj_ptr = FindFirstProjection(plan.get());
+			auto *cjoin = FindFirstComparisonJoin(plan.get());
 			if (top_proj_ptr && cjoin) {
 				// Collect (table_index, column_index) pairs that appear in join conditions.
 				unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
 				for (auto &cond : cjoin->conditions) {
-					auto collect = [&](const unique_ptr<Expression> &side) {
-						if (side->type == ExpressionType::BOUND_COLUMN_REF) {
-							auto &bcr = side->Cast<BoundColumnRefExpression>();
-							join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
-						}
-					};
-					collect(cond.left);
-					collect(cond.right);
+					AddJoinKeyColumn(cond.left, join_key_cols);
+					AddJoinKeyColumn(cond.right, join_key_cols);
 				}
 				// Match those bindings against the top projection's output expressions.
 				auto &top_proj = *top_proj_ptr;
@@ -1296,81 +1345,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		//   query_1696/1699: SUM(COALESCE(h.H_AMOUNT, 0))
 		//   query_1746/1749: SUM(COALESCE(1, 0)), AVG(1)
 		if ((found_left_join || found_full_outer) && found_aggregation) {
-			bool needs_recompute = false;
-			std::function<bool(const Expression *)> is_pure_pass_through = [&](const Expression *expr) -> bool {
-				// A pure pass-through is a BCR or a cast of a BCR. Anything else
-				// (functions, CASE, COALESCE, arithmetic, constants) is "computed".
-				if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
-					return true;
-				}
-				if (expr->expression_class == ExpressionClass::BOUND_CAST) {
-					auto &cast = expr->Cast<BoundCastExpression>();
-					return is_pure_pass_through(cast.child.get());
-				}
-				return false;
-			};
-			std::function<void(LogicalOperator *)> walk = [&](LogicalOperator *op) {
-				if (needs_recompute) {
-					return;
-				}
-				if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-					auto &agg = op->Cast<LogicalAggregate>();
-					for (auto &expr : agg.expressions) {
-						if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-							continue;
-						}
-						auto &bound = expr->Cast<BoundAggregateExpression>();
-						// count_star() has no children — trivially safe.
-						for (auto &child : bound.children) {
-							if (!is_pure_pass_through(child.get())) {
-								needs_recompute = true;
-								return;
-							}
-						}
-					}
-				}
-				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					auto &proj = op->Cast<LogicalProjection>();
-					for (auto &expr : proj.expressions) {
-						// A projection expression over an aggregate output is
-						// "computed" if it's not a pure BCR. If its BCR refers to
-						// the AGGREGATE's table_index, it's a pass-through; any
-						// other structure (COALESCE/CASE/function over BCR) is a
-						// wrapper that breaks MERGE semantics.
-						if (!is_pure_pass_through(expr.get())) {
-							// Only flag if this expression references an
-							// aggregate output (not just a group column).
-							bool refs_agg = false;
-							std::function<void(Expression *)> check = [&](Expression *e) {
-								if (refs_agg) {
-									return;
-								}
-								if (e->type == ExpressionType::BOUND_COLUMN_REF) {
-									auto &bcr = e->Cast<BoundColumnRefExpression>();
-									// Find the AGGREGATE's binding index to compare.
-									// Conservatively flag any non-group BCR as aggregate ref.
-									if (bcr.binding.table_index != analysis.group_index) {
-										refs_agg = true;
-									}
-									return;
-								}
-								ExpressionIterator::EnumerateChildren(
-								    *e, [&](unique_ptr<Expression> &c) { check(c.get()); });
-							};
-							check(expr.get());
-							if (refs_agg) {
-								needs_recompute = true;
-								return;
-							}
-						}
-					}
-				}
-				for (auto &child : op->children) {
-					walk(child.get());
-				}
-			};
-			walk(plan.get());
-			if (needs_recompute) {
+			if (OuterJoinAggregateNeedsRecompute(plan.get(), analysis.group_index)) {
 				OPENIVM_DEBUG_PRINT(
 				    "[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper — "
 				    "using group-recompute (found_minmax=true)\n");
@@ -1391,32 +1366,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Inclusion-exclusion can't generate the right delta terms — rows for the
 		// shared scan aren't replicated across both join sides. Route to RECOMPUTE.
 		// Catches ducklake_0240 (CTE referenced twice on both sides of an INNER JOIN).
-		bool has_cte_self_join = false;
-		{
-			std::map<idx_t, int> cte_ref_count;
-			std::function<void(const LogicalOperator *, bool)> walk_cte = [&](const LogicalOperator *op,
-			                                                                  bool under_join) {
-				if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-				    op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
-				    op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
-					under_join = true;
-				}
-				if (under_join && op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
-					auto &cte_ref = op->Cast<LogicalCTERef>();
-					cte_ref_count[cte_ref.cte_index]++;
-				}
-				for (auto &c : op->children) {
-					walk_cte(c.get(), under_join);
-				}
-			};
-			walk_cte(plan.get(), false);
-			for (auto &kv : cte_ref_count) {
-				if (kv.second >= 2) {
-					has_cte_self_join = true;
-					break;
-				}
-			}
-		}
+		bool has_cte_self_join = HasRepeatedCteRefUnderJoin(plan.get());
 
 		IVMType ivm_type;
 		// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
