@@ -1,2 +1,2 @@
--- {"operators": "EXCEPT_ALL,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE", "non_incr_reason": "kw:EXCEPT_ALL"}
+-- {"operators": "EXCEPT_ALL,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE"}
 SELECT S_W_ID, S_I_ID, RANK() OVER (PARTITION BY S_W_ID ORDER BY S_QUANTITY DESC) AS rk FROM STOCK EXCEPT ALL SELECT OL_SUPPLY_W_ID, OL_I_ID, RANK() OVER (PARTITION BY OL_SUPPLY_W_ID ORDER BY OL_QUANTITY DESC) FROM ORDER_LINE;
