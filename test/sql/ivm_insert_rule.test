@@ -42,12 +42,12 @@ PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 # MV must match base table after every PRAGMA
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -62,12 +62,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -82,12 +82,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -102,12 +102,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -122,12 +122,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -142,12 +142,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -167,7 +167,7 @@ SELECT count(*) FROM mv_staff;
 0
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
@@ -182,7 +182,7 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
@@ -193,12 +193,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -213,12 +213,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -233,12 +233,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -253,12 +253,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -297,12 +297,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -317,12 +317,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -337,12 +337,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -361,12 +361,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -381,12 +381,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -404,12 +404,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -427,12 +427,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -447,12 +447,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -467,12 +467,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -487,12 +487,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -522,12 +522,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -548,12 +548,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -568,12 +568,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -598,12 +598,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -623,12 +623,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -643,12 +643,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -663,12 +663,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -686,12 +686,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -703,12 +703,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -726,12 +726,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -762,12 +762,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -794,12 +794,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -820,12 +820,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -846,12 +846,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -872,12 +872,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -898,12 +898,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -929,12 +929,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -980,12 +980,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -1006,12 +1006,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 
@@ -1037,12 +1037,12 @@ statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
 query I
-SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
 ----
 0
 
 query I
-SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
 ----
 0
 

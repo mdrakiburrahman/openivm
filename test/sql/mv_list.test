@@ -22,12 +22,26 @@ CREATE MATERIALIZED VIEW mv_list AS (
     FROM items GROUP BY grp
 );
 
-# Verify initial state (check first element of each list)
-query IR
-SELECT grp, total[1] FROM mv_list ORDER BY grp;
+# Verify initial state
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list
+    EXCEPT ALL
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+);
 ----
-1	30.0
-2	30.0
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list
+);
+----
+0
 
 # ==========================================
 # 1. Insert into existing group
@@ -39,11 +53,25 @@ INSERT INTO items VALUES (4, 2, list_transform(generate_series(1, 64), lambda x:
 statement ok
 pragma ivm('mv_list');
 
-query IR
-SELECT grp, total[1] FROM mv_list ORDER BY grp;
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list
+    EXCEPT ALL
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+);
 ----
-1	30.0
-2	70.0
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list
+);
+----
+0
 
 # ==========================================
 # 2. Insert new group
@@ -55,12 +83,25 @@ INSERT INTO items VALUES (5, 3, list_transform(generate_series(1, 64), lambda x:
 statement ok
 pragma ivm('mv_list');
 
-query IR
-SELECT grp, total[1] FROM mv_list ORDER BY grp;
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list
+    EXCEPT ALL
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+);
 ----
-1	30.0
-2	70.0
-3	50.0
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list
+);
+----
+0
 
 # ==========================================
 # 3. Delete from existing group
@@ -72,12 +113,25 @@ DELETE FROM items WHERE id = 1;
 statement ok
 pragma ivm('mv_list');
 
-query IR
-SELECT grp, total[1] FROM mv_list ORDER BY grp;
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list
+    EXCEPT ALL
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+);
 ----
-1	20.0
-2	70.0
-3	50.0
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list
+);
+----
+0
 
 # ==========================================
 # 4. Mixed insert + delete in same batch
@@ -92,12 +146,25 @@ DELETE FROM items WHERE id = 2;
 statement ok
 pragma ivm('mv_list');
 
-query IR
-SELECT grp, total[1] FROM mv_list ORDER BY grp;
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list
+    EXCEPT ALL
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+);
 ----
-1	100.0
-2	70.0
-3	50.0
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list
+);
+----
+0
 
 # ==========================================
 # 5. No-op pragma
@@ -106,9 +173,22 @@ SELECT grp, total[1] FROM mv_list ORDER BY grp;
 statement ok
 pragma ivm('mv_list');
 
-query IR
-SELECT grp, total[1] FROM mv_list ORDER BY grp;
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list
+    EXCEPT ALL
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+);
 ----
-1	100.0
-2	70.0
-3	50.0
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list
+);
+----
+0
