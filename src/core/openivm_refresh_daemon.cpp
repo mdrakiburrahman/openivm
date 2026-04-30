@@ -163,12 +163,14 @@ void IVMRefreshDaemon::Run() {
 				}
 
 				// Quick check if the view is already being refreshed (non-blocking).
-				if (!IVMRefreshLocks::TryLockView(sv.view_name)) {
-					OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Skipping '%s' — refresh already in progress\n",
-					                    sv.view_name.c_str());
-					continue;
+				{
+					TryViewLockGuard view_lock(sv.view_name);
+					if (!view_lock.OwnsLock()) {
+						OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Skipping '%s' — refresh already in progress\n",
+						                    sv.view_name.c_str());
+						continue;
+					}
 				}
-				IVMRefreshLocks::UnlockView(sv.view_name);
 
 				{
 					std::lock_guard<std::mutex> guard(refreshing_mutex_);

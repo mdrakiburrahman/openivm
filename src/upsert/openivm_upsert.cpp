@@ -118,7 +118,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
                               const string &attached_db_schema_name) {
-	IVMRefreshLocks::LockView(vn);
+	ViewLockGuard view_guard(vn);
 	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
 	// share base tables (e.g. mv_A and mv_B both reading STOCK → both write to
 	// `delta_STOCK` inside their transactions → "Conflict on tuple deletion!" when
@@ -126,19 +126,13 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 	// guarantees the same acquisition order across all views, so no deadlock is
 	// possible between concurrent refreshes.
 	vector<unique_ptr<DeltaLockGuard>> delta_guards;
-	try {
-		Connection probe_con(*context.db.get());
-		IVMMetadata probe_meta(probe_con);
-		auto delta_table_names = probe_meta.GetDeltaTables(vn);
-		std::sort(delta_table_names.begin(), delta_table_names.end());
-		delta_table_names.erase(std::unique(delta_table_names.begin(), delta_table_names.end()),
-		                        delta_table_names.end());
-		for (auto &dt : delta_table_names) {
-			delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
-		}
-	} catch (...) {
-		IVMRefreshLocks::UnlockView(vn);
-		throw;
+	Connection probe_con(*context.db.get());
+	IVMMetadata probe_meta(probe_con);
+	auto delta_table_names = probe_meta.GetDeltaTables(vn);
+	std::sort(delta_table_names.begin(), delta_table_names.end());
+	delta_table_names.erase(std::unique(delta_table_names.begin(), delta_table_names.end()), delta_table_names.end());
+	for (auto &dt : delta_table_names) {
+		delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
 	}
 	// Track whether we're inside an open exec_con transaction so any exception path can
 	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
@@ -270,10 +264,8 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			}
 			tx_open = false;
 		}
-		IVMRefreshLocks::UnlockView(vn);
 		throw;
 	}
-	IVMRefreshLocks::UnlockView(vn);
 }
 
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {

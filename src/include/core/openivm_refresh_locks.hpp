@@ -63,6 +63,46 @@ public:
 	DeltaLockGuard &operator=(DeltaLockGuard &&) = delete;
 };
 
+// RAII guard for view locks. Automatically unlocks on scope exit (including exceptions).
+class ViewLockGuard {
+	string name_;
+
+public:
+	explicit ViewLockGuard(const string &view_name) : name_(view_name) {
+		IVMRefreshLocks::LockView(name_);
+	}
+	~ViewLockGuard() {
+		IVMRefreshLocks::UnlockView(name_);
+	}
+	ViewLockGuard(const ViewLockGuard &) = delete;
+	ViewLockGuard &operator=(const ViewLockGuard &) = delete;
+	ViewLockGuard(ViewLockGuard &&) = delete;
+	ViewLockGuard &operator=(ViewLockGuard &&) = delete;
+};
+
+// Non-blocking RAII guard for opportunistic view-lock checks.
+class TryViewLockGuard {
+	string name_;
+	bool owns_lock_;
+
+public:
+	explicit TryViewLockGuard(const string &view_name)
+	    : name_(view_name), owns_lock_(IVMRefreshLocks::TryLockView(name_)) {
+	}
+	~TryViewLockGuard() {
+		if (owns_lock_) {
+			IVMRefreshLocks::UnlockView(name_);
+		}
+	}
+	bool OwnsLock() const {
+		return owns_lock_;
+	}
+	TryViewLockGuard(const TryViewLockGuard &) = delete;
+	TryViewLockGuard &operator=(const TryViewLockGuard &) = delete;
+	TryViewLockGuard(TryViewLockGuard &&) = delete;
+	TryViewLockGuard &operator=(TryViewLockGuard &&) = delete;
+};
+
 } // namespace duckdb
 
 #endif // OPENIVM_REFRESH_LOCKS_HPP
