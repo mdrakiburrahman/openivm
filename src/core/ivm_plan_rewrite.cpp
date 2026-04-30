@@ -1131,29 +1131,91 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	                    is_full_outer ? " + _ivm_right_match_count" : "");
 }
 
+struct PlanRewriteContext {
+	ClientContext &context;
+	Binder &binder;
+	unique_ptr<LogicalOperator> &plan;
+	vector<string> &planner_names;
+};
+
+using PlanRewritePass = void (*)(PlanRewriteContext &);
+
+struct PlanRewritePassEntry {
+	const char *name;
+	PlanRewritePass rewrite;
+};
+
+static bool HasTopLevelDistinct(const unique_ptr<LogicalOperator> &plan) {
+	return plan->type == LogicalOperatorType::LOGICAL_DISTINCT ||
+	       (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&
+	        plan->children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT);
+}
+
+static void RunRewritePass(const PlanRewritePassEntry &pass, PlanRewriteContext &rewrite_context) {
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Pass start: %s\n", pass.name);
+	pass.rewrite(rewrite_context);
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Pass done: %s\n", pass.name);
+}
+
+static void RewritePassInlineCteRefs(PlanRewriteContext &rewrite_context) {
+	InlineCteRefs(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
+}
+
+static void RewritePassAggregateFilters(PlanRewriteContext &rewrite_context) {
+	RewriteAggregateFilters(rewrite_context.context, rewrite_context.plan);
+}
+
+static void RewritePassDistinct(PlanRewriteContext &rewrite_context) {
+	bool had_distinct = HasTopLevelDistinct(rewrite_context.plan);
+	RewriteDistinct(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
+	if (had_distinct) {
+		rewrite_context.planner_names.push_back(ivm::DISTINCT_COUNT_COL);
+	}
+}
+
+static void RewritePassDerivedAggregates(PlanRewriteContext &rewrite_context) {
+	Optimizer opt(rewrite_context.binder, rewrite_context.context);
+	RewriteDerivedAggregates(rewrite_context.context, rewrite_context.plan, opt);
+}
+
+static void RewritePassGroupCountStar(PlanRewriteContext &rewrite_context) {
+	InjectGroupCountStar(rewrite_context.plan);
+}
+
+static void RewritePassHiddenAggregatePropagation(PlanRewriteContext &rewrite_context) {
+	PropagateHiddenAggregateColumns(rewrite_context.plan);
+}
+
+static void RewritePassOuterJoinKey(PlanRewriteContext &rewrite_context) {
+	RewriteLeftJoinKey(rewrite_context.binder, rewrite_context.plan);
+}
+
+static void RewritePassOuterJoinMatchCount(PlanRewriteContext &rewrite_context) {
+	RewriteLeftJoinMatchCount(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
+}
+
+static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
+	const PlanRewritePassEntry passes[] = {
+	    {"inline_cte_refs", RewritePassInlineCteRefs},
+	    {"aggregate_filters", RewritePassAggregateFilters},
+	    {"distinct", RewritePassDistinct},
+	    {"derived_aggregates", RewritePassDerivedAggregates},
+	    {"group_count_star", RewritePassGroupCountStar},
+	    {"hidden_aggregate_propagation", RewritePassHiddenAggregatePropagation},
+	    {"outer_join_key", RewritePassOuterJoinKey},
+	    {"outer_join_match_count", RewritePassOuterJoinMatchCount},
+	};
+
+	for (const auto &pass : passes) {
+		RunRewritePass(pass, rewrite_context);
+	}
+}
+
 void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                     vector<string> &planner_names) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
-	// Run CTE-ref inlining first so every downstream pass (and IvmJoinRule's
-	// inclusion-exclusion in particular) sees N independent leaves for an N-way
-	// self-join through a CTE — required for delta cross-terms to fire.
-	InlineCteRefs(context, binder, plan);
-	RewriteAggregateFilters(context, plan);
-	bool had_distinct = plan->type == LogicalOperatorType::LOGICAL_DISTINCT ||
-	                    (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&
-	                     plan->children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT);
-	RewriteDistinct(context, binder, plan);
-	if (had_distinct) {
-		planner_names.push_back(ivm::DISTINCT_COUNT_COL);
-	}
-	{
-		Optimizer opt(binder, context);
-		RewriteDerivedAggregates(context, plan, opt);
-	}
-	InjectGroupCountStar(plan);
-	PropagateHiddenAggregateColumns(plan);
-	RewriteLeftJoinKey(binder, plan);
-	RewriteLeftJoinMatchCount(context, binder, plan);
+	PlanRewriteContext rewrite_context {context, binder, plan, planner_names};
+	RunRewritePipeline(rewrite_context);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");
 }
 
