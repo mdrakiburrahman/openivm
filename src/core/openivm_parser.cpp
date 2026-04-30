@@ -79,6 +79,241 @@ static string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limi
 	return sql;
 }
 
+/// Extract a `(SELECT DISTINCT cols FROM source [WHERE p])` subquery from the
+/// user's CREATE-MV SQL. Single-source v0 — succeeds only for the simple shape
+/// where the DISTINCT body has exactly one base table after FROM (joins/CTEs
+/// fail extraction; caller demotes to GROUP_RECOMPUTE).
+///
+/// Output:
+///   `out_cols`        — column names from `DISTINCT a, b, c`
+///   `out_input_sql`   — same SELECT body with `DISTINCT` keyword stripped
+///   `out_source`      — the table referenced after `FROM` (alias-stripped)
+///   `out_filter_sql`  — anything between `WHERE` and the next clause boundary,
+///                       or empty if no WHERE; included so the aux-population
+///                       and refresh-time delta queries apply the same filter
+///
+/// Returns false on: no DISTINCT, multiple DISTINCTs, a non-table FROM (subquery,
+/// CTE, JOIN), unbalanced parens, or any structural surprise. The caller treats
+/// false as "demote to GROUP_RECOMPUTE".
+static bool ExtractInnerDistinct(const string &original_sql, vector<string> &out_cols, string &out_input_sql,
+                                 string &out_source, string &out_filter_sql) {
+	string lower = StringUtil::Lower(original_sql);
+	// Find "select distinct" — must be a token (preceded by '(' or whitespace).
+	size_t pos = 0;
+	auto find_kw = [&](const string &kw, size_t from) -> size_t {
+		size_t p = from;
+		while (true) {
+			p = lower.find(kw, p);
+			if (p == string::npos) {
+				return string::npos;
+			}
+			bool ok_left = (p == 0) || std::isspace(static_cast<unsigned char>(lower[p - 1])) || lower[p - 1] == '(';
+			bool ok_right = (p + kw.size() == lower.size()) ||
+			                std::isspace(static_cast<unsigned char>(lower[p + kw.size()])) ||
+			                lower[p + kw.size()] == '(';
+			if (ok_left && ok_right) {
+				return p;
+			}
+			p++;
+		}
+	};
+	size_t distinct_pos = find_kw("select distinct", 0);
+	if (distinct_pos == string::npos) {
+		return false;
+	}
+	// Multiple DISTINCTs in the same view → unsupported in v0.
+	if (find_kw("select distinct", distinct_pos + 1) != string::npos) {
+		return false;
+	}
+
+	// Find " from " at the same paren level as the SELECT DISTINCT.
+	size_t cols_start = distinct_pos + strlen("select distinct ");
+	int depth = 0;
+	size_t from_pos = string::npos;
+	for (size_t i = cols_start; i < lower.size(); i++) {
+		if (lower[i] == '(') {
+			depth++;
+		} else if (lower[i] == ')') {
+			if (depth == 0) {
+				return false; // unbalanced, abort
+			}
+			depth--;
+		} else if (depth == 0) {
+			static const string from_kw = " from ";
+			if (i + from_kw.size() <= lower.size() && lower.compare(i, from_kw.size(), from_kw) == 0) {
+				from_pos = i;
+				break;
+			}
+		}
+	}
+	if (from_pos == string::npos) {
+		return false;
+	}
+
+	// Parse the column list (comma-split at depth 0). Use the original-case substring.
+	string cols_text = original_sql.substr(cols_start, from_pos - cols_start);
+	vector<string> cols;
+	{
+		int pd = 0;
+		size_t last = 0;
+		for (size_t i = 0; i < cols_text.size(); i++) {
+			if (cols_text[i] == '(') {
+				pd++;
+			} else if (cols_text[i] == ')') {
+				pd--;
+			} else if (pd == 0 && cols_text[i] == ',') {
+				string c = cols_text.substr(last, i - last);
+				StringUtil::Trim(c);
+				cols.push_back(std::move(c));
+				last = i + 1;
+			}
+		}
+		string last_c = cols_text.substr(last);
+		StringUtil::Trim(last_c);
+		cols.push_back(std::move(last_c));
+	}
+	if (cols.empty()) {
+		return false;
+	}
+	for (auto &c : cols) {
+		if (c.empty() || c == "*") {
+			return false; // unqualified `*` would need source-schema introspection — punt.
+		}
+	}
+
+	// Read the FROM clause. Source must be a single bare identifier (or
+	// schema.table); subqueries, JOINs, and CTE references abort.
+	size_t after_from = from_pos + strlen(" from ");
+	// Skip leading whitespace.
+	while (after_from < lower.size() && std::isspace(static_cast<unsigned char>(lower[after_from]))) {
+		after_from++;
+	}
+	if (after_from >= lower.size() || lower[after_from] == '(') {
+		return false; // FROM is a subquery — multi-source/complex shape, demote.
+	}
+	// Read identifier (allow letters, digits, underscores, dots, double-quotes).
+	size_t src_end = after_from;
+	bool in_quote = false;
+	while (src_end < lower.size()) {
+		char c = lower[src_end];
+		if (in_quote) {
+			if (c == '"') {
+				in_quote = false;
+			}
+			src_end++;
+			continue;
+		}
+		if (c == '"') {
+			in_quote = true;
+			src_end++;
+			continue;
+		}
+		if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.') {
+			src_end++;
+			continue;
+		}
+		break;
+	}
+	out_source = original_sql.substr(after_from, src_end - after_from);
+	if (out_source.empty()) {
+		return false;
+	}
+
+	// Skip optional alias (single bare word after the source identifier).
+	size_t alias_skip = src_end;
+	while (alias_skip < lower.size() && std::isspace(static_cast<unsigned char>(lower[alias_skip]))) {
+		alias_skip++;
+	}
+	// Recognised keywords that terminate the FROM section.
+	auto starts_kw = [&](size_t p, const string &kw) {
+		if (p + kw.size() > lower.size()) {
+			return false;
+		}
+		if (lower.compare(p, kw.size(), kw) != 0) {
+			return false;
+		}
+		bool ok_right =
+		    (p + kw.size() == lower.size()) || !std::isalnum(static_cast<unsigned char>(lower[p + kw.size()]));
+		return ok_right;
+	};
+	if (alias_skip < lower.size() && lower[alias_skip] != ',' && lower[alias_skip] != ')' &&
+	    !starts_kw(alias_skip, "where") && !starts_kw(alias_skip, "group") && !starts_kw(alias_skip, "order") &&
+	    !starts_kw(alias_skip, "having") && !starts_kw(alias_skip, "limit") && !starts_kw(alias_skip, "union") &&
+	    !starts_kw(alias_skip, "join") && !starts_kw(alias_skip, "left") && !starts_kw(alias_skip, "right") &&
+	    !starts_kw(alias_skip, "inner") && !starts_kw(alias_skip, "full") && !starts_kw(alias_skip, "cross") &&
+	    !starts_kw(alias_skip, "on")) {
+		// Treat as an alias word; consume it.
+		size_t alias_end = alias_skip;
+		while (alias_end < lower.size() &&
+		       (std::isalnum(static_cast<unsigned char>(lower[alias_end])) || lower[alias_end] == '_')) {
+			alias_end++;
+		}
+		alias_skip = alias_end;
+	}
+	// Anything other than WHERE / end-of-subquery here means we hit a JOIN or comma,
+	// which we don't support in v0.
+	while (alias_skip < lower.size() && std::isspace(static_cast<unsigned char>(lower[alias_skip]))) {
+		alias_skip++;
+	}
+	size_t where_pos = string::npos;
+	if (alias_skip < lower.size()) {
+		if (starts_kw(alias_skip, "where")) {
+			where_pos = alias_skip;
+		} else if (lower[alias_skip] != ')' && !starts_kw(alias_skip, "group") && !starts_kw(alias_skip, "order") &&
+		           !starts_kw(alias_skip, "limit") && !starts_kw(alias_skip, "union")) {
+			return false; // unsupported shape (JOIN, comma, etc.)
+		}
+	}
+
+	// Compute the end of the DISTINCT subquery. If we're inside parens (the common
+	// case `... FROM (SELECT DISTINCT ...) sub ...`), match the closing ')'. If not,
+	// the subquery ends at the next clause boundary or end of statement.
+	size_t end_pos = string::npos;
+	int d = 0;
+	for (size_t i = (where_pos != string::npos ? where_pos : alias_skip); i < lower.size(); i++) {
+		if (lower[i] == '(') {
+			d++;
+		} else if (lower[i] == ')') {
+			if (d == 0) {
+				end_pos = i;
+				break;
+			}
+			d--;
+		} else if (d == 0 &&
+		           (starts_kw(i, "group") || starts_kw(i, "order") || starts_kw(i, "limit") || starts_kw(i, "union"))) {
+			end_pos = i;
+			break;
+		}
+	}
+	if (end_pos == string::npos) {
+		end_pos = lower.size();
+	}
+
+	// Build out_filter_sql from `WHERE ... <end>` (excluding WHERE keyword).
+	if (where_pos != string::npos) {
+		size_t filter_start = where_pos + strlen("where ");
+		out_filter_sql = original_sql.substr(filter_start, end_pos - filter_start);
+		StringUtil::Trim(out_filter_sql);
+	} else {
+		out_filter_sql.clear();
+	}
+
+	// Build input_sql: the original DISTINCT subquery span with `DISTINCT ` removed.
+	string subq = original_sql.substr(distinct_pos, end_pos - distinct_pos);
+	{
+		string subq_lower = StringUtil::Lower(subq);
+		size_t kw = subq_lower.find("distinct ");
+		if (kw == string::npos) {
+			return false;
+		}
+		out_input_sql = subq.substr(0, kw) + subq.substr(kw + strlen("distinct "));
+		StringUtil::Trim(out_input_sql);
+	}
+
+	out_cols = std::move(cols);
+	return true;
+}
+
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	// DDL statements are passed via result.parameters from the plan function.
@@ -752,18 +987,26 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// (to skip key extraction) and the classification chain (to route to RECOMPUTE).
 		bool has_union_over_agg = false;
 		{
-			std::function<bool(const LogicalOperator *)> plan_has_union = [&](const LogicalOperator *op) -> bool {
-				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+			// True only when the UNION node is an ancestor of the aggregate (union-of-aggs pattern).
+			// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
+			// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
+			// `seen_agg_above` tracks whether we have passed an aggregate on the way down.
+			std::function<bool(const LogicalOperator *, bool)> union_before_agg = [&](const LogicalOperator *op,
+			                                                                          bool seen_agg_above) -> bool {
+				if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+					seen_agg_above = true;
+				}
+				if (op->type == LogicalOperatorType::LOGICAL_UNION && !seen_agg_above) {
 					return true;
 				}
 				for (auto &c : op->children) {
-					if (plan_has_union(c.get())) {
+					if (union_before_agg(c.get(), seen_agg_above)) {
 						return true;
 					}
 				}
 				return false;
 			};
-			has_union_over_agg = found_aggregation && plan_has_union(plan.get());
+			has_union_over_agg = found_aggregation && union_before_agg(plan.get(), false);
 		}
 
 		if (distinct_at_top) {
@@ -900,12 +1143,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// If the plan contains a LOGICAL_UNION above the aggregate(s), the MV's output
 			// columns come from multiple independent branches — collecting group keys from
 			// a single branch would return names that aren't in the MV's user-facing output
-			// (UNION ALL re-aliases them at the top). Classify as SIMPLE_AGGREGATE so the
+			// (UNION ALL re-aliases them at the top). Use the first group_count output names
+			// as group keys (positional: DuckDB places GROUP BY cols before aggregates).
 			if (has_union_over_agg) {
-				group_names_list.clear();
-				// UNION/UNION ALL over aggregates: key extraction from a single branch is
-				// unreliable. Leave aggregate_columns empty so no unique index is created;
-				// the RECOMPUTE classification below handles refresh correctly.
+				for (size_t i = 0; i < group_count && i < output_names.size(); i++) {
+					if (!IVMTableNames::IsInternalColumn(output_names[i])) {
+						group_names_list.push_back(output_names[i]);
+					}
+				}
 			} else {
 				find_group_cols(plan.get());
 			}
@@ -938,6 +1183,88 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		auto aggregate_types = std::move(analysis.aggregate_types);
 		auto window_partition_columns = std::move(analysis.window_partition_columns);
+
+		// Fallback group-key extraction for inner-aggregate-in-join patterns.
+		// When the top-level SELECT joins against a subquery/CTE that performs GROUP BY,
+		// find_group_cols fails (the inner aggregate's group_index isn't referenced by the
+		// outer projection — the join key comes from the non-aggregate arm). Recover group
+		// keys by matching the outermost JOIN's condition BCRs against the top projection.
+		//
+		// Use GROUP_RECOMPUTE for these views: AGGREGATE_GROUP would try to SUM pass-through
+		// attributes (e.g. W_YTD from WAREHOUSE) as if they were aggregate results.
+		bool join_key_group_fallback = false;
+		if (aggregate_columns.empty() && found_join && group_count > 0 && !has_union_over_agg) {
+			// plan root is LOGICAL_CREATE_TABLE; descend to find the outermost PROJECTION
+			// (the SELECT output list) and the outermost comparison join.
+			std::function<LogicalProjection *(LogicalOperator *)> find_outer_proj =
+			    [&](LogicalOperator *op) -> LogicalProjection * {
+				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					return &op->Cast<LogicalProjection>();
+				}
+				for (auto &child : op->children) {
+					auto *p = find_outer_proj(child.get());
+					if (p) {
+						return p;
+					}
+				}
+				return nullptr;
+			};
+			std::function<LogicalComparisonJoin *(LogicalOperator *)> find_outer_join =
+			    [&](LogicalOperator *op) -> LogicalComparisonJoin * {
+				if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+					return &op->Cast<LogicalComparisonJoin>();
+				}
+				for (auto &child : op->children) {
+					auto *j = find_outer_join(child.get());
+					if (j) {
+						return j;
+					}
+				}
+				return nullptr;
+			};
+			auto *top_proj_ptr = find_outer_proj(plan.get());
+			auto *cjoin = find_outer_join(plan.get());
+			if (top_proj_ptr && cjoin) {
+				// Collect (table_index, column_index) pairs that appear in join conditions.
+				unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
+				for (auto &cond : cjoin->conditions) {
+					auto collect = [&](const unique_ptr<Expression> &side) {
+						if (side->type == ExpressionType::BOUND_COLUMN_REF) {
+							auto &bcr = side->Cast<BoundColumnRefExpression>();
+							join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
+						}
+					};
+					collect(cond.left);
+					collect(cond.right);
+				}
+				// Match those bindings against the top projection's output expressions.
+				auto &top_proj = *top_proj_ptr;
+				for (idx_t expr_i = 0; expr_i < top_proj.expressions.size(); expr_i++) {
+					auto &expr = top_proj.expressions[expr_i];
+					if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+						continue;
+					}
+					auto &bcr = expr->Cast<BoundColumnRefExpression>();
+					auto it = join_key_cols.find(bcr.binding.table_index);
+					if (it == join_key_cols.end() || !it->second.count(bcr.binding.column_index)) {
+						continue;
+					}
+					string col_name;
+					if (!expr->alias.empty()) {
+						col_name = expr->alias;
+					} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
+					           !IVMTableNames::IsInternalColumn(output_names[expr_i])) {
+						col_name = output_names[expr_i];
+					} else {
+						col_name = bcr.GetName();
+					}
+					if (!IVMTableNames::IsInternalColumn(col_name)) {
+						aggregate_columns.push_back(col_name);
+						join_key_group_fallback = true;
+					}
+				}
+			}
+		}
 
 		// Window over join: partition columns may come from a joined table whose delta
 		// doesn't have that column. We can't resolve joins at refresh time without LPTS
@@ -1083,6 +1410,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		IVMType ivm_type;
+		// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
+		vector<string> distinct_extracted_cols;
+		string distinct_extracted_input_sql;
+		string distinct_extracted_source;
+		string distinct_extracted_filter;
+		// Outer-aggregate spec for the v0 aux-state pipeline. Single SUM(<arg>) only —
+		// any other shape (multiple SUMs, AVG, COUNT, etc.) demotes to GROUP_RECOMPUTE.
+		// `sum_arg` is the column name from the DISTINCT input (one of distinct_cols).
+		// `sum_out` is the user-facing output column name in the data table.
+		string distinct_sum_arg;
+		string distinct_sum_out;
 
 		if (found_window) {
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
@@ -1121,10 +1459,98 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			} else {
 				ivm_type = IVMType::GROUP_RECOMPUTE;
 			}
+			// Try to extract the DISTINCT subquery from the user's original SQL. If the
+			// shape isn't recognised (multi-source body, subquery FROM, etc.), demote to
+			// GROUP_RECOMPUTE — the aux pipeline is single-source-only in v0.
+			if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+				vector<string> dcols;
+				string d_input_sql, d_source, d_filter;
+				if (!ExtractInnerDistinct(original_view_query, dcols, d_input_sql, d_source, d_filter)) {
+					ivm_type = IVMType::GROUP_RECOMPUTE;
+					OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL extractor failed — demoting to "
+					                    "GROUP_RECOMPUTE\n");
+				} else {
+					distinct_extracted_cols = std::move(dcols);
+					distinct_extracted_input_sql = std::move(d_input_sql);
+					distinct_extracted_source = std::move(d_source);
+					distinct_extracted_filter = std::move(d_filter);
+				}
+			}
+			// Walk the rewritten plan for the outer aggregate's expressions. v0 supports
+			// exactly one SUM(<arg>) — `_ivm_count_star` (auto-injected by IVMPlanRewrite)
+			// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
+			// demotes back to GROUP_RECOMPUTE.
+			if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+				LogicalAggregate *outer_agg = nullptr;
+				std::function<void(LogicalOperator *)> find_outer = [&](LogicalOperator *op) {
+					if (outer_agg || !op) {
+						return;
+					}
+					if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+						outer_agg = &op->Cast<LogicalAggregate>();
+						return;
+					}
+					for (auto &c : op->children) {
+						find_outer(c.get());
+					}
+				};
+				find_outer(plan.get());
+				int sum_count = 0;
+				bool unsupported_agg = false;
+				if (outer_agg) {
+					for (auto &expr : outer_agg->expressions) {
+						if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+							continue;
+						}
+						auto &bound = expr->Cast<BoundAggregateExpression>();
+						const string &fname = bound.function.name;
+						if (fname == "count_star") {
+							continue; // injected by IvmPlanRewrite — fine
+						}
+						if (fname != "sum") {
+							unsupported_agg = true;
+							break;
+						}
+						if (bound.children.empty() ||
+						    bound.children[0]->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+							unsupported_agg = true;
+							break;
+						}
+						auto &bcr = bound.children[0]->Cast<BoundColumnRefExpression>();
+						distinct_sum_arg = bcr.alias.empty() ? bcr.GetName() : bcr.alias;
+						distinct_sum_out = bound.alias;
+						sum_count++;
+					}
+				}
+				if (!outer_agg || unsupported_agg || sum_count != 1) {
+					ivm_type = IVMType::GROUP_RECOMPUTE;
+					distinct_sum_arg.clear();
+					distinct_sum_out.clear();
+					OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL outer-agg not single-SUM — demoting "
+					                    "to GROUP_RECOMPUTE\n");
+				} else if (distinct_sum_out.empty()) {
+					// `SUM(c) AS s` puts the alias `s` on the SELECT-list BCR above the
+					// aggregate, not on the BoundAggregateExpression itself. Recover it
+					// from output_names: the SUM output column is the first non-group
+					// position (group cols come first in the data table layout).
+					if (aggregate_columns.size() < output_names.size()) {
+						distinct_sum_out = output_names[aggregate_columns.size()];
+					}
+				}
+			}
 		} else if (found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_HAVING;
+		} else if ((has_union_over_agg || join_key_group_fallback || analysis.found_nested_aggregate) &&
+		           !aggregate_columns.empty()) {
+			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.
+			// Inner-aggregate-in-join: group keys are the join-condition columns visible in the
+			// top projection. Nested aggregate (outer COUNT(*) over inner GROUP BY via CTE): outer
+			// COUNT counts inner groups, not source rows, so linear delta is incorrect.
+			// All three use GROUP_RECOMPUTE — not AGGREGATE_GROUP — because non-key output columns
+			// may be pass-through attributes or non-linear functions over inner aggregates.
+			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_aggregation && aggregate_columns.empty()) {
@@ -1176,7 +1602,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " fd_summary_json varchar default null,"
 		              " source_tables_json varchar default null,"
 		              " aggregate_decomposition_json varchar default null,"
-		              " nullified_columns_json varchar default null)");
+		              " nullified_columns_json varchar default null,"
+		              " distinct_aux_meta_json varchar default null)");
+		// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
+		// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
+		ddl.push_back("alter table " + string(ivm::VIEWS_TABLE) +
+		              " add column if not exists distinct_aux_meta_json varchar default null");
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -1390,15 +1821,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			extract_foj_cols(plan.get());
 		}
 
-		// 8 trailing NULLs are matcher metadata columns. Populated below when
-		// ivm_enable_view_matching=true — currently only source_tables_json
-		// and dependency edges; canonicalizer / oracle columns stay NULL.
+		// 9 trailing NULLs: 8 matcher metadata columns + distinct_aux_meta_json.
+		// Matcher metadata is populated by the Stage I block below when
+		// ivm_enable_view_matching=true. distinct_aux_meta_json is populated by a
+		// follow-up UPDATE if ivm_type == DISTINCT_INCREMENTAL and the extractor
+		// recognised the DISTINCT shape.
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
 		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 		              (found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
-		              ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+		              ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
 
 		Value match_flag_val;
 		bool view_matching_enabled = context.TryGetCurrentSetting("ivm_enable_view_matching", match_flag_val) &&
@@ -1443,6 +1876,62 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				              string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + OpenIVMUtils::EscapeSingleQuotes(t) +
 				              "'");
 			}
+		}
+
+		// DISTINCT_INCREMENTAL: create the per-tuple count auxiliary table and store its
+		// metadata so refresh-time can find the source SQL, the column list, and the aux
+		// table name. The aux table is populated from the (DISTINCT-stripped) input SQL
+		// at CREATE time; refresh-time MERGE keeps it in sync with delta multiplicities.
+		if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+			string aux_table = "_ivm_distinct_count_" + view_name;
+			string cols_csv;
+			for (size_t i = 0; i < distinct_extracted_cols.size(); i++) {
+				if (i > 0) {
+					cols_csv += ", ";
+				}
+				cols_csv += distinct_extracted_cols[i];
+			}
+			// CREATE+POPULATE the aux table from the extracted DISTINCT input SQL.
+			// _count is a signed BIGINT (deltas can transiently push it negative during
+			// concurrent refreshes; the post-update DELETE drops rows whose count <= 0).
+			string aux_create = "create table if not exists " + view_catalog_prefix +
+			                    KeywordHelper::WriteOptionallyQuoted(aux_table) + " as select " + cols_csv +
+			                    ", count(*)::BIGINT as _count from (" + distinct_extracted_input_sql + ") group by " +
+			                    cols_csv;
+			ddl.push_back(aux_create);
+			// Build a JSON metadata blob that the refresh-time compile reads back.
+			auto json_quote = [](const string &s) {
+				string out = "\"";
+				for (char c : s) {
+					if (c == '"' || c == '\\') {
+						out += '\\';
+						out += c;
+					} else if (c == '\n') {
+						out += "\\n";
+					} else {
+						out += c;
+					}
+				}
+				out += "\"";
+				return out;
+			};
+			string cols_json = "[";
+			for (size_t i = 0; i < distinct_extracted_cols.size(); i++) {
+				if (i > 0) {
+					cols_json += ",";
+				}
+				cols_json += json_quote(distinct_extracted_cols[i]);
+			}
+			cols_json += "]";
+			string meta_json = "{\"aux_table\":" + json_quote(aux_table) + ",\"cols\":" + cols_json +
+			                   ",\"input_sql\":" + json_quote(distinct_extracted_input_sql) +
+			                   ",\"source\":" + json_quote(distinct_extracted_source) +
+			                   ",\"filter\":" + json_quote(distinct_extracted_filter) +
+			                   ",\"sum_arg\":" + json_quote(distinct_sum_arg) +
+			                   ",\"sum_out\":" + json_quote(distinct_sum_out) + "}";
+			ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET distinct_aux_meta_json = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 
 		// Classify each base table by catalog type (duckdb vs ducklake).

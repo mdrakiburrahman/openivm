@@ -204,16 +204,31 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					if (bound_agg.function.name == "list") {
 						result.found_list = true;
 					}
-					result.aggregate_types.push_back(bound_agg.function.name);
+					// Record aggregate function types only for the outermost aggregate in the plan.
+					// Nested aggregates (CTE re-aggregate, subquery-join inner agg) would misalign
+					// aggregate_types with the output column count and confuse CompileAggregateGroups.
+					// Compatibility flags (found_minmax, found_list, found_count_distinct) are
+					// recorded for all aggregates above so unsafe inner aggs still gate classification.
+					if (result.group_index == DConstants::INVALID_INDEX) {
+						result.aggregate_types.push_back(bound_agg.function.name);
+					}
 				}
 			}
 			if (HasVolatileExpression(agg->groups)) {
 				result.ivm_compatible = false;
 			}
-			// Record group count and group_index — caller walks the plan's projection to extract
-			// the final column names for GROUP BY columns (SELECT list order != GROUP BY order).
-			result.group_count = agg->groups.size();
-			result.group_index = agg->group_index;
+			// Record group count and group_index for the outermost (first-found) aggregate only.
+			// In plans with nested aggregates the DFS visits the outer aggregate first; overwriting
+			// with an inner aggregate's binding causes find_group_cols to miss the top projection.
+			if (result.group_index == DConstants::INVALID_INDEX) {
+				result.group_count = agg->groups.size();
+				result.group_index = agg->group_index;
+			} else {
+				// A second aggregate node below the outermost one → nested aggregate pattern.
+				// COUNT(*)/COUNT(x) in the outer aggregate counts inner-group rows, not source rows,
+				// so the standard linear delta rule is incorrect. Route to group-recompute.
+				result.found_nested_aggregate = true;
+			}
 		}
 		break;
 	}

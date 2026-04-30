@@ -20,9 +20,16 @@ struct PlanAnalysis {
 	bool found_join = false;
 	bool found_window = false;
 	bool found_top_k = false;
-	bool found_count_distinct = false; // COUNT(DISTINCT x) — handled via group-recompute
-	bool found_grouping_sets = false;  // ROLLUP/CUBE/GROUPING SETS — handled via RECOMPUTE
-	idx_t top_k_limit = 0;             // constant LIMIT value from LOGICAL_TOP_N
+	bool found_count_distinct = false;      // COUNT(DISTINCT x) — handled via group-recompute
+	bool found_grouping_sets = false;       // ROLLUP/CUBE/GROUPING SETS — handled via RECOMPUTE
+	bool found_nested_aggregate = false;    // outer aggregate over inner aggregate (CTE re-agg); COUNT(*) in outer is
+	                                        // non-linear over source deltas → group-recompute
+	idx_t top_k_limit = 0;                  // constant LIMIT value from LOGICAL_TOP_N
+	idx_t top_k_offset = 0;                 // OFFSET value (0 if none)
+	vector<string> top_k_order_columns;     // ORDER BY column names (in order) for the top-k
+	vector<bool> top_k_order_desc;          // parallel to top_k_order_columns; true = DESC
+	vector<string> top_k_partition_columns; // PARTITION BY cols for per-partition top-k via ROW_NUMBER ≤ k pattern;
+	                                        // empty for global top-k
 	vector<string> aggregate_columns;
 	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
 	vector<string> window_partition_columns; // PARTITION BY columns from window functions

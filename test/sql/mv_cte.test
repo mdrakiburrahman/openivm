@@ -601,3 +601,182 @@ query I
 SELECT type FROM _duckdb_ivm_views WHERE view_name = 'selfjoin_mv';
 ----
 2
+
+# ==========================================
+# JOIN with inner subquery aggregate (join-key-group fallback)
+# Regression: must route to GROUP_RECOMPUTE with join key as group key, not SIMPLE_AGGREGATE
+# ==========================================
+
+statement ok
+CREATE TABLE jia_customer (c_id INT, c_w_id INT, c_balance DOUBLE);
+
+statement ok
+CREATE TABLE jia_history (h_c_id INT, h_amount DOUBLE);
+
+statement ok
+INSERT INTO jia_customer VALUES (1, 1, 50.0), (2, 1, 100.0), (3, 2, 75.0);
+
+statement ok
+INSERT INTO jia_history VALUES (1, 10.0), (1, 20.0), (2, 5.0), (3, 30.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_jia AS
+    SELECT c.c_id, agg.avg_val
+    FROM jia_customer c
+    JOIN (SELECT h_c_id, AVG(h_amount) AS avg_val FROM jia_history GROUP BY h_c_id) agg
+      ON c.c_id = agg.h_c_id;
+
+# Verify classification is GROUP_RECOMPUTE (6)
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_jia';
+----
+6
+
+statement ok
+INSERT INTO jia_history VALUES (2, 15.0);
+
+statement ok
+DELETE FROM jia_customer WHERE c_id = 3;
+
+statement ok
+PRAGMA ivm('mv_jia');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c.c_id, agg.avg_val
+     FROM jia_customer c
+     JOIN (SELECT h_c_id, AVG(h_amount) AS avg_val FROM jia_history GROUP BY h_c_id) agg
+       ON c.c_id = agg.h_c_id)
+    EXCEPT ALL SELECT * FROM mv_jia
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_jia
+    EXCEPT ALL
+    (SELECT c.c_id, agg.avg_val
+     FROM jia_customer c
+     JOIN (SELECT h_c_id, AVG(h_amount) AS avg_val FROM jia_history GROUP BY h_c_id) agg
+       ON c.c_id = agg.h_c_id)
+);
+----
+0
+
+# Second refresh: insert into history (affects avg) + insert new customer row
+statement ok
+INSERT INTO jia_history VALUES (1, 30.0);
+
+statement ok
+INSERT INTO jia_customer VALUES (4, 2, 200.0);
+
+statement ok
+PRAGMA ivm('mv_jia');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c.c_id, agg.avg_val
+     FROM jia_customer c
+     JOIN (SELECT h_c_id, AVG(h_amount) AS avg_val FROM jia_history GROUP BY h_c_id) agg
+       ON c.c_id = agg.h_c_id)
+    EXCEPT ALL SELECT * FROM mv_jia
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_jia
+    EXCEPT ALL
+    (SELECT c.c_id, agg.avg_val
+     FROM jia_customer c
+     JOIN (SELECT h_c_id, AVG(h_amount) AS avg_val FROM jia_history GROUP BY h_c_id) agg
+       ON c.c_id = agg.h_c_id)
+);
+----
+0
+
+# ==========================================
+# CTE re-aggregate: outer GROUP BY over inner CTE aggregate
+# Regression: first-found-wins for group_index must preserve the outermost aggregate's group key
+# ==========================================
+
+statement ok
+CREATE TABLE cra_customer (c_w_id INT, c_d_id INT, c_balance DOUBLE);
+
+statement ok
+INSERT INTO cra_customer VALUES (1, 1, 100.0), (1, 1, 50.0), (1, 2, 200.0), (2, 1, 75.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cra AS
+    WITH mat AS (
+        SELECT c_w_id, c_d_id, SUM(c_balance) AS tot, COUNT(*) AS n
+        FROM cra_customer GROUP BY c_w_id, c_d_id
+    )
+    SELECT c_w_id, SUM(tot) AS w_tot, SUM(n) AS w_cnt, COUNT(*) AS dists
+    FROM mat GROUP BY c_w_id;
+
+# Verify classification is GROUP_RECOMPUTE (6): outer COUNT(*) counts inner groups (non-linear over source deltas)
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_cra';
+----
+6
+
+statement ok
+INSERT INTO cra_customer VALUES (1, 3, 999.0), (2, 1, 25.0);
+
+statement ok
+PRAGMA ivm('mv_cra');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c_w_id, SUM(tot) AS w_tot, SUM(n) AS w_cnt, COUNT(*) AS dists
+     FROM (SELECT c_w_id, c_d_id, SUM(c_balance) AS tot, COUNT(*) AS n FROM cra_customer GROUP BY c_w_id, c_d_id) mat
+     GROUP BY c_w_id)
+    EXCEPT ALL SELECT * FROM mv_cra
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cra
+    EXCEPT ALL
+    (SELECT c_w_id, SUM(tot) AS w_tot, SUM(n) AS w_cnt, COUNT(*) AS dists
+     FROM (SELECT c_w_id, c_d_id, SUM(c_balance) AS tot, COUNT(*) AS n FROM cra_customer GROUP BY c_w_id, c_d_id) mat
+     GROUP BY c_w_id)
+);
+----
+0
+
+# Second refresh with deletions
+statement ok
+DELETE FROM cra_customer WHERE c_d_id = 3;
+
+statement ok
+INSERT INTO cra_customer VALUES (3, 1, 500.0);
+
+statement ok
+PRAGMA ivm('mv_cra');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c_w_id, SUM(tot) AS w_tot, SUM(n) AS w_cnt, COUNT(*) AS dists
+     FROM (SELECT c_w_id, c_d_id, SUM(c_balance) AS tot, COUNT(*) AS n FROM cra_customer GROUP BY c_w_id, c_d_id) mat
+     GROUP BY c_w_id)
+    EXCEPT ALL SELECT * FROM mv_cra
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cra
+    EXCEPT ALL
+    (SELECT c_w_id, SUM(tot) AS w_tot, SUM(n) AS w_cnt, COUNT(*) AS dists
+     FROM (SELECT c_w_id, c_d_id, SUM(c_balance) AS tot, COUNT(*) AS n FROM cra_customer GROUP BY c_w_id, c_d_id) mat
+     GROUP BY c_w_id)
+);
+----
+0
