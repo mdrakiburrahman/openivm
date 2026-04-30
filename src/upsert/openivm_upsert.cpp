@@ -1186,14 +1186,34 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		break;
 	}
-	case IVMType::DISTINCT_INCREMENTAL:
-		// TODO(plan §5): aux-state DBSP-correct DISTINCT pipeline. Maintains a per-DISTINCT
-		// count auxiliary table; on refresh emits ±1 only on count transitions across zero,
-		// strictly fewer rows than GROUP_RECOMPUTE reaches the parent aggregate's MERGE.
-		// Until that pipeline lands, fall through to GROUP_RECOMPUTE — semantically
-		// correct, just not minimal-delta. The flag `ivm_distinct_aux_state` and this
-		// enum value are wired so the eventual implementation has stable surface.
+	case IVMType::DISTINCT_INCREMENTAL: {
+		// Aux-state DBSP-correct DISTINCT pipeline. Reads metadata captured at CREATE-MV
+		// time (aux_table, distinct_cols, source/filter, single-SUM spec) and emits a
+		// multi-statement batch:
+		//   1) Δinput temp table (per-distinct-tuple net multiplicity from source delta)
+		//   2) MERGE Δagg into _ivm_data_<view> (Δdistinct = ±1 transitions × sum_arg)
+		//   3) DELETE rows whose _ivm_count_star fell to 0
+		//   4) MERGE Δinput into the aux table; DELETE rows with _count ≤ 0
+		// If metadata is missing (older view created before this column landed) we fall
+		// through to GROUP_RECOMPUTE so the view still refreshes correctly.
+		IVMMetadata::DistinctAuxMeta aux_meta;
+		if (metadata.GetDistinctAuxMeta(view_name, aux_meta)) {
+			auto group_columns = metadata.GetGroupColumns(view_name);
+			string delta_source = OpenIVMUtils::DeltaName(aux_meta.source);
+			string ts = metadata.GetLastUpdate(view_name, delta_source);
+			upsert_query = CompileDistinctIncremental(view_name, aux_meta.aux_table, aux_meta.cols, delta_source, ts,
+			                                          aux_meta.filter, group_columns, aux_meta.sum_arg,
+			                                          aux_meta.sum_out, string(ivm::COUNT_STAR_COL), catalog_prefix);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: DISTINCT_INCREMENTAL (%zu distinct cols, "
+			                    "%zu group cols, sum_arg=%s, sum_out=%s)\n",
+			                    aux_meta.cols.size(), group_columns.size(), aux_meta.sum_arg.c_str(),
+			                    aux_meta.sum_out.c_str());
+			break;
+		}
+		OPENIVM_DEBUG_PRINT("[UPSERT] DISTINCT_INCREMENTAL view has no aux meta — falling through to "
+		                    "GROUP_RECOMPUTE\n");
 		[[fallthrough]];
+	}
 	case IVMType::GROUP_RECOMPUTE: {
 		// Inner-DISTINCT-under-AGG: re-evaluate only the GROUP BY tuples touched by source
 		// deltas. For each base table register a (base_name, last_update) spec; the compile
@@ -1225,6 +1245,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		                    group_columns.size(), delta_specs.size());
 		break;
 	}
+	case IVMType::TOP_K:
+		// TOP_K is reserved for a future DBSP-correct bounded integration path; the classifier
+		// never assigns it today, so this case is unreachable in practice.
+		[[fallthrough]];
 	case IVMType::FULL_REFRESH: {
 		// Should not reach here — full refresh is handled earlier via BuildRecomputeQuery.
 		throw InternalException("FULL_REFRESH views should not reach incremental upsert compilation");
