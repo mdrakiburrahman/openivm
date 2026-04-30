@@ -1,0 +1,2 @@
+-- {"operators": "UNNEST,TABLE_FUNCTION,FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "op:UNNEST"}
+SELECT c.C_W_ID, c.C_D_ID, phone_piece.part FROM CUSTOMER c CROSS JOIN UNNEST([substr(c.C_PHONE, 1, 3), substr(c.C_PHONE, 4, 3), substr(c.C_PHONE, 7, 4)]) AS phone_piece(part) WHERE phone_piece.part IS NOT NULL;

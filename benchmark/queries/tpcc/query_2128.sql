@@ -1,0 +1,2 @@
+-- {"operators": "RECURSIVE_CTE,AGGREGATE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "non_incr_reason": "op:RECURSIVE_CTE"}
+WITH RECURSIVE item_chain(item_id, depth) AS (SELECT I_ID, 1 FROM ITEM WHERE I_ID <= 5 UNION ALL SELECT item_id + 1, depth + 1 FROM item_chain WHERE depth < 3) SELECT ic.item_id, COUNT(ol.OL_I_ID) AS order_lines FROM item_chain ic LEFT JOIN ORDER_LINE ol ON ol.OL_I_ID = ic.item_id GROUP BY ic.item_id;

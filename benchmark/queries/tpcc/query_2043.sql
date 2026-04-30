@@ -1,0 +1,2 @@
+-- {"operators": "INTERSECT_ALL,AGGREGATE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE", "non_incr_reason": "kw:INTERSECT_ALL"}
+SELECT S_W_ID AS w_id, S_I_ID AS item_id, COUNT(*) AS cnt FROM STOCK GROUP BY S_W_ID, S_I_ID INTERSECT ALL SELECT OL_SUPPLY_W_ID, OL_I_ID, COUNT(*) FROM ORDER_LINE GROUP BY OL_SUPPLY_W_ID, OL_I_ID;

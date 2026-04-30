@@ -1,0 +1,2 @@
+-- {"operators": "INTERSECT_ALL,AGGREGATE,HAVING", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,STOCK", "non_incr_reason": "kw:INTERSECT_ALL"}
+SELECT OL_W_ID, OL_I_ID FROM ORDER_LINE GROUP BY OL_W_ID, OL_I_ID HAVING SUM(OL_QUANTITY) > 0 INTERSECT ALL SELECT S_W_ID, S_I_ID FROM STOCK GROUP BY S_W_ID, S_I_ID HAVING SUM(S_QUANTITY) > 0;

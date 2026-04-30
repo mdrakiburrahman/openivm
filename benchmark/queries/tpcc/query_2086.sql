@@ -1,0 +1,2 @@
+-- {"operators": "FILTER,ANTI_JOIN,SUBQUERY,INNER_JOIN", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "non_incr_reason": "join:ANTI"}
+SELECT i.I_ID, s.S_W_ID, s.S_QUANTITY FROM ITEM i JOIN STOCK s ON i.I_ID = s.S_I_ID WHERE NOT EXISTS (SELECT 1 FROM ORDER_LINE ol WHERE ol.OL_I_ID = i.I_ID AND ol.OL_SUPPLY_W_ID = s.S_W_ID);

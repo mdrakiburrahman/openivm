@@ -1,0 +1,2 @@
+-- {"operators": "RECURSIVE_CTE,INNER_JOIN", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,WAREHOUSE", "non_incr_reason": "op:RECURSIVE_CTE"}
+WITH RECURSIVE district_walk(w_id, d_id) AS (SELECT W_ID, 1 FROM WAREHOUSE UNION ALL SELECT w_id, d_id + 1 FROM district_walk WHERE d_id < 10) SELECT dw.w_id, dw.d_id, d.D_NAME FROM district_walk dw JOIN DISTRICT d ON d.D_W_ID = dw.w_id AND d.D_ID = dw.d_id;

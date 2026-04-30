@@ -1,0 +1,2 @@
+-- {"operators": "UNNEST,TABLE_FUNCTION,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "non_incr_reason": "op:UNNEST"}
+SELECT s.S_W_ID, s.S_I_ID, u.metric, ROW_NUMBER() OVER (PARTITION BY s.S_W_ID, u.metric ORDER BY s.S_QUANTITY DESC) AS metric_rank FROM STOCK s CROSS JOIN UNNEST(['qty', 'orders', 'remote']) AS u(metric);

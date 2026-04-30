@@ -1,0 +1,2 @@
+-- {"operators": "DELIM_JOIN,CORRELATED_SUBQUERY,AGGREGATE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,ORDER_LINE", "non_incr_reason": "op:CORRELATED_SUBQUERY"}
+SELECT c.C_W_ID, c.C_D_ID, c.C_ID, (SELECT SUM(ol.OL_AMOUNT) FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID WHERE o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID) AS lifetime_amount FROM CUSTOMER c;

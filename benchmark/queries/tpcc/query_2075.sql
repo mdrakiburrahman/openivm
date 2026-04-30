@@ -1,0 +1,2 @@
+-- {"operators": "FILTER,SEMI_JOIN,SUBQUERY,LEFT_JOIN", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER", "non_incr_reason": "join:SEMI"}
+SELECT w.W_ID, d.D_ID FROM WAREHOUSE w LEFT JOIN DISTRICT d ON w.W_ID = d.D_W_ID WHERE EXISTS (SELECT 1 FROM CUSTOMER c WHERE c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID);
