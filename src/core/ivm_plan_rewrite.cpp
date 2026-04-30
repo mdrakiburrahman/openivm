@@ -19,6 +19,9 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "upsert/openivm_index_regen.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -118,6 +121,93 @@ static const char *SumSqPrefix(const string &func_name) {
 		return ivm::VAR_SQ_COL_PREFIX;
 	}
 	return ivm::SUM_SQ_COL_PREFIX; // stddev, stddev_samp
+}
+
+/// Inline every `LOGICAL_CTE_REF` in the plan with a fresh deep copy of its CTE
+/// definition, then collapse `LOGICAL_MATERIALIZED_CTE` wrapper nodes. This makes
+/// IVM see N independent leaves for an N-way self-join through a CTE, instead of
+/// one materialized intermediate referenced N times — without it, `IvmJoinRule`'s
+/// inclusion-exclusion can't generate the cross-terms (Δt ⋈ t_now and t_now ⋈ Δt)
+/// needed to produce new pairs from a single base-table delta.
+///
+/// Inlining strategy: for each CTE_REF, deep-copy the definition subtree and
+/// renumber its bindings to fresh table indices via `renumber_and_rebind_subtree`.
+/// Wrap the renumbered subtree in a passthrough projection at the CTE_REF's
+/// original `table_index` so parent operators' BCRs (which point to
+/// `(ref.table_index, i)`) keep resolving correctly with no upstream rebinding.
+///
+/// We process MATERIALIZED_CTE nodes bottom-up: at each one, fully inline the
+/// definition into the consumer (children[1]), then replace the MATERIALIZED_CTE
+/// node with the modified consumer. Bottom-up traversal ensures that nested
+/// CTEs inside the definition or consumer are resolved before this CTE is, so
+/// no captured pointer ever dangles.
+///
+/// CTEInlining (already invoked in `openivm_parser.cpp`) usually handles this for
+/// single-reference and small CTEs, but multi-reference CTEs that don't get
+/// inlined by the optimizer end up here. Recursive CTEs are not supported and
+/// are left untouched (caller catches the unsupported-operator error downstream).
+static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	if (!plan) {
+		return;
+	}
+	// Process this node's children first (bottom-up). Each child may itself be
+	// a MATERIALIZED_CTE — handle each independently.
+	for (auto &c : plan->children) {
+		InlineCteRefs(context, binder, c);
+	}
+	if (plan->type != LogicalOperatorType::LOGICAL_MATERIALIZED_CTE || plan->children.size() != 2) {
+		return;
+	}
+	auto &cte = plan->Cast<LogicalMaterializedCTE>();
+	idx_t cte_index = cte.table_index;
+	// Definition is now fully inlined (recursion above ran on cte.children[0] too).
+	// Walk the consumer (cte.children[1]) and replace every CTE_REF with this
+	// cte_index with a fresh deep-copied + renumbered + passthrough-projected copy
+	// of the definition.
+	std::function<void(unique_ptr<LogicalOperator> &)> visit = [&](unique_ptr<LogicalOperator> &node) {
+		if (!node) {
+			return;
+		}
+		if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+			auto &ref = node->Cast<LogicalCTERef>();
+			if (ref.cte_index != cte_index) {
+				return; // belongs to another (outer) CTE — handle on its way up
+			}
+			auto deep_copy = plan->children[0]->Copy(context);
+			auto renumbered = renumber_and_rebind_subtree(std::move(deep_copy), binder);
+			// `types` only gets populated by ResolveOperatorTypes — call it once on the
+			// renumbered subtree before reading types for the wrapper projection.
+			renumbered.op->ResolveOperatorTypes();
+			// Wrap in a passthrough projection at ref.table_index so parent BCRs
+			// (ref.table_index, i) keep resolving with no upstream rebind.
+			auto subtree_bindings = renumbered.op->GetColumnBindings();
+			auto subtree_types = renumbered.op->types;
+			vector<unique_ptr<Expression>> proj_exprs;
+			idx_t cols = std::min(ref.chunk_types.size(), subtree_bindings.size());
+			for (idx_t i = 0; i < cols; i++) {
+				auto col_ref = make_uniq<BoundColumnRefExpression>(subtree_types[i], subtree_bindings[i]);
+				if (i < ref.bound_columns.size() && !ref.bound_columns[i].empty()) {
+					col_ref->alias = ref.bound_columns[i];
+				}
+				proj_exprs.push_back(std::move(col_ref));
+			}
+			auto wrapper = make_uniq<LogicalProjection>(ref.table_index, std::move(proj_exprs));
+			wrapper->children.push_back(std::move(renumbered.op));
+			wrapper->ResolveOperatorTypes();
+			OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Inlined CTE_REF cte_index=%lu (table_index=%lu, %zu cols)\n",
+			                    (unsigned long)ref.cte_index, (unsigned long)ref.table_index, (size_t)cols);
+			node = std::move(wrapper);
+			return;
+		}
+		for (auto &c : node->children) {
+			visit(c);
+		}
+	};
+	visit(plan->children[1]);
+	// Replace this MATERIALIZED_CTE node with its (now fully inlined) consumer.
+	plan = std::move(plan->children[1]);
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Collapsed MATERIALIZED_CTE wrapper (cte_index=%lu)\n",
+	                    (unsigned long)cte_index);
 }
 
 /// @public — also called from openivm_parser.cpp on the full CREATE plan before AnalyzePlan.
@@ -1044,6 +1134,10 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                     vector<string> &planner_names) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
+	// Run CTE-ref inlining first so every downstream pass (and IvmJoinRule's
+	// inclusion-exclusion in particular) sees N independent leaves for an N-way
+	// self-join through a CTE — required for delta cross-terms to fire.
+	InlineCteRefs(context, binder, plan);
 	RewriteAggregateFilters(context, plan);
 	bool had_distinct = plan->type == LogicalOperatorType::LOGICAL_DISTINCT ||
 	                    (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&

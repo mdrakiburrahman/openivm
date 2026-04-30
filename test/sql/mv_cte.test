@@ -504,3 +504,100 @@ SELECT w_tax, w_tax_1, count_star FROM mv_dup_agg ORDER BY w_tax;
 0.100	0.100	2
 0.200	0.200	2
 0.300	0.300	1
+
+# ============================================================
+# CTE self-join (regression — pre-fix the optimizer's CTE
+# materialization left a single physical scan referenced from
+# both join sides, so IvmJoinRule's inclusion-exclusion saw one
+# leaf instead of two and missed the cross-term Δt × t_now /
+# t_now × Δt that produces new pairs from a single delta.
+# Fix: InlineCteRefs in src/core/ivm_plan_rewrite.cpp deep-copies
+# the CTE definition per reference before any IVM rewrite runs.)
+# ============================================================
+
+statement ok
+CREATE TABLE selfjoin_t (id INT, k INT, v INT);
+
+statement ok
+INSERT INTO selfjoin_t VALUES (1,1,10), (2,1,20), (3,2,30), (4,2,40);
+
+statement ok
+CREATE MATERIALIZED VIEW selfjoin_mv AS
+    WITH c AS (SELECT id, k, v FROM selfjoin_t)
+    SELECT x.id AS xid, x.v AS xv, y.id AS yid, y.v AS yv
+    FROM c x JOIN c y ON x.k = y.k AND x.id < y.id;
+
+# Initial state: 1 pair per group.
+query I
+SELECT COUNT(*) FROM (
+    SELECT xid, xv, yid, yv FROM selfjoin_mv
+    EXCEPT ALL
+    SELECT x.id, x.v, y.id, y.v
+    FROM selfjoin_t x JOIN selfjoin_t y ON x.k = y.k AND x.id < y.id
+);
+----
+0
+
+# Insert one new row: it must pair with each pre-existing row in the
+# same group. For k=1 with new id=5, two new pairs (1,5) and (2,5).
+statement ok
+INSERT INTO selfjoin_t VALUES (5, 1, 50);
+
+statement ok
+PRAGMA ivm('selfjoin_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT xid, xv, yid, yv FROM selfjoin_mv
+    EXCEPT ALL
+    SELECT x.id, x.v, y.id, y.v
+    FROM selfjoin_t x JOIN selfjoin_t y ON x.k = y.k AND x.id < y.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x.id, x.v, y.id, y.v
+    FROM selfjoin_t x JOIN selfjoin_t y ON x.k = y.k AND x.id < y.id
+    EXCEPT ALL
+    SELECT xid, xv, yid, yv FROM selfjoin_mv
+);
+----
+0
+
+# Mixed batch: new row in another group + delete an existing row.
+statement ok
+INSERT INTO selfjoin_t VALUES (6, 2, 60);
+
+statement ok
+DELETE FROM selfjoin_t WHERE id = 1;
+
+statement ok
+PRAGMA ivm('selfjoin_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT xid, xv, yid, yv FROM selfjoin_mv
+    EXCEPT ALL
+    SELECT x.id, x.v, y.id, y.v
+    FROM selfjoin_t x JOIN selfjoin_t y ON x.k = y.k AND x.id < y.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x.id, x.v, y.id, y.v
+    FROM selfjoin_t x JOIN selfjoin_t y ON x.k = y.k AND x.id < y.id
+    EXCEPT ALL
+    SELECT xid, xv, yid, yv FROM selfjoin_mv
+);
+----
+0
+
+# Classification: SIMPLE_PROJECTION (type 2), not FULL_REFRESH.
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'selfjoin_mv';
+----
+2
