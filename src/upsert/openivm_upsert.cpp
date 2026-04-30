@@ -118,6 +118,21 @@ static string BuildDeltaTimestampFilter(Connection &con, const string &view_name
 	return string(ivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
 }
 
+static string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
+                                         const string &attached_db_catalog_name) {
+	if (!attached_db_catalog_name.empty()) {
+		return attached_db_catalog_name;
+	}
+	auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake' LIMIT 1");
+	if (probe && !probe->HasError() && probe->RowCount() > 0 && !probe->GetValue(0, 0).IsNull()) {
+		return probe->GetValue(0, 0).ToString();
+	}
+	if (!view_catalog_name.empty() && view_catalog_name != "memory") {
+		return view_catalog_name;
+	}
+	return "dl";
+}
+
 static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
                                   bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "", const string &catalog_prefix = "",
@@ -1529,17 +1544,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// For cross-system refresh (native MV that reads from dl.*), view_catalog_name
 	// is the physical-default (no `current_snapshot()` function), so probe
 	// `duckdb_databases()` once per refresh to find the attached DuckLake catalog.
-	string dl_catalog_name = attached_db_catalog_name;
-	if (dl_catalog_name.empty()) {
-		auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake' LIMIT 1");
-		if (probe && !probe->HasError() && probe->RowCount() > 0 && !probe->GetValue(0, 0).IsNull()) {
-			dl_catalog_name = probe->GetValue(0, 0).ToString();
-		} else if (!view_catalog_name.empty() && view_catalog_name != "memory") {
-			dl_catalog_name = view_catalog_name;
-		} else {
-			dl_catalog_name = "dl";
-		}
-	}
+	string dl_catalog_name = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
 	string snapshot_update_query;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
