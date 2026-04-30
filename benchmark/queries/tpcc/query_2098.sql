@@ -1,2 +1,2 @@
--- {"operators": "ASOF_JOIN,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,OORDER", "non_incr_reason": "op:ASOF_JOIN"}
+-- {"operators": "ASOF_JOIN,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,OORDER"}
 SELECT ol.OL_W_ID, ol.OL_I_ID, o.O_ENTRY_D, ROW_NUMBER() OVER (PARTITION BY ol.OL_W_ID ORDER BY o.O_ENTRY_D DESC) AS recency_rank FROM ORDER_LINE ol ASOF JOIN OORDER o ON ol.OL_W_ID = o.O_W_ID AND ol.OL_D_ID = o.O_D_ID AND ol.OL_DELIVERY_D >= o.O_ENTRY_D;

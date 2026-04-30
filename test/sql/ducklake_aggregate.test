@@ -328,45 +328,6 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# SQLite-backed DuckLake metadata must not lock during OpenIVM refresh.
-statement ok
-ATTACH 'ducklake:sqlite:__TEST_DIR__/openivm_poc_meta.db' AS dlsql
-  (DATA_PATH '__TEST_DIR__/openivm_poc_data');
-
-statement ok
-CREATE TABLE dlsql.lock_t(i INT);
-
-statement ok
-INSERT INTO dlsql.lock_t VALUES (1);
-
-statement ok
-CREATE MATERIALIZED VIEW dlsql.lock_mv AS
-SELECT COUNT(*) AS c FROM dlsql.lock_t;
-
-statement ok
-INSERT INTO dlsql.lock_t VALUES (2), (3);
-
-statement ok
-PRAGMA ivm('lock_mv');
-
-query I
-SELECT COUNT(*) FROM (
-    SELECT c FROM dlsql.lock_mv
-    EXCEPT ALL
-    SELECT COUNT(*) AS c FROM dlsql.lock_t
-);
-----
-0
-
-query I
-SELECT COUNT(*) FROM (
-    SELECT COUNT(*) AS c FROM dlsql.lock_t
-    EXCEPT ALL
-    SELECT c FROM dlsql.lock_mv
-);
-----
-0
-
 # ==========================================
 # Scalar aggregate subquery in HAVING
 # ==========================================
@@ -576,6 +537,45 @@ SELECT COUNT(*) FROM (
     SELECT * FROM (SELECT product, SUM(revenue) AS total FROM dl.topk_sales GROUP BY product ORDER BY total DESC LIMIT 3) _q
     EXCEPT ALL
     SELECT product, total FROM dl.topk_sales_mv
+);
+----
+0
+
+# SQLite-backed DuckLake metadata must not lock during OpenIVM refresh.
+statement ok
+ATTACH 'ducklake:sqlite:__TEST_DIR__/openivm_poc_meta.db' AS dlsql
+  (DATA_PATH '__TEST_DIR__/openivm_poc_data');
+
+statement ok
+CREATE TABLE dlsql.lock_t(i INT);
+
+statement ok
+INSERT INTO dlsql.lock_t VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW dlsql.lock_mv AS
+SELECT COUNT(*) AS c FROM dlsql.lock_t;
+
+statement ok
+INSERT INTO dlsql.lock_t VALUES (2), (3);
+
+statement ok
+PRAGMA ivm('lock_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c FROM dlsql.lock_mv
+    EXCEPT ALL
+    SELECT COUNT(*) AS c FROM dlsql.lock_t
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT COUNT(*) AS c FROM dlsql.lock_t
+    EXCEPT ALL
+    SELECT c FROM dlsql.lock_mv
 );
 ----
 0

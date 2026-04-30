@@ -1,2 +1,2 @@
--- {"operators": "UNNEST,TABLE_FUNCTION,AGGREGATE,CASE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "ORDER_LINE", "non_incr_reason": "op:UNNEST"}
+-- {"operators": "UNNEST,TABLE_FUNCTION,AGGREGATE,CASE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "ORDER_LINE"}
 SELECT ol.OL_W_ID, u.measure, SUM(CASE WHEN u.measure = 'amount' THEN ol.OL_AMOUNT ELSE ol.OL_QUANTITY END) AS total_value FROM ORDER_LINE ol CROSS JOIN UNNEST(['amount', 'quantity']) AS u(measure) GROUP BY ol.OL_W_ID, u.measure;

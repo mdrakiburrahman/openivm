@@ -452,8 +452,8 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		} else if (cross_system && !meta_post_sql.empty()) {
 			if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 				string dl_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
-				auto snap_result =
-				    exec_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(dl_catalog) + ".current_snapshot()");
+				auto snap_result = exec_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(dl_catalog) +
+				                                  ".current_snapshot()");
 				if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 					throw Exception(ExceptionType::EXECUTOR,
 					                "IVM refresh of '" + vn +
@@ -550,32 +550,6 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			                               OnEntryNotFound::RETURN_NULL);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Default catalog entry: %s\n", entry ? "found" : "not found");
 			if (!entry) {
-				auto &db_manager = DatabaseManager::Get(context);
-				auto databases = db_manager.GetDatabases(context);
-				OPENIVM_DEBUG_PRINT("[UPSERT] Searching %zu databases...\n", databases.size());
-				for (auto &db : databases) {
-					auto &cat_name = db->GetName();
-					OPENIVM_DEBUG_PRINT("[UPSERT] Checking catalog '%s'...\n", cat_name.c_str());
-					auto found = Catalog::GetEntry(context, cat_name, DEFAULT_SCHEMA,
-					                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx),
-					                               OnEntryNotFound::RETURN_NULL);
-					if (found) {
-						view_catalog_name = cat_name;
-						view_schema_name = DEFAULT_SCHEMA;
-						// Non-default catalog (e.g. DuckLake attached DB): the MV data lives in a
-						// different database than the metadata tables (which are in "memory").
-						// DuckDB forbids writing to two databases in one transaction, so set
-						// cross_system to skip the transaction wrapper in RefreshViewLocked.
-						if (cat_name != "memory") {
-							cross_system = true;
-						}
-						OPENIVM_DEBUG_PRINT("[UPSERT] Found view in catalog '%s' (cross_system=%d)\n", cat_name.c_str(),
-						                    cross_system);
-						break;
-					}
-				}
-			}
-			if (!entry) {
 				auto found_view =
 				    con.Query("SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_type = "
 				              "'VIEW' AND table_name = '" +
@@ -583,6 +557,9 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 				if (!found_view->HasError() && found_view->RowCount() > 0) {
 					view_catalog_name = found_view->GetValue(0, 0).ToString();
 					view_schema_name = found_view->GetValue(1, 0).ToString();
+					if (view_catalog_name != "memory") {
+						cross_system = true;
+					}
 					OPENIVM_DEBUG_PRINT("[UPSERT] Found view via information_schema in '%s.%s'\n",
 					                    view_catalog_name.c_str(), view_schema_name.c_str());
 				}

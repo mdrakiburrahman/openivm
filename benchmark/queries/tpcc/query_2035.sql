@@ -1,2 +1,2 @@
--- {"operators": "UNNEST,TABLE_FUNCTION,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "non_incr_reason": "op:UNNEST"}
+-- {"operators": "UNNEST,TABLE_FUNCTION,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK"}
 SELECT u.threshold, COUNT(*) AS item_count, SUM(s.S_QUANTITY) AS qty FROM STOCK s CROSS JOIN UNNEST([10, 25, 50, 75, 100]) AS u(threshold) WHERE s.S_QUANTITY >= u.threshold GROUP BY u.threshold;
