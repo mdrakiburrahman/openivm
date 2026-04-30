@@ -965,6 +965,18 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		Log("✓ Database created");
 	}
 
+	// Delete any stale WAL before the first child opens the DB. A prior run killed
+	// by SIGKILL (timeout) never flushes its WAL; if we don't clean it up now,
+	// DuckDB's WAL replay throws "DatabaseManager::GetDefaultDatabase with no default
+	// database set" and the very first query crashes before doing any work.
+	{
+		string wal_path = db_path + ".wal";
+		if (FileExists(wal_path)) {
+			Log("Removing stale WAL: " + wal_path);
+			std::remove(wal_path.c_str());
+		}
+	}
+
 	vector<string> query_files = CollectQueryFiles(queries_dir);
 	int total = static_cast<int>(query_files.size());
 	Log("Running benchmark on " + std::to_string(total) + " queries...");
