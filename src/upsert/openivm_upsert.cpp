@@ -507,9 +507,33 @@ static string BuildDuckLakeSnapshotQuery(IVMMetadata &metadata, Connection &con,
 		int64_t old_snap = metadata.GetLastSnapshotId(view_name, dt);
 		auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
 		                                         attached_db_catalog_name, attached_db_schema_name);
-		string replacement = "(SELECT * FROM " + QualifiedName(loc.catalog_name, loc.schema_name, loc.table_name) +
-		                     " AT (VERSION => " + to_string(old_snap) + "))";
+		string source_name = loc.table_name;
+		if (StringUtil::StartsWith(source_name, ivm::DATA_TABLE_PREFIX)) {
+			source_name = source_name.substr(strlen(ivm::DATA_TABLE_PREFIX));
+		}
+		string visible_cols;
+		auto cols = con.Query("SELECT column_name FROM information_schema.columns WHERE table_catalog = '" +
+		                      OpenIVMUtils::EscapeValue(loc.catalog_name) + "' AND table_schema = '" +
+		                      OpenIVMUtils::EscapeValue(loc.schema_name) + "' AND table_name = '" +
+		                      OpenIVMUtils::EscapeValue(source_name) + "' ORDER BY ordinal_position");
+		if (!cols->HasError()) {
+			for (idx_t i = 0; i < cols->RowCount(); i++) {
+				if (!visible_cols.empty()) {
+					visible_cols += ", ";
+				}
+				visible_cols += OpenIVMUtils::QuoteIdentifier(cols->GetValue(0, i).ToString());
+			}
+		}
+		if (visible_cols.empty()) {
+			visible_cols = "*";
+		}
+		string replacement = "(SELECT " + visible_cols + " FROM " +
+		                     QualifiedName(loc.catalog_name, loc.schema_name, loc.table_name) + " AT (VERSION => " +
+		                     to_string(old_snap) + "))";
 		snapshot_query = ReplaceTableReferences(snapshot_query, loc.table_name, replacement);
+		if (!StringUtil::CIEquals(source_name, loc.table_name)) {
+			snapshot_query = ReplaceTableReferences(snapshot_query, source_name, replacement);
+		}
 	}
 	return snapshot_query;
 }
