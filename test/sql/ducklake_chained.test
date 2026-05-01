@@ -316,6 +316,42 @@ SELECT count(*) FROM (
 ----
 0
 
+statement ok
+CREATE MATERIALIZED VIEW dl.gold.cross_schema_join_l2 AS
+  WITH l1 AS (
+    SELECT id, amount FROM dl.silver.cross_schema_l1
+  )
+  SELECT l1.id, l1.amount, b.amount AS base_amount
+  FROM l1
+  JOIN dl.bronze.cross_schema_base b USING (id);
+
+statement ok
+INSERT INTO dl.bronze.cross_schema_base VALUES (4, 40);
+
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'cross_schema_l1');
+
+statement ok
+PRAGMA ivm_options('dl', 'gold', 'cross_schema_join_l2');
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount, base_amount FROM dl.gold.cross_schema_join_l2
+  EXCEPT ALL
+  SELECT id, amount, amount AS base_amount FROM dl.silver.cross_schema_l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount, amount AS base_amount FROM dl.silver.cross_schema_l1
+  EXCEPT ALL
+  SELECT id, amount, base_amount FROM dl.gold.cross_schema_join_l2
+);
+----
+0
+
 # ==========================================
 # Cascade mode: downstream
 # Refreshing mv_region should auto-refresh mv_top

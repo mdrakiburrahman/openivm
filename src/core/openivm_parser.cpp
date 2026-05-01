@@ -349,7 +349,7 @@ static void CollectSourceTables(LogicalOperator *op, unordered_map<string, OpenI
 		if (table_ref.get()) {
 			auto &table = *table_ref.get();
 			string table_name = table.name;
-			if (!table_name.empty() && !IVMTableNames::IsDataTable(table_name) && !OpenIVMUtils::IsDelta(table_name)) {
+			if (!table_name.empty() && !OpenIVMUtils::IsDelta(table_name)) {
 				source_table_info[table_name] = {table_name, table.ParentCatalog().GetName(), table.schema.name};
 			}
 		}
