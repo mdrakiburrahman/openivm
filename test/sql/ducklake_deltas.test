@@ -184,6 +184,162 @@ SELECT count(*) FROM (SELECT category, SUM(price), COUNT(*) FROM dl.del_test GRO
 ----
 0
 
+# ==========================================
+# Section 5: DuckLake table-level empty delta skipping
+# Catalog snapshots advance when any table changes. A join MV should not build a
+# delta term for an unchanged source table in the same catalog.
+# ==========================================
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+statement ok
+SET ivm_skip_empty_deltas=true;
+
+statement ok
+CREATE TABLE dl.skip_base (id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.skip_unrelated (id INTEGER);
+
+statement ok
+INSERT INTO dl.skip_base VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_skip_base AS
+SELECT id, v FROM dl.skip_base;
+
+statement ok
+CREATE TEMP TABLE skip_base_snapshot AS
+SELECT last_snapshot_id AS snap
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'mv_skip_base';
+
+statement ok
+INSERT INTO dl.skip_unrelated VALUES (1);
+
+statement ok
+PRAGMA ivm('mv_skip_base');
+
+query I
+SELECT last_snapshot_id = (SELECT snap FROM skip_base_snapshot)
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'mv_skip_base';
+----
+true
+
+statement ok
+DROP TABLE skip_base_snapshot;
+
+statement ok
+CREATE TABLE dl.skip_left (id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.skip_right (id INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO dl.skip_left VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO dl.skip_right VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_skip_unchanged_join AS
+SELECT l.id, l.v, r.w
+FROM dl.skip_left l
+JOIN dl.skip_right r USING (id);
+
+statement ok
+INSERT INTO dl.skip_left VALUES (3, 30);
+
+statement ok
+PRAGMA ivm('mv_skip_unchanged_join');
+
+query I
+SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_unchanged_join.sql');
+----
+0
+
+query I
+SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_unchanged_join.sql');
+----
+0
+
+query I
+SELECT contains(content, 'ducklake_table_insertions(''dl'', ''main'', ''skip_right''') FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_unchanged_join.sql');
+----
+false
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v, w FROM dl.mv_skip_unchanged_join
+  EXCEPT ALL
+  SELECT l.id, l.v, r.w FROM dl.skip_left l JOIN dl.skip_right r USING (id)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.v, r.w FROM dl.skip_left l JOIN dl.skip_right r USING (id)
+  EXCEPT ALL
+  SELECT id, v, w FROM dl.mv_skip_unchanged_join
+);
+----
+0
+
+statement ok
+CREATE TABLE dl.skip_key_left (id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.skip_key_right (id INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO dl.skip_key_left VALUES (1, 10);
+
+statement ok
+INSERT INTO dl.skip_key_right VALUES (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_skip_disjoint_key AS
+SELECT l.id, l.v, r.w
+FROM dl.skip_key_left l
+JOIN dl.skip_key_right r USING (id);
+
+statement ok
+INSERT INTO dl.skip_key_left VALUES (999, 999);
+
+statement ok
+PRAGMA ivm('mv_skip_disjoint_key');
+
+query I
+SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_disjoint_key.sql');
+----
+0
+
+query I
+SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_disjoint_key.sql');
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v, w FROM dl.mv_skip_disjoint_key
+  EXCEPT ALL
+  SELECT l.id, l.v, r.w FROM dl.skip_key_left l JOIN dl.skip_key_right r USING (id)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.v, r.w FROM dl.skip_key_left l JOIN dl.skip_key_right r USING (id)
+  EXCEPT ALL
+  SELECT id, v, w FROM dl.mv_skip_disjoint_key
+);
+----
+0
+
 # Delete all from a group
 statement ok
 DELETE FROM dl.del_test WHERE category = 'Y';

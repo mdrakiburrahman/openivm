@@ -11,6 +11,7 @@
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -18,6 +19,7 @@
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -26,6 +28,105 @@ namespace duckdb {
 
 static uint64_t BindingKey(const ColumnBinding &binding) {
 	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+}
+
+struct JoinColumnRef {
+	size_t leaf_index;
+	string table_name;
+	string delta_name;
+	string column_name;
+	string last_update;
+};
+
+struct JoinKeyProbe {
+	size_t other_leaf;
+	string delta_column;
+	string other_column;
+};
+
+static bool TryGetColumnRef(Expression &expr, ColumnBinding &binding) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+		auto &cast = expr.Cast<BoundCastExpression>();
+		return TryGetColumnRef(*cast.child, binding);
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &col = expr.Cast<BoundColumnRefExpression>();
+	binding = col.binding;
+	return true;
+}
+
+static void CollectJoinKeyProbes(LogicalOperator *node, const unordered_map<uint64_t, JoinColumnRef> &column_refs,
+                                 vector<vector<JoinKeyProbe>> &probes) {
+	if (!node) {
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+		if (join && join->join_type == JoinType::INNER) {
+			for (auto &cond : join->conditions) {
+				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+					continue;
+				}
+				ColumnBinding left_binding, right_binding;
+				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
+					continue;
+				}
+				auto left_entry = column_refs.find(BindingKey(left_binding));
+				auto right_entry = column_refs.find(BindingKey(right_binding));
+				if (left_entry == column_refs.end() || right_entry == column_refs.end()) {
+					continue;
+				}
+				auto &left = left_entry->second;
+				auto &right = right_entry->second;
+				if (left.leaf_index == right.leaf_index) {
+					continue;
+				}
+				probes[left.leaf_index].push_back({right.leaf_index, left.column_name, right.column_name});
+				probes[right.leaf_index].push_back({left.leaf_index, right.column_name, left.column_name});
+			}
+		}
+	}
+	for (auto &child : node->children) {
+		CollectJoinKeyProbes(child.get(), column_refs, probes);
+	}
+}
+
+static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref, const string &delta_column,
+                                 const JoinColumnRef &other_ref, const string &other_column) {
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + OpenIVMUtils::QuoteIdentifier(delta_column) +
+	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(delta_ref.delta_name) + " WHERE " +
+	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(delta_ref.last_update) +
+	             "'::TIMESTAMP) _ivm_delta_keys JOIN " + OpenIVMUtils::QuoteIdentifier(other_ref.table_name) +
+	             " _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." +
+	             OpenIVMUtils::QuoteIdentifier(other_column) + " LIMIT 1)";
+	auto result = con.Query(sql);
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Could not probe key-domain intersection: %s\n",
+		                    result->HasError() ? result->GetError().c_str() : "no result");
+		return true;
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
+}
+
+static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref, const string &left_column,
+                                  const JoinColumnRef &right_ref, const string &right_column) {
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + OpenIVMUtils::QuoteIdentifier(left_column) +
+	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(left_ref.delta_name) + " WHERE " +
+	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(left_ref.last_update) +
+	             "'::TIMESTAMP) _ivm_left_delta_keys JOIN (SELECT " + OpenIVMUtils::QuoteIdentifier(right_column) +
+	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(right_ref.delta_name) + " WHERE " +
+	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(right_ref.last_update) +
+	             "'::TIMESTAMP) _ivm_right_delta_keys ON _ivm_left_delta_keys._ivm_key = "
+	             "_ivm_right_delta_keys._ivm_key LIMIT 1)";
+	auto result = con.Query(sql);
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Could not probe delta key-domain intersection: %s\n",
+		                    result->HasError() ? result->GetError().c_str() : "no result");
+		return true;
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
 }
 
 static void CollectExistingMultiplicityBindings(LogicalOperator *node, unordered_set<uint64_t> &mul_set) {
@@ -470,36 +571,110 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	}
 	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
 	uint64_t total_terms = (1ULL << N) - 1;
-	uint64_t fallback_mask = total_terms;
-	for (size_t i = 0; i < N; i++) {
-		if (!(delta_status.constant_mask & (1ULL << i))) {
-			fallback_mask = 1ULL << i;
-			break;
+
+	Connection key_probe_con(*context.db);
+	vector<JoinColumnRef> leaf_refs(N);
+	vector<vector<JoinKeyProbe>> key_probes(N);
+	if (skip_empty_enabled && !has_left_join) {
+		unordered_map<uint64_t, JoinColumnRef> column_refs;
+		for (size_t i = 0; i < N; i++) {
+			LogicalGet *get = GetLeafScan(leaves[i]);
+			if (!get) {
+				continue;
+			}
+			auto table_ref = get->GetTable();
+			if (table_ref.get() == nullptr) {
+				continue;
+			}
+			string table_name = table_ref.get()->name;
+			string delta_name = OpenIVMUtils::DeltaName(table_name);
+			auto ts_result = key_probe_con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) +
+			                                     " WHERE view_name = '" + OpenIVMUtils::EscapeValue(pw.view) +
+			                                     "' AND table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+			if (ts_result->HasError() || ts_result->RowCount() == 0 || ts_result->GetValue(0, 0).IsNull()) {
+				continue;
+			}
+			leaf_refs[i].leaf_index = i;
+			leaf_refs[i].table_name = table_name;
+			leaf_refs[i].delta_name = delta_name;
+			leaf_refs[i].last_update = ts_result->GetValue(0, 0).ToString();
+
+			auto bindings = get->GetColumnBindings();
+			auto &column_ids = get->GetColumnIds();
+			idx_t count = std::min<idx_t>(bindings.size(), column_ids.size());
+			for (idx_t col_idx = 0; col_idx < count; col_idx++) {
+				if (column_ids[col_idx].IsVirtualColumn()) {
+					continue;
+				}
+				auto column_name = get->GetColumnName(column_ids[col_idx]);
+				leaf_refs[i].column_name = column_name;
+				column_refs[BindingKey(bindings[col_idx])] = {i, table_name, delta_name, column_name,
+				                                              leaf_refs[i].last_update};
+			}
+			auto leaf_bindings = leaves[i].node->GetColumnBindings();
+			idx_t leaf_count = std::min<idx_t>(leaf_bindings.size(), count);
+			for (idx_t col_idx = 0; col_idx < leaf_count; col_idx++) {
+				if (column_ids[col_idx].IsVirtualColumn()) {
+					continue;
+				}
+				auto column_name = get->GetColumnName(column_ids[col_idx]);
+				column_refs[BindingKey(leaf_bindings[col_idx])] = {i, table_name, delta_name, column_name,
+				                                                   leaf_refs[i].last_update};
+			}
 		}
+		CollectJoinKeyProbes(pw.plan.get(), column_refs, key_probes);
 	}
 
 	uint64_t pruned_count = 0;
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu)\n",
 	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask);
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
-		// Safety: always generate at least one term to avoid empty UNION ALL.
-		// If every useful term was pruned as empty, use one mutable source leaf as
-		// the fallback. Constant leaves (VALUES/UNNEST/table functions) have no
-		// delta scan, so the fallback must not force them onto the delta side.
-		bool is_last_chance = (mask == fallback_mask) && terms.empty();
-
 		// FK pruning: skip any term whose mask overlaps with insert-only PK leaves.
 		// All such terms cancel algebraically via XOR (see ComputeSkipBits).
-		if (!is_last_chance && skip_bits && (mask & skip_bits)) {
+		if (skip_bits && (mask & skip_bits)) {
 			pruned_count++;
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Pruned term mask=%lu (FK insert-only PK)\n", (unsigned long)mask);
 			continue;
 		}
 		// Empty-delta skipping: if any table in the mask has zero delta rows,
 		// the join term produces zero rows (join with empty input = empty).
-		if (!is_last_chance && empty_mask && (mask & empty_mask)) {
+		if (empty_mask && (mask & empty_mask)) {
 			pruned_count++;
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Skipped term mask=%lu (empty delta)\n", (unsigned long)mask);
+			continue;
+		}
+		bool key_domain_empty = false;
+		if (skip_empty_enabled && !has_left_join) {
+			for (size_t i = 0; i < N && !key_domain_empty; i++) {
+				if (!(mask & (1ULL << i)) || key_probes[i].empty() || leaf_refs[i].last_update.empty()) {
+					continue;
+				}
+				for (auto &probe : key_probes[i]) {
+					if (leaf_refs[probe.other_leaf].last_update.empty()) {
+						continue;
+					}
+					bool has_match;
+					if (mask & (1ULL << probe.other_leaf)) {
+						if (i > probe.other_leaf) {
+							continue;
+						}
+						has_match = DeltaKeyHasDeltaMatch(key_probe_con, leaf_refs[i], probe.delta_column,
+						                                  leaf_refs[probe.other_leaf], probe.other_column);
+					} else {
+						has_match = DeltaKeyHasBaseMatch(key_probe_con, leaf_refs[i], probe.delta_column,
+						                                 leaf_refs[probe.other_leaf], probe.other_column);
+					}
+					if (!has_match) {
+						key_domain_empty = true;
+						break;
+					}
+				}
+			}
+		}
+		if (key_domain_empty) {
+			pruned_count++;
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Skipped term mask=%lu (delta key-domain empty)\n",
+			                    (unsigned long)mask);
 			continue;
 		}
 		auto term = pw.plan->Copy(context);
@@ -623,6 +798,16 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 // ============================================================================
 static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                     const vector<LogicalType> &types, Binder &binder) {
+	if (terms.empty()) {
+		vector<ColumnBinding> bindings;
+		auto table_index = binder.GenerateTableIndex();
+		for (idx_t i = 0; i < types.size(); i++) {
+			bindings.emplace_back(table_index, i);
+		}
+		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
+		empty->ResolveOperatorTypes();
+		return std::move(empty);
+	}
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {
 		auto union_table_index = binder.GenerateTableIndex();

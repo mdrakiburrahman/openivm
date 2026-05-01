@@ -1024,3 +1024,24 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Re-refreshing a downstream view with only stale already-consumed delta rows
+# should be skipped, not treated as a new delta.
+statement ok
+CREATE TEMP TABLE ch_noop_l2_last_update AS
+SELECT last_update
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'ch_noop_l2';
+
+statement ok
+PRAGMA ivm('ch_noop_l2');
+
+query I
+SELECT d.last_update = p.last_update
+FROM _duckdb_ivm_delta_tables d, ch_noop_l2_last_update p
+WHERE d.view_name = 'ch_noop_l2';
+----
+true
+
+statement ok
+DROP TABLE ch_noop_l2_last_update;

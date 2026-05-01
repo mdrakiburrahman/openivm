@@ -119,6 +119,49 @@ static string BuildDeltaTimestampFilter(Connection &con, const string &view_name
 	return string(ivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
 }
 
+static bool IsEmptyDeltaPlan(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	switch (op->type) {
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+		return true;
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		return op->children.size() == 1 && IsEmptyDeltaPlan(op->children[0].get());
+	case LogicalOperatorType::LOGICAL_UNION:
+		if (op->children.empty()) {
+			return false;
+		}
+		for (auto &child : op->children) {
+			if (!IsEmptyDeltaPlan(child.get())) {
+				return false;
+			}
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
+static string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,
+                                    const vector<LogicalType> &column_types) {
+	string sql = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name) + " SELECT ";
+	for (size_t i = 0; i < column_names.size(); i++) {
+		if (i > 0) {
+			sql += ", ";
+		}
+		auto type = i < column_types.size() ? column_types[i] : LogicalType::VARCHAR;
+		sql += "NULL::" + type.ToString();
+	}
+	sql += " WHERE false;\n";
+	return sql;
+}
+
 static const char *IVMTypeName(IVMType type) {
 	switch (type) {
 	case IVMType::AGGREGATE_HAVING:
@@ -922,7 +965,24 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					}
 					auto ducklake_current_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
 					auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
-					if (last_snap != ducklake_current_snap) {
+					if (last_snap == ducklake_current_snap) {
+						continue;
+					}
+					auto has_changes = snap_con.Query(
+					    "SELECT EXISTS(SELECT 1 FROM ("
+					    "(SELECT 1 FROM ducklake_table_insertions('" +
+					    OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+					    OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+					    OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+					    to_string(ducklake_current_snap) + ") LIMIT 1) "
+					    "UNION ALL "
+					    "(SELECT 1 FROM ducklake_table_deletions('" +
+					    OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+					    OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+					    OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+					    to_string(ducklake_current_snap) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)");
+					if (has_changes->HasError() || has_changes->RowCount() == 0 ||
+					    has_changes->GetValue(0, 0).IsNull() || has_changes->GetValue(0, 0).GetValue<bool>()) {
 						all_empty = false;
 						break;
 					}
@@ -932,8 +992,19 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 				if (!view_catalog_name.empty() && !view_schema_name.empty()) {
 					delta_probe = QualifiedName(view_catalog_name, view_schema_name, dt);
 				}
-				auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_probe);
+				auto last_update = metadata.GetLastUpdate(view_name, dt);
+				if (last_update.empty()) {
+					all_empty = false;
+					break;
+				}
+				auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_probe + " WHERE " +
+				                              string(ivm::TIMESTAMP_COL) + " >= '" +
+				                              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP");
 				if (!count_result->HasError() && count_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
+					all_empty = false;
+					break;
+				}
+				if (count_result->HasError()) {
 					all_empty = false;
 					break;
 				}
@@ -1239,13 +1310,30 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				if (last_snap == cur_snap) {
 					continue; // no changes — empty delta
 				}
+				auto count_result =
+				    con.Query("SELECT "
+				              "(SELECT COUNT(*) FROM ducklake_table_insertions('" +
+				              OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+				              OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+				              OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+				              to_string(cur_snap) + ")), "
+				              "(SELECT COUNT(*) FROM ducklake_table_deletions('" +
+				              OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+				              OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+				              OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+				              to_string(cur_snap) + "))");
+				if (count_result->HasError()) {
+					any_has_deletes = true;
+					tables_with_changes++;
+					continue;
+				}
+				auto insert_count = count_result->GetValue(0, 0).GetValue<int64_t>();
+				auto delete_count = count_result->GetValue(1, 0).GetValue<int64_t>();
+				if (insert_count == 0 && delete_count == 0) {
+					continue;
+				}
 				tables_with_changes++;
-				auto del_result = con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" +
-				                            OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
-				                            OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
-				                            OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) +
-				                            ", " + to_string(cur_snap) + ")");
-				if (del_result->HasError() || del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
+				if (delete_count > 0) {
 					any_has_deletes = true;
 				}
 			} else {
@@ -1724,6 +1812,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string pre_companion;
 	string post_companion;
 	string delete_from_view_query;
+	string delta_view_name = catalog_prefix + OpenIVMUtils::DeltaName(view_name);
 
 	if (view_query_type == IVMType::WINDOW_PARTITION || view_query_type == IVMType::GROUP_RECOMPUTE ||
 	    view_query_type == IVMType::DISTINCT_INCREMENTAL || view_query_type == IVMType::SEMI_ANTI_RECOMPUTE) {
@@ -1767,24 +1856,29 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// this fallback the whole PRAGMA ivm() call would surface "Invalid Error:
 		// map::at" and the user gets a cryptic crash instead of a working refresh.
 		string raw_ivm_sql;
-		try {
-			auto ast = LogicalPlanToAst(con_ctx, plan);
-			auto cte_list = AstToCteList(*ast);
-			raw_ivm_sql = cte_list->ToQuery(false);
-			OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
-		} catch (const std::exception &e) {
-			Printer::Print("Warning: materialized view '" + view_name +
-			               "' uses constructs not supported by IVM's SQL serializer (" + e.what() +
-			               "). Falling back to full recompute for this refresh.");
-			OPENIVM_DEBUG_PRINT("[UPSERT] LPTS fallback (%s) for view '%s' → full recompute\n", e.what(),
+		if (IsEmptyDeltaPlan(plan.get())) {
+			raw_ivm_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Delta plan is empty; generated no-op delta insert for '%s'\n",
 			                    view_name.c_str());
-			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-			                           attached_db_schema_name, catalog_prefix, out_post_meta);
+		} else {
+			try {
+				auto ast = LogicalPlanToAst(con_ctx, plan);
+				auto cte_list = AstToCteList(*ast);
+				raw_ivm_sql = cte_list->ToQuery(false);
+				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
+			} catch (const std::exception &e) {
+				Printer::Print("Warning: materialized view '" + view_name +
+				               "' uses constructs not supported by IVM's SQL serializer (" + e.what() +
+				               "). Falling back to full recompute for this refresh.");
+				OPENIVM_DEBUG_PRINT("[UPSERT] LPTS fallback (%s) for view '%s' → full recompute\n", e.what(),
+				                    view_name.c_str());
+				return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+				                           attached_db_schema_name, catalog_prefix, out_post_meta);
+			}
 		}
 
 		// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
 		// so the DEFAULT now() fills it in (for chained MV support)
-		string delta_view_name = catalog_prefix + OpenIVMUtils::DeltaName(view_name);
 		string insert_target_bare = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name);
 		auto insert_pos = raw_ivm_sql.find(insert_target_bare);
 		if (insert_pos != string::npos) {

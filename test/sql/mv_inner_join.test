@@ -1008,6 +1008,94 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Empty-delta skipping can prove an inner-join refresh has no output when the
+# changed join keys do not exist on the other side.
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+statement ok
+SET ivm_skip_empty_deltas=true;
+
+statement ok
+CREATE TABLE skj_left (id INT, v INT);
+
+statement ok
+CREATE TABLE skj_right (id INT, w INT);
+
+statement ok
+INSERT INTO skj_left VALUES (1, 10);
+
+statement ok
+INSERT INTO skj_right VALUES (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_skip_join_key AS
+    SELECT l.id, l.v, r.w FROM skj_left l JOIN skj_right r ON l.id = r.id;
+
+statement ok
+INSERT INTO skj_left VALUES (999, 999);
+
+statement ok
+PRAGMA ivm('mv_skip_join_key');
+
+query I
+SELECT contains(content, 'SELECT NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER WHERE false')
+FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_join_key.sql');
+----
+true
+
+query I
+SELECT contains(content, 'JOIN skj_right') FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_join_key.sql');
+----
+false
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_skip_join_key
+    EXCEPT ALL SELECT l.id, l.v, r.w FROM skj_left l JOIN skj_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.v, r.w FROM skj_left l JOIN skj_right r ON l.id = r.id
+    EXCEPT ALL SELECT * FROM mv_skip_join_key
+);
+----
+0
+
+statement ok
+INSERT INTO skj_left VALUES (1000, 1000);
+
+statement ok
+INSERT INTO skj_right VALUES (2000, 2000);
+
+statement ok
+PRAGMA ivm('mv_skip_join_key');
+
+query I
+SELECT contains(content, 'SELECT NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER WHERE false')
+FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_join_key.sql');
+----
+true
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_skip_join_key
+    EXCEPT ALL SELECT l.id, l.v, r.w FROM skj_left l JOIN skj_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.v, r.w FROM skj_left l JOIN skj_right r ON l.id = r.id
+    EXCEPT ALL SELECT * FROM mv_skip_join_key
+);
+----
+0
+
 statement ok
 INSERT INTO any_w VALUES (4);
 

@@ -5,16 +5,126 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "upsert/openivm_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "storage/ducklake_scan.hpp"
 
 namespace duckdb {
+
+static uint64_t DuckLakeJoinBindingKey(const ColumnBinding &binding) {
+	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+}
+
+struct DuckLakeJoinColumnRef {
+	size_t leaf_index;
+	string column_name;
+};
+
+struct DuckLakeKeyProbe {
+	size_t other_leaf;
+	string delta_column;
+	string other_column;
+};
+
+static bool TryGetColumnRef(Expression &expr, ColumnBinding &binding) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+		auto &cast = expr.Cast<BoundCastExpression>();
+		return TryGetColumnRef(*cast.child, binding);
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &col = expr.Cast<BoundColumnRefExpression>();
+	binding = col.binding;
+	return true;
+}
+
+static void CollectDuckLakeKeyProbes(LogicalOperator *node,
+                                     const unordered_map<uint64_t, DuckLakeJoinColumnRef> &column_refs,
+                                     vector<vector<DuckLakeKeyProbe>> &probes) {
+	if (!node) {
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+		if (join && join->join_type == JoinType::INNER) {
+			for (auto &cond : join->conditions) {
+				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+					continue;
+				}
+				ColumnBinding left_binding, right_binding;
+				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
+					continue;
+				}
+				auto left_entry = column_refs.find(DuckLakeJoinBindingKey(left_binding));
+				auto right_entry = column_refs.find(DuckLakeJoinBindingKey(right_binding));
+				if (left_entry == column_refs.end() || right_entry == column_refs.end()) {
+					continue;
+				}
+				auto &left = left_entry->second;
+				auto &right = right_entry->second;
+				if (left.leaf_index == right.leaf_index) {
+					continue;
+				}
+				probes[left.leaf_index].push_back({right.leaf_index, left.column_name, right.column_name});
+				probes[right.leaf_index].push_back({left.leaf_index, right.column_name, left.column_name});
+			}
+		}
+	}
+	for (auto &child : node->children) {
+		CollectDuckLakeKeyProbes(child.get(), column_refs, probes);
+	}
+}
+
+static string DuckLakeQualifiedTable(const string &catalog, const string &schema, const string &table_name,
+                                     int64_t snapshot_id) {
+	string result = OpenIVMUtils::QuoteIdentifier(catalog) + "." + OpenIVMUtils::QuoteIdentifier(schema) + "." +
+	                OpenIVMUtils::QuoteIdentifier(table_name);
+	if (snapshot_id >= 0) {
+		result += " AT (VERSION => " + to_string(snapshot_id) + ")";
+	}
+	return result;
+}
+
+static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, const string &schema,
+                                     const string &table_name, const string &delta_column, int64_t old_snapshot,
+                                     int64_t current_snapshot, const string &other_catalog,
+                                     const string &other_schema, const string &other_table,
+                                     const string &other_column, int64_t other_snapshot) {
+	string delta_col = OpenIVMUtils::QuoteIdentifier(delta_column);
+	string other_col = OpenIVMUtils::QuoteIdentifier(other_column);
+	string other_relation = DuckLakeQualifiedTable(other_catalog, other_schema, other_table, other_snapshot);
+	string old_snap = to_string(old_snapshot);
+	string cur_snap = to_string(current_snapshot);
+	string sql =
+	    "SELECT EXISTS(SELECT 1 FROM ("
+	    "SELECT " +
+	    delta_col + " AS _ivm_key FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog) + "', '" +
+	    OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " + old_snap + ", " +
+	    cur_snap + ") "
+	    "UNION ALL "
+	    "SELECT " +
+	    delta_col + " AS _ivm_key FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog) + "', '" +
+	    OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " + old_snap + ", " +
+	    cur_snap + ")) _ivm_delta_keys "
+	    "JOIN (SELECT * FROM " +
+	    other_relation + ") _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." + other_col + " LIMIT 1)";
+	auto result = con.Query(sql);
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe key-domain intersection: %s\n",
+		                    result->HasError() ? result->GetError().c_str() : "no result");
+		return true;
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
+}
 
 // ============================================================================
 // PinToOldSnapshot: set a DuckLake scan to read the table at last_snapshot_id
@@ -49,10 +159,17 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 	// Collect last_snapshot_id for each leaf upfront (one query per table).
 	Connection con(*context.db);
 	vector<int64_t> old_snapshots(N);
+	vector<string> table_catalogs(N);
+	vector<string> table_schemas(N);
+	vector<string> table_names(N);
 	for (size_t i = 0; i < N; i++) {
 		auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
 		D_ASSERT(get);
-		string table_name = get->GetTable().get()->name;
+		auto table_ref = get->GetTable();
+		string table_name = table_ref.get()->name;
+		table_catalogs[i] = table_ref->ParentCatalog().GetName();
+		table_schemas[i] = table_ref->schema.name;
+		table_names[i] = table_name;
 		auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
 		                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(pw.view) +
 		                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
@@ -82,16 +199,101 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		}
 	}
 
+	// DuckLake snapshot ids are catalog-wide. A table can have last_snapshot_id !=
+	// current_snapshot because another table changed. Probe table-level changes before
+	// building the term so unchanged tables do not force a full plan copy/rewrite.
+	vector<bool> empty_table_delta(N, false);
+	if (skip_empty_enabled && current_snapshot >= 0) {
+		for (size_t i = 0; i < N; i++) {
+			if (old_snapshots[i] == current_snapshot) {
+				empty_table_delta[i] = true;
+				continue;
+			}
+			string has_changes_sql =
+			    "SELECT EXISTS(SELECT 1 FROM ("
+			    "(SELECT 1 FROM ducklake_table_insertions('" +
+			    OpenIVMUtils::EscapeValue(table_catalogs[i]) + "', '" +
+			    OpenIVMUtils::EscapeValue(table_schemas[i]) + "', '" + OpenIVMUtils::EscapeValue(table_names[i]) +
+			    "', " + to_string(old_snapshots[i]) + ", " + to_string(current_snapshot) + ") LIMIT 1) "
+			    "UNION ALL "
+			    "(SELECT 1 FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(table_catalogs[i]) +
+			    "', '" + OpenIVMUtils::EscapeValue(table_schemas[i]) + "', '" +
+			    OpenIVMUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
+			    to_string(current_snapshot) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)";
+			auto has_changes = con.Query(has_changes_sql);
+			if (has_changes->HasError()) {
+				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe changes for %s.%s.%s: %s\n",
+				                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
+				                    has_changes->GetError().c_str());
+				continue;
+			}
+			if (has_changes->RowCount() > 0 && !has_changes->GetValue(0, 0).IsNull() &&
+			    !has_changes->GetValue(0, 0).GetValue<bool>()) {
+				empty_table_delta[i] = true;
+			}
+		}
+	}
+
+	vector<vector<DuckLakeKeyProbe>> key_probes(N);
+	if (skip_empty_enabled && !has_left_join && current_snapshot >= 0) {
+		unordered_map<uint64_t, DuckLakeJoinColumnRef> column_refs;
+		for (size_t i = 0; i < N; i++) {
+			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+			if (!get) {
+				continue;
+			}
+			auto bindings = get->GetColumnBindings();
+			auto &column_ids = get->GetColumnIds();
+			idx_t count = std::min<idx_t>(bindings.size(), column_ids.size());
+			for (idx_t col_idx = 0; col_idx < count; col_idx++) {
+				if (column_ids[col_idx].IsVirtualColumn()) {
+					continue;
+				}
+				column_refs[DuckLakeJoinBindingKey(bindings[col_idx])] = {i, get->GetColumnName(column_ids[col_idx])};
+			}
+			auto leaf_bindings = leaves[i].node->GetColumnBindings();
+			idx_t leaf_count = std::min<idx_t>(leaf_bindings.size(), count);
+			for (idx_t col_idx = 0; col_idx < leaf_count; col_idx++) {
+				if (column_ids[col_idx].IsVirtualColumn()) {
+					continue;
+				}
+				column_refs[DuckLakeJoinBindingKey(leaf_bindings[col_idx])] = {i,
+				                                                               get->GetColumnName(column_ids[col_idx])};
+			}
+		}
+		CollectDuckLakeKeyProbes(pw.plan.get(), column_refs, key_probes);
+	}
+
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves, current_snapshot=%ld)\n",
 	                    N, (long)current_snapshot);
 
 	for (size_t i = 0; i < N; i++) {
 		// Skip term if this table has no changes since last refresh.
-		// Safety: always generate at least one term to avoid empty UNION ALL.
-		bool is_last_chance = (i == N - 1) && terms.empty();
-		if (skip_empty_enabled && !is_last_chance && current_snapshot >= 0 && old_snapshots[i] == current_snapshot) {
-			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: no changes (snapshot %ld == current)\n", i,
-			                    (long)old_snapshots[i]);
+		if (skip_empty_enabled && empty_table_delta[i]) {
+			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: no changes in %s.%s.%s (%ld -> %ld)\n", i,
+			                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
+			                    (long)old_snapshots[i], (long)current_snapshot);
+			continue;
+		}
+		bool key_domain_empty = false;
+		if (skip_empty_enabled && !key_probes[i].empty()) {
+			for (auto &probe : key_probes[i]) {
+				size_t other = probe.other_leaf;
+				int64_t other_snapshot = other > i ? old_snapshots[other] : -1;
+				if (!DuckLakeDeltaKeyHasMatch(con, table_catalogs[i], table_schemas[i], table_names[i],
+				                              probe.delta_column, old_snapshots[i], current_snapshot,
+				                              table_catalogs[other], table_schemas[other], table_names[other],
+				                              probe.other_column, other_snapshot)) {
+					key_domain_empty = true;
+					OPENIVM_DEBUG_PRINT(
+					    "[DuckLakeJoin] Skipping term %zu: delta key %s.%s has no match in %s.%s\n", i,
+					    table_names[i].c_str(), probe.delta_column.c_str(), table_names[other].c_str(),
+					    probe.other_column.c_str());
+					break;
+				}
+			}
+		}
+		if (key_domain_empty) {
 			continue;
 		}
 
