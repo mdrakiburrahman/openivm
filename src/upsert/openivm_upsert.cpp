@@ -432,6 +432,60 @@ static bool IdentifierMatchesTable(const string &identifier, const string &table
 	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
 }
 
+static bool ReadIdentifierSegment(const string &sql, idx_t &pos, string &segment) {
+	if (pos >= sql.size()) {
+		return false;
+	}
+	idx_t start = pos;
+	if (sql[pos] == '"') {
+		pos++;
+		string unquoted;
+		while (pos < sql.size()) {
+			char c = sql[pos++];
+			if (c == '"') {
+				if (pos < sql.size() && sql[pos] == '"') {
+					unquoted += '"';
+					pos++;
+					continue;
+				}
+				segment = unquoted;
+				return true;
+			}
+			unquoted += c;
+		}
+		pos = start;
+		return false;
+	}
+	if (!(std::isalpha(static_cast<unsigned char>(sql[pos])) || sql[pos] == '_')) {
+		return false;
+	}
+	pos++;
+	while (pos < sql.size() && IsIdentifierChar(sql[pos]) && sql[pos] != '.') {
+		pos++;
+	}
+	segment = sql.substr(start, pos - start);
+	return true;
+}
+
+static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, string &identifier) {
+	idx_t pos = start;
+	string segment;
+	if (!ReadIdentifierSegment(sql, pos, segment)) {
+		return false;
+	}
+	identifier = segment;
+	while (pos < sql.size() && sql[pos] == '.') {
+		idx_t dot_pos = pos++;
+		if (!ReadIdentifierSegment(sql, pos, segment)) {
+			pos = dot_pos;
+			break;
+		}
+		identifier += "." + segment;
+	}
+	end = pos;
+	return true;
+}
+
 static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
 	if (needle.empty()) {
 		return haystack;
@@ -466,6 +520,17 @@ static string ReplaceTableReferences(const string &sql, const string &table_name
 		}
 		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
 			idx_t start = i;
+			if (expect_table) {
+				idx_t end = i;
+				string qualified_identifier;
+				if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
+				    IdentifierMatchesTable(qualified_identifier, table_name)) {
+					result += replacement;
+					i = end;
+					expect_table = false;
+					continue;
+				}
+			}
 			bool in_identifier_quote = c == '"';
 			i++;
 			while (i < sql.size()) {

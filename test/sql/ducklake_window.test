@@ -161,6 +161,284 @@ SELECT count(*) FROM (
 0
 
 statement ok
+SET ivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE dl.accounts_crm_src (
+    ca_id INT,
+    action_ts TIMESTAMP,
+    action_type VARCHAR,
+    nat_tax_id INT,
+    lcl_tax_id INT,
+    balance INT
+);
+
+statement ok
+CREATE TABLE dl.accounts_tax_src (
+    tax_id INT,
+    tax_rate DECIMAL(6, 4)
+);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.accounts_crm AS
+SELECT
+    ca_id,
+    action_ts,
+    action_type,
+    nat_tax_id,
+    lcl_tax_id,
+    balance
+FROM dl.accounts_crm_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.accounts_tax AS
+SELECT
+    tax_id,
+    tax_rate
+FROM dl.accounts_tax_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_accounts_like AS
+SELECT
+    c.ca_id AS account_id,
+    c.action_ts AS start_timestamp,
+    COALESCE(
+        LAG(c.action_ts) OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) - INTERVAL 1 MILLISECOND,
+        TIMESTAMP '9999-12-31 23:59:59.999'
+    ) AS end_timestamp,
+    CASE
+        WHEN ROW_NUMBER() OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) = 1 THEN TRUE
+        ELSE FALSE
+    END AS is_current,
+    c.action_type,
+    c.balance,
+    ntx.tax_rate AS nat_tax_rate,
+    ltx.tax_rate AS lcl_tax_rate
+FROM "dl"."main"."accounts_crm" c
+LEFT JOIN "dl"."main"."accounts_tax" ntx
+    ON c.nat_tax_id = ntx.tax_id
+LEFT JOIN "dl"."main"."accounts_tax" ltx
+    ON c.lcl_tax_id = ltx.tax_id
+WHERE c.ca_id IS NOT NULL;
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_accounts_like';
+----
+account_id=ca_id
+
+statement ok
+INSERT INTO dl.accounts_tax_src VALUES
+    (1, 0.0500),
+    (2, 0.0750);
+
+statement ok
+INSERT INTO dl.accounts_crm_src VALUES
+    (10, '2026-01-01 09:00:00', 'NEW', 1, 2, 100),
+    (20, '2026-01-01 10:00:00', 'NEW', 2, 1, 200);
+
+statement ok
+PRAGMA ivm('accounts_tax');
+
+statement ok
+PRAGMA ivm('accounts_crm');
+
+statement ok
+PRAGMA ivm('mv_accounts_like');
+
+statement ok
+INSERT INTO dl.accounts_crm_src VALUES
+    (30, '2026-01-02 09:00:00', 'NEW', 1, 2, 300),
+    (10, '2026-01-02 10:00:00', 'UPDATE', 2, 1, 150);
+
+statement ok
+PRAGMA ivm('accounts_crm');
+
+statement ok
+PRAGMA ivm('mv_accounts_like');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_accounts_like
+    EXCEPT ALL
+    SELECT
+        c.ca_id AS account_id,
+        c.action_ts AS start_timestamp,
+        COALESCE(
+            LAG(c.action_ts) OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        CASE
+            WHEN ROW_NUMBER() OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) = 1 THEN TRUE
+            ELSE FALSE
+        END AS is_current,
+        c.action_type,
+        c.balance,
+        ntx.tax_rate AS nat_tax_rate,
+        ltx.tax_rate AS lcl_tax_rate
+    FROM dl.accounts_crm c
+    LEFT JOIN dl.accounts_tax ntx
+        ON c.nat_tax_id = ntx.tax_id
+    LEFT JOIN dl.accounts_tax ltx
+        ON c.lcl_tax_id = ltx.tax_id
+    WHERE c.ca_id IS NOT NULL
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        c.ca_id AS account_id,
+        c.action_ts AS start_timestamp,
+        COALESCE(
+            LAG(c.action_ts) OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        CASE
+            WHEN ROW_NUMBER() OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) = 1 THEN TRUE
+            ELSE FALSE
+        END AS is_current,
+        c.action_type,
+        c.balance,
+        ntx.tax_rate AS nat_tax_rate,
+        ltx.tax_rate AS lcl_tax_rate
+    FROM dl.accounts_crm c
+    LEFT JOIN dl.accounts_tax ntx
+        ON c.nat_tax_id = ntx.tax_id
+    LEFT JOIN dl.accounts_tax ltx
+        ON c.lcl_tax_id = ltx.tax_id
+    WHERE c.ca_id IS NOT NULL
+    EXCEPT ALL
+    SELECT * FROM dl.mv_accounts_like
+);
+----
+0
+
+statement ok
+SET ivm_cascade_refresh = 'downstream';
+
+statement ok
+CREATE TABLE dl.cascade_accounts_crm_src (
+    ca_id INT,
+    action_ts TIMESTAMP,
+    nat_tax_id INT,
+    lcl_tax_id INT
+);
+
+statement ok
+CREATE TABLE dl.cascade_accounts_tax_src (
+    tax_id INT,
+    tax_rate DECIMAL(6, 4)
+);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.cascade_accounts_crm AS
+SELECT
+    ca_id,
+    action_ts,
+    nat_tax_id,
+    lcl_tax_id
+FROM dl.cascade_accounts_crm_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.cascade_accounts_tax AS
+SELECT
+    tax_id,
+    tax_rate
+FROM dl.cascade_accounts_tax_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_cascade_accounts_like AS
+SELECT
+    c.ca_id AS account_id,
+    c.action_ts AS start_timestamp,
+    COALESCE(
+        LAG(c.action_ts) OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) - INTERVAL 1 MILLISECOND,
+        TIMESTAMP '9999-12-31 23:59:59.999'
+    ) AS end_timestamp,
+    ntx.tax_rate AS nat_tax_rate,
+    ltx.tax_rate AS lcl_tax_rate
+FROM "dl"."main"."cascade_accounts_crm" c
+LEFT JOIN "dl"."main"."cascade_accounts_tax" ntx
+    ON c.nat_tax_id = ntx.tax_id
+LEFT JOIN "dl"."main"."cascade_accounts_tax" ltx
+    ON c.lcl_tax_id = ltx.tax_id
+WHERE c.ca_id IS NOT NULL;
+
+statement ok
+INSERT INTO dl.cascade_accounts_tax_src VALUES
+    (1, 0.0500),
+    (2, 0.0750);
+
+statement ok
+INSERT INTO dl.cascade_accounts_crm_src VALUES
+    (10, '2026-01-01 09:00:00', 1, 2),
+    (20, '2026-01-01 10:00:00', 2, 1);
+
+# Refresh one upstream parent first. This cascades into the downstream window
+# MV before the other upstream parent has been refreshed; the later parent
+# refresh must still recover the downstream MV.
+statement ok
+PRAGMA ivm('cascade_accounts_tax');
+
+query I
+SELECT count(*) FROM dl.mv_cascade_accounts_like;
+----
+0
+
+statement ok
+PRAGMA ivm('cascade_accounts_crm');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_cascade_accounts_like
+    EXCEPT ALL
+    SELECT
+        c.ca_id AS account_id,
+        c.action_ts AS start_timestamp,
+        COALESCE(
+            LAG(c.action_ts) OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        ntx.tax_rate AS nat_tax_rate,
+        ltx.tax_rate AS lcl_tax_rate
+    FROM dl.cascade_accounts_crm c
+    LEFT JOIN dl.cascade_accounts_tax ntx
+        ON c.nat_tax_id = ntx.tax_id
+    LEFT JOIN dl.cascade_accounts_tax ltx
+        ON c.lcl_tax_id = ltx.tax_id
+    WHERE c.ca_id IS NOT NULL
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        c.ca_id AS account_id,
+        c.action_ts AS start_timestamp,
+        COALESCE(
+            LAG(c.action_ts) OVER (PARTITION BY c.ca_id ORDER BY c.action_ts DESC) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        ntx.tax_rate AS nat_tax_rate,
+        ltx.tax_rate AS lcl_tax_rate
+    FROM dl.cascade_accounts_crm c
+    LEFT JOIN dl.cascade_accounts_tax ntx
+        ON c.nat_tax_id = ntx.tax_id
+    LEFT JOIN dl.cascade_accounts_tax ltx
+        ON c.lcl_tax_id = ltx.tax_id
+    WHERE c.ca_id IS NOT NULL
+    EXCEPT ALL
+    SELECT * FROM dl.mv_cascade_accounts_like
+);
+----
+0
+
+statement ok
+SET ivm_cascade_refresh = 'downstream';
+
+statement ok
 CREATE TABLE dl.window_upstream_src (
     acct_id INT,
     event_ts INT,
