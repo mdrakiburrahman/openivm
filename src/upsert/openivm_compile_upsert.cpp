@@ -921,6 +921,22 @@ static string ReplaceAllOccurrences(string haystack, const string &needle, const
 	return haystack;
 }
 
+static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
+                                                 const string &replacement) {
+	vector<string> variants;
+	if (needle.empty()) {
+		return variants;
+	}
+	size_t pos = 0;
+	while ((pos = haystack.find(needle, pos)) != string::npos) {
+		string variant = haystack;
+		variant.replace(pos, needle.size(), replacement);
+		variants.push_back(std::move(variant));
+		pos += needle.size();
+	}
+	return variants;
+}
+
 static bool IsIdentifierChar(char c) {
 	return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
 }
@@ -998,6 +1014,64 @@ static string ReplaceTableReferences(const string &sql, const string &table_name
 	return result;
 }
 
+static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name, const string &replacement) {
+	vector<string> variants;
+	if (table_name.empty()) {
+		return variants;
+	}
+	bool in_single_quote = false;
+	bool expect_table = false;
+	for (idx_t i = 0; i < sql.size();) {
+		char c = sql[i];
+		if (c == '\'') {
+			i++;
+			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
+				i++;
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+			idx_t start = i;
+			bool in_identifier_quote = c == '"';
+			i++;
+			while (i < sql.size()) {
+				char nc = sql[i];
+				if (in_identifier_quote) {
+					i++;
+					if (nc == '"') {
+						break;
+					}
+					continue;
+				}
+				if (!IsIdentifierChar(nc)) {
+					break;
+				}
+				i++;
+			}
+			string token = sql.substr(start, i - start);
+			string unquoted = token;
+			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
+				unquoted = unquoted.substr(1, unquoted.size() - 2);
+			}
+			if (expect_table && IdentifierMatchesTable(unquoted, table_name)) {
+				string variant = sql;
+				variant.replace(start, token.size(), replacement);
+				variants.push_back(std::move(variant));
+			}
+			string lower = StringUtil::Lower(unquoted);
+			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
+			continue;
+		}
+		if (!std::isspace(static_cast<unsigned char>(c))) {
+			expect_table = false;
+		}
+		i++;
+	}
+	return variants;
+}
+
 } // namespace
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
@@ -1044,22 +1118,34 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when
 		// the catalog is the default `memory` (so `catalog_prefix` is empty for SQL output, but
-		// `lpts_table_prefix` is still `memory.main.` here). Substitute that exact form.
+		// `lpts_table_prefix` is still `memory.main.` here). Build one affected-key query per
+		// source occurrence. Self-joins must replace only one occurrence at a time; replacing every
+		// occurrence with the delta would miss base rows affected by a delta row on another arm.
 		// Original-SQL recompute paths (e.g. ROLLUP/GROUPING SETS) can contain unqualified
 		// table names, so fall back to identifier-safe bare replacement when the exact LPTS
 		// form is absent.
 		string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
-		string filtered = ReplaceAllOccurrences(view_query_sql, source_full, delta_subselect);
-		if (filtered == view_query_sql) {
-			filtered = ReplaceTableReferences(view_query_sql, base, delta_subselect);
+		auto filtered_variants = ReplaceEachPlainOccurrence(view_query_sql, source_full, delta_subselect);
+		if (filtered_variants.empty()) {
+			filtered_variants = ReplaceEachTableReference(view_query_sql, base, delta_subselect);
+		}
+		if (filtered_variants.empty()) {
+			string filtered = ReplaceAllOccurrences(view_query_sql, source_full, delta_subselect);
+			if (filtered == view_query_sql) {
+				filtered = ReplaceTableReferences(view_query_sql, base, delta_subselect);
+			}
+			filtered_variants.push_back(std::move(filtered));
 		}
 
-		if (i > 0) {
-			affected_subquery += "\n  UNION\n  ";
-		} else {
-			affected_subquery += "  ";
+		for (idx_t occurrence = 0; occurrence < filtered_variants.size(); occurrence++) {
+			if (!affected_subquery.empty()) {
+				affected_subquery += "\n  UNION\n  ";
+			} else {
+				affected_subquery += "  ";
+			}
+			affected_subquery += "SELECT DISTINCT " + group_csv + " FROM (" + filtered_variants[occurrence] +
+			                     ") _ivm_src_" + to_string(i) + "_" + to_string(occurrence);
 		}
-		affected_subquery += "SELECT DISTINCT " + group_csv + " FROM (" + filtered + ") _ivm_src_" + to_string(i);
 	}
 
 	// EXISTS-based, NULL-safe match (IS NOT DISTINCT FROM). DuckDB inlines the subquery into both
