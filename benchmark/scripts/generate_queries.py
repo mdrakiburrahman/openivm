@@ -1681,9 +1681,10 @@ class QueryGenerator:
         has_cast = "CAST(" in query_upper or "::" in query
         has_case = "CASE WHEN" in query_upper
 
-        # Incrementability — classification based on what OpenIVM actually supports,
-        # verified by running the benchmark on 2000+ queries and reading the
-        # `type` column of `_duckdb_ivm_views` after CREATE MATERIALIZED VIEW.
+        # Incrementability — default heuristic for new generated queries. Existing
+        # query files can carry openivm_verified/openivm_lies flags from benchmark
+        # runs; retag_existing preserves those empirical classifications instead
+        # of overwriting them with this conservative heuristic.
         #
         # Verified incrementalizable (OpenIVM reports non-FULL_REFRESH):
         #   - SCAN, FILTER, AGGREGATE (SUM/COUNT/AVG/MIN/MAX), GROUP BY, HAVING
@@ -1702,11 +1703,13 @@ class QueryGenerator:
         #   - CASE WHEN / CAST / COALESCE / NULLIF and scalar functions
         #   - Uncorrelated subqueries (flattened during optimization)
         #
-        # Verified NOT supported (OpenIVM reports FULL_REFRESH):
+        # Conservative default for constructs with mixed support in OpenIVM:
         #   - ORDER BY, LIMIT (top-level ordering)
         #   - RANDOM / NOW / CURRENT_TIMESTAMP — non-deterministic
-        #   - LATERAL joins
-        #   - CORRELATED subqueries (EXISTS / NOT EXISTS / correlated IN / scalar)
+        #   - LATERAL joins / correlated subqueries have supported subsets
+        #     (DELIM/DEPENDENT joins, SEMI/ANTI aux state, group/window recompute),
+        #     but not every generated shape is incrementalizable. Benchmark-verified
+        #     exceptions are marked per query.
         #   - EXCEPT / INTERSECT
         #   - ANY / ALL subquery quantifiers
         #   - RECURSIVE CTEs

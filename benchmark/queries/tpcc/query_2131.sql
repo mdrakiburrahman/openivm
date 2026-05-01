@@ -1,2 +1,2 @@
--- {"operators": "DEPENDENT_JOIN,LATERAL,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "non_incr_reason": "op:LATERAL"}
+-- {"operators": "DEPENDENT_JOIN,LATERAL,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "openivm_verified": true}
 SELECT i.I_ID, recent.OL_W_ID, recent.OL_AMOUNT, recent.rn FROM ITEM i JOIN LATERAL (SELECT ol.OL_W_ID, ol.OL_AMOUNT, ROW_NUMBER() OVER (ORDER BY ol.OL_AMOUNT DESC) AS rn FROM ORDER_LINE ol WHERE ol.OL_I_ID = i.I_ID) recent ON recent.rn <= 3;

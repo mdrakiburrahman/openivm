@@ -1,2 +1,2 @@
--- {"operators": "FILTER,SEMI_JOIN,SUBQUERY,CASE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "STOCK,ORDER_LINE", "non_incr_reason": "join:SEMI"}
+-- {"operators": "FILTER,SEMI_JOIN,SUBQUERY,CASE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "STOCK,ORDER_LINE", "openivm_verified": true}
 SELECT s.S_W_ID, s.S_I_ID, CASE WHEN s.S_QUANTITY > 80 THEN 'high' ELSE 'normal' END AS bucket FROM STOCK s WHERE EXISTS (SELECT 1 FROM ORDER_LINE ol WHERE ol.OL_SUPPLY_W_ID = s.S_W_ID AND ol.OL_I_ID = s.S_I_ID);

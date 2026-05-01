@@ -1,2 +1,2 @@
--- {"operators": "FILTER,ANTI_JOIN,SUBQUERY,NULLS", "complexity": "medium", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,NEW_ORDER", "non_incr_reason": "join:ANTI"}
+-- {"operators": "FILTER,ANTI_JOIN,SUBQUERY,NULLS", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,NEW_ORDER", "openivm_verified": true}
 SELECT o.O_W_ID, o.O_D_ID, o.O_ID FROM OORDER o WHERE NOT EXISTS (SELECT 1 FROM NEW_ORDER n WHERE n.NO_W_ID = o.O_W_ID AND n.NO_D_ID = o.O_D_ID AND n.NO_O_ID = o.O_ID) AND o.O_CARRIER_ID IS NULL;

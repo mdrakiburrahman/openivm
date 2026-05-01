@@ -1,2 +1,2 @@
--- {"operators": "DEPENDENT_JOIN,LATERAL,AGGREGATE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "WAREHOUSE,STOCK", "non_incr_reason": "op:LATERAL"}
+-- {"operators": "DEPENDENT_JOIN,LATERAL,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "WAREHOUSE,STOCK", "openivm_verified": true}
 SELECT w.W_ID, stats.total_qty, stats.low_qty FROM WAREHOUSE w JOIN LATERAL (SELECT SUM(S_QUANTITY) AS total_qty, SUM(CASE WHEN S_QUANTITY < 20 THEN 1 ELSE 0 END) AS low_qty FROM STOCK s WHERE s.S_W_ID = w.W_ID) stats ON TRUE;
