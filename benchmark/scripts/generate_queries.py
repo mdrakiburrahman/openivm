@@ -1577,12 +1577,20 @@ class QueryGenerator:
             operators.append("HAVING")
         if "UNION" in query_upper:
             operators.append("UNION")
+        if "INTERSECT" in query_upper:
+            operators.append("INTERSECT")
+        if "EXCEPT" in query_upper:
+            operators.append("EXCEPT")
+        if "PIVOT" in query_upper:
+            operators.append("PIVOT")
         if "DISTINCT" in query_upper:
             operators.append("DISTINCT")
         if "OVER (" in query_upper or "OVER(" in query_upper:
             operators.append("WINDOW")
         if "GENERATE_SERIES" in query_upper or "RANGE(" in query_upper or "UNNEST(" in query_upper:
             operators.append("TABLE_FUNCTION")
+        if "UNNEST(" in query_upper:
+            operators.append("UNNEST")
 
         # CTE: starts with WITH keyword before the main SELECT
         stripped = query_upper.lstrip()
@@ -1695,8 +1703,9 @@ class QueryGenerator:
         #     optimizer level (surprising, but confirmed by the run)
         #   - STDDEV / VARIANCE / STDDEV_POP / VAR_POP — OpenIVM handles these
         #     via SUM/COUNT decomposition
-        #   - TABLE_FUNCTION (range, generate_series, unnest) — handled as long
-        #     as not combined with LATERAL
+        #   - TABLE_FUNCTION (range, generate_series) — handled when DuckDB plans
+        #     it as a constant leaf in a larger incremental plan. UNNEST currently
+        #     plans as LOGICAL_UNNEST and is rejected by the checker.
         #   - FILTER (...) clause on aggregates — handled (FILTER → CASE-WHEN)
         #   - LIST / ARRAY_AGG — handled
         #   - ROLLUP / CUBE / GROUPING SETS — handled
@@ -1711,6 +1720,7 @@ class QueryGenerator:
         #     but not every generated shape is incrementalizable. Benchmark-verified
         #     exceptions are marked per query.
         #   - EXCEPT / INTERSECT
+        #   - PIVOT
         #   - ANY / ALL subquery quantifiers
         #   - RECURSIVE CTEs
         #   - Rare holistic aggregates (CORR, COVAR_*, KURTOSIS, SKEWNESS, MEDIAN,
@@ -1723,7 +1733,7 @@ class QueryGenerator:
             # maintainable — top-level ORDER BY doesn't affect MV state, and
             # window functions are handled by IvmWindowRule via partition
             # recompute. Don't classify as non-incremental on ORDER alone.
-            "LIMIT", "LATERAL",
+            "LIMIT", "LATERAL", "UNNEST", "PIVOT", "EXCEPT", "INTERSECT",
             "SUBQUERY_FILTER",  # IN/scalar-compare/scalar-in-SELECT — not flattened by OpenIVM
             "VALUES_ONLY",      # FROM (VALUES …) — no base table to delta
         }
