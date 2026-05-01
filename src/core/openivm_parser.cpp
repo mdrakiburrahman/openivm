@@ -269,6 +269,7 @@ static bool HasRepeatedCteRefUnderJoin(const LogicalOperator *plan) {
 struct OpenIVMDuckLakeTableInfo {
 	string table_name;   // actual name as stored in DuckLake (case-preserved)
 	string catalog_name; // DuckLake catalog name (e.g., "dl")
+	string schema_name;  // DuckLake schema name
 };
 
 struct OpenIVMSourceTableInfo {
@@ -329,7 +330,7 @@ static void CollectDuckLakeTables(LogicalOperator *op, const string &current_cat
 				if (cat.empty()) {
 					cat = current_catalog.empty() ? "dl" : current_catalog;
 				}
-				dl_table_info[lc] = {info.table_name, cat};
+				dl_table_info[lc] = {info.table_name, cat, info.table.schema.name};
 			}
 		}
 	}
@@ -2268,6 +2269,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " last_refresh_ts timestamp default null,"
 		              " pending_row_estimate bigint default null,"
 		              " pending_estimate_ts timestamp default null,"
+		              " source_catalog varchar default null,"
+		              " source_schema varchar default null,"
 		              " primary key(view_name, table_name))");
 		// Backfill for existing databases without the columns (added post-release).
 		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
@@ -2276,6 +2279,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " add column if not exists pending_row_estimate bigint default null");
 		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists pending_estimate_ts timestamp default null");
+		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		              " add column if not exists source_catalog varchar default null");
+		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		              " add column if not exists source_schema varchar default null");
 
 		// Refresh history: stores execution stats for learned cost model calibration.
 		// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
@@ -2538,10 +2545,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			string catalog_type = "duckdb";
 			string snapshot_val = "null";
 			string meta_table_name = OpenIVMUtils::DeltaName(table_name);
+			string source_catalog_val = current_catalog.empty() ? "memory" : current_catalog;
+			string source_schema_val = current_schema.empty() ? "main" : current_schema;
 
 			string table_lc = table_name;
 			std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
 			               [](unsigned char c) { return std::tolower(c); });
+			auto source_info_it = source_table_info.find(table_name);
+			if (source_info_it != source_table_info.end()) {
+				source_catalog_val = source_info_it->second.catalog_name;
+				source_schema_val = source_info_it->second.schema_name;
+			}
 			auto it = dl_table_info.find(table_lc);
 			if (it != dl_table_info.end()) {
 				catalog_type = "ducklake";
@@ -2549,15 +2563,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				ducklake_tables.insert(it->second.table_name);
 				ducklake_tables.insert(table_name); // also insert SQL-parsed name
 				snapshot_val = dl_snapshot_val;
+				source_catalog_val = it->second.catalog_name;
+				source_schema_val = it->second.schema_name;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake table '%s' → meta_name='%s', snap=%s\n", table_name.c_str(),
 				                    meta_table_name.c_str(), snapshot_val.c_str());
 			}
 
 			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) +
-			              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, last_refresh_ts) "
+			              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, last_refresh_ts, "
+			              "source_catalog, source_schema) "
 			              "values ('" +
 			              view_name + "', '" + OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" +
-			              catalog_type + "', " + snapshot_val + ", now())");
+			              catalog_type + "', " + snapshot_val + ", now(), '" +
+			              OpenIVMUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
+			              OpenIVMUtils::EscapeSingleQuotes(source_schema_val) + "')");
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -2698,7 +2717,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// to the current snapshot. This ensures the first refresh only sees changes
 		// made AFTER the MV was created (not the initial data load).
 		for (const auto &table_name : table_names) {
-			if (ducklake_tables.count(table_name)) {
+			string table_lc = table_name;
+			std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
+			               [](unsigned char c) { return std::tolower(c); });
+			if (ducklake_tables.count(table_name) || ducklake_tables.count(table_lc)) {
 				// Use the DuckLake catalog for current_snapshot() — NOT view_catalog_prefix
 				// or current_catalog. For cross-system MVs (native MV reading from dl.*),
 				// view_catalog_prefix is empty and current_catalog is the physical-default

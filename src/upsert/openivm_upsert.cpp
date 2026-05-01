@@ -296,43 +296,6 @@ static void AppendSimpleAggregateEmptySourceNulling(IVMMetadata &metadata, strin
 	}
 }
 
-static vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(IVMMetadata &metadata, const string &view_name,
-                                                                     const vector<string> &delta_table_names,
-                                                                     const string &ducklake_catalog,
-                                                                     const string &ducklake_schema,
-                                                                     int64_t ducklake_current_snapshot) {
-	vector<GroupRecomputeDeltaSpec> delta_specs;
-	for (auto &dt : delta_table_names) {
-		GroupRecomputeDeltaSpec spec;
-		spec.base_table = dt;
-		static const string prefix(ivm::DELTA_PREFIX);
-		if (spec.base_table.size() > prefix.size() && spec.base_table.rfind(prefix, 0) == 0) {
-			spec.base_table = spec.base_table.substr(prefix.size());
-		}
-		spec.last_update = metadata.GetLastUpdate(view_name, dt);
-		spec.is_ducklake = metadata.IsDuckLakeTable(view_name, dt);
-		if (spec.is_ducklake) {
-			spec.ducklake_catalog = ducklake_catalog;
-			spec.ducklake_schema = ducklake_schema;
-			spec.last_snapshot_id = metadata.GetLastSnapshotId(view_name, dt);
-			spec.current_snapshot_id = ducklake_current_snapshot;
-		}
-		delta_specs.push_back(std::move(spec));
-	}
-	return delta_specs;
-}
-
-static string BuildLptsTablePrefix(const string &view_catalog_name, const string &view_schema_name) {
-	string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
-	string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
-	return lpts_cat + "." + lpts_sch + ".";
-}
-
-static string QualifiedName(const string &catalog_name, const string &schema_name, const string &table_name) {
-	return OpenIVMUtils::QuoteIdentifier(catalog_name) + "." + OpenIVMUtils::QuoteIdentifier(schema_name) + "." +
-	       OpenIVMUtils::QuoteIdentifier(table_name);
-}
-
 struct ViewLocation {
 	string catalog_name;
 	string schema_name;
@@ -364,6 +327,92 @@ static ViewLocation ResolveViewLocation(Connection &con, const string &view_name
 	auto current_database = CurrentDatabase(con);
 	bool cross_system = !catalog_name.empty() && !current_database.empty() && catalog_name != current_database;
 	return {catalog_name, schema_name, cross_system};
+}
+
+struct DuckLakeSourceLocation {
+	string catalog_name;
+	string schema_name;
+	string table_name;
+};
+
+static DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const string &view_name,
+                                                            const string &table_name, const string &fallback_catalog,
+                                                            const string &fallback_schema,
+                                                            const string &attached_catalog,
+                                                            const string &attached_schema) {
+	DuckLakeSourceLocation loc;
+	loc.catalog_name = attached_catalog.empty() ? fallback_catalog : attached_catalog;
+	loc.schema_name = attached_schema.empty() ? fallback_schema : attached_schema;
+	loc.table_name = table_name;
+
+	auto meta = con.Query("SELECT source_catalog, source_schema FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	                      " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	                      OpenIVMUtils::EscapeValue(table_name) + "'");
+	if (!meta->HasError() && meta->RowCount() > 0) {
+		if (!meta->GetValue(0, 0).IsNull()) {
+			loc.catalog_name = meta->GetValue(0, 0).ToString();
+		}
+		if (!meta->GetValue(1, 0).IsNull()) {
+			loc.schema_name = meta->GetValue(1, 0).ToString();
+		}
+	}
+
+	if (StringUtil::StartsWith(table_name, ivm::DATA_TABLE_PREFIX)) {
+		string source_view = table_name.substr(strlen(ivm::DATA_TABLE_PREFIX));
+		auto source_view_location = ResolveViewLocation(con, source_view, loc.catalog_name, loc.schema_name);
+		loc.catalog_name = source_view_location.catalog_name;
+		loc.schema_name = source_view_location.schema_name;
+	}
+
+	if (loc.catalog_name.empty()) {
+		loc.catalog_name = fallback_catalog.empty() ? "memory" : fallback_catalog;
+	}
+	if (loc.schema_name.empty()) {
+		loc.schema_name = fallback_schema.empty() ? "main" : fallback_schema;
+	}
+	return loc;
+}
+
+static vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(IVMMetadata &metadata, const string &view_name,
+                                                                     Connection &con,
+                                                                     const vector<string> &delta_table_names,
+                                                                     const string &ducklake_catalog,
+                                                                     const string &ducklake_schema) {
+	vector<GroupRecomputeDeltaSpec> delta_specs;
+	for (auto &dt : delta_table_names) {
+		GroupRecomputeDeltaSpec spec;
+		spec.base_table = dt;
+		static const string prefix(ivm::DELTA_PREFIX);
+		if (spec.base_table.size() > prefix.size() && spec.base_table.rfind(prefix, 0) == 0) {
+			spec.base_table = spec.base_table.substr(prefix.size());
+		}
+		spec.last_update = metadata.GetLastUpdate(view_name, dt);
+		spec.is_ducklake = metadata.IsDuckLakeTable(view_name, dt);
+		if (spec.is_ducklake) {
+			auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, ducklake_catalog, ducklake_schema, "", "");
+			spec.ducklake_catalog = loc.catalog_name;
+			spec.ducklake_schema = loc.schema_name;
+			spec.last_snapshot_id = metadata.GetLastSnapshotId(view_name, dt);
+			auto snap_result =
+			    con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot()");
+			if (!snap_result->HasError() && snap_result->RowCount() > 0 && !snap_result->GetValue(0, 0).IsNull()) {
+				spec.current_snapshot_id = snap_result->GetValue(0, 0).GetValue<int64_t>();
+			}
+		}
+		delta_specs.push_back(std::move(spec));
+	}
+	return delta_specs;
+}
+
+static string BuildLptsTablePrefix(const string &view_catalog_name, const string &view_schema_name) {
+	string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
+	string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
+	return lpts_cat + "." + lpts_sch + ".";
+}
+
+static string QualifiedName(const string &catalog_name, const string &schema_name, const string &table_name) {
+	return OpenIVMUtils::QuoteIdentifier(catalog_name) + "." + OpenIVMUtils::QuoteIdentifier(schema_name) + "." +
+	       OpenIVMUtils::QuoteIdentifier(table_name);
 }
 
 static const string DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
@@ -654,28 +703,21 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			auto delta_tables = metadata.GetDeltaTables(view_name);
 			bool all_empty = true;
 
-			// For DuckLake tables, get the current snapshot ID once (shared across all tables).
-			int64_t ducklake_current_snap = -1;
-			bool ducklake_snap_queried = false;
-
 			for (auto &dt : delta_tables) {
 				if (metadata.IsDuckLakeTable(view_name, dt)) {
-					// DuckLake tables: compare last_snapshot_id with current snapshot.
-					if (!ducklake_snap_queried) {
-						Connection snap_con(*context.db.get());
-						auto cur_snap_result =
-						    snap_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(view_catalog_name) +
-						                   ".current_snapshot()");
-						if (!cur_snap_result->HasError() && cur_snap_result->RowCount() > 0) {
-							ducklake_current_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
-						}
-						ducklake_snap_queried = true;
-					}
-					if (ducklake_current_snap < 0) {
-						// Can't determine current snapshot — conservatively assume changes.
+					Connection snap_con(*context.db.get());
+					auto loc = ResolveDuckLakeSourceLocation(snap_con, view_name, dt, view_catalog_name,
+					                                         view_schema_name, attached_db_catalog_name,
+					                                         attached_db_schema_name);
+					auto cur_snap_result =
+					    snap_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) +
+					                   ".current_snapshot()");
+					if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 ||
+					    cur_snap_result->GetValue(0, 0).IsNull()) {
 						all_empty = false;
 						break;
 					}
+					auto ducklake_current_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
 					auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
 					if (last_snap != ducklake_current_snap) {
 						all_empty = false;
@@ -977,35 +1019,32 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		bool any_has_deletes = false;
 		bool all_ducklake = true;
 
-		// Cache DuckLake current snapshot (queried at most once).
-		int64_t ducklake_cur_snap = -1;
-		bool ducklake_snap_queried = false;
-
 		for (auto &dt : delta_table_names) {
 			if (metadata.IsDuckLakeTable(view_name, dt)) {
-				if (!ducklake_snap_queried) {
-					auto cur_snap_result = con.Query("SELECT id FROM " + view_catalog_name + ".current_snapshot()");
-					if (!cur_snap_result->HasError() && cur_snap_result->RowCount() > 0) {
-						ducklake_cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
-					}
-					ducklake_snap_queried = true;
-				}
+				auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
+				                                         attached_db_catalog_name, attached_db_schema_name);
+				auto cur_snap_result =
+				    con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) +
+				              ".current_snapshot()");
 				auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
-				if (ducklake_cur_snap < 0) {
+				if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 ||
+				    cur_snap_result->GetValue(0, 0).IsNull()) {
 					any_has_deletes = true; // conservative
 					tables_with_changes++;
 					continue;
 				}
-				auto cur_snap = ducklake_cur_snap;
+				auto cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
 				if (last_snap == cur_snap) {
 					continue; // no changes — empty delta
 				}
 				tables_with_changes++;
-				auto del_result = con.Query(
-				    "SELECT COUNT(*) FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(view_catalog_name) +
-				    "', '" + OpenIVMUtils::EscapeValue(view_schema_name) + "', '" + OpenIVMUtils::EscapeValue(dt) +
-				    "', " + to_string(last_snap) + ", " + to_string(cur_snap) + ")");
-				if (!del_result->HasError() && del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
+				auto del_result =
+				    con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" +
+				              OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+				              OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+				              OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+				              to_string(cur_snap) + ")");
+				if (del_result->HasError() || del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
 					any_has_deletes = true;
 				}
 			} else {
@@ -1286,12 +1325,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (safe_for_snapdiff) {
 			const string &base_name = delta_table_names[0];
 			int64_t old_snap = metadata.GetLastSnapshotId(view_name, base_name);
-			// For PRAGMA ivm('mv'), attached_db_catalog_name is empty — use view_catalog_name
-			// (the catalog hosting the DuckLake MV, which also hosts its base tables).
-			string dl_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
-			string dl_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
-			string qualified_base =
-			    dl_catalog + "." + dl_schema + "." + KeywordHelper::WriteOptionallyQuoted(base_name);
+			auto loc = ResolveDuckLakeSourceLocation(con, view_name, base_name, view_catalog_name, view_schema_name,
+			                                         attached_db_catalog_name, attached_db_schema_name);
+			string qualified_base = QualifiedName(loc.catalog_name, loc.schema_name, loc.table_name);
 			string snap_clause = " AT (VERSION => " + to_string(old_snap) + ")";
 			string diff_sql = "(SELECT * FROM " + qualified_base + " EXCEPT ALL SELECT * FROM " + qualified_base +
 			                  snap_clause + ") UNION ALL (SELECT * FROM " + qualified_base + snap_clause +
@@ -1383,20 +1419,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		string recompute_ducklake_catalog =
 		    ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
 		string recompute_ducklake_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
-		int64_t recompute_ducklake_snapshot = -1;
-		for (const auto &dt : delta_table_names) {
-			if (!metadata.IsDuckLakeTable(view_name, dt)) {
-				continue;
-			}
-			auto snap_result = con.Query("SELECT id FROM " + recompute_ducklake_catalog + ".current_snapshot()");
-			if (!snap_result->HasError() && snap_result->RowCount() > 0 && !snap_result->GetValue(0, 0).IsNull()) {
-				recompute_ducklake_snapshot = snap_result->GetValue(0, 0).GetValue<int64_t>();
-			}
-			break;
-		}
 		auto delta_specs =
-		    BuildGroupRecomputeDeltaSpecs(metadata, view_name, delta_table_names, recompute_ducklake_catalog,
-		                                  recompute_ducklake_schema, recompute_ducklake_snapshot);
+		    BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, delta_table_names, recompute_ducklake_catalog,
+		                                  recompute_ducklake_schema);
 		// LPTS emits fully-qualified `cat.schema.tbl` even when the catalog is the default
 		// `memory` (where `catalog_prefix` for SQL emission is empty). Reconstruct the
 		// always-qualified prefix so the source-table substitution finds the LPTS form

@@ -279,6 +279,43 @@ SELECT id, amount FROM dl.gold.cross_schema_l2 ORDER BY id;
 2	20
 3	30
 
+# Explicit refresh after an upstream delete/rewrite must not duplicate rows in the downstream schema.
+# This covers gold views that read silver._ivm_data_* tables, as in the benchmark.
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+statement ok
+DELETE FROM dl.bronze.cross_schema_base WHERE id = 2;
+
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'cross_schema_l1');
+
+statement ok
+PRAGMA ivm_options('dl', 'gold', 'cross_schema_l2');
+
+query I
+SELECT count(*) FROM dl.gold.cross_schema_l2;
+----
+2
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount FROM dl.gold.cross_schema_l2
+  EXCEPT ALL
+  SELECT id, amount FROM dl.silver.cross_schema_l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount FROM dl.silver.cross_schema_l1
+  EXCEPT ALL
+  SELECT id, amount FROM dl.gold.cross_schema_l2
+);
+----
+0
+
 # ==========================================
 # Cascade mode: downstream
 # Refreshing mv_region should auto-refresh mv_top
