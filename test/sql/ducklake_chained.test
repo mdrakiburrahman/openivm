@@ -207,6 +207,79 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
+# Cascade mode across DuckLake schemas
+# ==========================================
+
+statement ok
+SET ivm_cascade_refresh = 'downstream';
+
+statement ok
+CREATE SCHEMA dl.bronze;
+
+statement ok
+CREATE SCHEMA dl.silver;
+
+statement ok
+CREATE SCHEMA dl.gold;
+
+statement ok
+CREATE TABLE dl.bronze.cross_schema_base (id INT, amount INT);
+
+statement ok
+INSERT INTO dl.bronze.cross_schema_base VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.silver.cross_schema_l1 AS
+  SELECT id, amount FROM dl.bronze.cross_schema_base;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.gold.cross_schema_l2 AS
+  SELECT id, amount FROM dl.silver._ivm_data_cross_schema_l1;
+
+statement ok
+INSERT INTO dl.bronze.cross_schema_base VALUES (2, 20);
+
+# Only refresh level 1 — level 2 should cascade in its own gold schema
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'cross_schema_l1');
+
+query II rowsort
+SELECT id, amount FROM dl.silver.cross_schema_l1 ORDER BY id;
+----
+1	10
+2	20
+
+query II rowsort
+SELECT id, amount FROM dl.gold.cross_schema_l2 ORDER BY id;
+----
+1	10
+2	20
+
+statement ok
+SET ivm_cascade_refresh = 'upstream';
+
+statement ok
+INSERT INTO dl.bronze.cross_schema_base VALUES (3, 30);
+
+# Only refresh level 2 — level 1 should cascade in its own silver schema first
+statement ok
+PRAGMA ivm_options('dl', 'gold', 'cross_schema_l2');
+
+query II rowsort
+SELECT id, amount FROM dl.silver.cross_schema_l1 ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+query II rowsort
+SELECT id, amount FROM dl.gold.cross_schema_l2 ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+# ==========================================
 # Cascade mode: downstream
 # Refreshing mv_region should auto-refresh mv_top
 # ==========================================

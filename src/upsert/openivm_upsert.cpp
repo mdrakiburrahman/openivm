@@ -333,6 +333,39 @@ static string QualifiedName(const string &catalog_name, const string &schema_nam
 	       OpenIVMUtils::QuoteIdentifier(table_name);
 }
 
+struct ViewLocation {
+	string catalog_name;
+	string schema_name;
+	bool cross_system;
+};
+
+static string CurrentDatabase(Connection &con) {
+	auto res = con.Query("SELECT current_database()");
+	if (!res->HasError() && res->RowCount() > 0 && !res->GetValue(0, 0).IsNull()) {
+		return res->GetValue(0, 0).ToString();
+	}
+	return "";
+}
+
+static ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const string &fallback_catalog,
+                                        const string &fallback_schema) {
+	string catalog_name = fallback_catalog;
+	string schema_name = fallback_schema;
+	string query = "SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_type = 'VIEW' "
+	               "AND table_name = '" +
+	               OpenIVMUtils::EscapeValue(view_name) + "' ORDER BY CASE WHEN table_catalog = '" +
+	               OpenIVMUtils::EscapeValue(fallback_catalog) + "' AND table_schema = '" +
+	               OpenIVMUtils::EscapeValue(fallback_schema) + "' THEN 0 ELSE 1 END, table_catalog, table_schema LIMIT 1";
+	auto found = con.Query(query);
+	if (!found->HasError() && found->RowCount() > 0) {
+		catalog_name = found->GetValue(0, 0).ToString();
+		schema_name = found->GetValue(1, 0).ToString();
+	}
+	auto current_database = CurrentDatabase(con);
+	bool cross_system = !catalog_name.empty() && !current_database.empty() && catalog_name != current_database;
+	return {catalog_name, schema_name, cross_system};
+}
+
 static const string DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 
 // Generate refresh SQL for a single view (no cascade logic).
@@ -601,8 +634,9 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	if (cascade_mode == "upstream" || cascade_mode == "both") {
 		auto upstream = metadata.GetUpstreamViews(view_name);
 		for (auto &dep : upstream) {
-			RefreshViewLocked(context, view_catalog_name, view_schema_name, dep, cross_system, attached_db_catalog_name,
-			                  attached_db_schema_name);
+			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
+			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep, dep_location.cross_system,
+			                  attached_db_catalog_name, attached_db_schema_name);
 		}
 	}
 
@@ -701,8 +735,9 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	if (cascade_mode == "downstream" || cascade_mode == "both") {
 		auto downstream = metadata.GetDownstreamViews(view_name);
 		for (auto &dep : downstream) {
-			RefreshViewLocked(context, view_catalog_name, view_schema_name, dep, cross_system, attached_db_catalog_name,
-			                  attached_db_schema_name);
+			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
+			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep, dep_location.cross_system,
+			                  attached_db_catalog_name, attached_db_schema_name);
 		}
 	}
 }

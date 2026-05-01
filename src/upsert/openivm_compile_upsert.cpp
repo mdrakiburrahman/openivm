@@ -837,6 +837,11 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 			select_columns += column + ", ";
 		}
 	}
+	if (select_columns.empty()) {
+		throw InvalidInputException("Cannot compile projection refresh for materialized view '%s': delta view '%s' has no "
+		                            "user-visible columns",
+		                            view_name, OpenIVMUtils::DeltaName(view_name));
+	}
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);
 
