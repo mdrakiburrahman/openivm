@@ -81,6 +81,21 @@ static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
 	return false;
 }
 
+static bool HasUnnestExpression(vector<unique_ptr<Expression>> &expressions) {
+	for (auto &expr : expressions) {
+		bool found_unnest = false;
+		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
+			if (child.expression_class == ExpressionClass::BOUND_UNNEST) {
+				found_unnest = true;
+			}
+		});
+		if (found_unnest) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /// Single-pass recursive plan analysis: validates IVM compatibility AND extracts metadata.
 static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	switch (node->type) {
@@ -93,7 +108,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
+		break;
+
 	case LogicalOperatorType::LOGICAL_UNNEST:
+		result.ivm_compatible = false;
 		break;
 
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
@@ -124,6 +142,9 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 		result.found_projection = true;
 		if (HasVolatileExpression(node->expressions)) {
+			result.ivm_compatible = false;
+		}
+		if (HasUnnestExpression(node->expressions)) {
 			result.ivm_compatible = false;
 		}
 		break;
@@ -161,6 +182,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
 		result.found_join = true;
+		if (node->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+		    node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+			result.found_delim_join = true;
+		}
 		auto *join = dynamic_cast<LogicalJoin *>(node);
 		if (join) {
 			if (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
@@ -271,8 +296,11 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 				auto &win_expr = expr->Cast<BoundWindowExpression>();
 				for (auto &part : win_expr.partitions) {
 					string col_name;
+					idx_t col_index = DConstants::INVALID_INDEX;
 					if (part->type == ExpressionType::BOUND_COLUMN_REF) {
-						col_name = part->Cast<BoundColumnRefExpression>().alias;
+						auto &bcr = part->Cast<BoundColumnRefExpression>();
+						col_name = bcr.alias;
+						col_index = bcr.binding.column_index;
 					}
 					if (col_name.empty()) {
 						col_name = part->GetName();
@@ -287,6 +315,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					}
 					if (!found) {
 						result.window_partition_columns.push_back(col_name);
+						result.window_partition_column_indexes.push_back(col_index);
 					}
 				}
 			}

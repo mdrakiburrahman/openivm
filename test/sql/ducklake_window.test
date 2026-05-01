@@ -1,0 +1,94 @@
+# name: test/sql/ducklake_window.test
+# description: Test DuckLake window partition refresh uses the exposed partition output column
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_window.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.history_win (
+    H_C_ID INT,
+    H_C_D_ID INT,
+    H_C_W_ID INT,
+    H_D_ID INT,
+    H_W_ID INT,
+    H_DATE TIMESTAMP,
+    H_AMOUNT DECIMAL(6, 2),
+    H_DATA VARCHAR
+);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_history_window AS
+SELECT
+    H_W_ID,
+    H_D_ID,
+    H_C_ID,
+    H_AMOUNT,
+    SUM(H_AMOUNT) OVER (PARTITION BY H_W_ID) AS w_total,
+    H_AMOUNT / NULLIF(SUM(H_AMOUNT) OVER (PARTITION BY H_W_ID), 0) AS share
+FROM dl.history_win
+WHERE H_AMOUNT > 0;
+
+# The partition source column is the fifth source column, but it is the first MV
+# output column. Refresh must filter affected partitions on H_W_ID, not H_D_ID.
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_history_window';
+----
+H_W_ID=H_W_ID
+
+statement ok
+INSERT INTO dl.history_win VALUES
+    (4, 8, 3, 8, 3, '2026-01-01 00:00:00', 469.00, 'Payment'),
+    (28, 10, 1, 10, 1, '2026-01-01 00:00:00', 316.00, 'Payment'),
+    (22, 4, 2, 4, 2, '2026-01-01 00:00:00', 267.00, 'Payment');
+
+statement ok
+PRAGMA ivm('mv_history_window');
+
+query I
+SELECT count(*) FROM dl.mv_history_window;
+----
+3
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_history_window
+    EXCEPT ALL
+    SELECT
+        H_W_ID,
+        H_D_ID,
+        H_C_ID,
+        H_AMOUNT,
+        SUM(H_AMOUNT) OVER (PARTITION BY H_W_ID) AS w_total,
+        H_AMOUNT / NULLIF(SUM(H_AMOUNT) OVER (PARTITION BY H_W_ID), 0) AS share
+    FROM dl.history_win
+    WHERE H_AMOUNT > 0
+);
+----
+0
+query I
+SELECT count(*) FROM (
+    SELECT
+        H_W_ID,
+        H_D_ID,
+        H_C_ID,
+        H_AMOUNT,
+        SUM(H_AMOUNT) OVER (PARTITION BY H_W_ID) AS w_total,
+        H_AMOUNT / NULLIF(SUM(H_AMOUNT) OVER (PARTITION BY H_W_ID), 0) AS share
+    FROM dl.history_win
+    WHERE H_AMOUNT > 0
+    EXCEPT ALL
+    SELECT * FROM dl.mv_history_window
+);
+----
+0

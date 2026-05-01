@@ -1,0 +1,344 @@
+#include "rules/delim_join.hpp"
+
+#include "core/openivm_constants.hpp"
+#include "core/openivm_debug.hpp"
+#include "rules/join.hpp"
+#include "rules/openivm_rewrite_rule.hpp"
+#include "upsert/openivm_index_regen.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_delim_get.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
+
+namespace duckdb {
+
+namespace {
+
+struct BaseLeafInfo {
+	vector<size_t> path;
+	LogicalGet *get;
+	LogicalOperator *node;
+};
+
+static bool IsJoinNode(LogicalOperatorType type) {
+	return type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || type == LogicalOperatorType::LOGICAL_JOIN ||
+	       type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
+	       type == LogicalOperatorType::LOGICAL_DELIM_JOIN || type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN;
+}
+
+static void CollectBaseLeaves(LogicalOperator *node, vector<size_t> path, vector<BaseLeafInfo> &leaves) {
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		auto *get = dynamic_cast<LogicalGet *>(node);
+		if (get && get->GetTable().get() != nullptr) {
+			leaves.push_back({std::move(path), get, node});
+		}
+		return;
+	}
+	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
+		path.push_back(child_idx);
+		CollectBaseLeaves(node->children[child_idx].get(), path, leaves);
+		path.pop_back();
+	}
+}
+
+static void VerifyDelimJoinTypes(LogicalOperator *node) {
+	if (IsJoinNode(node->type)) {
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (join && join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
+		    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
+		    join->join_type != JoinType::MARK && join->join_type != JoinType::SEMI &&
+		    join->join_type != JoinType::ANTI && join->join_type != JoinType::RIGHT_SEMI &&
+		    join->join_type != JoinType::RIGHT_ANTI) {
+			throw Exception(ExceptionType::OPTIMIZER,
+			                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM DELIM_JOIN");
+		}
+	}
+	for (auto &child : node->children) {
+		VerifyDelimJoinTypes(child.get());
+	}
+}
+
+static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const BaseLeafInfo &leaf) {
+	if (leaf.path.empty()) {
+		return;
+	}
+	size_t child_side = leaf.path.back();
+	unique_ptr<LogicalOperator> *parent = &term;
+	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
+		parent = &((*parent)->children[leaf.path[s]]);
+	}
+	if (!IsJoinNode((*parent)->type)) {
+		return;
+	}
+	auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
+	if (!join) {
+		return;
+	}
+	auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
+	if (!proj_map.empty()) {
+		idx_t mul_idx = leaf.node->GetColumnBindings().size();
+		proj_map.push_back(mul_idx);
+	}
+}
+
+static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, Binder &binder,
+                                                       LogicalComparisonJoin &delim_join, LogicalDelimGet &delim_get) {
+	if (delim_join.children.size() != 2) {
+		throw InternalException("DELIM_JOIN must have two children");
+	}
+	const idx_t source_child_idx = delim_join.delim_flipped ? 1 : 0;
+	auto source_copy = delim_join.children[source_child_idx]->Copy(context);
+	auto copy_bindings = source_copy->GetColumnBindings();
+
+	vector<unique_ptr<Expression>> exprs;
+	exprs.reserve(delim_join.duplicate_eliminated_columns.size());
+	for (auto &expr : delim_join.duplicate_eliminated_columns) {
+		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+			throw NotImplementedException("DELIM_JOIN duplicate-eliminated expression must be a column reference");
+		}
+		auto &col_ref = expr->Cast<BoundColumnRefExpression>();
+		if (col_ref.binding.column_index >= copy_bindings.size()) {
+			throw InternalException("DELIM_JOIN duplicate-eliminated column index out of range");
+		}
+		exprs.push_back(
+		    make_uniq<BoundColumnRefExpression>(col_ref.return_type, copy_bindings[col_ref.binding.column_index]));
+	}
+	if (exprs.empty()) {
+		throw NotImplementedException("DELIM_JOIN without duplicate-eliminated columns is not supported");
+	}
+
+	auto projection = make_uniq<LogicalProjection>(delim_get.table_index, std::move(exprs));
+	projection->children.push_back(std::move(source_copy));
+	projection->ResolveOperatorTypes();
+
+	vector<unique_ptr<Expression>> distinct_targets;
+	auto bindings = projection->GetColumnBindings();
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		distinct_targets.push_back(make_uniq<BoundColumnRefExpression>(projection->types[i], bindings[i]));
+	}
+	auto distinct = make_uniq<LogicalDistinct>(std::move(distinct_targets), DistinctType::DISTINCT);
+	distinct->children.push_back(std::move(projection));
+	distinct->ResolveOperatorTypes();
+	return std::move(distinct);
+}
+
+static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer);
+
+static bool ReplaceDelimGets(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node,
+                             vector<ReplacementBinding> &replacement_bindings,
+                             LogicalComparisonJoin *active_delim_join = nullptr) {
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		if (!active_delim_join) {
+			throw NotImplementedException("LOGICAL_DELIM_GET without enclosing DELIM_JOIN is not supported");
+		}
+		auto &delim_get = node->Cast<LogicalDelimGet>();
+		auto old_bindings = delim_get.GetColumnBindings();
+		node = BuildDelimKeySource(context, binder, *active_delim_join, delim_get);
+		auto new_bindings = node->GetColumnBindings();
+		if (old_bindings.size() != new_bindings.size()) {
+			throw InternalException("DELIM_GET replacement changed binding count");
+		}
+		for (idx_t i = 0; i < old_bindings.size(); i++) {
+			replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
+		}
+		return true;
+	}
+
+	LogicalComparisonJoin *next_delim = active_delim_join;
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		next_delim = &node->Cast<LogicalComparisonJoin>();
+	}
+
+	bool replaced = false;
+	for (auto &child : node->children) {
+		replaced = ReplaceDelimGets(context, binder, child, replacement_bindings, next_delim) || replaced;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && replaced && !replacement_bindings.empty()) {
+		ColumnBindingReplacer replacer;
+		replacer.replacement_bindings = replacement_bindings;
+		RebindAllExpressions(*node, replacer);
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		node->Cast<LogicalComparisonJoin>().duplicate_eliminated_columns.clear();
+		node->type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
+	}
+	return replaced;
+}
+
+static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer) {
+	for (auto &expr : op.expressions) {
+		replacer.VisitExpression(&expr);
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		for (auto &condition : join.conditions) {
+			replacer.VisitExpression(&condition.left);
+			replacer.VisitExpression(&condition.right);
+		}
+		for (auto &expr : join.duplicate_eliminated_columns) {
+			replacer.VisitExpression(&expr);
+		}
+		if (join.predicate) {
+			replacer.VisitExpression(&join.predicate);
+		}
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &aggregate = op.Cast<LogicalAggregate>();
+		for (auto &expr : aggregate.groups) {
+			replacer.VisitExpression(&expr);
+		}
+	}
+	for (auto &child : op.children) {
+		RebindAllExpressions(*child, replacer);
+	}
+}
+
+static void CollectMulBindings(const vector<ColumnBinding> &mul_bindings, unordered_set<uint64_t> &mul_set) {
+	for (auto &mb : mul_bindings) {
+		mul_set.insert((uint64_t)mb.table_index ^ ((uint64_t)mb.column_index * 0x9e3779b97f4a7c15ULL));
+	}
+}
+
+static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const LogicalType &mul_type,
+                                                       const vector<ColumnBinding> &mul_bindings) {
+	FunctionBinder fbinder(binder);
+	unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[0]);
+	for (size_t i = 1; i < mul_bindings.size(); i++) {
+		vector<unique_ptr<Expression>> args;
+		args.push_back(std::move(product));
+		args.push_back(make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[i]));
+		ErrorData err;
+		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
+		if (!product) {
+			throw InternalException("IvmDelimJoinRule: failed to bind multiplicity product: %s", err.RawMessage());
+		}
+	}
+	if (mul_bindings.size() % 2 == 0) {
+		vector<unique_ptr<Expression>> args;
+		args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
+		args.push_back(std::move(product));
+		ErrorData err;
+		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
+		if (!product) {
+			throw InternalException("IvmDelimJoinRule: failed to bind multiplicity sign: %s", err.RawMessage());
+		}
+	}
+	return product;
+}
+
+static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
+                                                    const vector<LogicalType> &types, Binder &binder) {
+	auto result = std::move(terms[0]);
+	for (size_t i = 1; i < terms.size(); i++) {
+		result = make_uniq<LogicalSetOperation>(binder.GenerateTableIndex(), types.size(), std::move(result),
+		                                        std::move(terms[i]), LogicalOperatorType::LOGICAL_UNION, true);
+		result->types = types;
+	}
+
+	auto bindings = result->GetColumnBindings();
+	vector<unique_ptr<Expression>> exprs;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
+	}
+	auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
+	projection->children.push_back(std::move(result));
+	projection->ResolveOperatorTypes();
+	return std::move(projection);
+}
+
+static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original_bindings,
+                                           unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
+	auto new_bindings = result->GetColumnBindings();
+	ColumnBindingReplacer replacer;
+	idx_t map_count = std::min(original_bindings.size(), new_bindings.size() - 1);
+	for (idx_t col_idx = 0; col_idx < map_count; col_idx++) {
+		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], new_bindings[col_idx]);
+	}
+	replacer.stop_operator = result;
+	replacer.VisitOperator(root);
+	return new_bindings.back();
+}
+
+} // namespace
+
+ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
+	ClientContext &context = pw.input.context;
+	Binder &binder = pw.input.optimizer.binder;
+	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
+
+	VerifyDelimJoinTypes(pw.plan.get());
+	vector<BaseLeafInfo> leaves;
+	CollectBaseLeaves(pw.plan.get(), {}, leaves);
+	if (leaves.empty()) {
+		throw InternalException("IvmDelimJoinRule: no mutable base leaves found");
+	}
+	if (leaves.size() > ivm::MAX_JOIN_TABLES) {
+		throw NotImplementedException("DELIM_JOIN IVM not supported for joins with more than 16 base tables");
+	}
+
+	pw.plan->ResolveOperatorTypes();
+	auto types = pw.plan->types;
+	types.emplace_back(pw.mul_type);
+
+	vector<unique_ptr<LogicalOperator>> terms;
+	const uint64_t term_count = (1ULL << leaves.size()) - 1;
+	OPENIVM_DEBUG_PRINT("[IvmDelimJoinRule] Rewriting DELIM_JOIN with %zu base leaves (%llu terms)\n", leaves.size(),
+	                    (unsigned long long)term_count);
+	for (uint64_t mask = 1; mask <= term_count; mask++) {
+		auto term = pw.plan->Copy(context);
+		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
+		term = std::move(renumbered.op);
+		vector<ColumnBinding> mul_bindings;
+
+		for (size_t i = 0; i < leaves.size(); i++) {
+			if (!(mask & (1ULL << i))) {
+				continue;
+			}
+			DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
+			mul_bindings.push_back(delta_i.mul_binding);
+			GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
+			UpdateProjectionMapForLeaf(term, leaves[i]);
+		}
+
+		vector<ReplacementBinding> delim_replacements;
+		ReplaceDelimGets(context, binder, term, delim_replacements);
+		term->ResolveOperatorTypes();
+
+		auto term_bindings = term->GetColumnBindings();
+		auto term_types = term->types;
+		vector<unique_ptr<Expression>> exprs;
+		unordered_set<uint64_t> mul_set;
+		CollectMulBindings(mul_bindings, mul_set);
+		for (idx_t i = 0; i < term_bindings.size(); i++) {
+			uint64_t key = (uint64_t)term_bindings[i].table_index ^
+			               ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
+			if (!mul_set.count(key)) {
+				exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
+			}
+		}
+		exprs.push_back(BuildMultiplicityProduct(binder, pw.mul_type, mul_bindings));
+
+		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
+		projection->children.push_back(std::move(term));
+		projection->ResolveOperatorTypes();
+		terms.push_back(std::move(projection));
+	}
+
+	auto result = AssembleUnionAll(terms, types, binder);
+	ColumnBinding new_mul_binding = ReplaceOutputBindings(original_bindings, result, *pw.root);
+	pw.plan = std::move(result);
+	return {std::move(pw.plan), new_mul_binding};
+}
+
+} // namespace duckdb

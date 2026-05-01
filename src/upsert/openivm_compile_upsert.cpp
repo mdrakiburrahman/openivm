@@ -1180,17 +1180,18 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
-                                const vector<string> &left_cols, const vector<string> &output_cols,
-                                const string &left_delta_source, const string &right_delta_source,
-                                const string &left_last_update, const string &right_last_update,
-                                const string &catalog_prefix) {
-	if (left_cols.empty() || output_cols.empty() || aux_table.empty() || left_delta_source.empty() ||
-	    right_delta_source.empty() || left_last_update.empty() || right_last_update.empty()) {
+                                const vector<string> &left_cols, const vector<string> &left_exprs,
+                                const vector<string> &output_cols, const string &left_delta_source,
+                                const string &right_delta_source, const string &left_last_update,
+                                const string &right_last_update, const string &catalog_prefix) {
+	if (left_cols.empty() || output_cols.empty() || aux_table.empty() || right_delta_source.empty() ||
+	    right_last_update.empty()) {
 		return "-- CompileSemiAntiRecompute called with incomplete metadata; no-op\n";
 	}
 
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string aux_q = catalog_prefix + Q(aux_table);
+	bool has_left_delta = !left_delta_source.empty() && !left_last_update.empty();
 	string left_delta_q = catalog_prefix + Q(left_delta_source);
 	string right_delta_q = catalog_prefix + Q(right_delta_source);
 	string dleft_table = "_ivm_saj_dleft_" + view_name;
@@ -1200,12 +1201,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	bool is_anti = StringUtil::Lower(join_type) == "anti";
 	string visible = is_anti ? "_match_count = 0" : "_match_count > 0";
 	string cur_visible = is_anti ? "_cur._match_count = 0" : "_cur._match_count > 0";
-	string old_filter;
-	string cur_filter;
-	if (!post_filter.empty()) {
-		old_filter = " AND (" + ReplaceAllOccurrences(post_filter, left_alias + ".", "_old.") + ")";
-		cur_filter = " AND (" + ReplaceAllOccurrences(post_filter, left_alias + ".", "_cur.") + ")";
-	}
+	string left_delta_filter = post_filter.empty() ? "" : " AND (" + post_filter + ")";
 
 	string left_cols_csv = JoinQuotedColumns(left_cols);
 	string output_cols_csv = JoinQuotedColumns(output_cols);
@@ -1221,6 +1217,18 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	string aff_old_match = BuildNullSafeMatch(left_cols, "_aff", "_old");
 	string aff_cur_match = BuildNullSafeMatch(left_cols, "_aff", "_cur");
 	string data_match = BuildNullSafeMatch(output_cols, "_v", "_d");
+	string left_delta_select;
+	string left_delta_group;
+	for (size_t i = 0; i < left_cols.size(); i++) {
+		if (i > 0) {
+			left_delta_select += ", ";
+			left_delta_group += ", ";
+		}
+		string expr =
+		    i < left_exprs.size() && !left_exprs[i].empty() ? left_exprs[i] : left_alias + "." + Q(left_cols[i]);
+		left_delta_select += expr + " AS " + Q(left_cols[i]);
+		left_delta_group += expr;
+	}
 
 	string left_ts =
 	    string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(left_last_update) + "'::TIMESTAMP";
@@ -1231,9 +1239,15 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	sql += "CREATE OR REPLACE TEMP TABLE " + Q(old_table) + " AS SELECT *, (" + visible + ") AS _visible FROM " +
 	       aux_q + ";\n\n";
 
-	sql += "CREATE OR REPLACE TEMP TABLE " + Q(dleft_table) + " AS\n  SELECT " + left_cols_csv + ", SUM(" +
-	       string(ivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult\n  FROM " + left_delta_q + "\n  WHERE " + left_ts +
-	       "\n  GROUP BY " + left_cols_csv + "\n  HAVING SUM(" + string(ivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
+	if (has_left_delta) {
+		sql += "CREATE OR REPLACE TEMP TABLE " + Q(dleft_table) + " AS\n  SELECT " + left_delta_select + ", SUM(" +
+		       left_alias + "." + string(ivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult\n  FROM " + left_delta_q + " " +
+		       left_alias + "\n  WHERE " + left_alias + "." + left_ts + left_delta_filter + "\n  GROUP BY " +
+		       left_delta_group + "\n  HAVING SUM(" + left_alias + "." + string(ivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
+	} else {
+		sql += "CREATE OR REPLACE TEMP TABLE " + Q(dleft_table) + " AS\n  SELECT " + left_cols_csv +
+		       ", 0::BIGINT AS dmult FROM " + aux_q + " WHERE false;\n\n";
+	}
 
 	sql += "CREATE OR REPLACE TEMP TABLE " + Q(dright_table) + " AS\n  SELECT " + left_cols_l + ", SUM(" + right_alias +
 	       "." + string(ivm::MULTIPLICITY_COL) + ")::BIGINT AS dmatch\n  FROM " + aux_q + " " + left_alias + " JOIN " +
@@ -1267,7 +1281,6 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	sql += "WITH _old_rows AS (\n  SELECT " + output_old + " FROM " + Q(old_table) + " _old JOIN " + Q(aff_table) +
 	       " _aff ON " + aff_old_match +
 	       ", generate_series(1, _old._left_count::BIGINT)\n  WHERE _old._visible AND _old._left_count > 0" +
-	       old_filter +
 	       "\n), "
 	       "_net AS (\n  SELECT " +
 	       output_cols_csv + ", COUNT(*)::BIGINT AS _cnt FROM _old_rows GROUP BY " + output_cols_csv +
@@ -1277,7 +1290,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 
 	sql += "INSERT INTO " + data_table + " SELECT " + output_cur + "\nFROM " + aux_q + " _cur JOIN " + Q(aff_table) +
 	       " _aff ON " + aff_cur_match + ", generate_series(1, _cur._left_count::BIGINT)\nWHERE " + cur_visible +
-	       " AND _cur._left_count > 0" + cur_filter + ";\n\n";
+	       " AND _cur._left_count > 0;\n\n";
 
 	sql += "DELETE FROM " + aux_q + " WHERE _left_count <= 0;\n";
 	sql += "DROP TABLE IF EXISTS " + Q(old_table) + ";\nDROP TABLE IF EXISTS " + Q(dleft_table) +
@@ -1290,24 +1303,23 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
                               const string &catalog_prefix, const vector<string> &partition_columns,
-                              const vector<string> &delta_table_names) {
-	if (partition_columns.empty()) {
+                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs) {
+	if (partition_columns.empty() || partition_delta_specs.empty()) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
 	}
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
-	// Single-table window views: identify affected partitions from the base delta table.
-	// OR-based per-column filtering handles multiple PARTITION BY columns from different
-	// OVER clauses — a change in dept affects ALL rows in that dept regardless of team.
-	// (Window+join views have empty partition_columns → caught by full recompute above.)
 	string affected_filter;
-	for (size_t i = 0; i < partition_columns.size(); i++) {
+	for (size_t i = 0; i < partition_delta_specs.size(); i++) {
 		if (i > 0) {
 			affected_filter += " OR ";
 		}
-		string col = Q(partition_columns[i]);
-		affected_filter += col + " IN (SELECT DISTINCT " + col + " FROM " + Q(delta_table_names[0]) + delta_where + ")";
+		const auto &spec = partition_delta_specs[i];
+		string output_col = Q(spec.output_column);
+		string source_col = Q(spec.source_column);
+		affected_filter +=
+		    output_col + " IN (SELECT DISTINCT " + source_col + " FROM " + Q(spec.delta_table) + delta_where + ")";
 	}
 
 	string delete_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";

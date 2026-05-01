@@ -147,6 +147,7 @@ public:
 		string predicate;
 		string post_filter;
 		vector<string> left_cols;
+		vector<string> left_exprs;
 		vector<string> output_cols;
 	};
 

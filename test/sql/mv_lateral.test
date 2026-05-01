@@ -1,0 +1,109 @@
+# name: test/sql/mv_lateral.test
+# description: materialized view maintenance for LATERAL / DELIM_JOIN plans
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE lat_customer (c_id INT, c_w_id INT);
+
+statement ok
+CREATE TABLE lat_history (h_c_id INT, h_c_w_id INT, h_amount INT);
+
+statement ok
+INSERT INTO lat_customer VALUES (1, 1), (1, 1), (2, 1);
+
+statement ok
+INSERT INTO lat_history VALUES (1, 1, 10), (1, 1, 20), (2, 1, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat AS
+    SELECT c.c_id, c.c_w_id, lat.total_payments
+    FROM lat_customer c
+    JOIN LATERAL (
+        SELECT SUM(h_amount) AS total_payments
+        FROM lat_history
+        WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+    ) lat ON true;
+
+# DELIM/DEPENDENT aggregate views use affected-key recompute, not scalar aggregate upsert.
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_lat';
+----
+6
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+    EXCEPT ALL SELECT * FROM mv_lat
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat
+    EXCEPT ALL
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+);
+----
+0
+
+statement ok
+INSERT INTO lat_history VALUES (1, 1, 7);
+
+statement ok
+UPDATE lat_history SET h_amount = 6 WHERE h_c_id = 2 AND h_c_w_id = 1 AND h_amount = 5;
+
+statement ok
+INSERT INTO lat_customer VALUES (3, 1);
+
+statement ok
+INSERT INTO lat_history VALUES (3, 1, 9);
+
+statement ok
+DELETE FROM lat_customer WHERE rowid = (SELECT min(rowid) FROM lat_customer WHERE c_id = 1 AND c_w_id = 1);
+
+statement ok
+PRAGMA ivm('mv_lat');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+    EXCEPT ALL SELECT * FROM mv_lat
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat
+    EXCEPT ALL
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+);
+----
+0

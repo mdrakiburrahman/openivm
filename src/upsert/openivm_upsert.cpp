@@ -1298,6 +1298,31 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	case IVMType::WINDOW_PARTITION: {
 		// Window functions: partition-level recompute — delete+re-insert affected partitions.
 		auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
+		vector<WindowPartitionDeltaSpec> partition_delta_specs;
+		auto split_partition_spec = [](const string &raw) {
+			auto pos = raw.find('=');
+			if (pos == string::npos) {
+				return std::make_pair(raw, raw);
+			}
+			return std::make_pair(raw.substr(0, pos), raw.substr(pos + 1));
+		};
+		auto delta_has_column = [&](const string &delta_table, const string &column_name) {
+			auto col_result = con.Query("SELECT 1 FROM information_schema.columns WHERE table_name = '" +
+			                            OpenIVMUtils::EscapeValue(delta_table) + "' AND lower(column_name) = lower('" +
+			                            OpenIVMUtils::EscapeValue(column_name) + "') LIMIT 1");
+			return !col_result->HasError() && col_result->RowCount() > 0;
+		};
+		for (auto &raw_partition_col : partition_cols) {
+			auto parsed = split_partition_spec(raw_partition_col);
+			for (auto &dt : delta_table_names) {
+				if (metadata.IsDuckLakeTable(view_name, dt)) {
+					continue;
+				}
+				if (delta_has_column(dt, parsed.second)) {
+					partition_delta_specs.push_back({dt, parsed.first, parsed.second});
+				}
+			}
+		}
 		// For DuckLake base tables the delta source isn't a `delta_<T>` twin with
 		// `_duckdb_ivm_timestamp` — the delta_table_names entry is the DuckLake base name
 		// itself. Build the affected-partition filter via DuckLake snapshot diff instead:
@@ -1316,7 +1341,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		bool safe_for_snapdiff = any_ducklake && !partition_cols.empty() && delta_table_names.size() == 1;
 		if (safe_for_snapdiff) {
 			for (auto &pc : partition_cols) {
-				if (std::find(column_names.begin(), column_names.end(), pc) == column_names.end()) {
+				auto parsed = split_partition_spec(pc);
+				if (std::find(column_names.begin(), column_names.end(), parsed.first) == column_names.end()) {
 					safe_for_snapdiff = false;
 					break;
 				}
@@ -1337,9 +1363,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				if (i > 0) {
 					affected_filter += " OR ";
 				}
-				string col = KeywordHelper::WriteOptionallyQuoted(partition_cols[i]);
-				affected_filter +=
-				    col + " IN (SELECT DISTINCT " + col + " FROM (" + diff_sql + ") _ivm_diff_" + to_string(i) + ")";
+				auto parsed = split_partition_spec(partition_cols[i]);
+				string col = KeywordHelper::WriteOptionallyQuoted(parsed.first);
+				string source_col = KeywordHelper::WriteOptionallyQuoted(parsed.second);
+				affected_filter += col + " IN (SELECT DISTINCT " + source_col + " FROM (" + diff_sql + ") _ivm_diff_" +
+				                   to_string(i) + ")";
 			}
 			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n" + "INSERT INTO " +
 			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
@@ -1356,7 +1384,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			    "[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake, full recompute fallback)\n");
 		} else {
 			upsert_query = CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
-			                                      partition_cols, delta_table_names);
+			                                      partition_cols, partition_delta_specs);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols)\n",
 			                    partition_cols.size());
 		}
@@ -1393,14 +1421,27 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	case IVMType::SEMI_ANTI_RECOMPUTE: {
 		IVMMetadata::SemiAntiAuxMeta aux_meta;
 		if (metadata.GetSemiAntiAuxMeta(view_name, aux_meta)) {
-			string left_delta = OpenIVMUtils::DeltaName(aux_meta.left_table);
-			string right_delta = OpenIVMUtils::DeltaName(aux_meta.right_table);
+			auto resolve_delta_name = [&](const string &table_name) {
+				string wanted = OpenIVMUtils::DeltaName(table_name);
+				for (auto &dt : delta_table_names) {
+					if (StringUtil::CIEquals(dt, wanted)) {
+						return dt;
+					}
+				}
+				return wanted;
+			};
+			string left_delta = resolve_delta_name(aux_meta.left_table);
+			string right_delta = resolve_delta_name(aux_meta.right_table);
 			string left_ts = metadata.GetLastUpdate(view_name, left_delta);
 			string right_ts = metadata.GetLastUpdate(view_name, right_delta);
-			upsert_query = CompileSemiAntiRecompute(
-			    view_name, aux_meta.aux_table, aux_meta.join_type, aux_meta.left_table, aux_meta.left_alias,
-			    aux_meta.right_table, aux_meta.right_alias, aux_meta.predicate, aux_meta.post_filter,
-			    aux_meta.left_cols, aux_meta.output_cols, left_delta, right_delta, left_ts, right_ts, catalog_prefix);
+			if (left_ts.empty()) {
+				left_delta.clear();
+			}
+			upsert_query = CompileSemiAntiRecompute(view_name, aux_meta.aux_table, aux_meta.join_type,
+			                                        aux_meta.left_table, aux_meta.left_alias, aux_meta.right_table,
+			                                        aux_meta.right_alias, aux_meta.predicate, aux_meta.post_filter,
+			                                        aux_meta.left_cols, aux_meta.left_exprs, aux_meta.output_cols,
+			                                        left_delta, right_delta, left_ts, right_ts, catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: SEMI_ANTI_RECOMPUTE (%s, %zu left cols)\n",
 			                    aux_meta.join_type.c_str(), aux_meta.left_cols.size());
 			break;

@@ -1382,6 +1382,11 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 	return csv_lines;
 }
 
+static void PrintUsage() {
+	Log("Usage: rewriter_benchmark [--workload tpcc|tpcdi] [--queries DIR] [--db PATH] [--out PATH]");
+	Log("                         [--scale N] [--timeout SECONDS]");
+}
+
 int main(int argc, char **argv) {
 	signal(SIGPIPE, SIG_IGN);
 
@@ -1394,22 +1399,38 @@ int main(int argc, char **argv) {
 
 	for (int i = 1; i < argc; i++) {
 		string arg = argv[i];
-		if (arg == "--queries" && i + 1 < argc) {
-			queries_dir = argv[++i];
-		} else if (arg == "--db" && i + 1 < argc) {
-			db_path = argv[++i];
-		} else if (arg == "--out" && i + 1 < argc) {
-			out_file = argv[++i];
-		} else if (arg == "--scale" && i + 1 < argc) {
-			scale_factor = std::stoi(argv[++i]);
-		} else if (arg == "--timeout" && i + 1 < argc) {
-			timeout_s = std::stod(argv[++i]);
-		} else if (arg == "--workload" && i + 1 < argc) {
-			workload = argv[++i];
+		auto next_arg = [&](const string &flag) {
+			if (i + 1 >= argc) {
+				Log("Error: missing value for " + flag);
+				PrintUsage();
+				exit(1);
+			}
+			return string(argv[++i]);
+		};
+		if (arg == "--help" || arg == "-h") {
+			PrintUsage();
+			return 0;
+		} else if (arg == "--queries") {
+			queries_dir = next_arg(arg);
+		} else if (arg == "--db") {
+			db_path = next_arg(arg);
+		} else if (arg == "--out") {
+			out_file = next_arg(arg);
+		} else if (arg == "--scale") {
+			scale_factor = std::stoi(next_arg(arg));
+		} else if (arg == "--timeout") {
+			timeout_s = std::stod(next_arg(arg));
+		} else if (arg == "--workload") {
+			workload = next_arg(arg);
 			if (workload != "tpcc" && workload != "tpcdi") {
 				Log("Error: --workload must be 'tpcc' or 'tpcdi'");
+				PrintUsage();
 				return 1;
 			}
+		} else {
+			Log("Error: unknown argument: " + arg);
+			PrintUsage();
+			return 1;
 		}
 	}
 

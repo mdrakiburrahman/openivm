@@ -17,11 +17,47 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
 namespace duckdb {
+
+static uint64_t BindingKey(const ColumnBinding &binding) {
+	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+}
+
+static void CollectExistingMultiplicityBindings(LogicalOperator *node, unordered_set<uint64_t> &mul_set) {
+	if (!node) {
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &ref = node->Cast<LogicalCTERef>();
+		if (!ref.bound_columns.empty() && ref.bound_columns.back() == ivm::MULTIPLICITY_COL) {
+			auto bindings = node->GetColumnBindings();
+			if (!bindings.empty()) {
+				mul_set.insert(BindingKey(bindings.back()));
+			}
+		}
+	}
+	for (auto &child : node->children) {
+		CollectExistingMultiplicityBindings(child.get(), mul_set);
+	}
+}
+
+static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindings, const vector<LogicalType> &types,
+                                              const unordered_set<uint64_t> &mul_set,
+                                              vector<ColumnBinding> &filtered_bindings,
+                                              vector<LogicalType> &filtered_types) {
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		if (mul_set.count(BindingKey(bindings[i]))) {
+			continue;
+		}
+		filtered_bindings.push_back(bindings[i]);
+		filtered_types.push_back(types[i]);
+	}
+}
 
 void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
                        bool is_right_of_left) {
@@ -515,13 +551,12 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 
 		// Filter out multiplicity columns (O(1) lookup via hash set)
 		unordered_set<uint64_t> mul_set;
+		CollectExistingMultiplicityBindings(term.get(), mul_set);
 		for (auto &mb : mul_bindings) {
-			mul_set.insert((uint64_t)mb.table_index ^ ((uint64_t)mb.column_index * 0x9e3779b97f4a7c15ULL));
+			mul_set.insert(BindingKey(mb));
 		}
 		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			uint64_t key = (uint64_t)term_bindings[i].table_index ^
-			               ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
-			if (!mul_set.count(key)) {
+			if (!mul_set.count(BindingKey(term_bindings[i]))) {
 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
 			}
 		}
@@ -635,7 +670,14 @@ static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original
 ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	ClientContext &context = pw.input.context;
 	Binder &binder = pw.input.optimizer.binder;
-	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
+	pw.plan->ResolveOperatorTypes();
+	const vector<ColumnBinding> all_original_bindings = pw.plan->GetColumnBindings();
+	unordered_set<uint64_t> existing_mul_set;
+	CollectExistingMultiplicityBindings(pw.plan.get(), existing_mul_set);
+	vector<ColumnBinding> original_bindings;
+	vector<LogicalType> output_types;
+	FilterInternalMultiplicityColumns(all_original_bindings, pw.plan->types, existing_mul_set, original_bindings,
+	                                  output_types);
 
 	// 1. Verify + collect
 	bool has_left_join = VerifyJoinTypes(pw.plan.get());
@@ -652,8 +694,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	}
 
 	// 2. Output types
-	pw.plan->ResolveOperatorTypes();
-	auto types = pw.plan->types;
+	auto types = output_types;
 	D_ASSERT(types.size() == original_bindings.size());
 	types.emplace_back(pw.mul_type);
 

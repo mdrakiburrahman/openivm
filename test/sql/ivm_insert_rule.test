@@ -966,15 +966,14 @@ INSERT INTO staff VALUES (140, 'Sub1', 'temp', 1), (141, 'Sub2', 'temp', 2), (14
 statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');
 
-# DELETE with subquery not yet supported — should give clean error
-statement error
-DELETE FROM staff WHERE dept IN (SELECT 'temp');
-----
-not yet fully supported
-
-# Clean up manually since the DELETE didn't execute
+# DELETE with subquery should track deleted base rows in the delta table.
 statement ok
-DELETE FROM staff WHERE dept = 'temp';
+DELETE FROM staff WHERE dept IN (SELECT 'temp');
+
+query I
+SELECT count(*) FROM delta_staff WHERE dept = 'temp' AND _duckdb_ivm_multiplicity = -1;
+----
+2
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'mv_staff');

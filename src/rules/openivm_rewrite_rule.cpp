@@ -1,6 +1,7 @@
 #include "rules/openivm_rewrite_rule.hpp"
 
 #include "rules/aggregate.hpp"
+#include "rules/delim_join.hpp"
 #include "rules/distinct.hpp"
 #include "rules/filter.hpp"
 #include "rules/join.hpp"
@@ -105,6 +106,11 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
 	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
 		IvmJoinRule rule;
+		return rule.Rewrite(pw);
+	}
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN: {
+		IvmDelimJoinRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {

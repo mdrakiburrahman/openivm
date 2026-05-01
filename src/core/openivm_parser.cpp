@@ -21,6 +21,7 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
@@ -413,6 +414,17 @@ static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t exp
 	return bcr.GetName();
 }
 
+static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
+	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
+		auto &cast = expr->Cast<BoundCastExpression>();
+		expr = cast.child.get();
+	}
+	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	return &expr->Cast<BoundColumnRefExpression>();
+}
+
 static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
                                           const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
                                           idx_t group_index, size_t group_count, const vector<string> &output_names,
@@ -553,6 +565,44 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
 		column_index = next.binding.column_index;
 	}
 	return "";
+}
+
+static void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<string> &partition_columns,
+                                              const vector<string> &output_names) {
+	if (partition_columns.empty()) {
+		return;
+	}
+	auto *top_projection = FindFirstProjection(plan);
+	if (!top_projection) {
+		return;
+	}
+
+	unordered_map<idx_t, LogicalProjection *> proj_by_index;
+	unordered_map<idx_t, LogicalGet *> get_by_index;
+	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
+
+	for (auto &partition_column : partition_columns) {
+		if (partition_column.find('=') != string::npos) {
+			continue;
+		}
+		for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
+			auto &expr = top_projection->expressions[expr_i];
+			auto *bcr = GetColumnRefThroughCasts(expr.get());
+			if (!bcr) {
+				continue;
+			}
+			string base_col = ResolveBindingToBaseColumn(bcr, proj_by_index, get_by_index);
+			if (!StringUtil::CIEquals(base_col, partition_column) &&
+			    !StringUtil::CIEquals(bcr->GetName(), partition_column)) {
+				continue;
+			}
+			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+			if (!output_col.empty() && !IVMTableNames::IsInternalColumn(output_col)) {
+				partition_column = output_col + "=" + partition_column;
+			}
+			break;
+		}
+	}
 }
 
 static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr,
@@ -754,9 +804,39 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 	       fn_name == "arg_min" || fn_name == "arg_max";
 }
 
+static bool QueryNeedsOriginalSqlForLpts(const string &query) {
+	string lower = StringUtil::Lower(query);
+	return lower.find(" in (select") != string::npos || lower.find(" not in (select") != string::npos ||
+	       lower.find(" exists (select") != string::npos || lower.find(" intersect ") != string::npos ||
+	       lower.find(" intersect all ") != string::npos || lower.find(" except ") != string::npos ||
+	       lower.find(" except all ") != string::npos || lower.find("pivot ") != string::npos ||
+	       lower.find("(pivot ") != string::npos || lower.find(" unnest(") != string::npos ||
+	       lower.find(" cross join unnest(") != string::npos;
+}
+
+static bool QueryHasUnsupportedIncrementalConstruct(const string &query) {
+	string lower = StringUtil::Lower(query);
+	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos ||
+	       lower.find(" unnest(") != string::npos || lower.find(" cross join unnest(") != string::npos;
+}
+
 static bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
 	if (!op) {
 		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_EXCEPT || op->type == LogicalOperatorType::LOGICAL_INTERSECT ||
+	    op->type == LogicalOperatorType::LOGICAL_PIVOT || op->type == LogicalOperatorType::LOGICAL_UNNEST ||
+	    op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	    op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+		return true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto *join = dynamic_cast<LogicalJoin *>(op);
+		if (join && (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
+		             join->join_type == JoinType::MARK || join->join_type == JoinType::RIGHT_SEMI ||
+		             join->join_type == JoinType::RIGHT_ANTI)) {
+			return true;
+		}
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		auto *agg = dynamic_cast<LogicalAggregate *>(op);
@@ -1051,6 +1131,7 @@ struct SemiAntiExtract {
 	string predicate;
 	string post_filter;
 	vector<string> output_cols;
+	vector<string> output_exprs;
 };
 
 static bool ReadIdentifierToken(const string &sql, size_t &pos, string &out) {
@@ -1160,9 +1241,33 @@ static size_t FindMatchingParen(const string &text, size_t open_pos) {
 	return string::npos;
 }
 
-static bool ParseSelectOutputColumns(const string &original_sql, size_t select_pos, size_t from_pos,
-                                     vector<string> &output_cols) {
+struct SelectOutputItem {
+	string expr;
+	string name;
+};
+
+static bool ParseSelectOutputItems(const string &original_sql, size_t select_pos, size_t from_pos,
+                                   vector<SelectOutputItem> &items) {
 	string select_list = original_sql.substr(select_pos + strlen("select"), from_pos - (select_pos + strlen("select")));
+	auto parse_item = [](string item, SelectOutputItem &out) {
+		StringUtil::Trim(item);
+		size_t as_pos = FindTopLevelKeywordToken(StringUtil::Lower(item), "as", 0);
+		if (as_pos != string::npos) {
+			out.expr = item.substr(0, as_pos);
+			StringUtil::Trim(out.expr);
+			string alias = item.substr(as_pos + strlen("as"));
+			StringUtil::Trim(alias);
+			size_t alias_pos = 0;
+			string alias_token;
+			if (ReadIdentifierToken(alias, alias_pos, alias_token)) {
+				out.name = LastIdentifierPart(alias_token);
+				return !out.expr.empty() && !out.name.empty();
+			}
+		}
+		out.expr = item;
+		out.name = LastIdentifierPart(item);
+		return !out.expr.empty() && !out.name.empty();
+	};
 	int depth = 0;
 	size_t last = 0;
 	for (size_t i = 0; i < select_list.size(); i++) {
@@ -1171,19 +1276,34 @@ static bool ParseSelectOutputColumns(const string &original_sql, size_t select_p
 		} else if (select_list[i] == ')') {
 			depth--;
 		} else if (depth == 0 && select_list[i] == ',') {
-			string col = LastIdentifierPart(select_list.substr(last, i - last));
-			if (col.empty() || col == "*") {
+			SelectOutputItem item;
+			if (!parse_item(select_list.substr(last, i - last), item) || item.name == "*") {
 				return false;
 			}
-			output_cols.push_back(std::move(col));
+			items.push_back(std::move(item));
 			last = i + 1;
 		}
 	}
-	string col = LastIdentifierPart(select_list.substr(last));
-	if (col.empty() || col == "*") {
+	SelectOutputItem item;
+	if (!parse_item(select_list.substr(last), item) || item.name == "*") {
 		return false;
 	}
-	output_cols.push_back(std::move(col));
+	items.push_back(std::move(item));
+	return true;
+}
+
+static bool ParseSelectOutputColumns(const string &original_sql, size_t select_pos, size_t from_pos,
+                                     vector<string> &output_cols, vector<string> *output_exprs = nullptr) {
+	vector<SelectOutputItem> items;
+	if (!ParseSelectOutputItems(original_sql, select_pos, from_pos, items)) {
+		return false;
+	}
+	for (auto &item : items) {
+		output_cols.push_back(item.name);
+		if (output_exprs != nullptr) {
+			output_exprs->push_back(item.expr);
+		}
+	}
 	return true;
 }
 
@@ -1228,7 +1348,8 @@ static bool ExtractSemiAntiJoin(const string &original_sql, SemiAntiExtract &out
 	}
 
 	vector<string> output_cols;
-	if (!ParseSelectOutputColumns(original_sql, select_pos, from_pos, output_cols)) {
+	vector<string> output_exprs;
+	if (!ParseSelectOutputColumns(original_sql, select_pos, from_pos, output_cols, &output_exprs)) {
 		return false;
 	}
 
@@ -1305,6 +1426,7 @@ static bool ExtractSemiAntiJoin(const string &original_sql, SemiAntiExtract &out
 		StringUtil::Trim(out.post_filter);
 	}
 	out.output_cols = std::move(output_cols);
+	out.output_exprs = std::move(output_exprs);
 	return true;
 }
 
@@ -1317,7 +1439,8 @@ static bool ExtractExistsSubquery(const string &original_sql, SemiAntiExtract &o
 	}
 
 	vector<string> output_cols;
-	if (!ParseSelectOutputColumns(original_sql, select_pos, from_pos, output_cols)) {
+	vector<string> output_exprs;
+	if (!ParseSelectOutputColumns(original_sql, select_pos, from_pos, output_cols, &output_exprs)) {
 		return false;
 	}
 
@@ -1420,15 +1543,179 @@ static bool ExtractExistsSubquery(const string &original_sql, SemiAntiExtract &o
 		return false;
 	}
 	out.output_cols = std::move(output_cols);
+	out.output_exprs = std::move(output_exprs);
+	return true;
+}
+
+static bool ExtractInSubquery(const string &original_sql, SemiAntiExtract &out) {
+	string lower = StringUtil::Lower(original_sql);
+	size_t select_pos = FindKeywordToken(lower, "select", 0);
+	size_t from_pos = FindTopLevelKeywordToken(lower, "from", select_pos == string::npos ? 0 : select_pos);
+	if (select_pos == string::npos || from_pos == string::npos || select_pos > from_pos) {
+		return false;
+	}
+
+	vector<string> output_cols;
+	vector<string> output_exprs;
+	if (!ParseSelectOutputColumns(original_sql, select_pos, from_pos, output_cols, &output_exprs)) {
+		return false;
+	}
+
+	size_t where_pos = FindTopLevelKeywordToken(lower, "where", from_pos + strlen("from"));
+	if (where_pos == string::npos) {
+		return false;
+	}
+	string left_from = original_sql.substr(from_pos + strlen("from"), where_pos - (from_pos + strlen("from")));
+	StringUtil::Trim(left_from);
+	if (left_from.empty()) {
+		return false;
+	}
+	string left_table_expr = left_from;
+	string left_alias_expr = "_ivm_left";
+	bool simple_left_table = false;
+	size_t left_pos = 0;
+	string left_ident;
+	if (ReadIdentifierToken(left_from, left_pos, left_ident)) {
+		string candidate_table = left_ident;
+		string candidate_alias = LastIdentifierPart(left_ident);
+		size_t left_alias_pos = left_pos;
+		string maybe_left_alias;
+		if (ReadIdentifierToken(left_from, left_alias_pos, maybe_left_alias)) {
+			candidate_alias = maybe_left_alias;
+			left_pos = left_alias_pos;
+		}
+		size_t tail_pos = left_pos;
+		while (tail_pos < left_from.size() && std::isspace(static_cast<unsigned char>(left_from[tail_pos]))) {
+			tail_pos++;
+		}
+		if (tail_pos == left_from.size()) {
+			left_table_expr = candidate_table;
+			left_alias_expr = candidate_alias;
+			simple_left_table = true;
+		}
+	}
+	if (!simple_left_table) {
+		string select_list =
+		    original_sql.substr(select_pos + strlen("select"), from_pos - (select_pos + strlen("select")));
+		StringUtil::Trim(select_list);
+		left_table_expr = "(SELECT " + select_list + " FROM " + left_from + ")";
+		left_alias_expr = "_ivm_left";
+	}
+
+	size_t not_in_pos = FindTopLevelKeywordToken(lower, "not in", where_pos);
+	size_t in_pos = FindTopLevelKeywordToken(lower, "in", where_pos);
+	bool is_anti = not_in_pos != string::npos;
+	size_t in_kw_pos = is_anti ? not_in_pos : in_pos;
+	if (in_kw_pos == string::npos || (is_anti && in_pos != string::npos && in_pos < not_in_pos)) {
+		return false;
+	}
+
+	string lhs = original_sql.substr(where_pos + strlen("where"), in_kw_pos - (where_pos + strlen("where")));
+	lhs = TrimAndConjunctions(lhs);
+	if (lhs.empty()) {
+		return false;
+	}
+
+	size_t after_in = in_kw_pos + (is_anti ? strlen("not in") : strlen("in"));
+	while (after_in < original_sql.size() && std::isspace(static_cast<unsigned char>(original_sql[after_in]))) {
+		after_in++;
+	}
+	size_t close_pos = FindMatchingParen(original_sql, after_in);
+	if (close_pos == string::npos) {
+		return false;
+	}
+	string trailing_filter = original_sql.substr(close_pos + 1);
+	out.post_filter = TrimAndConjunctions(trailing_filter);
+
+	string subquery = original_sql.substr(after_in + 1, close_pos - after_in - 1);
+	string sub_lower = StringUtil::Lower(subquery);
+	if (FindTopLevelKeywordToken(sub_lower, "union", 0) != string::npos) {
+		return false;
+	}
+	size_t sub_select = FindKeywordToken(sub_lower, "select", 0);
+	size_t sub_from = FindTopLevelKeywordToken(sub_lower, "from", sub_select == string::npos ? 0 : sub_select);
+	if (sub_select == string::npos || sub_from == string::npos || sub_select > sub_from) {
+		return false;
+	}
+	string rhs_expr = subquery.substr(sub_select + strlen("select"), sub_from - (sub_select + strlen("select")));
+	StringUtil::Trim(rhs_expr);
+	string rhs_lower = StringUtil::Lower(rhs_expr);
+	if (rhs_lower.rfind("distinct ", 0) == 0) {
+		rhs_expr = rhs_expr.substr(strlen("distinct "));
+		StringUtil::Trim(rhs_expr);
+	}
+	if (rhs_expr.empty() || rhs_expr.find(',') != string::npos) {
+		return false;
+	}
+
+	size_t right_pos = sub_from + strlen("from");
+	if (!ReadIdentifierToken(subquery, right_pos, out.right_table)) {
+		return false;
+	}
+	size_t alias_pos = right_pos;
+	string maybe_alias;
+	if (ReadIdentifierToken(subquery, alias_pos, maybe_alias)) {
+		string maybe_lower = StringUtil::Lower(maybe_alias);
+		if (maybe_lower != "where" && maybe_lower != "group" && maybe_lower != "order" && maybe_lower != "limit") {
+			out.right_alias = maybe_alias;
+			right_pos = alias_pos;
+		}
+	}
+	if (out.right_alias.empty()) {
+		out.right_alias = LastIdentifierPart(out.right_table);
+	}
+	string original_right_alias = out.right_alias;
+
+	size_t sub_where = FindTopLevelKeywordToken(sub_lower, "where", right_pos);
+	string right_filter;
+	if (sub_where != string::npos) {
+		size_t pred_start = sub_where + strlen("where");
+		size_t pred_end = subquery.size();
+		for (auto kw : {"group", "order", "limit"}) {
+			size_t kw_pos = FindTopLevelKeywordToken(sub_lower, kw, pred_start);
+			if (kw_pos != string::npos) {
+				pred_end = std::min(pred_end, kw_pos);
+			}
+		}
+		right_filter = subquery.substr(pred_start, pred_end - pred_start);
+		StringUtil::Trim(right_filter);
+	}
+
+	out.join_type = is_anti ? "anti" : "semi";
+	out.left_table = left_table_expr;
+	out.left_alias = left_alias_expr;
+	out.right_alias = "_ivm_right";
+	if (simple_left_table) {
+		out.predicate = StringUtil::Replace(lhs, out.left_alias + ".", out.left_alias + ".");
+		out.predicate =
+		    StringUtil::Replace(out.predicate, LastIdentifierPart(out.left_table) + ".", out.left_alias + ".");
+	} else {
+		out.predicate = out.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(LastIdentifierPart(lhs));
+	}
+	out.predicate += " IS NOT DISTINCT FROM ";
+	out.predicate += StringUtil::Replace(rhs_expr, original_right_alias + ".", out.right_alias + ".");
+	out.predicate =
+	    StringUtil::Replace(out.predicate, LastIdentifierPart(out.right_table) + ".", out.right_alias + ".");
+	if (!right_filter.empty()) {
+		string rewritten_filter = StringUtil::Replace(right_filter, original_right_alias + ".", out.right_alias + ".");
+		rewritten_filter =
+		    StringUtil::Replace(rewritten_filter, LastIdentifierPart(out.right_table) + ".", out.right_alias + ".");
+		out.predicate += " AND (" + rewritten_filter + ")";
+	}
+	out.output_cols = std::move(output_cols);
+	out.output_exprs = std::move(output_exprs);
 	return true;
 }
 
 static bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &out) {
 	string lower = StringUtil::Lower(original_sql);
-	if (FindTopLevelKeywordToken(lower, "union", 0) != string::npos) {
+	if (FindTopLevelKeywordToken(lower, "union", 0) != string::npos ||
+	    FindTopLevelKeywordToken(lower, "intersect", 0) != string::npos ||
+	    FindTopLevelKeywordToken(lower, "except", 0) != string::npos) {
 		return false;
 	}
-	return ExtractSemiAntiJoin(original_sql, out) || ExtractExistsSubquery(original_sql, out);
+	return ExtractSemiAntiJoin(original_sql, out) || ExtractExistsSubquery(original_sql, out) ||
+	       ExtractInSubquery(original_sql, out);
 }
 
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
@@ -1610,6 +1897,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ForwardPacSettingsIfLoaded(context, con);
 
 		auto full_view_name = OpenIVMUtils::ExtractTableName(statement->query);
+		bool statement_needs_original_sql_for_lpts = QueryNeedsOriginalSqlForLpts(statement->query);
+		// Keep the user's raw AS-query as the source of truth for original-SQL fallback.
+		// Do not recover this from DuckDB's parsed QueryNode::ToString(): that path is a
+		// best-effort pretty-printer and has segfaulted on set-operation query nodes with
+		// incomplete CTE/query internals. LPTS remains the normalized serializer below
+		// for supported logical plans; this string is only the safe fallback input.
 		auto original_view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
 
 		// Split catalog-qualified name (e.g. "dl.mv_totals") into prefix and bare name.
@@ -1780,27 +2073,34 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 			}
 
-			try {
-				auto ast = LogicalPlanToAst(*con.context, select_plan);
-				auto cte_list = AstToCteList(*ast);
-				view_query = cte_list->ToQuery(true, output_names);
-				if (!view_query.empty() && view_query.back() == ';') {
-					view_query.pop_back();
+			if (statement_needs_original_sql_for_lpts || QueryNeedsOriginalSqlForLpts(original_view_query)) {
+				view_query = original_view_query;
+				lpts_fallback = true;
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
+				                    view_query.c_str());
+			} else {
+				try {
+					auto ast = LogicalPlanToAst(*con.context, select_plan);
+					auto cte_list = AstToCteList(*ast);
+					view_query = cte_list->ToQuery(true, output_names);
+					if (!view_query.empty() && view_query.back() == ';') {
+						view_query.pop_back();
+					}
+					StringUtil::Trim(view_query);
+					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
+				} catch (const std::exception &e) {
+					// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
+					// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
+					view_query = original_view_query;
+					lpts_fallback = true;
+					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
+					                    view_query.c_str());
+				} catch (...) {
+					view_query = original_view_query;
+					lpts_fallback = true;
+					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
+					                    view_query.c_str());
 				}
-				StringUtil::Trim(view_query);
-				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
-			} catch (const std::exception &e) {
-				// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
-				// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
-				view_query = original_view_query;
-				lpts_fallback = true;
-				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
-				                    view_query.c_str());
-			} catch (...) {
-				view_query = original_view_query;
-				lpts_fallback = true;
-				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
-				                    view_query.c_str());
 			}
 			// For views that LPTS silently mis-serializes (GROUPING SETS / ROLLUP / CUBE
 			// → plain GROUP BY; STRUCT_PACK field names → tN_col aliases; etc.), detect
@@ -1892,6 +2192,29 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
+		// LATERAL/correlated subquery aggregates are represented by DEPENDENT/DELIM joins.
+		// The inner aggregate's group binding is not projected as a top-level GROUP BY, so
+		// the normal group-column derivation above leaves aggregate_columns empty and would
+		// misclassify the MV as a scalar SIMPLE_AGGREGATE. For this shape, the visible
+		// non-aggregate output columns are the affected-key columns that scope
+		// GROUP_RECOMPUTE.
+		bool delim_aggregate_group_fallback = false;
+		if (analysis.found_delim_join && classification.found_aggregation && aggregate_columns.empty() &&
+		    output_names.size() > analysis.aggregate_types.size()) {
+			idx_t key_count = output_names.size() - analysis.aggregate_types.size();
+			for (idx_t i = 0; i < key_count; i++) {
+				if (!output_names[i].empty() && !IVMTableNames::IsInternalColumn(output_names[i])) {
+					aggregate_columns.push_back(output_names[i]);
+				}
+			}
+			delim_aggregate_group_fallback = !aggregate_columns.empty();
+			if (delim_aggregate_group_fallback) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] DELIM/DEPENDENT aggregate: using %zu visible key columns for "
+				                    "GROUP_RECOMPUTE\n",
+				                    aggregate_columns.size());
+			}
+		}
+
 		// Deduplicate aggregate_columns the same way we deduped output_names above.
 		// When the user writes `SELECT DISTINCT w_id, w_id` (or groups twice on the
 		// same column), the data table has columns `w_id, w_id_1` after the output_names
@@ -1916,15 +2239,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		auto aggregate_types = std::move(analysis.aggregate_types);
 		auto window_partition_columns = std::move(analysis.window_partition_columns);
-		for (idx_t i = 0; i < window_partition_columns.size(); i++) {
-			idx_t output_idx = i < analysis.window_partition_column_indexes.size()
-			                       ? analysis.window_partition_column_indexes[i]
-			                       : DConstants::INVALID_INDEX;
-			if (output_idx != DConstants::INVALID_INDEX && output_idx < output_names.size() &&
-			    !output_names[output_idx].empty()) {
-				window_partition_columns[i] = output_names[output_idx] + "=" + window_partition_columns[i];
-			}
-		}
+		ResolveWindowPartitionOutputNames(plan.get(), window_partition_columns, output_names);
 
 		// Fallback group-key extraction for inner-aggregate-in-join patterns.
 		// When the top-level SELECT joins against a subquery/CTE that performs GROUP BY,
@@ -2027,6 +2342,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// shared scan aren't replicated across both join sides. Route to RECOMPUTE.
 		// Catches ducklake_0240 (CTE referenced twice on both sides of an INNER JOIN).
 		bool has_cte_self_join = HasRepeatedCteRefUnderJoin(plan.get());
+		bool has_unsupported_set_operation = HasUnsupportedSetOperation(plan.get());
+		bool has_unsupported_incremental_construct = QueryHasUnsupportedIncrementalConstruct(original_view_query);
 
 		IVMType ivm_type;
 		// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
@@ -2043,25 +2360,55 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		SemiAntiExtract semi_anti_extract;
 		vector<string> semi_anti_left_cols;
 
-		if (classification.found_window) {
+		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
+			ivm_type = IVMType::FULL_REFRESH;
+		} else if (classification.found_window) {
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
 			ivm_type = IVMType::WINDOW_PARTITION;
+		} else if (classification.found_grouping_sets) {
+			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
+			// maintain them by recomputing the grouping-set keys touched by source
+			// deltas. The parser keeps the original SQL because LPTS currently drops
+			// the grouping-set annotation.
+			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_semi_anti_join && classification.found_aggregation) {
 			// SEMI/ANTI joins are thresholded by match-count transitions. The aux-state path below
 			// supports projection/filter stacks over one left base table; aggregates over SEMI/ANTI
 			// need a separate transition-to-aggregate compiler. Use full recompute until that lands.
 			ivm_type = IVMType::FULL_REFRESH;
-		} else if (classification.found_semi_anti_join && !classification.found_aggregation &&
-		           !classification.found_distinct) {
+		} else if (classification.found_semi_anti_join && !classification.found_aggregation) {
 			if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
 				string left_table_name = LastIdentifierPart(semi_anti_extract.left_table);
 				auto col_result =
-				    con.Query("SELECT column_name FROM information_schema.columns WHERE table_name = '" +
-				              OpenIVMUtils::EscapeSingleQuotes(left_table_name) + "' AND table_schema = '" +
+				    con.Query("SELECT column_name FROM information_schema.columns WHERE lower(table_name) = lower('" +
+				              OpenIVMUtils::EscapeSingleQuotes(left_table_name) + "') AND table_schema = '" +
 				              OpenIVMUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
-				if (!col_result->HasError() && col_result->RowCount() > 0) {
+				auto add_semi_anti_left_col = [&](const string &col_name) {
+					for (auto &existing : semi_anti_left_cols) {
+						if (StringUtil::CIEquals(existing, col_name)) {
+							return;
+						}
+					}
+					semi_anti_left_cols.push_back(col_name);
+				};
+				if (!semi_anti_extract.output_cols.empty()) {
+					for (auto &col : semi_anti_extract.output_cols) {
+						add_semi_anti_left_col(col);
+					}
+					// The aux state must evaluate the semi/anti predicate on refresh. If the
+					// MV projects only a subset of the left table, keep the base columns as
+					// hidden aux-state key columns as well (e.g. output C_ID/C_LAST, predicate
+					// uses C_W_ID). The user-facing MV still emits only output_cols.
+					if (semi_anti_extract.left_table.find('(') == string::npos && !col_result->HasError() &&
+					    col_result->RowCount() > 0) {
+						for (idx_t i = 0; i < col_result->RowCount(); i++) {
+							add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
+						}
+					}
+					ivm_type = semi_anti_left_cols.empty() ? IVMType::FULL_REFRESH : IVMType::SEMI_ANTI_RECOMPUTE;
+				} else if (!col_result->HasError() && col_result->RowCount() > 0) {
 					for (idx_t i = 0; i < col_result->RowCount(); i++) {
-						semi_anti_left_cols.push_back(col_result->GetValue(0, i).ToString());
+						add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
 					}
 					ivm_type = IVMType::SEMI_ANTI_RECOMPUTE;
 				} else {
@@ -2070,12 +2417,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			} else {
 				ivm_type = IVMType::FULL_REFRESH;
 			}
-		} else if (classification.found_grouping_sets) {
-			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
-			// maintain them by recomputing the grouping-set keys touched by source
-			// deltas. The parser keeps the original SQL because LPTS currently drops
-			// the grouping-set annotation.
-			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
 		} else if (!classification.ivm_compatible) {
 			ivm_type = IVMType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
@@ -2185,14 +2526,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (classification.found_having && classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_HAVING;
-		} else if ((has_union_over_agg || join_key_group_fallback || classification.found_nested_aggregate) &&
+		} else if ((has_union_over_agg || join_key_group_fallback || delim_aggregate_group_fallback ||
+		            classification.found_nested_aggregate) &&
 		           !aggregate_columns.empty()) {
 			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.
 			// Inner-aggregate-in-join: group keys are the join-condition columns visible in the
-			// top projection. Nested aggregate (outer COUNT(*) over inner GROUP BY via CTE): outer
-			// COUNT counts inner groups, not source rows, so linear delta is incorrect.
-			// All three use GROUP_RECOMPUTE — not AGGREGATE_GROUP — because non-key output columns
-			// may be pass-through attributes or non-linear functions over inner aggregates.
+			// top projection. DELIM/DEPENDENT aggregate: group keys are the visible correlated
+			// output columns. Nested aggregate (outer COUNT(*) over inner GROUP BY via CTE):
+			// outer COUNT counts inner groups, not source rows, so linear delta is incorrect.
+			// These use GROUP_RECOMPUTE — not AGGREGATE_GROUP — because non-key output columns
+			// may be pass-through attributes or non-linear functions over inner/correlated aggregates.
 			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
@@ -2457,14 +2800,26 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		if (ivm_type == IVMType::SEMI_ANTI_RECOMPUTE) {
 			string aux_table = "_ivm_semi_anti_state_" + view_name;
+			auto qualify_source_table = [&](const string &table_name) {
+				if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||
+				    table_name.find('(') != string::npos) {
+					return table_name;
+				}
+				return current_catalog + "." + current_schema + "." + table_name;
+			};
+			string left_source_table = qualify_source_table(semi_anti_extract.left_table);
+			string right_source_table = qualify_source_table(semi_anti_extract.right_table);
 			string left_cols_csv;
+			string left_source_select;
 			string left_cols_qualified;
 			string left_cols_lc;
 			string left_cols_mc;
 			string lc_mc_match;
+			vector<string> semi_anti_left_exprs;
 			for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
 				if (i > 0) {
 					left_cols_csv += ", ";
+					left_source_select += ", ";
 					left_cols_qualified += ", ";
 					left_cols_lc += ", ";
 					left_cols_mc += ", ";
@@ -2472,32 +2827,51 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 				string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
 				left_cols_csv += qcol;
+				string source_expr = semi_anti_extract.left_alias + "." + qcol;
+				for (size_t j = 0; j < semi_anti_extract.output_cols.size(); j++) {
+					if (StringUtil::CIEquals(semi_anti_extract.output_cols[j], semi_anti_left_cols[i]) &&
+					    j < semi_anti_extract.output_exprs.size()) {
+						source_expr = semi_anti_extract.output_exprs[j];
+						break;
+					}
+				}
+				semi_anti_left_exprs.push_back(source_expr);
+				left_source_select += source_expr + " AS " + qcol;
 				left_cols_qualified += semi_anti_extract.left_alias + "." + qcol;
 				left_cols_lc += "lc." + qcol;
 				left_cols_mc += "mc." + qcol;
 				lc_mc_match += "lc." + qcol + " IS NOT DISTINCT FROM mc." + qcol;
 			}
+			string left_source_filter;
+			if (!semi_anti_extract.post_filter.empty()) {
+				left_source_filter = " WHERE " + semi_anti_extract.post_filter;
+			}
 			string aux_create =
 			    "create table if not exists " + view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table) +
-			    " as with left_counts as (select " + left_cols_csv + ", count(*)::BIGINT as _left_count from " +
-			    semi_anti_extract.left_table + " group by " + left_cols_csv + "), match_counts as (select " +
-			    left_cols_qualified + ", count(*)::BIGINT as _match_count from (select distinct " + left_cols_csv +
-			    " from " + semi_anti_extract.left_table + ") " + semi_anti_extract.left_alias + " join " +
-			    semi_anti_extract.right_table + " " + semi_anti_extract.right_alias + " on " +
-			    semi_anti_extract.predicate + " group by " + left_cols_qualified + ") select " + left_cols_lc +
+			    " as with left_source as (select " + left_source_select + " from " + left_source_table + " " +
+			    semi_anti_extract.left_alias + left_source_filter + "), left_counts as (select " + left_cols_csv +
+			    ", count(*)::BIGINT as _left_count from left_source group by " + left_cols_csv +
+			    "), match_counts as (select " + left_cols_qualified +
+			    ", count(*)::BIGINT as _match_count from (select distinct " + left_cols_csv + " from left_source) " +
+			    semi_anti_extract.left_alias + " join " + right_source_table + " " + semi_anti_extract.right_alias +
+			    " on " + semi_anti_extract.predicate + " group by " + left_cols_qualified + ") select " + left_cols_lc +
 			    ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT as _match_count from "
 			    "left_counts lc left join match_counts mc on " +
 			    lc_mc_match;
 			ddl.push_back(aux_create);
 
 			string left_cols_json = "[";
+			string left_exprs_json = "[";
 			for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
 				if (i > 0) {
 					left_cols_json += ",";
+					left_exprs_json += ",";
 				}
 				left_cols_json += JsonQuote(semi_anti_left_cols[i]);
+				left_exprs_json += JsonQuote(semi_anti_left_exprs[i]);
 			}
 			left_cols_json += "]";
+			left_exprs_json += "]";
 			string output_cols_json = "[";
 			for (size_t i = 0; i < semi_anti_extract.output_cols.size(); i++) {
 				if (i > 0) {
@@ -2506,15 +2880,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				output_cols_json += JsonQuote(semi_anti_extract.output_cols[i]);
 			}
 			output_cols_json += "]";
-			string meta_json = "{\"aux_table\":" + JsonQuote(aux_table) +
-			                   ",\"join_type\":" + JsonQuote(semi_anti_extract.join_type) +
-			                   ",\"left_table\":" + JsonQuote(semi_anti_extract.left_table) +
-			                   ",\"left_alias\":" + JsonQuote(semi_anti_extract.left_alias) +
-			                   ",\"right_table\":" + JsonQuote(semi_anti_extract.right_table) +
-			                   ",\"right_alias\":" + JsonQuote(semi_anti_extract.right_alias) +
-			                   ",\"predicate\":" + JsonQuote(semi_anti_extract.predicate) +
-			                   ",\"post_filter\":" + JsonQuote(semi_anti_extract.post_filter) +
-			                   ",\"left_cols\":" + left_cols_json + ",\"output_cols\":" + output_cols_json + "}";
+			string meta_json =
+			    "{\"aux_table\":" + JsonQuote(aux_table) + ",\"join_type\":" + JsonQuote(semi_anti_extract.join_type) +
+			    ",\"left_table\":" + JsonQuote(semi_anti_extract.left_table) +
+			    ",\"left_alias\":" + JsonQuote(semi_anti_extract.left_alias) +
+			    ",\"right_table\":" + JsonQuote(semi_anti_extract.right_table) +
+			    ",\"right_alias\":" + JsonQuote(semi_anti_extract.right_alias) +
+			    ",\"predicate\":" + JsonQuote(semi_anti_extract.predicate) +
+			    ",\"post_filter\":" + JsonQuote(semi_anti_extract.post_filter) + ",\"left_cols\":" + left_cols_json +
+			    ",\"left_exprs\":" + left_exprs_json + ",\"output_cols\":" + output_cols_json + "}";
 			ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET semi_anti_aux_meta_json = '" +
 			              OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
 			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");

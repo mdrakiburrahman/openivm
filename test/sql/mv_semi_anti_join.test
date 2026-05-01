@@ -300,6 +300,58 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# NOT IN with computed output columns keeps expression-valued aux columns.
+statement ok
+CREATE TABLE in_cast_l (id INT, x INT);
+
+statement ok
+CREATE TABLE in_cast_r (rid INT, y BIGINT);
+
+statement ok
+INSERT INTO in_cast_l VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+statement ok
+INSERT INTO in_cast_r VALUES (1, 20), (2, 99);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_not_in_cast AS
+    SELECT CAST(x AS BIGINT) AS item_id
+    FROM in_cast_l
+    WHERE CAST(x AS BIGINT) NOT IN (SELECT CAST(y AS BIGINT) FROM in_cast_r);
+
+statement ok
+INSERT INTO in_cast_l VALUES (5, 50), (6, 20);
+
+statement ok
+DELETE FROM in_cast_r WHERE rid = 1;
+
+statement ok
+INSERT INTO in_cast_r VALUES (3, 30), (4, 50);
+
+statement ok
+PRAGMA ivm('mv_not_in_cast');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT CAST(x AS BIGINT) AS item_id
+    FROM in_cast_l
+    WHERE CAST(x AS BIGINT) NOT IN (SELECT CAST(y AS BIGINT) FROM in_cast_r)
+    EXCEPT ALL SELECT item_id FROM mv_not_in_cast
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT item_id FROM mv_not_in_cast
+    EXCEPT ALL
+    SELECT CAST(x AS BIGINT) AS item_id
+    FROM in_cast_l
+    WHERE CAST(x AS BIGINT) NOT IN (SELECT CAST(y AS BIGINT) FROM in_cast_r)
+);
+----
+0
+
 # ============================================================
 # EXISTS / NOT EXISTS subqueries lower to SEMI/ANTI joins. These
 # should use the same aux-state path, including arbitrary correlated

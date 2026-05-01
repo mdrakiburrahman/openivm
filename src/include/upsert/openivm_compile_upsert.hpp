@@ -20,6 +20,12 @@ struct GroupRecomputeDeltaSpec {
 	int64_t current_snapshot_id = -1;
 };
 
+struct WindowPartitionDeltaSpec {
+	string delta_table;
+	string output_column;
+	string source_column;
+};
+
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql = "", bool has_minmax = false,
                               bool list_mode = false, const string &delta_ts_filter = "",
@@ -35,7 +41,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
                                  bool insert_only = false);
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
-                              const vector<string> &delta_table_names = {});
+                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {});
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
 /// Group-level partial recompute, used by `IVMType::GROUP_RECOMPUTE` (inner-DISTINCT under
@@ -79,10 +85,10 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
-                                const vector<string> &left_cols, const vector<string> &output_cols,
-                                const string &left_delta_source, const string &right_delta_source,
-                                const string &left_last_update, const string &right_last_update,
-                                const string &catalog_prefix = "");
+                                const vector<string> &left_cols, const vector<string> &left_exprs,
+                                const vector<string> &output_cols, const string &left_delta_source,
+                                const string &right_delta_source, const string &left_last_update,
+                                const string &right_last_update, const string &catalog_prefix = "");
 
 } // namespace duckdb
 

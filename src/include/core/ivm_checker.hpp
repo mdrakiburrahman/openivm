@@ -20,6 +20,7 @@ struct PlanAnalysis {
 	bool found_full_outer = false;
 	bool found_semi_anti_join = false;
 	bool found_join = false;
+	bool found_delim_join = false;
 	bool found_window = false;
 	bool found_top_k = false;
 	bool found_count_distinct = false;      // COUNT(DISTINCT x) — handled via group-recompute
@@ -34,8 +35,8 @@ struct PlanAnalysis {
 	                                        // empty for global top-k
 	vector<string> aggregate_columns;
 	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
-	vector<string> window_partition_columns; // PARTITION BY columns from window functions
-	vector<idx_t> window_partition_column_indexes; // output indexes for PARTITION BY columns when known
+	vector<string> window_partition_columns; // PARTITION BY source columns from window functions
+	vector<idx_t> window_partition_column_indexes; // Output-position hint for each PARTITION BY column
 	size_t group_count = 0;                  // number of GROUP BY expressions
 	idx_t group_index = DConstants::INVALID_INDEX; // aggregate's group_index for binding lookup
 };

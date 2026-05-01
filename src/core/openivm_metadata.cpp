@@ -440,6 +440,7 @@ bool IVMMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &o
 	ok &= ExtractJsonString(json, "predicate", out.predicate);
 	ExtractJsonString(json, "post_filter", out.post_filter);
 	ok &= ExtractJsonStringArray(json, "left_cols", out.left_cols);
+	ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
 	ok &= ExtractJsonStringArray(json, "output_cols", out.output_cols);
 	return ok;
 }
