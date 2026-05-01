@@ -4,16 +4,122 @@
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "storage/ducklake_scan.hpp"
 
 namespace duckdb {
+
+static AggregateFunction BindAggregateByName(ClientContext &context, const string &name,
+                                             const vector<LogicalType> &arg_types) {
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto &entry = catalog.GetEntry<AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, name);
+	FunctionBinder function_binder(context);
+	ErrorData error;
+	auto best = function_binder.BindFunction(entry.name, entry.functions, arg_types, error);
+	if (!best.IsValid()) {
+		throw InternalException("OpenIVM: failed to bind aggregate '%s'", name);
+	}
+	return entry.functions.GetFunctionByOffset(best.GetIndex());
+}
+
+static bool CompactDeltasEnabled(ClientContext &context) {
+	Value compact_val;
+	if (context.TryGetCurrentSetting("ivm_compact_deltas", compact_val) && !compact_val.IsNull()) {
+		return compact_val.GetValue<bool>();
+	}
+	return true;
+}
+
+static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalOperator> delta_node,
+                                     idx_t output_table_index, ColumnBinding mul_binding) {
+	auto input_bindings = delta_node->GetColumnBindings();
+	auto input_types = delta_node->types;
+	vector<unique_ptr<Expression>> remap_exprs;
+	for (idx_t i = 0; i < input_bindings.size(); i++) {
+		if (input_bindings[i] == mul_binding) {
+			remap_exprs.push_back(BoundCastExpression::AddCastToType(
+			    context, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]), LogicalType::INTEGER));
+		} else {
+			remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
+		}
+	}
+	auto remap_proj = make_uniq<LogicalProjection>(output_table_index, std::move(remap_exprs));
+	remap_proj->children.push_back(std::move(delta_node));
+	remap_proj->ResolveOperatorTypes();
+
+	ColumnBinding remapped_mul(output_table_index, input_bindings.size() - 1);
+	return {std::move(remap_proj), remapped_mul};
+}
+
+static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
+                                       idx_t output_table_index, ColumnBinding mul_binding) {
+	auto input_bindings = delta_node->GetColumnBindings();
+	auto input_types = delta_node->types;
+	idx_t base_col_count = input_bindings.size() - 1;
+
+	auto group_index = binder.GenerateTableIndex();
+	auto aggregate_index = binder.GenerateTableIndex();
+
+	vector<unique_ptr<Expression>> sum_args;
+	sum_args.push_back(make_uniq<BoundColumnRefExpression>(input_types[base_col_count], mul_binding));
+	auto sum_func = BindAggregateByName(context, "sum", {input_types[base_col_count]});
+	auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
+	                                                    AggregateType::NON_DISTINCT);
+	sum_expr->alias = ivm::MULTIPLICITY_COL;
+
+	vector<unique_ptr<Expression>> aggregates;
+	aggregates.push_back(std::move(sum_expr));
+	auto aggregate = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
+	GroupingSet grouping_set;
+	for (idx_t i = 0; i < base_col_count; i++) {
+		aggregate->groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
+		aggregate->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input_types[i])));
+		grouping_set.insert(i);
+	}
+	aggregate->grouping_sets.push_back(std::move(grouping_set));
+	aggregate->children.push_back(std::move(delta_node));
+	aggregate->ResolveOperatorTypes();
+
+	auto agg_bindings = aggregate->GetColumnBindings();
+	auto agg_types = aggregate->types;
+	auto filter_expr = make_uniq<BoundComparisonExpression>(
+	    ExpressionType::COMPARE_NOTEQUAL,
+	    make_uniq<BoundColumnRefExpression>(agg_types[base_col_count], agg_bindings[base_col_count]),
+	    make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+	auto filter = make_uniq<LogicalFilter>(std::move(filter_expr));
+	filter->children.push_back(std::move(aggregate));
+	filter->ResolveOperatorTypes();
+
+	auto filter_bindings = filter->GetColumnBindings();
+	vector<unique_ptr<Expression>> remap_exprs;
+	for (idx_t i = 0; i < base_col_count; i++) {
+		remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(agg_types[i], filter_bindings[i]));
+	}
+	remap_exprs.push_back(BoundCastExpression::AddCastToType(
+	    context, make_uniq<BoundColumnRefExpression>(agg_types[base_col_count], filter_bindings[base_col_count]),
+	    LogicalType::INTEGER));
+
+	auto remap_proj = make_uniq<LogicalProjection>(output_table_index, std::move(remap_exprs));
+	remap_proj->children.push_back(std::move(filter));
+	remap_proj->ResolveOperatorTypes();
+
+	ColumnBinding compact_mul_binding(output_table_index, base_col_count);
+	return {std::move(remap_proj), compact_mul_binding};
+}
 
 // ============================================================================
 // DuckLake delta scan: direct plan construction using native catalog types
@@ -125,23 +231,17 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	                                   std::move(del_proj), LogicalOperatorType::LOGICAL_UNION, true /* setop_all */);
 	union_op->types = union_types;
 
-	// Outer projection to remap output bindings to old_get->table_index.
-	auto union_bindings = union_op->GetColumnBindings();
-	vector<unique_ptr<Expression>> remap_exprs;
-	for (idx_t i = 0; i < union_bindings.size(); i++) {
-		remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(union_types[i], union_bindings[i]));
+	ColumnBinding mul_binding(union_op->GetColumnBindings().back());
+	if (!CompactDeltasEnabled(context)) {
+		OPENIVM_DEBUG_PRINT("[DuckLake] Delta compaction disabled\n");
+		return RemapDeltaNode(context, std::move(union_op), old_get->table_index, mul_binding);
 	}
-	auto remap_proj = make_uniq<LogicalProjection>(old_get->table_index, std::move(remap_exprs));
-	remap_proj->children.push_back(std::move(union_op));
-	remap_proj->ResolveOperatorTypes();
 
-	ColumnBinding mul_binding(old_get->table_index, union_bindings.size() - 1);
-
+	auto compacted = CompactDeltaNode(context, binder, std::move(union_op), old_get->table_index, mul_binding);
 	OPENIVM_DEBUG_PRINT("[DuckLake] Delta plan built: %zu output cols, mul_binding: table=%lu col=%lu\n",
-	                    union_bindings.size(), (unsigned long)mul_binding.table_index,
-	                    (unsigned long)mul_binding.column_index);
-
-	return {std::move(remap_proj), mul_binding};
+	                    compacted.node->types.size(), (unsigned long)compacted.mul_binding.table_index,
+	                    (unsigned long)compacted.mul_binding.column_index);
+	return compacted;
 }
 
 // ============================================================================
@@ -272,6 +372,9 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
 	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index,
 	                    (unsigned long)new_mul_binding.column_index, delta_get_node->GetColumnIds().size());
+	if (CompactDeltasEnabled(context)) {
+		return CompactDeltaNode(context, binder, std::move(delta_get_node), old_get->table_index, new_mul_binding);
+	}
 	return {std::move(delta_get_node), new_mul_binding};
 }
 

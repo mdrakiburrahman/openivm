@@ -121,6 +121,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Per-optimization flags (default: all enabled)
 	db_config.AddExtensionOption("ivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_compact_deltas",
+	                             "compact raw delta rows into net logical Z-set deltas before refresh",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("ivm_ducklake_nterm",
 	                             "use N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
