@@ -162,6 +162,52 @@ static string BuildEmptyDeltaInsert(const string &view_name, const vector<string
 	return sql;
 }
 
+static string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
+                                       const vector<string> &column_names, const string &delta_ts_filter) {
+	vector<string> data_columns;
+	for (auto &col : column_names) {
+		if (col != string(ivm::MULTIPLICITY_COL)) {
+			data_columns.push_back(col);
+		}
+	}
+	if (data_columns.empty()) {
+		return "";
+	}
+
+	string col_list;
+	string data_select;
+	string group_by;
+	for (size_t i = 0; i < data_columns.size(); i++) {
+		if (i > 0) {
+			data_select += ", ";
+			group_by += ", ";
+		}
+		data_select += OpenIVMUtils::QuoteIdentifier(data_columns[i]);
+		group_by += OpenIVMUtils::QuoteIdentifier(data_columns[i]);
+	}
+	for (size_t i = 0; i < column_names.size(); i++) {
+		if (i > 0) {
+			col_list += ", ";
+		}
+		col_list += OpenIVMUtils::QuoteIdentifier(column_names[i]);
+	}
+
+	string where_clause = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string delete_filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string temp_name = string(ivm::TEMP_TABLE_PREFIX) + "compact_" + view_name;
+	string qtemp = KeywordHelper::WriteOptionallyQuoted(temp_name);
+	string qmul = OpenIVMUtils::QuoteIdentifier(string(ivm::MULTIPLICITY_COL));
+
+	string sql;
+	sql += "CREATE TEMP TABLE " + qtemp + " AS SELECT " + data_select + ", SUM(" + qmul + ")::INTEGER AS " + qmul +
+	       " FROM " + delta_view_name + where_clause + " GROUP BY " + group_by + " HAVING SUM(" + qmul +
+	       ") <> 0;\n";
+	sql += "DELETE FROM " + delta_view_name + delete_filter + ";\n";
+	sql += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + col_list + " FROM " + qtemp + ";\n";
+	sql += "DROP TABLE " + qtemp + ";\n";
+	return sql;
+}
+
 static const char *IVMTypeName(IVMType type) {
 	switch (type) {
 	case IVMType::AGGREGATE_HAVING:
@@ -1071,6 +1117,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	auto &catalog = Catalog::GetSystemCatalog(context);
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
+	Value skip_empty_val;
+	bool skip_empty_enabled = true;
+	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+		skip_empty_enabled = skip_empty_val.GetValue<bool>();
+	}
 	// Catalog-qualified prefix for SQL references (e.g. "dl.main." or "" for default).
 	// Only add the prefix when the catalog is non-default (e.g. DuckLake attached DB).
 	// Metadata tables (_duckdb_ivm_views etc.) are always unqualified — they live in the
@@ -1811,6 +1862,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string companion_query;
 	string pre_companion;
 	string post_companion;
+	string compact_delta_view_query;
 	string delete_from_view_query;
 	string delta_view_name = catalog_prefix + OpenIVMUtils::DeltaName(view_name);
 
@@ -2014,6 +2066,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 
 		if (has_downstream) {
+			if (skip_empty_enabled) {
+				compact_delta_view_query =
+				    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
+				OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n",
+				                    compact_delta_view_query.c_str());
+			}
 			delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
 		} else {
 			delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
@@ -2133,7 +2191,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// (metadata tables) while steps 1-5 and 8-9 write to dl. DuckDB forbids cross-catalog
 	// writes in one transaction. When out_pre_meta/out_post_meta are provided, we split them.
 	string data_sql = pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" + post_companion +
-	                  delete_from_view_query + "\n" + delete_from_delta_table_query;
+	                  compact_delta_view_query + delete_from_view_query + "\n" + delete_from_delta_table_query;
 	const string &meta_pre_sql = set_in_progress;
 	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + clear_in_progress;
 

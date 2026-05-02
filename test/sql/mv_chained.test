@@ -75,6 +75,98 @@ SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY 
 ----
 1500
 
+# Downstream delta compaction: a tiny upstream projection change should not
+# produce a full old/new MV snapshot for dependent views.
+statement ok
+CREATE TABLE compact_src (id INT, k INT, v INT);
+
+statement ok
+CREATE TABLE compact_dim (k INT, label VARCHAR);
+
+statement ok
+INSERT INTO compact_src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+
+statement ok
+INSERT INTO compact_dim VALUES (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd');
+
+statement ok
+CREATE MATERIALIZED VIEW compact_proj AS
+    SELECT id, k, v FROM compact_src;
+
+statement ok
+CREATE MATERIALIZED VIEW compact_join AS
+    SELECT p.id, p.k, d.label
+    FROM compact_proj p
+    JOIN compact_dim d USING (k);
+
+statement ok
+INSERT INTO compact_src VALUES (4, 40, 400);
+
+statement ok
+PRAGMA ivm('compact_proj');
+
+query I
+SELECT COUNT(*) FROM delta_compact_proj;
+----
+1
+
+statement ok
+PRAGMA ivm('compact_join');
+
+query III
+SELECT id, k, label FROM compact_join ORDER BY id;
+----
+1	10	a
+2	20	b
+3	30	c
+4	40	d
+
+# Canceling source deltas should leave no pending upstream delta for downstream.
+statement ok
+CREATE TABLE compact_cancel_src (id INT, k INT, v INT);
+
+statement ok
+CREATE TABLE compact_cancel_dim (k INT, label VARCHAR);
+
+statement ok
+INSERT INTO compact_cancel_src VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+INSERT INTO compact_cancel_dim VALUES (10, 'a'), (20, 'b'), (30, 'c');
+
+statement ok
+CREATE MATERIALIZED VIEW compact_cancel_proj AS
+    SELECT id, k, v FROM compact_cancel_src;
+
+statement ok
+CREATE MATERIALIZED VIEW compact_cancel_join AS
+    SELECT p.id, p.k, d.label
+    FROM compact_cancel_proj p
+    JOIN compact_cancel_dim d USING (k);
+
+statement ok
+INSERT INTO compact_cancel_src VALUES (3, 30, 300);
+
+statement ok
+DELETE FROM compact_cancel_src WHERE id = 3;
+
+statement ok
+PRAGMA ivm('compact_cancel_proj');
+
+query I
+SELECT COUNT(*) FROM delta_compact_cancel_proj;
+----
+0
+
+statement ok
+PRAGMA ivm('compact_cancel_join');
+
+query III
+SELECT id, k, label FROM compact_cancel_join ORDER BY id;
+----
+1	10	a
+2	20	b
+
 # ============================================================
 # Three-level chain: table -> MV1 -> MV2 -> MV3
 # ============================================================
