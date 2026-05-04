@@ -3342,11 +3342,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              qdt + " limit 0");
 		ddl.push_back("alter table " + qdv + " alter " + string(ivm::TIMESTAMP_COL) + " set default now()");
 
-		// Record source-table metadata only after physical MV objects exist. DuckLake
-		// DDL can fail during commit; writing metadata first leaves stale rows that
-		// make dbt's lock retry fail with duplicate source-table keys.
-		ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
-
 		// --- Index DDL (for aggregate group queries) ---
 		// DuckLake does not support indexes. Skip when: (a) any source table is DuckLake, OR
 		// (b) view_catalog_prefix is non-empty, meaning the data table lands in a non-default
@@ -3372,6 +3367,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			ddl.push_back("use " + default_db + ".main");
 		}
+
+		// Record source-table metadata only after physical MV objects exist. DuckLake
+		// creation temporarily switches into the DuckLake catalog for CTAS/view DDL, so
+		// this must run after restoring the physical-default catalog where metadata lives.
+		ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
 
 		// After all tables are created and populated, update DuckLake snapshot IDs
 		// to the current snapshot. This ensures the first refresh only sees changes
