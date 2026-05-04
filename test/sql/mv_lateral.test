@@ -61,6 +61,58 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# LATERAL table functions should keep original SQL for creation but still refresh incrementally.
+statement ok
+CREATE TABLE lat_wh (w_id INT, w_name VARCHAR);
+
+statement ok
+INSERT INTO lat_wh VALUES (1, 'w1'), (2, 'w2');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_series AS
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot);
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_lat_series';
+----
+6
+
+statement ok
+INSERT INTO lat_wh VALUES (3, 'w3');
+
+statement ok
+PRAGMA ivm('mv_lat_series');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot)
+    EXCEPT ALL
+    SELECT * FROM mv_lat_series
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_series
+    EXCEPT ALL
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot)
+);
+----
+0
+
 statement ok
 INSERT INTO lat_history VALUES (1, 1, 7);
 

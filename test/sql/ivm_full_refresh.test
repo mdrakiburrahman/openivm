@@ -48,6 +48,79 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# ============================================================
+# LPTS-hostile constructs still create MVs and full-refresh correctly
+# ============================================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_unnest_values AS
+SELECT unnest(['BC', 'GC']) AS credit_type;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_unnest_values';
+----
+3
+
+statement ok
+PRAGMA ivm('mv_unnest_values');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT unnest(['BC', 'GC']) AS credit_type
+    EXCEPT ALL
+    SELECT credit_type FROM mv_unnest_values
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT credit_type FROM mv_unnest_values
+    EXCEPT ALL
+    SELECT unnest(['BC', 'GC']) AS credit_type
+);
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW mv_except_all AS
+SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+EXCEPT ALL
+SELECT a, b FROM t1;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_except_all';
+----
+3
+
+statement ok
+INSERT INTO t1 VALUES (99, 100);
+
+statement ok
+PRAGMA ivm('mv_except_all');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+     EXCEPT ALL
+     SELECT a, b FROM t1)
+    EXCEPT ALL
+    SELECT * FROM mv_except_all
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_except_all
+    EXCEPT ALL
+    (SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+     EXCEPT ALL
+     SELECT a, b FROM t1)
+);
+----
+0
+
 query I
 SELECT COUNT(*) FROM (
     SELECT a, b, c FROM mv_left

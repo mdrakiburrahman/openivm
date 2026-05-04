@@ -1027,7 +1027,11 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 
 static bool QueryNeedsOriginalSqlForLpts(const string &query) {
 	string lower = StringUtil::Lower(query);
-	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
+	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos ||
+	       lower.find("unnest(") != string::npos || lower.find(" unnest(") != string::npos ||
+	       lower.find("generate_series(") != string::npos || FindKeywordToken(lower, "except", 0) != string::npos ||
+	       FindKeywordToken(lower, "intersect", 0) != string::npos ||
+	       (lower.find(" range ") != string::npos && lower.find(" interval ") != string::npos);
 }
 
 static bool QueryHasUnsupportedIncrementalConstruct(const string &query) {
@@ -1041,6 +1045,10 @@ static bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
 		return false;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
+		return true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_UNNEST || op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
+	    op->type == LogicalOperatorType::LOGICAL_INTERSECT) {
 		return true;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -2454,6 +2462,30 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
+		// LATERAL table functions (e.g. CROSS JOIN LATERAL generate_series(...)) are
+		// DEPENDENT/DELIM joins in DuckDB. LPTS can preserve the original SQL at CREATE
+		// time, but the normal projection delta path still has to stringify a rewritten
+		// lateral/delim delta plan at refresh time, which is not supported robustly yet.
+		// Use affected-output GROUP_RECOMPUTE: compute only result tuples touched by the
+		// base delta, delete those keys from the MV, then reinsert the current matching
+		// result. This stays incremental and follows Z-set delete+insert semantics for
+		// projection outputs without falling back to a full refresh.
+		bool lateral_table_function_group_fallback = false;
+		if (analysis.found_delim_join && !classification.found_aggregation &&
+		    QueryNeedsOriginalSqlForLpts(original_view_query)) {
+			for (auto &name : output_names) {
+				if (!name.empty() && !IVMTableNames::IsInternalColumn(name)) {
+					aggregate_columns.push_back(name);
+				}
+			}
+			lateral_table_function_group_fallback = !aggregate_columns.empty();
+			if (lateral_table_function_group_fallback) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] DELIM/DEPENDENT table function: using %zu visible output "
+				                    "columns for GROUP_RECOMPUTE\n",
+				                    aggregate_columns.size());
+			}
+		}
+
 		// Deduplicate aggregate_columns the same way we deduped output_names above.
 		// When the user writes `SELECT DISTINCT w_id, w_id` (or groups twice on the
 		// same column), the data table has columns `w_id, w_id_1` after the output_names
@@ -2640,6 +2672,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// deltas. The parser keeps the original SQL because LPTS currently drops
 			// the grouping-set annotation.
 			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
+		} else if (lateral_table_function_group_fallback && !aggregate_columns.empty()) {
+			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_semi_anti_join && classification.found_aggregation) {
 			// SEMI/ANTI joins are thresholded by match-count transitions. The aux-state path below
 			// supports projection/filter stacks over one left base table; aggregates over SEMI/ANTI
@@ -2869,6 +2903,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " add column if not exists distinct_aux_meta_json varchar default null");
 		ddl.push_back("alter table " + string(ivm::VIEWS_TABLE) +
 		              " add column if not exists semi_anti_aux_meta_json varchar default null");
+		if (!ivm_parse_data.is_replace) {
+			ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(ivm::VIEWS_TABLE) +
+			              " WHERE view_name = '" + OpenIVMUtils::EscapeSingleQuotes(view_name) +
+			              "') THEN error('Duplicate key: materialized view \"" +
+			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "\" already exists') ELSE NULL END");
+		}
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)

@@ -408,3 +408,71 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 11: RANGE frame with INTERVAL uses original SQL and partition refresh
+# ==========================================
+
+statement ok
+CREATE TABLE w_history_range (h_w_id INT, h_date TIMESTAMP, h_amount INT);
+
+statement ok
+INSERT INTO w_history_range VALUES
+    (1, '2026-01-01 00:00:00', 10),
+    (1, '2026-01-10 00:00:00', 20),
+    (1, '2026-02-20 00:00:00', 30),
+    (2, '2026-01-05 00:00:00', 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_window_range AS
+    SELECT h_w_id, h_date, h_amount,
+        COUNT(*) OVER (
+            PARTITION BY h_w_id
+            ORDER BY h_date
+            RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+        ) AS rolling_30d
+    FROM w_history_range
+    WHERE h_date IS NOT NULL;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_window_range';
+----
+5
+
+statement ok
+INSERT INTO w_history_range VALUES (1, '2026-01-20 00:00:00', 50);
+
+statement ok
+PRAGMA ivm('mv_window_range');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT h_w_id, h_date, h_amount,
+        COUNT(*) OVER (
+            PARTITION BY h_w_id
+            ORDER BY h_date
+            RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+        )
+    FROM w_history_range
+    WHERE h_date IS NOT NULL
+    EXCEPT ALL
+    SELECT * FROM mv_window_range
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_window_range
+    EXCEPT ALL
+    SELECT h_w_id, h_date, h_amount,
+        COUNT(*) OVER (
+            PARTITION BY h_w_id
+            ORDER BY h_date
+            RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+        )
+    FROM w_history_range
+    WHERE h_date IS NOT NULL
+);
+----
+0
