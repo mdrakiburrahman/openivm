@@ -115,3 +115,76 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Repeated aggregate CTE under join
+# ==========================================
+
+statement ok
+CREATE TABLE dl.cte_reuse (a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO dl.cte_reuse VALUES (1, 10), (1, 20), (2, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_cte_reuse AS
+  WITH s AS (
+    SELECT a, SUM(b) AS sb
+    FROM dl.cte_reuse
+    GROUP BY a
+  )
+  SELECT s.a, s.sb, g.av
+  FROM s
+  CROSS JOIN (SELECT AVG(sb) AS av FROM s) g;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_reuse';
+----
+6
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_reuse';
+----
+a
+
+statement ok
+INSERT INTO dl.cte_reuse VALUES (2, 15);
+
+statement ok
+PRAGMA ivm('mv_cte_reuse');
+
+query I
+SELECT count(*) FROM (
+  SELECT a, sb, av FROM dl.mv_cte_reuse
+  EXCEPT ALL
+  SELECT * FROM (
+    WITH s AS (
+      SELECT a, SUM(b) AS sb
+      FROM dl.cte_reuse
+      GROUP BY a
+    )
+    SELECT s.a, s.sb, g.av
+    FROM s
+    CROSS JOIN (SELECT AVG(sb) AS av FROM s) g
+  ) expected
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (
+    WITH s AS (
+      SELECT a, SUM(b) AS sb
+      FROM dl.cte_reuse
+      GROUP BY a
+    )
+    SELECT s.a, s.sb, g.av
+    FROM s
+    CROSS JOIN (SELECT AVG(sb) AS av FROM s) g
+  ) expected
+  EXCEPT ALL
+  SELECT a, sb, av FROM dl.mv_cte_reuse
+);
+----
+0

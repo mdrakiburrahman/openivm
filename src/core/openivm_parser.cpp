@@ -365,6 +365,26 @@ static string QualifiedTablePrefix(const string &catalog_name, const string &sch
 	       KeywordHelper::WriteOptionallyQuoted(schema_name) + ".";
 }
 
+static string QuoteQualifiedPrefix(const string &prefix) {
+	string result;
+	size_t start = 0;
+	while (start < prefix.size()) {
+		size_t dot = prefix.find('.', start);
+		string part = prefix.substr(start, dot == string::npos ? string::npos : dot - start);
+		if (!part.empty()) {
+			if (!result.empty()) {
+				result += ".";
+			}
+			result += KeywordHelper::WriteOptionallyQuoted(part);
+		}
+		if (dot == string::npos) {
+			break;
+		}
+		start = dot + 1;
+	}
+	return result.empty() ? "" : result + ".";
+}
+
 static void CollectProjectionIndex(LogicalOperator *op,
                                    unordered_map<idx_t, LogicalProjection *> &projections_by_index) {
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
@@ -493,6 +513,57 @@ static vector<string> DeriveGroupColumnNames(LogicalOperator *plan, idx_t group_
 	unordered_map<idx_t, LogicalProjection *> projections_by_index;
 	CollectProjectionIndex(plan, projections_by_index);
 	FindGroupColumns(plan, projections_by_index, group_index, group_count, output_names, group_names);
+	return group_names;
+}
+
+static void AddUniqueGroupNames(vector<string> &group_names, const vector<string> &new_names) {
+	for (auto &name : new_names) {
+		bool exists = false;
+		for (auto &existing : group_names) {
+			if (StringUtil::CIEquals(existing, name)) {
+				exists = true;
+				break;
+			}
+		}
+		if (!exists) {
+			group_names.push_back(name);
+		}
+	}
+}
+
+static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator *op,
+                                         const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
+                                         const vector<string> &output_names, vector<string> &group_names,
+                                         bool include_first_aggregate, bool &seen_aggregate) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &agg = op->Cast<LogicalAggregate>();
+		bool include_this = include_first_aggregate || seen_aggregate;
+		seen_aggregate = true;
+		if (include_this && !agg.groups.empty()) {
+			vector<string> nested_names;
+			if (FindGroupColumns(root, projections_by_index, agg.group_index, agg.groups.size(), output_names,
+			                     nested_names)) {
+				AddUniqueGroupNames(group_names, nested_names);
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectAggregateGroupColumns(root, child.get(), projections_by_index, output_names, group_names,
+		                             include_first_aggregate, seen_aggregate);
+	}
+}
+
+static vector<string> DeriveAggregateGroupColumnNames(LogicalOperator *plan, const vector<string> &output_names,
+                                                      bool include_first_aggregate) {
+	vector<string> group_names;
+	unordered_map<idx_t, LogicalProjection *> projections_by_index;
+	CollectProjectionIndex(plan, projections_by_index);
+	bool seen_aggregate = false;
+	CollectAggregateGroupColumns(plan, plan, projections_by_index, output_names, group_names, include_first_aggregate,
+	                             seen_aggregate);
 	return group_names;
 }
 
@@ -1911,7 +1982,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string view_name;           // bare name without catalog, e.g. "mv_totals"
 		auto dot_pos = full_view_name.rfind('.');
 		if (dot_pos != string::npos) {
-			view_catalog_prefix = full_view_name.substr(0, dot_pos + 1); // includes the dot
+			view_catalog_prefix = QuoteQualifiedPrefix(full_view_name.substr(0, dot_pos + 1));
 			view_name = full_view_name.substr(dot_pos + 1);
 		} else {
 			view_name = full_view_name;
@@ -1920,7 +1991,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// than the physical default. Metadata tables (unqualified) stay in the physical
 			// default — PRAGMA ivm() always uses a fresh connection without USE.
 			if (!current_catalog.empty() && current_catalog != default_db) {
-				view_catalog_prefix = current_catalog + "." + current_schema + ".";
+				view_catalog_prefix = QualifiedTablePrefix(current_catalog, current_schema);
 			}
 		}
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
@@ -1975,12 +2046,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		vector<string> output_names;
 		string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 		bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
+		bool original_has_repeated_cte_ref_under_join = false;
 		{
 			Parser select_parser;
 			select_parser.ParseQuery(original_view_query);
 			Planner select_planner(*con.context);
 			select_planner.CreatePlan(std::move(select_parser.statements[0]));
 			auto select_plan = std::move(select_planner.plan);
+			original_has_repeated_cte_ref_under_join = HasRepeatedCteRefUnderJoin(select_plan.get());
 
 			// Inline CTEs so LPTS (which doesn't implement LOGICAL_CTE_REF) sees a flat
 			// plan. Query-bound CTEs become LOGICAL_MATERIALIZED_CTE + LOGICAL_CTE_REF
@@ -2213,6 +2286,38 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			if (delim_aggregate_group_fallback) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DELIM/DEPENDENT aggregate: using %zu visible key columns for "
 				                    "GROUP_RECOMPUTE\n",
+				                    aggregate_columns.size());
+			}
+		}
+
+		bool nested_aggregate_group_fallback = false;
+		if (classification.found_nested_aggregate && aggregate_columns.empty()) {
+			auto nested_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, false);
+			for (auto &name : nested_group_names) {
+				if (!IVMTableNames::IsInternalColumn(name)) {
+					aggregate_columns.push_back(name);
+				}
+			}
+			nested_aggregate_group_fallback = !aggregate_columns.empty();
+			if (nested_aggregate_group_fallback) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Nested aggregate: using %zu visible inner group columns for "
+				                    "GROUP_RECOMPUTE\n",
+				                    aggregate_columns.size());
+			}
+		}
+
+		bool repeated_cte_aggregate_group_fallback = false;
+		if (classification.found_aggregation && aggregate_columns.empty()) {
+			auto cte_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, true);
+			for (auto &name : cte_group_names) {
+				if (!IVMTableNames::IsInternalColumn(name)) {
+					aggregate_columns.push_back(name);
+				}
+			}
+			repeated_cte_aggregate_group_fallback = !aggregate_columns.empty();
+			if (repeated_cte_aggregate_group_fallback) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Repeated CTE aggregate under join: using %zu visible group columns "
+				                    "for GROUP_RECOMPUTE\n",
 				                    aggregate_columns.size());
 			}
 		}
@@ -2545,6 +2650,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		} else if (classification.found_having && classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_HAVING;
 		} else if ((has_union_over_agg || join_key_group_fallback || delim_aggregate_group_fallback ||
+		            nested_aggregate_group_fallback || repeated_cte_aggregate_group_fallback ||
 		            classification.found_nested_aggregate) &&
 		           !aggregate_columns.empty()) {
 			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.

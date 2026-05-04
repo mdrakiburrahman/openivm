@@ -538,7 +538,7 @@ static vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(IVMMetadata
 static string BuildLptsTablePrefix(const string &view_catalog_name, const string &view_schema_name) {
 	string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 	string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
-	return lpts_cat + "." + lpts_sch + ".";
+	return OpenIVMUtils::QuoteIdentifier(lpts_cat) + "." + OpenIVMUtils::QuoteIdentifier(lpts_sch) + ".";
 }
 
 static string QualifiedName(const string &catalog_name, const string &schema_name, const string &table_name) {
@@ -1169,7 +1169,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// physical default catalog, resolved via the fresh connection without any USE.
 	string catalog_prefix;
 	if (!view_catalog_name.empty() && view_catalog_name != "memory") {
-		catalog_prefix = view_catalog_name + "." + view_schema_name + ".";
+		catalog_prefix =
+		    OpenIVMUtils::QuoteIdentifier(view_catalog_name) + "." + OpenIVMUtils::QuoteIdentifier(view_schema_name) +
+		    ".";
 	}
 	// Bare table names for catalog lookups; qualified names for SQL
 	string data_table_bare = IVMTableNames::DataTableName(view_name);

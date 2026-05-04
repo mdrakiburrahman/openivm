@@ -393,7 +393,7 @@ string OpenIVMUtils::DeltaName(const string &name) {
 }
 
 string OpenIVMUtils::FullName(const string &catalog, const string &schema, const string &table) {
-	return catalog + "." + schema + "." + table;
+	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
 }
 
 string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
@@ -402,7 +402,7 @@ string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, 
 	if (base.size() > data_prefix.size() && base.rfind(data_prefix, 0) == 0) {
 		base = base.substr(data_prefix.size());
 	}
-	return catalog + "." + schema + ".delta_" + base;
+	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(DeltaName(base));
 }
 
 bool OpenIVMUtils::IsDelta(const string &name) {

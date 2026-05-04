@@ -1049,3 +1049,40 @@ query I
 SELECT salary FROM mv_staff WHERE id = 201;
 ----
 999
+
+# ==========================================
+# Attached catalog with quoted identifier
+# ==========================================
+
+statement ok
+ATTACH '__TEST_DIR__/hyphen-catalog.db' AS "hyphen-cat";
+
+statement ok
+CREATE TABLE "hyphen-cat".main.hy_staff(id INT, dept VARCHAR);
+
+statement ok
+CREATE MATERIALIZED VIEW "hyphen-cat".main.mv_hy_staff AS SELECT * FROM "hyphen-cat".main.hy_staff;
+
+statement ok
+INSERT INTO "hyphen-cat".main.hy_staff VALUES (1, 'eng');
+
+statement ok
+PRAGMA ivm('mv_hy_staff');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM "hyphen-cat".main.mv_hy_staff
+  EXCEPT ALL
+  SELECT * FROM "hyphen-cat".main.hy_staff
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM "hyphen-cat".main.hy_staff
+  EXCEPT ALL
+  SELECT * FROM "hyphen-cat".main.mv_hy_staff
+);
+----
+0
