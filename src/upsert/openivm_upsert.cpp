@@ -713,18 +713,6 @@ static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, 
 	return true;
 }
 
-static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
-	if (needle.empty()) {
-		return haystack;
-	}
-	size_t pos = 0;
-	while ((pos = haystack.find(needle, pos)) != string::npos) {
-		haystack.replace(pos, needle.size(), replacement);
-		pos += replacement.size();
-	}
-	return haystack;
-}
-
 static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
 	if (table_name.empty()) {
 		return sql;
@@ -752,6 +740,26 @@ static string ReplaceTableReferences(const string &sql, const string &table_name
 				string qualified_identifier;
 				if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
 				    IdentifierMatchesTable(qualified_identifier, table_name)) {
+					idx_t at_pos = end;
+					while (at_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[at_pos]))) {
+						at_pos++;
+					}
+					if (StringUtil::CIStartsWith(sql.substr(at_pos), "AT (")) {
+						idx_t depth = 0;
+						while (at_pos < sql.size()) {
+							if (sql[at_pos] == '(') {
+								depth++;
+							} else if (sql[at_pos] == ')') {
+								depth--;
+								if (depth == 0) {
+									at_pos++;
+									break;
+								}
+							}
+							at_pos++;
+						}
+						end = at_pos;
+					}
 					result += replacement;
 					i = end;
 					expect_table = false;
@@ -834,10 +842,6 @@ static string BuildDuckLakeSnapshotQuery(IVMMetadata &metadata, Connection &con,
 		string replacement = "(SELECT " + visible_cols + " FROM " +
 		                     QualifiedName(loc.catalog_name, loc.schema_name, loc.table_name) + " AT (VERSION => " +
 		                     to_string(old_snap) + "))";
-		snapshot_query = ReplaceAllOccurrences(
-		    snapshot_query, QualifiedName(loc.catalog_name, loc.schema_name, source_name), replacement);
-		snapshot_query = ReplaceAllOccurrences(
-		    snapshot_query, loc.catalog_name + "." + loc.schema_name + "." + source_name, replacement);
 		snapshot_query = ReplaceTableReferences(snapshot_query, loc.table_name, replacement);
 		if (!StringUtil::CIEquals(source_name, loc.table_name)) {
 			snapshot_query = ReplaceTableReferences(snapshot_query, source_name, replacement);
