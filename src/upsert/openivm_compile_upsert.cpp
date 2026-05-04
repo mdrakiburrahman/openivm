@@ -1014,7 +1014,8 @@ static string ReplaceTableReferences(const string &sql, const string &table_name
 	return result;
 }
 
-static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name, const string &replacement) {
+static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
+                                                const string &replacement) {
 	vector<string> variants;
 	if (table_name.empty()) {
 		return variants;

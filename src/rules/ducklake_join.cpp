@@ -96,27 +96,27 @@ static string DuckLakeQualifiedTable(const string &catalog, const string &schema
 
 static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, const string &schema,
                                      const string &table_name, const string &delta_column, int64_t old_snapshot,
-                                     int64_t current_snapshot, const string &other_catalog,
-                                     const string &other_schema, const string &other_table,
-                                     const string &other_column, int64_t other_snapshot) {
+                                     int64_t current_snapshot, const string &other_catalog, const string &other_schema,
+                                     const string &other_table, const string &other_column, int64_t other_snapshot) {
 	string delta_col = OpenIVMUtils::QuoteIdentifier(delta_column);
 	string other_col = OpenIVMUtils::QuoteIdentifier(other_column);
 	string other_relation = DuckLakeQualifiedTable(other_catalog, other_schema, other_table, other_snapshot);
 	string old_snap = to_string(old_snapshot);
 	string cur_snap = to_string(current_snapshot);
-	string sql =
-	    "SELECT EXISTS(SELECT 1 FROM ("
-	    "SELECT " +
-	    delta_col + " AS _ivm_key FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog) + "', '" +
-	    OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " + old_snap + ", " +
-	    cur_snap + ") "
-	    "UNION ALL "
-	    "SELECT " +
-	    delta_col + " AS _ivm_key FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog) + "', '" +
-	    OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " + old_snap + ", " +
-	    cur_snap + ")) _ivm_delta_keys "
-	    "JOIN (SELECT * FROM " +
-	    other_relation + ") _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." + other_col + " LIMIT 1)";
+	string sql = "SELECT EXISTS(SELECT 1 FROM ("
+	             "SELECT " +
+	             delta_col + " AS _ivm_key FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog) +
+	             "', '" + OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	             old_snap + ", " + cur_snap +
+	             ") "
+	             "UNION ALL "
+	             "SELECT " +
+	             delta_col + " AS _ivm_key FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog) +
+	             "', '" + OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	             old_snap + ", " + cur_snap +
+	             ")) _ivm_delta_keys "
+	             "JOIN (SELECT * FROM " +
+	             other_relation + ") _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." + other_col + " LIMIT 1)";
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe key-domain intersection: %s\n",
@@ -212,13 +212,14 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			string has_changes_sql =
 			    "SELECT EXISTS(SELECT 1 FROM ("
 			    "(SELECT 1 FROM ducklake_table_insertions('" +
-			    OpenIVMUtils::EscapeValue(table_catalogs[i]) + "', '" +
-			    OpenIVMUtils::EscapeValue(table_schemas[i]) + "', '" + OpenIVMUtils::EscapeValue(table_names[i]) +
-			    "', " + to_string(old_snapshots[i]) + ", " + to_string(current_snapshot) + ") LIMIT 1) "
+			    OpenIVMUtils::EscapeValue(table_catalogs[i]) + "', '" + OpenIVMUtils::EscapeValue(table_schemas[i]) +
+			    "', '" + OpenIVMUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
+			    to_string(current_snapshot) +
+			    ") LIMIT 1) "
 			    "UNION ALL "
-			    "(SELECT 1 FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(table_catalogs[i]) +
-			    "', '" + OpenIVMUtils::EscapeValue(table_schemas[i]) + "', '" +
-			    OpenIVMUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
+			    "(SELECT 1 FROM ducklake_table_deletions('" +
+			    OpenIVMUtils::EscapeValue(table_catalogs[i]) + "', '" + OpenIVMUtils::EscapeValue(table_schemas[i]) +
+			    "', '" + OpenIVMUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
 			    to_string(current_snapshot) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)";
 			auto has_changes = con.Query(has_changes_sql);
 			if (has_changes->HasError()) {
@@ -285,10 +286,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 				                              table_catalogs[other], table_schemas[other], table_names[other],
 				                              probe.other_column, other_snapshot)) {
 					key_domain_empty = true;
-					OPENIVM_DEBUG_PRINT(
-					    "[DuckLakeJoin] Skipping term %zu: delta key %s.%s has no match in %s.%s\n", i,
-					    table_names[i].c_str(), probe.delta_column.c_str(), table_names[other].c_str(),
-					    probe.other_column.c_str());
+					OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: delta key %s.%s has no match in %s.%s\n", i,
+					                    table_names[i].c_str(), probe.delta_column.c_str(), table_names[other].c_str(),
+					                    probe.other_column.c_str());
 					break;
 				}
 			}

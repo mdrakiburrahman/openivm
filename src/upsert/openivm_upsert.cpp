@@ -21,6 +21,9 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
+#include "duckdb/planner/operator/logical_cte.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include <cctype>
 #include <chrono>
@@ -143,6 +146,35 @@ static bool IsEmptyDeltaPlan(LogicalOperator *op) {
 			}
 		}
 		return true;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+		auto &agg = op->Cast<LogicalAggregate>();
+		return !agg.groups.empty() && op->children.size() == 1 && IsEmptyDeltaPlan(op->children[0].get());
+	}
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
+		if (op->children.size() != 2) {
+			return false;
+		}
+		auto *join = dynamic_cast<LogicalJoin *>(op);
+		if (!join || join->join_type == JoinType::INNER || op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+			return IsEmptyDeltaPlan(op->children[0].get()) || IsEmptyDeltaPlan(op->children[1].get());
+		}
+		if (join->join_type == JoinType::LEFT) {
+			return IsEmptyDeltaPlan(op->children[0].get());
+		}
+		if (join->join_type == JoinType::RIGHT) {
+			return IsEmptyDeltaPlan(op->children[1].get());
+		}
+		if (join->join_type == JoinType::OUTER) {
+			return IsEmptyDeltaPlan(op->children[0].get()) && IsEmptyDeltaPlan(op->children[1].get());
+		}
+		return false;
+	}
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+		return !op->children.empty() && IsEmptyDeltaPlan(op->children[0].get());
+	}
 	default:
 		return false;
 	}
@@ -160,6 +192,15 @@ static string BuildEmptyDeltaInsert(const string &view_name, const vector<string
 	}
 	sql += " WHERE false;\n";
 	return sql;
+}
+
+static string NormalizeEmptyResultSql(const string &sql) {
+	// LPTS serializes DuckDB's LogicalEmptyResult as a synthetic __empty__ table:
+	//   SELECT ... FROM __empty__ WHERE false
+	// __empty__ is not a real catalog table, but DuckDB accepts the equivalent
+	// zero-row projection without a FROM clause. Keep this local to generated
+	// IVM SQL so partially-pruned UNION branches stay incremental and valid.
+	return StringUtil::Replace(sql, " FROM __empty__ WHERE false", " WHERE false");
 }
 
 static string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
@@ -200,8 +241,7 @@ static string BuildCompactDeltaViewSQL(const string &view_name, const string &de
 
 	string sql;
 	sql += "CREATE TEMP TABLE " + qtemp + " AS SELECT " + data_select + ", SUM(" + qmul + ")::INTEGER AS " + qmul +
-	       " FROM " + delta_view_name + where_clause + " GROUP BY " + group_by + " HAVING SUM(" + qmul +
-	       ") <> 0;\n";
+	       " FROM " + delta_view_name + where_clause + " GROUP BY " + group_by + " HAVING SUM(" + qmul + ") <> 0;\n";
 	sql += "DELETE FROM " + delta_view_name + delete_filter + ";\n";
 	sql += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + col_list + " FROM " + qtemp + ";\n";
 	sql += "DROP TABLE " + qtemp + ";\n";
@@ -1014,19 +1054,20 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					if (last_snap == ducklake_current_snap) {
 						continue;
 					}
-					auto has_changes = snap_con.Query(
-					    "SELECT EXISTS(SELECT 1 FROM ("
-					    "(SELECT 1 FROM ducklake_table_insertions('" +
-					    OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
-					    OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
-					    OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-					    to_string(ducklake_current_snap) + ") LIMIT 1) "
-					    "UNION ALL "
-					    "(SELECT 1 FROM ducklake_table_deletions('" +
-					    OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
-					    OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
-					    OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-					    to_string(ducklake_current_snap) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)");
+					auto has_changes =
+					    snap_con.Query("SELECT EXISTS(SELECT 1 FROM ("
+					                   "(SELECT 1 FROM ducklake_table_insertions('" +
+					                   OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+					                   OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+					                   OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+					                   to_string(ducklake_current_snap) +
+					                   ") LIMIT 1) "
+					                   "UNION ALL "
+					                   "(SELECT 1 FROM ducklake_table_deletions('" +
+					                   OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+					                   OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+					                   OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+					                   to_string(ducklake_current_snap) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)");
 					if (has_changes->HasError() || has_changes->RowCount() == 0 ||
 					    has_changes->GetValue(0, 0).IsNull() || has_changes->GetValue(0, 0).GetValue<bool>()) {
 						all_empty = false;
@@ -1043,9 +1084,9 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					all_empty = false;
 					break;
 				}
-				auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_probe + " WHERE " +
-				                              string(ivm::TIMESTAMP_COL) + " >= '" +
-				                              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+				auto count_result =
+				    con.Query("SELECT COUNT(*) FROM " + delta_probe + " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
+				              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP");
 				if (!count_result->HasError() && count_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
 					all_empty = false;
 					break;
@@ -1361,18 +1402,17 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				if (last_snap == cur_snap) {
 					continue; // no changes — empty delta
 				}
-				auto count_result =
-				    con.Query("SELECT "
-				              "(SELECT COUNT(*) FROM ducklake_table_insertions('" +
-				              OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
-				              OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
-				              OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-				              to_string(cur_snap) + ")), "
-				              "(SELECT COUNT(*) FROM ducklake_table_deletions('" +
-				              OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
-				              OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
-				              OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-				              to_string(cur_snap) + "))");
+				auto count_result = con.Query(
+				    "SELECT "
+				    "(SELECT COUNT(*) FROM ducklake_table_insertions('" +
+				    OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" + OpenIVMUtils::EscapeValue(loc.schema_name) +
+				    "', '" + OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+				    to_string(cur_snap) +
+				    ")), "
+				    "(SELECT COUNT(*) FROM ducklake_table_deletions('" +
+				    OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" + OpenIVMUtils::EscapeValue(loc.schema_name) +
+				    "', '" + OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
+				    to_string(cur_snap) + "))");
 				if (count_result->HasError()) {
 					any_has_deletes = true;
 					tables_with_changes++;
@@ -1731,11 +1771,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			if (partition_cols.size() == 1) {
 				affected_filter = affected_tuple + " IN (SELECT " + affected_cols + " FROM " + qtemp_affected + ")";
 			} else {
-				affected_filter = "(" + affected_tuple + ") IN (SELECT " + affected_cols + " FROM " +
-				                  qtemp_affected + ")";
+				affected_filter =
+				    "(" + affected_tuple + ") IN (SELECT " + affected_cols + " FROM " + qtemp_affected + ")";
 			}
-			upsert_query = "CREATE TEMP TABLE " + qtemp_affected + " AS SELECT DISTINCT " + affected_cols +
-			               " FROM ((" + insertions + ") UNION ALL (" + deletions + ")) _ivm_changed_partitions;\n";
+			upsert_query = "CREATE TEMP TABLE " + qtemp_affected + " AS SELECT DISTINCT " + affected_cols + " FROM ((" +
+			               insertions + ") UNION ALL (" + deletions + ")) _ivm_changed_partitions;\n";
 			upsert_query += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
 			upsert_query += "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
 			                ") _ivm_recompute\nWHERE " + affected_filter + ";\n";
@@ -1744,9 +1784,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			                    "partition cols, old_snap=%ld, current_snap=%ld)\n",
 			                    partition_cols.size(), (long)old_snap, (long)current_snap);
 		} else if (safe_for_snapdiff && any_ducklake) {
-			string old_view_query = BuildDuckLakeSnapshotQuery(metadata, con, view_name, view_query_sql, delta_table_names,
-			                                                  view_catalog_name, view_schema_name,
-			                                                  attached_db_catalog_name, attached_db_schema_name);
+			string old_view_query = BuildDuckLakeSnapshotQuery(metadata, con, view_name, view_query_sql,
+			                                                   delta_table_names, view_catalog_name, view_schema_name,
+			                                                   attached_db_catalog_name, attached_db_schema_name);
 			string key_cols;
 			string key_tuple;
 			for (size_t i = 0; i < partition_cols.size(); i++) {
@@ -1944,7 +1984,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			try {
 				auto ast = LogicalPlanToAst(con_ctx, plan);
 				auto cte_list = AstToCteList(*ast);
-				raw_ivm_sql = cte_list->ToQuery(false);
+				raw_ivm_sql = NormalizeEmptyResultSql(cte_list->ToQuery(false));
 				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
 			} catch (const std::exception &e) {
 				Printer::Print("Warning: materialized view '" + view_name +
@@ -2099,8 +2139,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			if (skip_empty_enabled) {
 				compact_delta_view_query =
 				    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
-				OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n",
-				                    compact_delta_view_query.c_str());
+				OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 			}
 			delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
 		} else {

@@ -99,8 +99,8 @@ static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref
 	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(delta_ref.delta_name) + " WHERE " +
 	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(delta_ref.last_update) +
 	             "'::TIMESTAMP) _ivm_delta_keys JOIN " + OpenIVMUtils::QuoteIdentifier(other_ref.table_name) +
-	             " _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." +
-	             OpenIVMUtils::QuoteIdentifier(other_column) + " LIMIT 1)";
+	             " _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." + OpenIVMUtils::QuoteIdentifier(other_column) +
+	             " LIMIT 1)";
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Could not probe key-domain intersection: %s\n",
@@ -673,8 +673,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		}
 		if (key_domain_empty) {
 			pruned_count++;
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Skipped term mask=%lu (delta key-domain empty)\n",
-			                    (unsigned long)mask);
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Skipped term mask=%lu (delta key-domain empty)\n", (unsigned long)mask);
 			continue;
 		}
 		auto term = pw.plan->Copy(context);

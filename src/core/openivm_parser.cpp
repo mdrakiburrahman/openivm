@@ -2305,7 +2305,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// every changed source, so native window recompute could miss partitions. DuckLake
 		// can compare the old/new view result at source snapshots, so it can safely keep
 		// partition keys even for multi-source window joins.
-		bool all_sources_are_ducklake = !table_names.empty() && table_names.size() == dl_table_info_for_classification.size();
+		bool all_sources_are_ducklake =
+		    !table_names.empty() && table_names.size() == dl_table_info_for_classification.size();
 		if (all_sources_are_ducklake) {
 			for (const auto &table_name : table_names) {
 				string table_lc = table_name;
@@ -2317,7 +2318,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 		}
-		bool single_source_window_join = classification.found_window && classification.found_join && table_names.size() == 1;
+		bool single_source_window_join =
+		    classification.found_window && classification.found_join && table_names.size() == 1;
 		if (classification.found_window && classification.found_join && !single_source_window_join &&
 		    !all_sources_are_ducklake) {
 			window_partition_columns.clear();
