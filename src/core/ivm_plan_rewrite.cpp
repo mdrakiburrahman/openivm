@@ -908,9 +908,6 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 			return false;
 		};
 		find_path(plan.get(), false);
-		// Reverse: path is currently top-down, we need bottom-up
-		std::reverse(path.begin(), path.end());
-
 		// Step 2: Propagate binding through each operator on the path
 		ColumnBinding current = key_binding;
 		for (auto &entry : path) {

@@ -185,6 +185,57 @@ static void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
 	join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
 }
 
+static string BindingKey(const BoundColumnRefExpression &bcr) {
+	return to_string(bcr.binding.table_index) + ":" + to_string(bcr.binding.column_index);
+}
+
+static string FindBindingParent(unordered_map<string, string> &parents, const string &key) {
+	auto it = parents.find(key);
+	if (it == parents.end()) {
+		parents[key] = key;
+		return key;
+	}
+	if (it->second == key) {
+		return key;
+	}
+	it->second = FindBindingParent(parents, it->second);
+	return it->second;
+}
+
+static void UnionBindings(unordered_map<string, string> &parents, const string &left, const string &right) {
+	string left_parent = FindBindingParent(parents, left);
+	string right_parent = FindBindingParent(parents, right);
+	if (left_parent != right_parent) {
+		parents[right_parent] = left_parent;
+	}
+}
+
+static void CollectJoinEquivalences(LogicalOperator *op, unordered_map<string, string> &parents,
+                                    vector<BoundColumnRefExpression *> &join_refs) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		for (auto &cond : join.conditions) {
+			if (cond.left->type != ExpressionType::BOUND_COLUMN_REF ||
+			    cond.right->type != ExpressionType::BOUND_COLUMN_REF) {
+				continue;
+			}
+			auto &left = cond.left->Cast<BoundColumnRefExpression>();
+			auto &right = cond.right->Cast<BoundColumnRefExpression>();
+			string left_key = BindingKey(left);
+			string right_key = BindingKey(right);
+			UnionBindings(parents, left_key, right_key);
+			join_refs.push_back(&left);
+			join_refs.push_back(&right);
+		}
+	}
+	for (auto &child : op->children) {
+		CollectJoinEquivalences(child.get(), parents, join_refs);
+	}
+}
+
 static bool IsPurePassThroughExpression(const Expression *expr) {
 	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 		return true;
@@ -672,6 +723,105 @@ static void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<stri
 				partition_column = output_col + "=" + partition_column;
 			}
 			break;
+		}
+	}
+}
+
+static void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, vector<string> &aggregate_columns,
+                                                        const vector<string> &output_names) {
+	if (aggregate_columns.empty()) {
+		return;
+	}
+	auto *top_projection = FindFirstProjection(plan);
+	if (!top_projection) {
+		return;
+	}
+
+	unordered_map<idx_t, LogicalProjection *> proj_by_index;
+	unordered_map<idx_t, LogicalGet *> get_by_index;
+	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
+
+	unordered_map<string, string> parents;
+	vector<BoundColumnRefExpression *> join_refs;
+	CollectJoinEquivalences(plan, parents, join_refs);
+	if (join_refs.empty()) {
+		return;
+	}
+
+	unordered_map<string, string> output_by_parent;
+	for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
+		auto &expr = top_projection->expressions[expr_i];
+		auto *bcr = GetColumnRefThroughCasts(expr.get());
+		if (!bcr) {
+			continue;
+		}
+		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+		if (output_col.empty() || IVMTableNames::IsInternalColumn(output_col)) {
+			continue;
+		}
+		string parent = FindBindingParent(parents, BindingKey(*bcr));
+		if (!output_by_parent.count(parent)) {
+			output_by_parent[parent] = output_col;
+		}
+	}
+
+	for (auto &group_col : aggregate_columns) {
+		bool already_visible = false;
+		for (auto &output_col : output_names) {
+			if (StringUtil::CIEquals(group_col, output_col)) {
+				already_visible = true;
+				break;
+			}
+		}
+		if (already_visible) {
+			continue;
+		}
+		for (auto *ref : join_refs) {
+			string ref_col = ResolveBindingToBaseColumn(ref, proj_by_index, get_by_index);
+			if (ref_col.empty()) {
+				ref_col = ref->GetName();
+			}
+			if (!StringUtil::CIEquals(ref_col, group_col) && !StringUtil::CIEquals(ref->GetName(), group_col)) {
+				continue;
+			}
+			string parent = FindBindingParent(parents, BindingKey(*ref));
+			auto out_it = output_by_parent.find(parent);
+			if (out_it != output_by_parent.end()) {
+				group_col = out_it->second;
+				break;
+			}
+		}
+		bool resolved = false;
+		for (auto &output_col : output_names) {
+			if (StringUtil::CIEquals(group_col, output_col)) {
+				resolved = true;
+				break;
+			}
+		}
+		if (resolved) {
+			continue;
+		}
+		string suffix = group_col;
+		while (true) {
+			auto underscore = suffix.find('_');
+			if (underscore == string::npos || underscore + 1 >= suffix.size()) {
+				break;
+			}
+			suffix = suffix.substr(underscore + 1);
+			string matched_output;
+			for (auto &output_col : output_names) {
+				if (StringUtil::CIEquals(output_col, suffix)) {
+					if (!matched_output.empty()) {
+						matched_output.clear();
+						break;
+					}
+					matched_output = output_col;
+				}
+			}
+			if (!matched_output.empty()) {
+				group_col = matched_output;
+				break;
+			}
 		}
 	}
 }
@@ -2387,6 +2537,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 		}
+		if (classification.found_join && classification.found_aggregation && !aggregate_columns.empty()) {
+			ResolveAggregateGroupColumnsThroughJoinKeys(plan.get(), aggregate_columns, output_names);
+		}
+
 		bool join_aggregate_projection_fallback = false;
 		if (classification.found_join && classification.found_aggregation && !aggregate_columns.empty()) {
 			idx_t expected_linear_outputs = aggregate_columns.size() + aggregate_types.size();
@@ -3031,6 +3185,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
+		vector<string> source_metadata_ddl;
 		unordered_set<string> inserted_meta_table_names;
 		for (const auto &table_name : table_names) {
 			string catalog_type = "duckdb";
@@ -3069,14 +3224,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				continue;
 			}
 
-			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) +
-			              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, last_refresh_ts, "
-			              "source_catalog, source_schema) "
-			              "values ('" +
-			              view_name + "', '" + OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" +
-			              catalog_type + "', " + snapshot_val + ", now(), '" +
-			              OpenIVMUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
-			              OpenIVMUtils::EscapeSingleQuotes(source_schema_val) + "')");
+			source_metadata_ddl.push_back("insert or replace into " + string(ivm::DELTA_TABLES_TABLE) +
+			                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
+			                              "last_refresh_ts, source_catalog, source_schema) "
+			                              "values ('" +
+			                              view_name + "', '" + OpenIVMUtils::EscapeSingleQuotes(meta_table_name) +
+			                              "', now(), '" + catalog_type + "', " + snapshot_val + ", now(), '" +
+			                              OpenIVMUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
+			                              OpenIVMUtils::EscapeSingleQuotes(source_schema_val) + "')");
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -3186,6 +3341,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
 		              qdt + " limit 0");
 		ddl.push_back("alter table " + qdv + " alter " + string(ivm::TIMESTAMP_COL) + " set default now()");
+
+		// Record source-table metadata only after physical MV objects exist. DuckLake
+		// DDL can fail during commit; writing metadata first leaves stale rows that
+		// make dbt's lock retry fail with duplicate source-table keys.
+		ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
 
 		// --- Index DDL (for aggregate group queries) ---
 		// DuckLake does not support indexes. Skip when: (a) any source table is DuckLake, OR

@@ -838,6 +838,123 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# ==========================================
+# Reused CTE aggregate under joins: affected keys must use visible output columns
+# ==========================================
+
+statement ok
+CREATE TABLE cte_wh (w_id INT, w_name VARCHAR, w_ytd DOUBLE);
+
+statement ok
+CREATE TABLE cte_dist (d_w_id INT, d_id INT, d_name VARCHAR);
+
+statement ok
+CREATE TABLE cte_ol (ol_w_id INT, ol_d_id INT, ol_o_id INT, ol_number INT, ol_amount DOUBLE);
+
+statement ok
+INSERT INTO cte_wh VALUES (1, 'w1', 100.0), (2, 'w2', 200.0);
+
+statement ok
+INSERT INTO cte_dist VALUES (1, 1, 'd1'), (1, 2, 'd2'), (2, 1, 'd3');
+
+statement ok
+INSERT INTO cte_ol VALUES
+    (1, 1, 1, 1, 10.0),
+    (1, 1, 1, 2, 20.0),
+    (1, 2, 2, 1, 30.0),
+    (2, 1, 3, 1, 40.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cte_join_keys AS
+WITH ol_by_district AS (
+    SELECT ol_w_id, ol_d_id, SUM(ol_amount) AS district_revenue, COUNT(*) AS line_count
+    FROM cte_ol
+    GROUP BY ol_w_id, ol_d_id
+),
+ol_by_warehouse AS (
+    SELECT ol_w_id, SUM(district_revenue) AS warehouse_revenue, SUM(line_count) AS total_lines,
+           COUNT(*) AS district_count
+    FROM ol_by_district
+    GROUP BY ol_w_id
+)
+SELECT w.w_id, w.w_name, w.w_ytd, ow.warehouse_revenue, ow.total_lines, ow.district_count,
+       d.d_id, d.d_name, od.district_revenue, od.line_count
+FROM cte_wh w
+JOIN ol_by_warehouse ow ON w.w_id = ow.ol_w_id
+JOIN cte_dist d ON w.w_id = d.d_w_id
+JOIN ol_by_district od ON d.d_w_id = od.ol_w_id AND d.d_id = od.ol_d_id;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_join_keys';
+----
+6
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_join_keys';
+----
+w_id,d_id
+
+statement ok
+UPDATE cte_ol SET ol_amount = 15.0 WHERE ol_w_id = 1 AND ol_d_id = 1 AND ol_o_id = 1 AND ol_number = 1;
+
+statement ok
+INSERT INTO cte_ol VALUES (2, 1, 4, 1, 5.0);
+
+statement ok
+PRAGMA ivm('mv_cte_join_keys');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cte_join_keys
+    EXCEPT ALL
+    SELECT * FROM (WITH ol_by_district AS (
+        SELECT ol_w_id, ol_d_id, SUM(ol_amount) AS district_revenue, COUNT(*) AS line_count
+        FROM cte_ol
+        GROUP BY ol_w_id, ol_d_id
+    ),
+    ol_by_warehouse AS (
+        SELECT ol_w_id, SUM(district_revenue) AS warehouse_revenue, SUM(line_count) AS total_lines,
+               COUNT(*) AS district_count
+        FROM ol_by_district
+        GROUP BY ol_w_id
+    )
+    SELECT w.w_id, w.w_name, w.w_ytd, ow.warehouse_revenue, ow.total_lines, ow.district_count,
+           d.d_id, d.d_name, od.district_revenue, od.line_count
+    FROM cte_wh w
+    JOIN ol_by_warehouse ow ON w.w_id = ow.ol_w_id
+    JOIN cte_dist d ON w.w_id = d.d_w_id
+    JOIN ol_by_district od ON d.d_w_id = od.ol_w_id AND d.d_id = od.ol_d_id
+    ) _expected
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (WITH ol_by_district AS (
+        SELECT ol_w_id, ol_d_id, SUM(ol_amount) AS district_revenue, COUNT(*) AS line_count
+        FROM cte_ol
+        GROUP BY ol_w_id, ol_d_id
+    ),
+    ol_by_warehouse AS (
+        SELECT ol_w_id, SUM(district_revenue) AS warehouse_revenue, SUM(line_count) AS total_lines,
+               COUNT(*) AS district_count
+        FROM ol_by_district
+        GROUP BY ol_w_id
+    )
+    SELECT w.w_id, w.w_name, w.w_ytd, ow.warehouse_revenue, ow.total_lines, ow.district_count,
+           d.d_id, d.d_name, od.district_revenue, od.line_count
+    FROM cte_wh w
+    JOIN ol_by_warehouse ow ON w.w_id = ow.ol_w_id
+    JOIN cte_dist d ON w.w_id = d.d_w_id
+    JOIN ol_by_district od ON d.d_w_id = od.ol_w_id AND d.d_id = od.ol_d_id
+    ) _expected
+    EXCEPT ALL
+    SELECT * FROM mv_cte_join_keys
+);
+----
+0
+
 # Second refresh with deletions
 statement ok
 DELETE FROM cra_customer WHERE c_d_id = 3;
