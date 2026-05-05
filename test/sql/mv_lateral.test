@@ -61,6 +61,111 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Scalar correlated subqueries use DuckDB's SINGLE DELIM_JOIN shape.
+statement ok
+CREATE TABLE lat_scalar_wh(w_id INT, w_name VARCHAR);
+
+statement ok
+INSERT INTO lat_scalar_wh VALUES (1, 'w1'), (2, 'w2'), (4, 'w4');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_scalar AS
+    WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+    SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+    FROM numbers;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_lat_scalar';
+----
+6
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+    EXCEPT ALL SELECT * FROM mv_lat_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_scalar
+    EXCEPT ALL
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+);
+----
+0
+
+statement ok
+UPDATE lat_scalar_wh SET w_name = 'w1x' WHERE w_id = 1;
+
+statement ok
+DELETE FROM lat_scalar_wh WHERE w_id = 2;
+
+statement ok
+INSERT INTO lat_scalar_wh VALUES (3, 'w3');
+
+statement ok
+PRAGMA ivm('mv_lat_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+    EXCEPT ALL SELECT * FROM mv_lat_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_scalar
+    EXCEPT ALL
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+);
+----
+0
+
+statement ok
+DELETE FROM lat_scalar_wh WHERE w_id = 1;
+
+statement ok
+UPDATE lat_scalar_wh SET w_name = 'w4x' WHERE w_id = 4;
+
+statement ok
+INSERT INTO lat_scalar_wh VALUES (5, 'w5');
+
+statement ok
+PRAGMA ivm('mv_lat_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+    EXCEPT ALL SELECT * FROM mv_lat_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_scalar
+    EXCEPT ALL
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+);
+----
+0
+
 # LATERAL table functions should keep original SQL for creation but still refresh incrementally.
 statement ok
 CREATE TABLE lat_wh (w_id INT, w_name VARCHAR);

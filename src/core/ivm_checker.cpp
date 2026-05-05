@@ -191,8 +191,11 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			if (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
 			    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
 			    join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI &&
-			    join->join_type != JoinType::MARK) {
+			    join->join_type != JoinType::MARK && join->join_type != JoinType::SINGLE) {
 				result.ivm_compatible = false;
+			}
+			if (join->join_type == JoinType::SINGLE) {
+				result.found_single_join = true;
 			}
 			if (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
 			    join->join_type == JoinType::MARK) {

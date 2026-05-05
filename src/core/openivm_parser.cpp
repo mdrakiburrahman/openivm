@@ -349,6 +349,7 @@ struct MVClassificationState {
 	bool found_grouping_sets;
 	bool found_nested_aggregate;
 	bool found_filtered_list;
+	bool found_single_join;
 
 	explicit MVClassificationState(const PlanAnalysis &analysis)
 	    : ivm_compatible(analysis.ivm_compatible), found_aggregation(analysis.found_aggregation),
@@ -359,7 +360,8 @@ struct MVClassificationState {
 	      found_semi_anti_join(analysis.found_semi_anti_join), found_window(analysis.found_window),
 	      found_join(analysis.found_join), found_top_k(analysis.found_top_k),
 	      found_count_distinct(analysis.found_count_distinct), found_grouping_sets(analysis.found_grouping_sets),
-	      found_nested_aggregate(analysis.found_nested_aggregate), found_filtered_list(analysis.found_filtered_list) {
+	      found_nested_aggregate(analysis.found_nested_aggregate), found_filtered_list(analysis.found_filtered_list),
+	      found_single_join(analysis.found_single_join) {
 	}
 };
 
@@ -582,6 +584,62 @@ static void AddUniqueGroupNames(vector<string> &group_names, const vector<string
 			group_names.push_back(name);
 		}
 	}
+}
+
+static void CollectSingleDelimKeyBindings(LogicalOperator *op, unordered_set<string> &key_bindings) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		if (join.join_type == JoinType::SINGLE) {
+			for (auto &expr : join.duplicate_eliminated_columns) {
+				if (expr && expr->type == ExpressionType::BOUND_COLUMN_REF) {
+					key_bindings.insert(BindingKey(expr->Cast<BoundColumnRefExpression>()));
+				}
+			}
+			for (auto &cond : join.conditions) {
+				if (cond.left && cond.left->type == ExpressionType::BOUND_COLUMN_REF) {
+					key_bindings.insert(BindingKey(cond.left->Cast<BoundColumnRefExpression>()));
+				}
+				if (cond.right && cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
+					key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectSingleDelimKeyBindings(child.get(), key_bindings);
+	}
+}
+
+static vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, const vector<string> &output_names) {
+	vector<string> group_names;
+	unordered_set<string> key_bindings;
+	CollectSingleDelimKeyBindings(plan, key_bindings);
+	auto *top_projection = FindFirstProjection(plan);
+	if (top_projection) {
+		for (idx_t expr_idx = 0; expr_idx < top_projection->expressions.size() && expr_idx < output_names.size();
+		     expr_idx++) {
+			auto &expr = top_projection->expressions[expr_idx];
+			if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+				continue;
+			}
+			if (!key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
+				continue;
+			}
+			if (!output_names[expr_idx].empty() && !IVMTableNames::IsInternalColumn(output_names[expr_idx])) {
+				AddUniqueGroupNames(group_names, vector<string> {output_names[expr_idx]});
+			}
+		}
+	}
+	if (group_names.empty() && !output_names.empty() && !IVMTableNames::IsInternalColumn(output_names[0])) {
+		// Scalar correlated subqueries normally project the duplicate-eliminated outer keys
+		// first. Use that shape as a fallback if binding aliases were hidden by projection
+		// rewrites.
+		group_names.push_back(output_names[0]);
+	}
+	return group_names;
 }
 
 static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator *op,
@@ -2352,7 +2410,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
 		auto analysis = AnalyzePlan(plan.get());
 		MVClassificationState classification(analysis);
-		if (analysis.found_delim_join && !classification.found_aggregation) {
+		if (analysis.found_delim_join && !classification.found_aggregation && !analysis.found_single_join) {
 			// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
 			// round-trip lateral table functions, but its CTE-normalized SQL lowers them
 			// into ordinary joins/table-function scans; that bypasses IvmDelimJoinRule
@@ -2441,6 +2499,21 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			if (delim_aggregate_group_fallback) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DELIM/DEPENDENT aggregate: using %zu visible key columns for "
 				                    "GROUP_RECOMPUTE\n",
+				                    aggregate_columns.size());
+			}
+		}
+
+		bool scalar_delim_projection_group_fallback = false;
+		if (analysis.found_delim_join && classification.found_single_join && !classification.found_aggregation &&
+		    aggregate_columns.empty()) {
+			auto delim_key_names = DeriveScalarDelimKeyColumnNames(plan.get(), output_names);
+			for (auto &name : delim_key_names) {
+				aggregate_columns.push_back(name);
+			}
+			scalar_delim_projection_group_fallback = !aggregate_columns.empty();
+			if (scalar_delim_projection_group_fallback) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Scalar DELIM/DEPENDENT projection: using %zu visible key columns "
+				                    "for GROUP_RECOMPUTE\n",
 				                    aggregate_columns.size());
 			}
 		}
@@ -2825,16 +2898,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		} else if (classification.found_having && classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_HAVING;
 		} else if ((has_union_over_agg || join_key_group_fallback || delim_aggregate_group_fallback ||
-		            join_aggregate_projection_fallback || nested_aggregate_group_fallback ||
-		            repeated_cte_aggregate_group_fallback || classification.found_nested_aggregate) &&
+		            scalar_delim_projection_group_fallback || join_aggregate_projection_fallback ||
+		            nested_aggregate_group_fallback || repeated_cte_aggregate_group_fallback ||
+		            classification.found_nested_aggregate) &&
 		           !aggregate_columns.empty()) {
 			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.
 			// Inner-aggregate-in-join: group keys are the join-condition columns visible in the
-			// top projection. DELIM/DEPENDENT aggregate: group keys are the visible correlated
-			// output columns. Nested aggregate (outer COUNT(*) over inner GROUP BY via CTE):
-			// outer COUNT counts inner groups, not source rows, so linear delta is incorrect.
-			// These use GROUP_RECOMPUTE — not AGGREGATE_GROUP — because non-key output columns
-			// may be pass-through attributes or non-linear functions over inner/correlated aggregates.
+			// top projection. DELIM/DEPENDENT aggregate or scalar-subquery projection: group
+			// keys are the visible correlated output columns. Nested aggregate (outer COUNT(*)
+			// over inner GROUP BY via CTE): outer COUNT counts inner groups, not source rows,
+			// so linear delta is incorrect. These use GROUP_RECOMPUTE — not AGGREGATE_GROUP —
+			// because non-key output columns may be pass-through attributes or non-linear
+			// functions over inner/correlated expressions.
 			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;

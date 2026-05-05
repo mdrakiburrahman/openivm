@@ -834,12 +834,14 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
 	string select_columns;
+	string delete_candidate_columns;
 	string match_conditions;
 	for (auto &raw_col : column_names) {
 		if (raw_col != mul) {
 			string column = Q(raw_col);
 			match_conditions += "v." + column + " IS NOT DISTINCT FROM d." + column + " AND ";
 			select_columns += column + ", ";
+			delete_candidate_columns += "v." + column + " AS " + column + ", ";
 		}
 	}
 	if (select_columns.empty()) {
@@ -850,6 +852,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	}
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);
+	delete_candidate_columns.erase(delete_candidate_columns.size() - 2, 2);
 
 	if (insert_only) {
 		// Insert-only fast path: all deltas are inserts (w > 0), just INSERT directly.
@@ -866,26 +869,30 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	string cte_body = "SELECT " + select_columns + ",\n    SUM(" + mul + ") AS _net\n  FROM " + delta_view + ts_where +
 	                  "\n  GROUP BY " + select_columns + "\n  HAVING SUM(" + mul + ") != 0";
 
-	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER.
+	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER. Join
+	// negative net tuples to the MV first so duplicate ranking only touches affected
+	// candidates, not the whole materialized view.
 	string delete_query = "WITH _ivm_net AS (\n  " + cte_body +
 	                      "\n)\n"
+	                      ", _ivm_delete_net AS (\n"
+	                      "  SELECT * FROM _ivm_net WHERE _net < 0\n"
+	                      "), _ivm_delete_candidates AS (\n"
+	                      "  SELECT v.rowid, " +
+	                      delete_candidate_columns +
+	                      ", d._net\n"
+	                      "  FROM " +
+	                      data_table + " v JOIN _ivm_delete_net d ON " + match_conditions +
+	                      "\n), _ivm_ranked_deletes AS (\n"
+	                      "  SELECT rowid, _net,\n"
+	                      "    ROW_NUMBER() OVER (PARTITION BY " +
+	                      select_columns +
+	                      " ORDER BY rowid) AS _rn\n"
+	                      "  FROM _ivm_delete_candidates\n"
+	                      ")\n"
 	                      "DELETE FROM " +
 	                      data_table +
 	                      " WHERE rowid IN (\n"
-	                      "  SELECT v.rowid FROM (\n"
-	                      "    SELECT rowid, " +
-	                      select_columns +
-	                      ",\n"
-	                      "      ROW_NUMBER() OVER (PARTITION BY " +
-	                      select_columns +
-	                      " ORDER BY rowid) AS _rn\n"
-	                      "    FROM " +
-	                      data_table +
-	                      "\n"
-	                      "  ) v JOIN _ivm_net d ON " +
-	                      match_conditions +
-	                      "\n"
-	                      "  WHERE d._net < 0 AND v._rn <= -d._net\n"
+	                      "  SELECT rowid FROM _ivm_ranked_deletes WHERE _rn <= -_net\n"
 	                      ");\n\n";
 
 	// INSERT: replicate each net-insert tuple _net times using generate_series.

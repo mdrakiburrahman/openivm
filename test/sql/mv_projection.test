@@ -896,6 +896,68 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Projection delete should rank only affected join candidates while preserving bag semantics.
+statement ok
+CREATE TABLE proj_rank_w(w_id INT, w_name VARCHAR);
+
+statement ok
+CREATE TABLE proj_rank_d(d_w_id INT, d_id INT);
+
+statement ok
+CREATE TABLE proj_rank_c(c_w_id INT, c_id INT);
+
+statement ok
+INSERT INTO proj_rank_w VALUES (1, 'w1'), (2, 'w2');
+
+statement ok
+INSERT INTO proj_rank_d VALUES (1, 10), (1, 10), (2, 20);
+
+statement ok
+INSERT INTO proj_rank_c VALUES (1, 100), (1, 100), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW proj_rank_mv AS
+    SELECT w.w_id, d.d_id, c.c_id
+    FROM proj_rank_w w
+    JOIN proj_rank_d d ON w.w_id = d.d_w_id
+    JOIN proj_rank_c c ON d.d_w_id = c.c_w_id;
+
+statement ok
+DELETE FROM proj_rank_c WHERE rowid = (SELECT min(rowid) FROM proj_rank_c WHERE c_w_id = 1 AND c_id = 100);
+
+statement ok
+INSERT INTO proj_rank_d VALUES (2, 20), (2, 21);
+
+statement ok
+UPDATE proj_rank_w SET w_name = 'w2x' WHERE w_id = 2;
+
+statement ok
+PRAGMA ivm('proj_rank_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM proj_rank_mv
+    EXCEPT ALL
+    SELECT w.w_id, d.d_id, c.c_id
+    FROM proj_rank_w w
+    JOIN proj_rank_d d ON w.w_id = d.d_w_id
+    JOIN proj_rank_c c ON d.d_w_id = c.c_w_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.w_id, d.d_id, c.c_id
+    FROM proj_rank_w w
+    JOIN proj_rank_d d ON w.w_id = d.d_w_id
+    JOIN proj_rank_c c ON d.d_w_id = c.c_w_id
+    EXCEPT ALL
+    SELECT * FROM proj_rank_mv
+);
+----
+0
+
 # Insert a new top-scorer
 statement ok
 INSERT INTO topkp_t VALUES (6,'frank',99);

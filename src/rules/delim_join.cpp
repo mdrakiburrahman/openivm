@@ -58,7 +58,7 @@ static void VerifyDelimJoinTypes(LogicalOperator *node) {
 		    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
 		    join->join_type != JoinType::MARK && join->join_type != JoinType::SEMI &&
 		    join->join_type != JoinType::ANTI && join->join_type != JoinType::RIGHT_SEMI &&
-		    join->join_type != JoinType::RIGHT_ANTI) {
+		    join->join_type != JoinType::RIGHT_ANTI && join->join_type != JoinType::SINGLE) {
 			throw Exception(ExceptionType::OPTIMIZER,
 			                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM DELIM_JOIN");
 		}
