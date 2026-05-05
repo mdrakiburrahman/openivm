@@ -2083,12 +2083,21 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Query the physical default by running SELECT current_database() on the fresh `con`
 		// (created above without any USE, so it reflects the DB's true default, not the session).
 		string default_db;
+		string default_schema = "main";
 		{
 			auto res = con.Query("SELECT current_database()");
 			if (!res->HasError() && res->RowCount() > 0) {
 				default_db = res->GetValue(0, 0).ToString();
 			}
+			auto schema_res = con.Query("SELECT current_schema()");
+			if (!schema_res->HasError() && schema_res->RowCount() > 0) {
+				default_schema = schema_res->GetValue(0, 0).ToString();
+			}
 		}
+		string default_catalog_schema =
+		    KeywordHelper::WriteOptionallyQuoted(default_db) + "." + KeywordHelper::WriteOptionallyQuoted(default_schema);
+		string current_catalog_schema = KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
+		                                KeywordHelper::WriteOptionallyQuoted(current_schema);
 
 		// Handle ALTER MATERIALIZED VIEW — just execute the metadata UPDATE
 		if (!ivm_parse_data.alter_sql.empty()) {
@@ -3294,13 +3303,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 		string stage_table = "_ivm_stage_" + view_name;
 		string qstage =
-		    QualifiedTablePrefix(default_db, "main") + KeywordHelper::WriteOptionallyQuoted(stage_table);
+		    QualifiedTablePrefix(default_db, default_schema) + KeywordHelper::WriteOptionallyQuoted(stage_table);
 		// The view_query may contain unqualified base-table references (e.g. `FROM WAREHOUSE`
 		// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
 		// Connection starts in the physical-default catalog, so apply USE before CREATE
 		// TABLE AS so those unqualified names resolve in the MV's catalog.
 		if (!current_catalog.empty() && current_catalog != default_db) {
-			ddl.push_back("use " + current_catalog + "." + current_schema);
+			ddl.push_back("use " + current_catalog_schema);
 		}
 		if (!view_catalog_prefix.empty()) {
 			// DuckLake can self-lock when one statement reads DuckLake tables and commits
@@ -3308,6 +3317,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// copy that result into DuckLake so the DuckLake commit has no DuckLake read.
 			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
 			ddl.push_back("create table " + qstage + " as " + view_query);
+			ddl.push_back("use " + default_catalog_schema);
 			ddl.push_back("create table " + qdt + " as select * from " + qstage);
 			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
 		} else {
@@ -3430,7 +3440,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// inserted before `create table qdt as view_query` routed unqualified base
 		// tables through the user's catalog; flip back for the metadata UPDATE below.
 		if (!current_catalog.empty() && current_catalog != default_db) {
-			ddl.push_back("use " + default_db + ".main");
+			ddl.push_back("use " + default_catalog_schema);
 		}
 
 		// Record source-table metadata only after physical MV objects exist. DuckLake
