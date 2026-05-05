@@ -9,6 +9,8 @@
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_delim_get.hpp>
+#include <duckdb/planner/operator/logical_dependent_join.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
 
@@ -61,7 +63,19 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 #if OPENIVM_DEBUG
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_GET: Change %zu -> %zu\n", current_idx, new_idx);
 #endif
+		get_ptr->children = std::move(rec_children);
 		return {std::move(get_ptr), table_reassign, current_bindings};
+	}
+	case LogicalOperatorType::LOGICAL_DELIM_GET: {
+		unique_ptr<LogicalDelimGet> delim_get_ptr = unique_ptr_cast<LogicalOperator, LogicalDelimGet>(std::move(plan));
+		const idx_t current_idx = delim_get_ptr->table_index;
+		const idx_t new_idx = binder.GenerateTableIndex();
+		delim_get_ptr->table_index = new_idx;
+		table_reassign[current_idx] = new_idx;
+#if OPENIVM_DEBUG
+		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_DELIM_GET: Change %zu -> %zu\n", current_idx, new_idx);
+#endif
+		return {std::move(delim_get_ptr), table_reassign, current_bindings};
 	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
 		unique_ptr<LogicalProjection> proj_ptr = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(plan));
@@ -129,6 +143,19 @@ static uint64_t HashBinding(const ColumnBinding &b) {
 	return std::hash<idx_t>()(b.table_index) ^ (std::hash<idx_t>()(b.column_index) * 0x9e3779b97f4a7c15ULL);
 }
 
+static bool ContainsDelimOperator(LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN || op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+	    op.type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (ContainsDelimOperator(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen,
                                std::vector<ColumnBinding> &out) {
 	std::function<void(Expression &)> CollectExpr = [&](Expression &e) {
@@ -139,7 +166,11 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
 				out.push_back(bcr.binding);
 			}
 		}
-		ExpressionIterator::EnumerateChildren(e, [&](Expression &child) { CollectExpr(child); });
+		ExpressionIterator::EnumerateChildren(e, [&](unique_ptr<Expression> &child) {
+			if (child) {
+				CollectExpr(*child);
+			}
+		});
 	};
 	// GetColumnBindings
 	for (auto &cb : op.GetColumnBindings()) {
@@ -150,23 +181,67 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
 	}
 	// Standard expressions
 	for (auto &expr : op.expressions) {
+		if (!expr) {
+			continue;
+		}
 		CollectExpr(*expr);
 	}
-	// COMPARISON_JOIN conditions (stored separately from expressions)
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	// Comparison/delim/dependent join conditions (stored separately from expressions)
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		for (auto &cond : join.conditions) {
-			CollectExpr(*cond.left);
-			CollectExpr(*cond.right);
+			if (cond.left) {
+				CollectExpr(*cond.left);
+			}
+			if (cond.right) {
+				CollectExpr(*cond.right);
+			}
+		}
+		for (auto &expr : join.duplicate_eliminated_columns) {
+			if (!expr) {
+				continue;
+			}
+			CollectExpr(*expr);
+		}
+		if (join.predicate) {
+			CollectExpr(*join.predicate);
+		}
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+		auto &join = op.Cast<LogicalDependentJoin>();
+		if (join.join_condition) {
+			CollectExpr(*join.join_condition);
+		}
+		for (auto &expr : join.arbitrary_expressions) {
+			if (!expr) {
+				continue;
+			}
+			CollectExpr(*expr);
+		}
+		for (auto &expr : join.expression_children) {
+			if (!expr) {
+				continue;
+			}
+			CollectExpr(*expr);
+		}
+		for (auto &col : join.correlated_columns) {
+			uint64_t key = HashBinding(col.binding);
+			if (seen.insert(key).second) {
+				out.push_back(col.binding);
+			}
 		}
 	}
 	for (auto &child : op.children) {
+		if (!child) {
+			continue;
+		}
 		CollectAllBindings(*child, seen, out);
 	}
 }
 
 // Replace bindings in expressions that ColumnBindingReplacer skips:
-//   - COMPARISON_JOIN conditions (stored outside op.expressions)
+//   - COMPARISON/DELIM/DEPENDENT_JOIN conditions (stored outside op.expressions)
 //   - LogicalAggregate::groups (GROUP BY expressions, also outside op.expressions)
 static void RebindSkippedExpressions(LogicalOperator &op, const std::unordered_map<old_idx, new_idx> &table_mapping) {
 	std::function<void(Expression &)> RebindExpr = [&](Expression &e) {
@@ -177,22 +252,76 @@ static void RebindSkippedExpressions(LogicalOperator &op, const std::unordered_m
 				bcr.binding.table_index = it->second;
 			}
 		}
-		ExpressionIterator::EnumerateChildren(e, [&](Expression &child) { RebindExpr(child); });
+		ExpressionIterator::EnumerateChildren(e, [&](unique_ptr<Expression> &child) {
+			if (child) {
+				RebindExpr(*child);
+			}
+		});
 	};
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	for (auto &expr : op.expressions) {
+		if (!expr) {
+			continue;
+		}
+		RebindExpr(*expr);
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		for (auto &cond : join.conditions) {
-			RebindExpr(*cond.left);
-			RebindExpr(*cond.right);
+			if (cond.left) {
+				RebindExpr(*cond.left);
+			}
+			if (cond.right) {
+				RebindExpr(*cond.right);
+			}
+		}
+		for (auto &expr : join.duplicate_eliminated_columns) {
+			if (!expr) {
+				continue;
+			}
+			RebindExpr(*expr);
+		}
+		if (join.predicate) {
+			RebindExpr(*join.predicate);
+		}
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+		auto &join = op.Cast<LogicalDependentJoin>();
+		if (join.join_condition) {
+			RebindExpr(*join.join_condition);
+		}
+		for (auto &expr : join.arbitrary_expressions) {
+			if (!expr) {
+				continue;
+			}
+			RebindExpr(*expr);
+		}
+		for (auto &expr : join.expression_children) {
+			if (!expr) {
+				continue;
+			}
+			RebindExpr(*expr);
+		}
+		for (auto &col : join.correlated_columns) {
+			auto it = table_mapping.find(col.binding.table_index);
+			if (it != table_mapping.end()) {
+				col.binding.table_index = it->second;
+			}
 		}
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		auto &agg = op.Cast<LogicalAggregate>();
 		for (auto &group : agg.groups) {
+			if (!group) {
+				continue;
+			}
 			RebindExpr(*group);
 		}
 	}
 	for (auto &child : op.children) {
+		if (!child) {
+			continue;
+		}
 		RebindSkippedExpressions(*child, table_mapping);
 	}
 }
@@ -219,6 +348,7 @@ RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Bi
 	// Collect ALL bindings BEFORE renumbering (we need the old table indices)
 	std::unordered_set<uint64_t> seen;
 	std::vector<ColumnBinding> all_bindings;
+	const bool contains_delim_operator = ContainsDelimOperator(*plan);
 	CollectAllBindings(*plan, seen, all_bindings);
 
 	RenumberWrapper res = renumber_table_indices(std::move(plan), binder);
@@ -232,9 +362,13 @@ RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Bi
 	}
 
 	ColumnBindingReplacer replacer = vec_to_replacer(all_bindings, res.idx_map);
-	replacer.VisitOperator(*res.op);
+	if (!contains_delim_operator) {
+		replacer.VisitOperator(*res.op);
+	}
 
-	// Also rebind expressions that ColumnBindingReplacer skips (JOIN conditions, AGGREGATE groups)
+	// DELIM/DEPENDENT joins store nullable expression slots that the generic
+	// visitor can dereference before the delimiter rewrite has normalized them.
+	// Rebind the explicit expression fields below instead.
 	RebindSkippedExpressions(*res.op, res.idx_map);
 	return res;
 }

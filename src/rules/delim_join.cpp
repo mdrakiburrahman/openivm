@@ -161,6 +161,9 @@ static bool ReplaceDelimGets(ClientContext &context, Binder &binder, unique_ptr<
 
 	bool replaced = false;
 	for (auto &child : node->children) {
+		if (!child) {
+			continue;
+		}
 		replaced = ReplaceDelimGets(context, binder, child, replacement_bindings, next_delim) || replaced;
 	}
 	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && replaced && !replacement_bindings.empty()) {
@@ -177,16 +180,26 @@ static bool ReplaceDelimGets(ClientContext &context, Binder &binder, unique_ptr<
 
 static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer) {
 	for (auto &expr : op.expressions) {
+		if (!expr) {
+			continue;
+		}
 		replacer.VisitExpression(&expr);
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
 	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		for (auto &condition : join.conditions) {
-			replacer.VisitExpression(&condition.left);
-			replacer.VisitExpression(&condition.right);
+			if (condition.left) {
+				replacer.VisitExpression(&condition.left);
+			}
+			if (condition.right) {
+				replacer.VisitExpression(&condition.right);
+			}
 		}
 		for (auto &expr : join.duplicate_eliminated_columns) {
+			if (!expr) {
+				continue;
+			}
 			replacer.VisitExpression(&expr);
 		}
 		if (join.predicate) {
@@ -196,10 +209,16 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
 	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		auto &aggregate = op.Cast<LogicalAggregate>();
 		for (auto &expr : aggregate.groups) {
+			if (!expr) {
+				continue;
+			}
 			replacer.VisitExpression(&expr);
 		}
 	}
 	for (auto &child : op.children) {
+		if (!child) {
+			continue;
+		}
 		RebindAllExpressions(*child, replacer);
 	}
 }
@@ -253,7 +272,7 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
 	}
 	auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
 	projection->children.push_back(std::move(result));
-	projection->ResolveOperatorTypes();
+	projection->types = types;
 	return std::move(projection);
 }
 
@@ -288,7 +307,8 @@ ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
 	}
 
 	pw.plan->ResolveOperatorTypes();
-	auto types = pw.plan->types;
+	auto output_types = pw.plan->types;
+	auto types = output_types;
 	types.emplace_back(pw.mul_type);
 
 	vector<unique_ptr<LogicalOperator>> terms;
@@ -313,25 +333,28 @@ ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
 
 		vector<ReplacementBinding> delim_replacements;
 		ReplaceDelimGets(context, binder, term, delim_replacements);
-		term->ResolveOperatorTypes();
 
 		auto term_bindings = term->GetColumnBindings();
-		auto term_types = term->types;
 		vector<unique_ptr<Expression>> exprs;
 		unordered_set<uint64_t> mul_set;
 		CollectMulBindings(mul_bindings, mul_set);
+		idx_t output_idx = 0;
 		for (idx_t i = 0; i < term_bindings.size(); i++) {
 			uint64_t key = (uint64_t)term_bindings[i].table_index ^
 			               ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
 			if (!mul_set.count(key)) {
-				exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
+				if (output_idx >= output_types.size()) {
+					throw InternalException(
+					    "IvmDelimJoinRule: term output binding count exceeds original output types");
+				}
+				exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx++], term_bindings[i]));
 			}
 		}
 		exprs.push_back(BuildMultiplicityProduct(binder, pw.mul_type, mul_bindings));
 
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
 		projection->children.push_back(std::move(term));
-		projection->ResolveOperatorTypes();
+		projection->types = types;
 		terms.push_back(std::move(projection));
 	}
 

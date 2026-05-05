@@ -18,7 +18,10 @@ ModifiedPlan IvmProjectionRule::Rewrite(PlanWrapper pw) {
 	auto projection_node = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(pw.plan));
 	auto mul_expression = make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, child_mul_binding);
 	projection_node->expressions.emplace_back(std::move(mul_expression));
-	projection_node->ResolveOperatorTypes();
+	projection_node->types.clear();
+	for (auto &expr : projection_node->expressions) {
+		projection_node->types.push_back(expr->return_type);
+	}
 
 	const auto new_bindings = projection_node->GetColumnBindings();
 	auto new_mul_binding = new_bindings.back();

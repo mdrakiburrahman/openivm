@@ -51,7 +51,8 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 
 	// Add all child columns as group-by keys (except multiplicity)
 	GroupingSet grouping_set;
-	for (idx_t i = 0; i < child_bindings.size(); i++) {
+	const idx_t child_output_count = MinValue<idx_t>(child_bindings.size(), child_types.size());
+	for (idx_t i = 0; i < child_output_count; i++) {
 		if (child_bindings[i] == input_mul_binding) {
 			continue; // skip multiplicity — added separately below
 		}
@@ -87,7 +88,8 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 	// are still valid (they are the UNION's genuine output bindings).
 	ColumnBindingReplacer replacer;
 	idx_t group_position = 0;
-	for (idx_t i = 0; i < original_bindings.size(); i++) {
+	const idx_t remap_count = MinValue<idx_t>(original_bindings.size(), child_output_count);
+	for (idx_t i = 0; i < remap_count; i++) {
 		if (child_bindings[i] == input_mul_binding) {
 			continue; // multiplicity is not in the parent's original bindings
 		}

@@ -944,6 +944,10 @@ struct ForkWorker {
 		result_phase = 0;
 		result_incremental = 0;
 		result_correct = 0;
+		result_time_select_ms = 0;
+		result_time_mv_ms = 0;
+		result_time_refresh_ms = 0;
+		result_time_verify_ms = 0;
 		result_error.clear();
 
 		if (child_pid <= 0)

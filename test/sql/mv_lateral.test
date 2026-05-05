@@ -79,7 +79,7 @@ CREATE MATERIALIZED VIEW mv_lat_series AS
 query I
 SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_lat_series';
 ----
-6
+2
 
 statement ok
 INSERT INTO lat_wh VALUES (3, 'w3');

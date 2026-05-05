@@ -1027,11 +1027,7 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 
 static bool QueryNeedsOriginalSqlForLpts(const string &query) {
 	string lower = StringUtil::Lower(query);
-	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos ||
-	       lower.find("unnest(") != string::npos || lower.find(" unnest(") != string::npos ||
-	       lower.find("generate_series(") != string::npos || FindKeywordToken(lower, "except", 0) != string::npos ||
-	       FindKeywordToken(lower, "intersect", 0) != string::npos ||
-	       (lower.find(" range ") != string::npos && lower.find(" interval ") != string::npos);
+	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
 }
 
 static bool QueryHasUnsupportedIncrementalConstruct(const string &query) {
@@ -1047,16 +1043,9 @@ static bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
 	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
 		return true;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_UNNEST || op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
-	    op->type == LogicalOperatorType::LOGICAL_INTERSECT) {
-		return true;
-	}
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		auto *agg = dynamic_cast<LogicalAggregate *>(op);
 		if (agg) {
-			if (agg->grouping_sets.size() > 1) {
-				return true;
-			}
 			for (auto &expr : agg->expressions) {
 				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
 					continue;
@@ -2094,8 +2083,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				default_schema = schema_res->GetValue(0, 0).ToString();
 			}
 		}
-		string default_catalog_schema =
-		    KeywordHelper::WriteOptionallyQuoted(default_db) + "." + KeywordHelper::WriteOptionallyQuoted(default_schema);
+		string default_catalog_schema = KeywordHelper::WriteOptionallyQuoted(default_db) + "." +
+		                                KeywordHelper::WriteOptionallyQuoted(default_schema);
 		string current_catalog_schema = KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
 		                                KeywordHelper::WriteOptionallyQuoted(current_schema);
 
@@ -2354,6 +2343,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
 		auto analysis = AnalyzePlan(plan.get());
 		MVClassificationState classification(analysis);
+		if (analysis.found_delim_join && !classification.found_aggregation) {
+			// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
+			// round-trip lateral table functions, but its CTE-normalized SQL lowers them
+			// into ordinary joins/table-function scans; that bypasses IvmDelimJoinRule
+			// and sends the refresh plan through the generic N-way join rule instead.
+			view_query = original_view_query;
+			lpts_fallback = true;
+		}
 		if (classification.found_filtered_list) {
 			view_query = original_view_query;
 			lpts_fallback = true;
@@ -2467,30 +2464,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			if (repeated_cte_aggregate_group_fallback) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Repeated CTE aggregate under join: using %zu visible group columns "
 				                    "for GROUP_RECOMPUTE\n",
-				                    aggregate_columns.size());
-			}
-		}
-
-		// LATERAL table functions (e.g. CROSS JOIN LATERAL generate_series(...)) are
-		// DEPENDENT/DELIM joins in DuckDB. LPTS can preserve the original SQL at CREATE
-		// time, but the normal projection delta path still has to stringify a rewritten
-		// lateral/delim delta plan at refresh time, which is not supported robustly yet.
-		// Use affected-output GROUP_RECOMPUTE: compute only result tuples touched by the
-		// base delta, delete those keys from the MV, then reinsert the current matching
-		// result. This stays incremental and follows Z-set delete+insert semantics for
-		// projection outputs without falling back to a full refresh.
-		bool lateral_table_function_group_fallback = false;
-		if (analysis.found_delim_join && !classification.found_aggregation &&
-		    QueryNeedsOriginalSqlForLpts(original_view_query)) {
-			for (auto &name : output_names) {
-				if (!name.empty() && !IVMTableNames::IsInternalColumn(name)) {
-					aggregate_columns.push_back(name);
-				}
-			}
-			lateral_table_function_group_fallback = !aggregate_columns.empty();
-			if (lateral_table_function_group_fallback) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] DELIM/DEPENDENT table function: using %zu visible output "
-				                    "columns for GROUP_RECOMPUTE\n",
 				                    aggregate_columns.size());
 			}
 		}
@@ -2654,6 +2627,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool has_cte_self_join = HasRepeatedCteRefUnderJoin(plan.get());
 		bool has_unsupported_set_operation = HasUnsupportedSetOperation(plan.get());
 		bool has_unsupported_incremental_construct = QueryHasUnsupportedIncrementalConstruct(original_view_query);
+		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
+			// These views are maintained by full refresh, so store the user's query directly.
+			// The CREATE-time IVM rewrites can add hidden columns for incremental paths (e.g.
+			// LEFT JOIN match keys) that do not survive SQL set-operation arity rules.
+			view_query = original_view_query;
+			lpts_fallback = true;
+		}
 
 		IVMType ivm_type;
 		// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
@@ -2678,11 +2658,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		} else if (classification.found_grouping_sets) {
 			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
 			// maintain them by recomputing the grouping-set keys touched by source
-			// deltas. The parser keeps the original SQL because LPTS currently drops
-			// the grouping-set annotation.
+			// deltas.
 			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
-		} else if (lateral_table_function_group_fallback && !aggregate_columns.empty()) {
-			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_semi_anti_join && classification.found_aggregation) {
 			// SEMI/ANTI joins are thresholded by match-count transitions. The aux-state path below
 			// supports projection/filter stacks over one left base table; aggregates over SEMI/ANTI
