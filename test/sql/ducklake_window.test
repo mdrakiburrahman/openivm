@@ -314,6 +314,44 @@ SELECT count(*) FROM (
 ----
 0
 
+# A failed/retried DuckLake CREATE MV can leave metadata behind before the
+# physical DuckLake view/data tables are created. Retrying should clean that
+# stale metadata row, not fail with a duplicate materialized-view error.
+statement ok
+CREATE TABLE dl.retry_window_src (
+    acct_id INT,
+    event_ts INT,
+    amount INT
+);
+
+statement ok
+INSERT INTO _duckdb_ivm_views (view_name, sql_string, type, last_update)
+VALUES ('mv_retry_window', 'stale interrupted create', 5, now());
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_retry_window';
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_retry_window AS
+SELECT
+    acct_id,
+    event_ts,
+    SUM(amount) OVER (PARTITION BY acct_id ORDER BY event_ts) AS running_amount
+FROM dl.retry_window_src;
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_retry_window';
+----
+1
+
+statement error
+CREATE MATERIALIZED VIEW dl.mv_retry_window AS
+SELECT acct_id, event_ts, amount FROM dl.retry_window_src;
+----
+Duplicate key: materialized view "mv_retry_window" already exists
+
 statement ok
 SET ivm_cascade_refresh = 'downstream';
 

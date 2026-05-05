@@ -2904,10 +2904,22 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ddl.push_back("alter table " + string(ivm::VIEWS_TABLE) +
 		              " add column if not exists semi_anti_aux_meta_json varchar default null");
 		if (!ivm_parse_data.is_replace) {
+			string escaped_view_name = OpenIVMUtils::EscapeSingleQuotes(view_name);
+			string escaped_data_table = OpenIVMUtils::EscapeSingleQuotes(IVMTableNames::DataTableName(view_name));
+			string stale_mv_condition =
+			    "view_name = '" + escaped_view_name +
+			    "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" + escaped_view_name +
+			    "') AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" + escaped_data_table +
+			    "')";
+			// CREATE MV executes as multiple catalog statements. If a process dies or loses
+			// a DuckDB file lock after writing metadata but before creating the physical
+			// DuckLake/default-catalog objects, a retry should clean that stale row rather
+			// than report a misleading duplicate MV.
+			ddl.push_back("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
 			ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(ivm::VIEWS_TABLE) +
-			              " WHERE view_name = '" + OpenIVMUtils::EscapeSingleQuotes(view_name) +
-			              "') THEN error('Duplicate key: materialized view \"" +
-			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "\" already exists') ELSE NULL END");
+			              " WHERE view_name = '" + escaped_view_name +
+			              "') THEN error('Duplicate key: materialized view \"" + escaped_view_name +
+			              "\" already exists') ELSE NULL END");
 		}
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
