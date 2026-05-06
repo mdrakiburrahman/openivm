@@ -441,6 +441,11 @@ static string QuoteQualifiedPrefix(const string &prefix) {
 	return result.empty() ? "" : result + ".";
 }
 
+static bool RelationExists(Connection &con, const string &qualified_name) {
+	auto result = con.Query("SELECT * FROM " + qualified_name + " LIMIT 0");
+	return !result->HasError();
+}
+
 static void CollectProjectionIndex(LogicalOperator *op,
                                    unordered_map<idx_t, LogicalProjection *> &projections_by_index) {
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
@@ -2224,6 +2229,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (!view_catalog_prefix.empty() && default_db != "memory") {
 			internal_catalog_prefix = QualifiedTablePrefix(default_db, default_schema);
 		}
+		string data_table = IVMTableNames::DataTableName(view_name);
+		string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
+		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
 		string top_k_suffix;                     // ORDER BY … LIMIT k, appended to the CREATE VIEW
 
@@ -2234,6 +2242,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// exist" because the fresh connection resolves against the physical-default catalog.
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			con.Query("USE " + current_catalog + "." + current_schema);
+		}
+
+		if (!ivm_parse_data.is_replace) {
+			// Fail before registering cleanup DDL. Otherwise a duplicate CREATE attempt
+			// can fail on the pre-existing backing table and then cleanup would drop the
+			// original MV's user-facing view/data table.
+			if (RelationExists(con, qvn) || RelationExists(con, qdt)) {
+				throw CatalogException("Table with name \"" + view_name + "\" already exists!");
+			}
 		}
 
 		// Use con for planning — sees all committed state from previous bind-phase DDL
@@ -3402,9 +3419,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// DuckLake-targeted MVs publish only the user-facing view in DuckLake. Internal
 		// state remains in the physical default catalog, because DuckDB/DuckLake cannot
 		// roll back one atomic transaction across both catalogs.
-		string data_table = IVMTableNames::DataTableName(view_name);
-		string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
-		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 		string stage_table = "_ivm_stage_" + view_name;
 		string qstage =
 		    QualifiedTablePrefix(default_db, default_schema) + KeywordHelper::WriteOptionallyQuoted(stage_table);

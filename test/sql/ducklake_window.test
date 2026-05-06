@@ -350,7 +350,7 @@ statement error
 CREATE MATERIALIZED VIEW dl.mv_retry_window AS
 SELECT acct_id, event_ts, amount FROM dl.retry_window_src;
 ----
-Duplicate key: materialized view "mv_retry_window" already exists
+already exists
 
 statement ok
 CREATE TABLE dl.stage_lock_market_src (

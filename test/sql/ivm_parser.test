@@ -373,7 +373,7 @@ does_not_exist
 statement error
 CREATE MATERIALIZED VIEW mv_sales AS SELECT region, sum(amount) as total FROM sales GROUP BY region;
 ----
-Duplicate key
+already exists
 
 # Note: IF NOT EXISTS on the table itself works, but the system table insert
 # (_duckdb_ivm_delta_tables) is unconditional, so it still errors on duplicate.
@@ -385,6 +385,16 @@ SELECT region, sum_amount, count_amount FROM mv_sales ORDER BY region;
 ----
 east	300	3
 west	200	1
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_sales';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = '_ivm_data_mv_sales';
+----
+1
 
 # ==========================================
 # Test 18: Empty base table — MV should be empty but valid

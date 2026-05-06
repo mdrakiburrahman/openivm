@@ -504,11 +504,35 @@ static string CompileProjectionRefresh(IVMMetadata &metadata, const string &view
 
 static void AppendSimpleAggregateEmptySourceNulling(IVMMetadata &metadata, string &upsert_query,
                                                     const string &view_name, const vector<string> &column_names,
-                                                    const string &data_table, const string &catalog_prefix) {
+                                                    const string &data_table, Connection &con,
+                                                    const string &view_catalog_name, const string &view_schema_name,
+                                                    const string &attached_db_catalog_name,
+                                                    const string &attached_db_schema_name) {
 	auto source_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : source_tables) {
-		string base_name = StringUtil::StartsWith(dt, ivm::DELTA_PREFIX) ? dt.substr(strlen(ivm::DELTA_PREFIX)) : dt;
-		string source = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(base_name);
+		static const string prefix(ivm::DELTA_PREFIX);
+		string base_name = dt.size() > prefix.size() && dt.rfind(prefix, 0) == 0 ? dt.substr(prefix.size()) : dt;
+		string catalog_name = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
+		string schema_name = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
+		auto meta = con.Query("SELECT source_catalog, source_schema FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                      " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+		                      OpenIVMUtils::EscapeValue(dt) + "'");
+		if (!meta->HasError() && meta->RowCount() > 0) {
+			if (!meta->GetValue(0, 0).IsNull()) {
+				catalog_name = meta->GetValue(0, 0).ToString();
+			}
+			if (!meta->GetValue(1, 0).IsNull()) {
+				schema_name = meta->GetValue(1, 0).ToString();
+			}
+		}
+		if (catalog_name.empty()) {
+			catalog_name = "memory";
+		}
+		if (schema_name.empty()) {
+			schema_name = "main";
+		}
+		string source = OpenIVMUtils::QuoteIdentifier(catalog_name) + "." + OpenIVMUtils::QuoteIdentifier(schema_name) +
+		                "." + OpenIVMUtils::QuoteIdentifier(base_name);
 		string null_cols;
 		for (auto &col : column_names) {
 			if (col == string(ivm::MULTIPLICITY_COL)) {
@@ -642,6 +666,14 @@ static string BuildLptsTablePrefix(const string &view_catalog_name, const string
 static string QualifiedName(const string &catalog_name, const string &schema_name, const string &table_name) {
 	return OpenIVMUtils::QuoteIdentifier(catalog_name) + "." + OpenIVMUtils::QuoteIdentifier(schema_name) + "." +
 	       OpenIVMUtils::QuoteIdentifier(table_name);
+}
+
+static string BaseTableNameFromDeltaKey(const string &delta_key) {
+	static const string prefix(ivm::DELTA_PREFIX);
+	if (delta_key.size() > prefix.size() && delta_key.rfind(prefix, 0) == 0) {
+		return delta_key.substr(prefix.size());
+	}
+	return delta_key;
 }
 
 static bool IsIdentifierChar(char c) {
@@ -850,6 +882,28 @@ static string BuildDuckLakeSnapshotQuery(IVMMetadata &metadata, Connection &con,
 	return snapshot_query;
 }
 
+static string QualifyViewQuerySources(IVMMetadata &metadata, Connection &con, const string &view_name,
+                                      const string &view_query_sql, const vector<string> &delta_table_names,
+                                      const string &view_catalog_name, const string &view_schema_name,
+                                      const string &attached_db_catalog_name, const string &attached_db_schema_name) {
+	string qualified_query = view_query_sql;
+	for (auto &dt : delta_table_names) {
+		string base_name = BaseTableNameFromDeltaKey(dt);
+		auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
+		                                         attached_db_catalog_name, attached_db_schema_name);
+		loc.table_name = base_name;
+		if (loc.catalog_name.empty() || loc.schema_name.empty()) {
+			continue;
+		}
+		// LPTS may serialize source scans with bare table names even when the MV
+		// reads another catalog/schema. Refresh runs on a fresh connection, so make
+		// those sources explicit before compiling recompute and delta SQL.
+		qualified_query = ReplaceTableReferences(qualified_query, base_name,
+		                                         QualifiedName(loc.catalog_name, loc.schema_name, base_name));
+	}
+	return qualified_query;
+}
+
 static constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 
 // Generate refresh SQL for a single view (no cascade logic).
@@ -942,7 +996,11 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			tx_open = true;
 		} else if (!meta_pre_sql.empty()) {
 			Connection meta_con(*context.db.get());
-			meta_con.Query(meta_pre_sql);
+			auto meta_result = meta_con.Query(meta_pre_sql);
+			if (meta_result->HasError()) {
+				throw Exception(ExceptionType::EXECUTOR,
+				                "IVM refresh of '" + vn + "' failed before data refresh: " + meta_result->GetError());
+			}
 		}
 		auto start = std::chrono::steady_clock::now();
 		auto result = exec_con.Query(sql);
@@ -966,7 +1024,11 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		} else if (cross_system && !meta_post_sql.empty()) {
 			if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 				string dl_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
-				auto snap_result = exec_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(dl_catalog) +
+				// DuckLake can keep read snapshot state on the connection that compiled
+				// the data refresh. Read the post-refresh watermark through a fresh
+				// connection so we do not persist an old snapshot and replay deltas.
+				Connection snap_con(*context.db.get());
+				auto snap_result = snap_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(dl_catalog) +
 				                                  ".current_snapshot()");
 				if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 					throw Exception(ExceptionType::EXECUTOR,
@@ -977,7 +1039,11 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 				                                    snap_result->GetValue(0, 0).ToString());
 			}
 			Connection meta_con(*context.db.get());
-			meta_con.Query(meta_post_sql);
+			auto meta_result = meta_con.Query(meta_post_sql);
+			if (meta_result->HasError()) {
+				throw Exception(ExceptionType::EXECUTOR,
+				                "IVM refresh of '" + vn + "' failed after data refresh: " + meta_result->GetError());
+			}
 		}
 
 		// Record execution history for the learned cost model.
@@ -1325,6 +1391,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	IVMType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
+	auto delta_table_names = metadata.GetDeltaTables(view_name);
+	view_query_sql =
+	    QualifyViewQuerySources(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
+	                            view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 
 	// Crash recovery: if a previous refresh was interrupted (process died between MERGE and
 	// last_update), the flag is still true. Recover via full recompute to avoid double-applying deltas.
@@ -1489,7 +1559,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	//   has no XOR cross-terms, so insert-only base = insert-only delta view)
 	// - Standard join views: safe only if exactly ONE table changed AND it's insert-only
 	//   (no cross-terms fire when other deltas are empty, so no XOR)
-	auto delta_table_names = metadata.GetDeltaTables(view_name);
 	bool insert_only = false;
 	{
 		// A view has a join if it references more than one base table (delta_table_names.size() > 1)
@@ -1687,8 +1756,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
 		                                       delta_ts_filter, internal_catalog_prefix, sa_insert_only, column_types);
 		if (!has_minmax) {
-			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table,
-			                                        internal_catalog_prefix);
+			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table, con,
+			                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                        attached_db_schema_name);
 		}
 		break;
 	}

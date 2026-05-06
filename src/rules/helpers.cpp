@@ -15,6 +15,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -153,12 +154,28 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	auto &old_func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 	int64_t cur_snap = static_cast<int64_t>(old_func_info.snapshot.snapshot_id);
 
-	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)last_snap, (long)cur_snap);
+	int64_t start_snap = last_snap + 1;
+	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)start_snap, (long)cur_snap);
 
-	// Build a start snapshot for the change tracking range [last_snap, cur_snap].
+	if (start_snap > cur_snap) {
+		vector<LogicalType> empty_types = old_get->types;
+		empty_types.push_back(LogicalType::INTEGER);
+		vector<ColumnBinding> bindings;
+		auto table_index = binder.GenerateTableIndex();
+		for (idx_t i = 0; i < empty_types.size(); i++) {
+			bindings.emplace_back(table_index, i);
+		}
+		auto mul_binding = bindings.back();
+		auto empty = make_uniq<LogicalEmptyResult>(empty_types, std::move(bindings));
+		empty->ResolveOperatorTypes();
+		return {std::move(empty), mul_binding};
+	}
+
+	// DuckLake's table_insertions/deletions functions treat the start snapshot as
+	// inclusive, so the next refresh starts at last_snapshot_id + 1.
 	// Only snapshot_id is used by DuckLake's file selection logic.
-	DuckLakeSnapshot start_snapshot(static_cast<idx_t>(last_snap), DConstants::INVALID_INDEX, DConstants::INVALID_INDEX,
-	                                DConstants::INVALID_INDEX);
+	DuckLakeSnapshot start_snapshot(static_cast<idx_t>(start_snap), DConstants::INVALID_INDEX,
+	                                DConstants::INVALID_INDEX, DConstants::INVALID_INDEX);
 
 	// Determine column IDs from old_get, skipping virtual columns (ROWID etc.)
 	// that don't exist in DuckLake change scans.
@@ -191,7 +208,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		get->SetColumnIds(vector<ColumnIndex>(delta_col_ids));
 
 		// Set parameters so LPTS can reconstruct the ducklake_table_insertions/deletions SQL.
-		get->parameters = {Value(catalog_name), Value(schema_name), Value(table_name), Value::BIGINT(last_snap),
+		get->parameters = {Value(catalog_name), Value(schema_name), Value(table_name), Value::BIGINT(start_snap),
 		                   Value::BIGINT(cur_snap)};
 
 		get->ResolveOperatorTypes();
