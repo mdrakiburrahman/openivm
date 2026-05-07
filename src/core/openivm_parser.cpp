@@ -3083,6 +3083,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " primary key(view_name, refresh_timestamp))");
 		ddl.push_back("alter table " + string(ivm::HISTORY_TABLE) +
 		              " add column if not exists strategy varchar default 'incremental'");
+		ddl.push_back("create table if not exists " + string(ivm::PROFILE_TABLE) +
+		              " (refresh_id varchar, view_name varchar,"
+		              " profile_timestamp timestamp default current_timestamp,"
+		              " step_order integer, step_name varchar, duration_ms bigint, detail varchar,"
+		              " primary key(refresh_id, step_order))");
 
 		// --- OR REPLACE: drop old MV if it exists ---
 		if (ivm_parse_data.is_replace) {

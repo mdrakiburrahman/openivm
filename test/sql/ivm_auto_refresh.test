@@ -47,6 +47,42 @@ SELECT id, name FROM mv_proj WHERE id = 101;
 ----
 101	new_name
 
+statement ok
+SET ivm_profile_refresh = true;
+
+statement ok
+CREATE TABLE profile_proj_base (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO profile_proj_base VALUES (1, 'one');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_profile_proj AS SELECT id, name FROM profile_proj_base;
+
+statement ok
+INSERT INTO profile_proj_base VALUES (2, 'two');
+
+statement ok
+PRAGMA ivm('mv_profile_proj');
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'total_refresh';
+----
+1
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'adaptive_cost_estimate';
+----
+0
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('acquire_locks', 'generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
+----
+4
+
+statement ok
+SET ivm_profile_refresh = false;
+
 # ==========================================
 # Test 2: Projection — large delta → recompute path
 # ==========================================
@@ -814,6 +850,72 @@ SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt' AND m
 ----
 3
 
+# Profiling is off by default.
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt';
+----
+0
+
+statement ok
+SET ivm_profile_refresh = true;
+
+statement ok
+INSERT INTO lt VALUES (103, 2, 500);
+
+statement ok
+PRAGMA ivm('mv_lt');
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh');
+----
+3
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
+----
+6
+
+statement ok
+INSERT INTO _duckdb_ivm_refresh_profile
+  (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail)
+VALUES ('old_profile_row', 'mv_lt', current_timestamp::TIMESTAMP - INTERVAL '32 days', 0, 'old', 0, '');
+
+statement ok
+INSERT INTO lt VALUES (104, 3, 500);
+
+statement ok
+PRAGMA ivm('mv_lt');
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE refresh_id = 'old_profile_row';
+----
+0
+
+statement ok
+SET ivm_profile_retention_days = 0;
+
+statement ok
+INSERT INTO lt VALUES (105, 4, 500);
+
+statement ok
+PRAGMA ivm('mv_lt');
+
+query I
+SELECT count(DISTINCT refresh_id) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt';
+----
+1
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'total_refresh';
+----
+1
+
+statement ok
+SET ivm_profile_retention_days = 31;
+
+statement ok
+SET ivm_profile_refresh = false;
+
 # Correctness preserved through learned cost model
 query II
 SELECT grp, total FROM mv_lt EXCEPT ALL SELECT grp, sum(val) FROM lt GROUP BY grp;
@@ -852,7 +954,7 @@ incremental	8.643856	401.000000	8.643856	401.000000	false
 query I
 SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt';
 ----
-3
+6
 
 statement ok
 CREATE OR REPLACE MATERIALIZED VIEW mv_lt AS SELECT grp, sum(val) as total FROM lt GROUP BY grp;

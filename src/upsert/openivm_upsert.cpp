@@ -943,6 +943,82 @@ static string QualifyViewQuerySources(IVMMetadata &metadata, Connection &con, co
 
 static constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 
+struct RefreshProfileStep {
+	int32_t step_order;
+	string step_name;
+	int64_t duration_ms;
+	string detail;
+};
+
+class RefreshProfiler {
+public:
+	RefreshProfiler(ClientContext &context, string view_name_p)
+	    : enabled(false), retention_days(31), view_name(std::move(view_name_p)), next_step(0),
+	      total_start(std::chrono::steady_clock::now()) {
+		Value profile_val;
+		enabled = context.TryGetCurrentSetting("ivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
+		          profile_val.GetValue<bool>();
+		if (enabled) {
+			Value retention_val;
+			if (context.TryGetCurrentSetting("ivm_profile_retention_days", retention_val) && !retention_val.IsNull()) {
+				retention_days = std::max<int64_t>(0, retention_val.GetValue<int64_t>());
+			}
+			auto now = std::chrono::steady_clock::now().time_since_epoch();
+			refresh_id = view_name + "_" + to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+		}
+	}
+
+	bool Enabled() const {
+		return enabled;
+	}
+
+	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
+	             const string &detail = string()) {
+		if (!enabled) {
+			return;
+		}
+		auto end = std::chrono::steady_clock::now();
+		auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+		steps.push_back({next_step++, step_name, duration_ms, detail});
+	}
+
+	void AddTotal() {
+		AddStep("total_refresh", total_start);
+	}
+
+	void Flush(DatabaseInstance &db) {
+		if (!enabled || steps.empty()) {
+			return;
+		}
+		Connection profile_con(db);
+		profile_con.Query("DELETE FROM " + string(ivm::PROFILE_TABLE) +
+		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
+		                  to_string(retention_days) + " days'");
+		for (auto &step : steps) {
+			auto result = profile_con.Query(
+			    "INSERT OR REPLACE INTO " + string(ivm::PROFILE_TABLE) +
+			    " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
+			    OpenIVMUtils::EscapeValue(refresh_id) + "', '" + OpenIVMUtils::EscapeValue(view_name) + "', " +
+			    to_string(step.step_order) + ", '" + OpenIVMUtils::EscapeValue(step.step_name) + "', " +
+			    to_string(step.duration_ms) + ", '" + OpenIVMUtils::EscapeValue(step.detail) + "')");
+			if (result->HasError()) {
+				OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record refresh step '%s': %s\n", step.step_name.c_str(),
+				                    result->GetError().c_str());
+				return;
+			}
+		}
+	}
+
+private:
+	bool enabled;
+	int64_t retention_days;
+	string view_name;
+	string refresh_id;
+	int32_t next_step;
+	std::chrono::steady_clock::time_point total_start;
+	vector<RefreshProfileStep> steps;
+};
+
 // Generate refresh SQL for a single view (no cascade logic).
 static string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name,
                                  const string &view_schema_name, const string &view_name, bool cross_system,
@@ -955,6 +1031,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
                               const string &attached_db_schema_name) {
+	RefreshProfiler profiler(context, vn);
+	auto lock_start = std::chrono::steady_clock::now();
 	ViewLockGuard view_guard(vn);
 	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
 	// share base tables (e.g. mv_A and mv_B both reading STOCK → both write to
@@ -971,6 +1049,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 	for (auto &dt : delta_table_names) {
 		delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
 	}
+	profiler.AddStep("acquire_locks", lock_start, to_string(delta_table_names.size()) + " delta locks");
 	// Track whether we're inside an open exec_con transaction so any exception path can
 	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
 	// Connection destructor, which can leak uncommitted writes into the WAL under some
@@ -985,6 +1064,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		Value adaptive_val;
 		if (context.TryGetCurrentSetting("ivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull() &&
 		    adaptive_val.GetValue<bool>()) {
+			auto adaptive_start = std::chrono::steady_clock::now();
 			// Compute cost estimate before refresh (for history recording).
 			// GenerateRefreshSQL also computes this when adaptive is on, but we need
 			// the estimate here to record alongside the actual execution time.
@@ -1003,14 +1083,20 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 				record_history = true;
 			}
 			cost_con.Rollback();
+			profiler.AddStep("adaptive_cost_estimate", adaptive_start,
+			                 record_history ? "record_history=true" : "record_history=false");
 		}
 
 		// For cross_system (DuckLake) MVs, split the refresh SQL into data ops (dl catalog)
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
+		auto generate_start = std::chrono::steady_clock::now();
 		string sql = GenerateRefreshSQL(
 		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
 		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr);
+		profiler.AddStep("generate_refresh_sql", generate_start,
+		                 "sql_bytes=" + to_string(sql.size()) + ", meta_pre_bytes=" + to_string(meta_pre_sql.size()) +
+		                     ", meta_post_bytes=" + to_string(meta_post_sql.size()));
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
@@ -1032,16 +1118,19 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			exec_con.BeginTransaction();
 			tx_open = true;
 		} else if (!meta_pre_sql.empty()) {
+			auto meta_pre_start = std::chrono::steady_clock::now();
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
 				throw Exception(ExceptionType::EXECUTOR,
 				                "IVM refresh of '" + vn + "' failed before data refresh: " + meta_result->GetError());
 			}
+			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
 		auto start = std::chrono::steady_clock::now();
 		auto result = exec_con.Query(sql);
 		auto end = std::chrono::steady_clock::now();
+		profiler.AddStep("execute_refresh_sql", start, "bytes=" + to_string(sql.size()));
 
 		if (result->HasError()) {
 			if (tx_open) {
@@ -1059,6 +1148,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			exec_con.Commit();
 			tx_open = false;
 		} else if (cross_system && !meta_post_sql.empty()) {
+			auto meta_post_start = std::chrono::steady_clock::now();
 			if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 				string dl_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
 				// DuckLake can keep read snapshot state on the connection that compiled
@@ -1081,10 +1171,12 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 				throw Exception(ExceptionType::EXECUTOR,
 				                "IVM refresh of '" + vn + "' failed after data refresh: " + meta_result->GetError());
 			}
+			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
 		}
 
 		// Record execution history for the learned cost model.
 		if (record_history) {
+			auto history_start = std::chrono::steady_clock::now();
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 			// Determine which method was used. Priority:
 			//   1) `ivm_refresh_mode = 'full'` overrides everything → "full".
@@ -1108,7 +1200,10 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			                                           duration_ms);
 			OPENIVM_DEBUG_PRINT("[HISTORY] Recorded: view=%s, method=%s, duration=%ldms\n", vn.c_str(), method.c_str(),
 			                    (long)duration_ms);
+			profiler.AddStep("record_refresh_history", history_start, method);
 		}
+		profiler.AddTotal();
+		profiler.Flush(*context.db.get());
 	} catch (...) {
 		// Ensure the transaction is rolled back before we propagate the exception.
 		// This covers the case where Query() itself threw (vs returning HasError) —
@@ -1123,6 +1218,8 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			}
 			tx_open = false;
 		}
+		profiler.AddTotal();
+		profiler.Flush(*context.db.get());
 		throw;
 	}
 }

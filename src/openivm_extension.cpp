@@ -179,6 +179,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("ivm_match_log_retention", "max rows per query_hash retained in _duckdb_ivm_match_log",
 	                             LogicalType::BIGINT, Value::BIGINT(50));
+	db_config.AddExtensionOption("ivm_profile_refresh", "record per-step materialized view refresh timings",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("ivm_profile_retention_days",
+	                             "delete refresh profile rows older than this many days when profiling is written",
+	                             LogicalType::BIGINT, Value::BIGINT(31));
 
 	Connection con(instance);
 
@@ -200,6 +205,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
 	          " PRIMARY KEY(view_name, refresh_timestamp))");
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::PROFILE_TABLE) +
+	          " (refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,"
+	          " step_order INTEGER, step_name VARCHAR, duration_ms BIGINT, detail VARCHAR,"
+	          " PRIMARY KEY(refresh_id, step_order))");
 
 	// View-matching CREATEs first (always succeed), ALTERs after. ALTERs that
 	// hit not-yet-existing tables on a fresh DB fail silently — the parser's

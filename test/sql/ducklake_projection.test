@@ -28,12 +28,25 @@ INSERT INTO dl.employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'sales'), (3, 'C
 statement ok
 CREATE MATERIALIZED VIEW dl.mv_emp AS SELECT id, name FROM dl.employees;
 
+statement ok
+SET ivm_profile_refresh = true;
+
 # --- INSERT propagation ---
 statement ok
 INSERT INTO dl.employees VALUES (4, 'Diana', 'ops');
 
 statement ok
 PRAGMA ivm('mv_emp');
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('metadata_pre_sql', 'metadata_post_sql');
+----
+2
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
+----
+3
 
 query I
 SELECT COUNT(*) FROM (
@@ -59,6 +72,14 @@ DELETE FROM dl.employees WHERE id = 2;
 
 statement ok
 PRAGMA ivm('mv_emp');
+
+query I
+SELECT count(DISTINCT refresh_id) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_emp';
+----
+2
+
+statement ok
+SET ivm_profile_refresh = false;
 
 query I
 SELECT COUNT(*) FROM (

@@ -10,6 +10,7 @@ namespace ivm {
 constexpr const char *VIEWS_TABLE = "_duckdb_ivm_views";
 constexpr const char *DELTA_TABLES_TABLE = "_duckdb_ivm_delta_tables";
 constexpr const char *HISTORY_TABLE = "_duckdb_ivm_refresh_history";
+constexpr const char *PROFILE_TABLE = "_duckdb_ivm_refresh_profile";
 
 // View-matching system tables.
 constexpr const char *MV_DEPS_TABLE = "_duckdb_ivm_mv_dependencies";
