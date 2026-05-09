@@ -15,6 +15,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_error_context.hpp"
@@ -24,6 +25,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_cte.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include <cctype>
 #include <chrono>
@@ -1101,6 +1103,10 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
 		exec_con.Query("SET max_expression_depth = 10000");
+		// Refreshes update relational MV state; physical insertion order is not part of
+		// the contract. Let DuckDB avoid large order-preservation buffers for big
+		// INSERT/CREATE TABLE style refresh plans.
+		exec_con.Query("SET preserve_insertion_order=false");
 		// Keep refresh execution in the physical default catalog. DuckLake-targeted MVs
 		// now write only physical _ivm_data_*/delta_* state; DuckLake source references
 		// emitted by LPTS are catalog-qualified, so switching USE to DuckLake would make
@@ -1226,6 +1232,11 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
+	// PRAGMA ivm refreshes relational state, not ordered output. Force the
+	// OpenIVM entry point onto DuckDB's unordered execution mode even if this
+	// connection previously had a local preserve_insertion_order=true setting.
+	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
+	                                                              Value::BOOLEAN(false));
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;

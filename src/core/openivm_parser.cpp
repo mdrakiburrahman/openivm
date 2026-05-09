@@ -8,8 +8,10 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
@@ -121,6 +123,69 @@ static void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_p
 	Optimizer cte_opt(binder, context);
 	CTEInlining cte_inlining(cte_opt);
 	plan = cte_inlining.Optimize(std::move(plan));
+}
+
+static bool BoolSetting(ClientContext &context, const string &name) {
+	Value value;
+	return context.TryGetCurrentSetting(name, value) && !value.IsNull() && BooleanValue::Get(value);
+}
+
+static const char *ParserIVMTypeName(IVMType type) {
+	switch (type) {
+	case IVMType::AGGREGATE_HAVING:
+		return "AGGREGATE_HAVING";
+	case IVMType::AGGREGATE_GROUP:
+		return "AGGREGATE_GROUP";
+	case IVMType::SIMPLE_AGGREGATE:
+		return "SIMPLE_AGGREGATE";
+	case IVMType::SIMPLE_PROJECTION:
+		return "SIMPLE_PROJECTION";
+	case IVMType::WINDOW_PARTITION:
+		return "WINDOW_PARTITION";
+	case IVMType::GROUP_RECOMPUTE:
+		return "GROUP_RECOMPUTE";
+	case IVMType::DISTINCT_INCREMENTAL:
+		return "DISTINCT_INCREMENTAL";
+	case IVMType::SEMI_ANTI_RECOMPUTE:
+		return "SEMI_ANTI_RECOMPUTE";
+	case IVMType::TOP_K:
+		return "TOP_K";
+	case IVMType::FULL_REFRESH:
+		return "FULL_REFRESH";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static string StripTrailingSemicolon(string sql) {
+	StringUtil::Trim(sql);
+	if (!sql.empty() && sql.back() == ';') {
+		sql.pop_back();
+		StringUtil::Trim(sql);
+	}
+	return sql;
+}
+
+static string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query) {
+	string sql = StripTrailingSemicolon(query);
+	if (sql.empty()) {
+		return label + "\n<empty query>\n";
+	}
+	auto old_explain = con.Query("SELECT current_setting('explain_output')");
+	con.Query("SET explain_output='all'");
+	auto explain = con.Query("EXPLAIN " + sql);
+	if (old_explain && !old_explain->HasError() && old_explain->RowCount() > 0 &&
+	    !old_explain->GetValue(0, 0).IsNull()) {
+		con.Query("SET explain_output='" + OpenIVMUtils::EscapeSingleQuotes(old_explain->GetValue(0, 0).ToString()) +
+		          "'");
+	}
+	string result = label + "\n";
+	if (!explain || explain->HasError()) {
+		result += "<EXPLAIN failed: " + (explain ? explain->GetError() : string("no result")) + ">\n";
+	} else {
+		result += explain->ToString() + "\n";
+	}
+	return result;
 }
 
 static bool HasUnionBeforeAggregate(const LogicalOperator *op, bool seen_agg_above = false) {
@@ -1992,6 +2057,16 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 	if (!input.inputs.empty()) {
 		auto &db = DatabaseInstance::GetDatabase(context);
 		auto conn = make_uniq<Connection>(db);
+		auto configure_openivm_connection = [&]() {
+			// OpenIVM-managed DDL materializes relational state where physical insertion
+			// order is not observable. Disabling order preservation avoids DuckDB holding
+			// large ordering buffers for wide CTAS-style MV builds.
+			auto preserve_result = conn->Query("SET preserve_insertion_order=false");
+			if (preserve_result->HasError()) {
+				throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
+			}
+		};
+		configure_openivm_connection();
 		vector<string> cleanup_ddl;
 		auto run_cleanup = [&]() {
 			for (const auto &cleanup : cleanup_ddl) {
@@ -2017,6 +2092,7 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 				// between staged DuckLake reads and DuckLake writes so the write-side
 				// commit cannot self-block on an earlier read from the same CREATE MV.
 				conn = make_uniq<Connection>(db);
+				configure_openivm_connection();
 				continue;
 			}
 			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
@@ -2137,6 +2213,11 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 
 ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInfo *info, ClientContext &context,
                                                               unique_ptr<ParserExtensionParseData> parse_data) {
+	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
+	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
+	// whole execution path on DuckDB's lower-memory unordered mode.
+	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
+	                                                              Value::BOOLEAN(false));
 	auto &ivm_parse_data = dynamic_cast<IVMParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(ivm_parse_data.statement.get());
 
@@ -3427,6 +3508,41 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string stage_table = "_ivm_stage_" + view_name;
 		string qstage =
 		    QualifiedTablePrefix(default_db, default_schema) + KeywordHelper::WriteOptionallyQuoted(stage_table);
+		if (BoolSetting(context, "ivm_explain_initial_load")) {
+			// This diagnostic intentionally reports the exact first heavy statement that
+			// CREATE MV will run. DuckLake-targeted MVs should now write _ivm_data_*
+			// directly; if staging reappears, this output makes the extra copy visible.
+			if (!current_catalog.empty() && current_catalog != default_db) {
+				con.Query("USE " + current_catalog_schema);
+			}
+			string initial_load_statement = "CREATE TABLE " + qdt + " AS " + view_query;
+			string diagnostic;
+			diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
+			diagnostic += "view_name: " + view_name + "\n";
+			diagnostic += "ivm_type: " + string(ParserIVMTypeName(ivm_type)) + "\n";
+			diagnostic += "lpts_fallback: " + string(lpts_fallback ? "true" : "false") + "\n";
+			diagnostic += "uses_staging_table: false\n";
+			diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
+			diagnostic += "original_view_query:\n" + original_view_query + "\n\n";
+			diagnostic += "generated_view_query:\n" + view_query + "\n\n";
+			diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN original_view_query:", original_view_query);
+			diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN generated_view_query:", view_query);
+			diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN initial_load_statement:", initial_load_statement);
+			Printer::Print(diagnostic);
+
+			Value files_path_val;
+			if (context.TryGetCurrentSetting("ivm_files_path", files_path_val) && !files_path_val.IsNull()) {
+				OpenIVMUtils::WriteFile(files_path_val.ToString() + "/ivm_initial_load_explain_" + view_name + ".txt",
+				                        false, diagnostic);
+			}
+			if (BoolSetting(context, "ivm_explain_initial_load_only")) {
+				result.function = TableFunction("ivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction,
+				                                IVMFunction::IVMInit);
+				result.requires_valid_transaction = true;
+				result.return_type = StatementReturnType::QUERY_RESULT;
+				return result;
+			}
+		}
 		// The view_query may contain unqualified base-table references (e.g. `FROM WAREHOUSE`
 		// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
 		// Connection starts in the physical-default catalog, so apply USE before CREATE
@@ -3435,16 +3551,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			ddl.push_back("use " + current_catalog_schema);
 		}
 		if (!view_catalog_prefix.empty()) {
-			// DuckLake can self-lock when one statement reads DuckLake tables and commits
-			// a DuckLake CTAS. Stage the SELECT into the physical default DB first, then
-			// persist OpenIVM's internal data table in that same physical catalog. The
-			// DuckLake write is limited to the final user-facing view metadata.
-			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
-			ddl.push_back("create table " + qstage + " as " + view_query);
+			// DuckLake can self-lock when the same connection both reads DuckLake tables
+			// and later publishes DuckLake metadata. Keep the reconnect boundary before
+			// the user-facing view publish, but write OpenIVM's internal state directly
+			// to the physical default catalog so large MVs do not need a second full copy.
+			ddl.push_back("create table " + qdt + " as " + view_query);
 			ddl.push_back(OPENIVM_DDL_RECONNECT);
 			ddl.push_back("use " + default_catalog_schema);
-			ddl.push_back("create table " + qdt + " as select * from " + qstage);
-			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
 		} else {
 			ddl.push_back("create table " + qdt + " as " + view_query);
 		}
