@@ -56,6 +56,11 @@ SELECT
 FROM dl.bronze.l1;
 
 statement ok
+CREATE MATERIALIZED VIEW dl.silver.l3 AS
+SELECT dm_date, sym, running_low, running_high
+FROM dl.silver.l2;
+
+statement ok
 INSERT INTO dl.bronze.src VALUES
     (DATE '2026-01-03', 'A', 7, 25);
 
@@ -76,6 +81,14 @@ SELECT count(*) FROM delta_l1;
 statement ok
 PRAGMA ivm_options('dl', 'silver', 'l2');
 
+# Window-partition recompute updates l2 directly. Because l3 depends on l2,
+# l2 must publish old/new companion rows in delta_l2 as well; otherwise l3
+# skips the change even though l2 is correct.
+query I
+SELECT count(*) FROM delta_l2;
+----
+1
+
 query I
 SELECT count(*) FROM (
     SELECT * FROM dl.silver.l2
@@ -88,6 +101,29 @@ SELECT count(*) FROM (
         MIN(low_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_low,
         MAX(high_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_high
     FROM dl.bronze.l1
+);
+----
+0
+
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'l3');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.silver.l3
+    EXCEPT ALL
+    SELECT dm_date, sym, running_low, running_high
+    FROM dl.silver.l2
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT dm_date, sym, running_low, running_high
+    FROM dl.silver.l2
+    EXCEPT ALL
+    SELECT * FROM dl.silver.l3
 );
 ----
 0

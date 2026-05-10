@@ -476,3 +476,72 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Regression: downstream delta from window recompute
+# ==========================================
+
+statement ok
+SET ivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE w_chain_src (d DATE, sym VARCHAR, lo INT, hi INT);
+
+statement ok
+INSERT INTO w_chain_src VALUES
+    (DATE '2026-01-01', 'A', 10, 20),
+    (DATE '2026-01-02', 'A', 8, 22);
+
+statement ok
+CREATE MATERIALIZED VIEW w_chain_l1 AS
+SELECT d, sym, lo, hi FROM w_chain_src;
+
+statement ok
+CREATE MATERIALIZED VIEW w_chain_l2 AS
+SELECT
+    d,
+    sym,
+    lo,
+    hi,
+    MIN(lo) OVER (PARTITION BY sym ORDER BY d) AS running_lo,
+    MAX(hi) OVER (PARTITION BY sym ORDER BY d) AS running_hi
+FROM w_chain_l1;
+
+statement ok
+CREATE MATERIALIZED VIEW w_chain_l3 AS
+SELECT d, sym, running_lo, running_hi FROM w_chain_l2;
+
+statement ok
+INSERT INTO w_chain_src VALUES (DATE '2026-01-03', 'A', 7, 25);
+
+statement ok
+PRAGMA ivm('w_chain_l1');
+
+statement ok
+PRAGMA ivm('w_chain_l2');
+
+query I
+SELECT count(*) FROM delta_w_chain_l2;
+----
+1
+
+statement ok
+PRAGMA ivm('w_chain_l3');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM w_chain_l3
+    EXCEPT ALL
+    SELECT d, sym, running_lo, running_hi FROM w_chain_l2
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT d, sym, running_lo, running_hi FROM w_chain_l2
+    EXCEPT ALL
+    SELECT * FROM w_chain_l3
+);
+----
+0

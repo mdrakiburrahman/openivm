@@ -2174,6 +2174,66 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string delta_view_name_bare = OpenIVMUtils::DeltaName(view_name);
 	string delta_view_name = internal_catalog_prefix + delta_view_name_bare;
 
+	// Delete from delta view: timestamp-based if downstream views depend on it,
+	// unconditional otherwise. Metadata stores dependency table names without
+	// catalog/schema qualification even when the physical delta table lives in a
+	// qualified internal catalog for DuckLake-backed MVs.
+	auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	                                  " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name_bare) + "'");
+	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
+	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
+
+	// Companion rows for downstream consumers.
+	// When a view has downstream MVs that read its delta, those downstream views
+	// need an old/new Z-set transition for the upstream MV. DoIVM paths usually
+	// produce a row-level delta directly, but recompute-style paths update the
+	// data table themselves. For those paths, and for simple aggregates whose
+	// numeric delta is not an absolute value, snapshot old state before the
+	// upsert and replace this refresh's delta with old(-1) + new(+1) after it.
+	auto build_snapshot_companion = [&]() {
+		string col_list;
+		for (auto &col : column_names) {
+			if (!col_list.empty()) {
+				col_list += ", ";
+			}
+			col_list += OpenIVMUtils::QuoteIdentifier(col);
+		}
+
+		string select_old, select_new;
+		bool first = true;
+		for (auto &col : column_names) {
+			if (!first) {
+				select_old += ", ";
+				select_new += ", ";
+			}
+			first = false;
+			if (col == string(ivm::MULTIPLICITY_COL)) {
+				select_old += "-1";
+				select_new += "1";
+			} else {
+				select_old += OpenIVMUtils::QuoteIdentifier(col);
+				select_new += OpenIVMUtils::QuoteIdentifier(col);
+			}
+		}
+
+		string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
+		string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
+		string qdvn = delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
+		                                                        : delta_view_name;
+		const string &qdt = data_table;
+		pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt + ";\n";
+		post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
+		if (!delta_ts_filter.empty()) {
+			post_companion += " AND " + delta_ts_filter;
+		}
+		post_companion += ";\n";
+		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_old + " FROM " + qt + ";\n";
+		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_new + " FROM " + qdt + ";\n";
+		post_companion += "DROP TABLE " + qt + ";\n";
+		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
+		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
+	};
+
 	if (view_query_type == IVMType::WINDOW_PARTITION || view_query_type == IVMType::GROUP_RECOMPUTE ||
 	    view_query_type == IVMType::DISTINCT_INCREMENTAL || view_query_type == IVMType::SEMI_ANTI_RECOMPUTE) {
 		// These types use a recompute path (partition-scoped, group-scoped, or — once
@@ -2185,6 +2245,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		                    : view_query_type == IVMType::GROUP_RECOMPUTE     ? "GROUP_RECOMPUTE"
 		                                                                      : "WINDOW_PARTITION");
 		ivm_query = "";
+		if (has_downstream) {
+			build_snapshot_companion();
+		}
 	} else {
 		// splitting the query in two to make it easier to turn into string (insertions are the same)
 		string do_ivm = "select * from DoIVM('" + OpenIVMUtils::EscapeValue(internal_catalog_name) + "','" +
@@ -2261,82 +2324,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		ivm_query += raw_ivm_sql;
 
-		// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise.
-		// Metadata stores dependency table names without catalog/schema qualification even when the
-		// physical delta table lives in a qualified internal catalog for DuckLake-backed MVs.
-		auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                                  " WHERE table_name = '" +
-		                                  OpenIVMUtils::EscapeValue(delta_view_name_bare) + "'");
-		bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
-		                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
-
-		// Companion rows for downstream consumers.
-		// When a view has downstream MVs that read its delta, those downstream views need
-		// both the OLD and NEW state to correctly compute their own deltas.
-		// The IVM query produces the NEW state (delta with mul=true).
-		// The companion query records the OLD state (current MV rows with mul=false)
-		// BEFORE the upsert modifies the MV.
-		// For SIMPLE_AGGREGATE with downstream consumers:
-		// The IVM delta represents the CHANGE (+5), but downstream projections need
-		// the ABSOLUTE old and new values to compute their own deltas correctly.
-		// Strategy: record old state (mul=false) BEFORE upsert, then record new state
-		// (mul=true) AFTER upsert. The IVM delta in delta_view is replaced by these
-		// absolute snapshots so downstream sees a clean old→new transition.
-
 		if (has_downstream && view_query_type == IVMType::SIMPLE_AGGREGATE) {
-			// Save old MV state to a temp table BEFORE the IVM+upsert modifies the MV.
-			// After the upsert, clear IVM delta from delta_view and replace with
-			// old(false) + new(true) absolute snapshots for downstream consumption.
-			// SIMPLE_PROJECTION/FILTER views do not use this path: their IVM output is
-			// already a row-level Z-set delta, while full old/new snapshots make downstream
-			// DuckLake joins pay for unchanged rows before compaction can cancel them.
-			string col_list;
-			for (auto &col : column_names) {
-				if (!col_list.empty()) {
-					col_list += ", ";
-				}
-				col_list += OpenIVMUtils::QuoteIdentifier(col);
-			}
-			// Build "snapshot" select lists: for the multiplicity column we substitute
-			// the literal Z-set weight (-1 for "old/retracted" snapshot, +1 for "new")
-			// instead of the column reference.
-			string select_old, select_new;
-			bool first = true;
-			for (auto &col : column_names) {
-				if (!first) {
-					select_old += ", ";
-					select_new += ", ";
-				}
-				first = false;
-				if (col == string(ivm::MULTIPLICITY_COL)) {
-					select_old += "-1";
-					select_new += "1";
-				} else {
-					select_old += OpenIVMUtils::QuoteIdentifier(col);
-					select_new += OpenIVMUtils::QuoteIdentifier(col);
-				}
-			}
-			// Pre: snapshot old state into temp table
-			string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
-			string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
-			string qdvn =
-			    delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
-			                                              : delta_view_name;
-			const string &qdt2 = data_table;
-			pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
-			// Post: clear ALL IVM delta rows, replace with absolute -1/+1 snapshots
-			post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
-			if (!delta_ts_filter.empty()) {
-				post_companion += " AND " + delta_ts_filter;
-			}
-			post_companion += ";\n";
-			post_companion +=
-			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_old + " FROM " + qt + ";\n";
-			post_companion +=
-			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_new + " FROM " + qdt2 + ";\n";
-			post_companion += "DROP TABLE " + qt + ";\n";
-			OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
-			OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
+			build_snapshot_companion();
 		} else if ((view_query_type == IVMType::AGGREGATE_GROUP || view_query_type == IVMType::AGGREGATE_HAVING) &&
 		           has_downstream && index_delta_view_catalog_entry) {
 			auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
@@ -2380,17 +2369,17 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
 			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 		}
+	}
 
-		if (has_downstream) {
-			if (skip_empty_enabled) {
-				compact_delta_view_query =
-				    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
-				OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
-			}
-			delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name_bare);
-		} else {
-			delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
+	if (has_downstream) {
+		if (skip_empty_enabled) {
+			compact_delta_view_query =
+			    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 		}
+		delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name_bare);
+	} else {
+		delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
 	}
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
