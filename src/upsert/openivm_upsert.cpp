@@ -2171,7 +2171,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string post_companion;
 	string compact_delta_view_query;
 	string delete_from_view_query;
-	string delta_view_name = internal_catalog_prefix + OpenIVMUtils::DeltaName(view_name);
+	string delta_view_name_bare = OpenIVMUtils::DeltaName(view_name);
+	string delta_view_name = internal_catalog_prefix + delta_view_name_bare;
 
 	if (view_query_type == IVMType::WINDOW_PARTITION || view_query_type == IVMType::GROUP_RECOMPUTE ||
 	    view_query_type == IVMType::DISTINCT_INCREMENTAL || view_query_type == IVMType::SEMI_ANTI_RECOMPUTE) {
@@ -2260,9 +2261,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		ivm_query += raw_ivm_sql;
 
-		// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise
+		// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise.
+		// Metadata stores dependency table names without catalog/schema qualification even when the
+		// physical delta table lives in a qualified internal catalog for DuckLake-backed MVs.
 		auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                                  " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name) + "'");
+		                                  " WHERE table_name = '" +
+		                                  OpenIVMUtils::EscapeValue(delta_view_name_bare) + "'");
 		bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 		                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
 
@@ -2315,7 +2319,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			// Pre: snapshot old state into temp table
 			string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
 			string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
-			string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
+			string qdvn =
+			    delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
+			                                              : delta_view_name;
 			const string &qdt2 = data_table;
 			pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
 			// Post: clear ALL IVM delta rows, replace with absolute -1/+1 snapshots
@@ -2381,7 +2387,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
 				OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 			}
-			delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
+			delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name_bare);
 		} else {
 			delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
 		}

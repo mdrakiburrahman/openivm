@@ -1,0 +1,109 @@
+# name: test/sql/ducklake_chained_physical.test
+# description: Chained DuckLake MV refresh with physical OpenIVM metadata database
+# group: [sql]
+
+require openivm
+
+require parquet
+
+load __TEST_DIR__/ducklake_chained_physical_main.db
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET ivm_cascade_refresh='off';
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_chained_physical_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE SCHEMA dl.bronze;
+
+statement ok
+CREATE SCHEMA dl.silver;
+
+statement ok
+CREATE TABLE dl.bronze.src (
+    dm_date DATE,
+    sym VARCHAR,
+    low_price INT,
+    high_price INT
+);
+
+statement ok
+INSERT INTO dl.bronze.src VALUES
+    (DATE '2026-01-01', 'A', 10, 20),
+    (DATE '2026-01-02', 'A', 8, 22);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.bronze.l1 AS
+SELECT dm_date, sym, low_price, high_price
+FROM dl.bronze.src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.silver.l2 AS
+SELECT
+    dm_date,
+    sym,
+    low_price,
+    high_price,
+    MIN(low_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_low,
+    MAX(high_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_high
+FROM dl.bronze.l1;
+
+statement ok
+INSERT INTO dl.bronze.src VALUES
+    (DATE '2026-01-03', 'A', 7, 25);
+
+statement ok
+PRAGMA ivm_options('dl', 'bronze', 'l1');
+
+# The upstream DuckLake MV writes its user-facing objects to dl, but its
+# companion delta table lives in the physical OpenIVM database. Downstream
+# metadata stores the bare name `delta_l1`; cleanup must use that metadata key
+# while deleting from the qualified physical table. If the cleanup uses the
+# qualified table name as the metadata key, this count becomes 0 and l2 misses
+# the new partition on refresh.
+query I
+SELECT count(*) FROM delta_l1;
+----
+1
+
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'l2');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.silver.l2
+    EXCEPT ALL
+    SELECT
+        dm_date,
+        sym,
+        low_price,
+        high_price,
+        MIN(low_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_low,
+        MAX(high_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_high
+    FROM dl.bronze.l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        dm_date,
+        sym,
+        low_price,
+        high_price,
+        MIN(low_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_low,
+        MAX(high_price) OVER (PARTITION BY sym ORDER BY dm_date) AS running_high
+    FROM dl.bronze.l1
+    EXCEPT ALL
+    SELECT * FROM dl.silver.l2
+);
+----
+0
