@@ -452,7 +452,11 @@ static void CollectDuckLakeTables(LogicalOperator *op, const string &current_cat
 				// default, not the DuckLake catalog.
 				string cat = info.table.ParentCatalog().GetName();
 				if (cat.empty()) {
-					cat = current_catalog.empty() ? "dl" : current_catalog;
+					if (current_catalog.empty()) {
+						throw CatalogException("Could not resolve DuckLake catalog for table '" + info.table_name +
+						                       "'");
+					}
+					cat = current_catalog;
 				}
 				dl_table_info[lc] = {info.table_name, cat, info.table.schema.name};
 			}
@@ -3849,8 +3853,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				std::transform(table_lc_for_lookup.begin(), table_lc_for_lookup.end(), table_lc_for_lookup.begin(),
 				               [](unsigned char c) { return std::tolower(c); });
 				auto info_it = dl_table_info.find(table_lc_for_lookup);
-				string meta_table_name = (info_it != dl_table_info.end()) ? info_it->second.table_name : table_name;
-				string dl_cat_name = (info_it != dl_table_info.end()) ? info_it->second.catalog_name : "dl";
+				if (info_it == dl_table_info.end() || info_it->second.catalog_name.empty()) {
+					throw CatalogException("Could not resolve DuckLake catalog for source table '" + table_name +
+					                       "' while creating materialized view '" + view_name + "'");
+				}
+				string meta_table_name = info_it->second.table_name;
+				string dl_cat_name = info_it->second.catalog_name;
 				ddl.push_back("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = (SELECT id FROM " +
 				              dl_cat_name + ".current_snapshot()) WHERE view_name = '" +
 				              OpenIVMUtils::EscapeSingleQuotes(view_name) + "' AND table_name = '" +

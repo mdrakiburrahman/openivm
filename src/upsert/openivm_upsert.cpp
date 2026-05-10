@@ -380,14 +380,24 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 	if (!attached_db_catalog_name.empty()) {
 		return attached_db_catalog_name;
 	}
-	auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake' LIMIT 1");
-	if (probe && !probe->HasError() && probe->RowCount() > 0 && !probe->GetValue(0, 0).IsNull()) {
+	if (!view_catalog_name.empty() && view_catalog_name != "memory") {
+		auto view_probe = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
+		                            OpenIVMUtils::EscapeValue(view_catalog_name) + "' LIMIT 1");
+		if (!view_probe->HasError() && view_probe->RowCount() > 0 && !view_probe->GetValue(0, 0).IsNull() &&
+		    StringUtil::CIEquals(view_probe->GetValue(0, 0).ToString(), "ducklake")) {
+			return view_catalog_name;
+		}
+	}
+	auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
+	if (probe && !probe->HasError() && probe->RowCount() == 1 && !probe->GetValue(0, 0).IsNull()) {
 		return probe->GetValue(0, 0).ToString();
 	}
-	if (!view_catalog_name.empty() && view_catalog_name != "memory") {
-		return view_catalog_name;
+	if (probe && !probe->HasError() && probe->RowCount() > 1) {
+		throw Exception(ExceptionType::CATALOG,
+		                "Could not resolve DuckLake catalog unambiguously; pass the materialized view catalog "
+		                "explicitly or use PRAGMA ivm_options");
 	}
-	return "dl";
+	throw Exception(ExceptionType::CATALOG, "Could not resolve attached DuckLake catalog");
 }
 
 static string BuildRecomputeQuery(IVMMetadata &metadata, Connection &con, const string &view_name,
@@ -1156,7 +1166,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		} else if (cross_system && !meta_post_sql.empty()) {
 			auto meta_post_start = std::chrono::steady_clock::now();
 			if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
-				string dl_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
+				string dl_catalog = ResolveDuckLakeCatalogName(exec_con, view_catalog_name, attached_db_catalog_name);
 				// DuckLake can keep read snapshot state on the connection that compiled
 				// the data refresh. Read the post-refresh watermark through a fresh
 				// connection so we do not persist an old snapshot and replay deltas.
