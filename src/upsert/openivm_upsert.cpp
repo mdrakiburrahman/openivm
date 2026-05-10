@@ -2197,8 +2197,19 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// delta-filtered subselect, projects DISTINCT GROUP BY columns, unions across
 		// sources, and uses the resulting key set to scope DELETE + INSERT.
 		auto group_columns = metadata.GetGroupColumns(view_name);
-		string recompute_ducklake_catalog =
-		    ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
+		bool group_recompute_has_ducklake_source = false;
+		for (auto &dt : delta_table_names) {
+			if (metadata.IsDuckLakeTable(view_name, dt)) {
+				group_recompute_has_ducklake_source = true;
+				break;
+			}
+		}
+		// Native GROUP_RECOMPUTE views do not require any DuckLake catalog. Only resolve the
+		// DuckLake source location when at least one source table is tracked by snapshots.
+		string recompute_ducklake_catalog;
+		if (group_recompute_has_ducklake_source) {
+			recompute_ducklake_catalog = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
+		}
 		string recompute_ducklake_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
 		auto delta_specs = BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, delta_table_names,
 		                                                 recompute_ducklake_catalog, recompute_ducklake_schema);
