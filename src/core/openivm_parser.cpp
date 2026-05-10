@@ -38,12 +38,14 @@
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_table_entry.hpp"
 
+#include <chrono>
 #include <regex>
 
 namespace duckdb {
 
 static constexpr const char *OPENIVM_DDL_RECONNECT = "__openivm_reconnect__";
 static constexpr const char *OPENIVM_DDL_CLEANUP_PREFIX = "__openivm_cleanup__:";
+static constexpr const char *OPENIVM_DDL_PROFILE_PREFIX = "__openivm_profile__:";
 
 /// Build "ORDER BY col1 ASC, col2 DESC LIMIT k [OFFSET n]".
 /// Works for both LOGICAL_TOP_N (fused) and separate LOGICAL_ORDER_BY + LOGICAL_LIMIT nodes.
@@ -2051,12 +2053,113 @@ static bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &ou
 	       ExtractInSubquery(original_sql, out);
 }
 
+struct CreateMVProfileStep {
+	int32_t step_order;
+	string step_name;
+	int64_t duration_ms;
+	string detail;
+};
+
+class CreateMVProfiler {
+public:
+	explicit CreateMVProfiler(ClientContext &context)
+	    : enabled(false), retention_days(31), next_step(0), total_start(std::chrono::steady_clock::now()) {
+		Value profile_val;
+		enabled = context.TryGetCurrentSetting("ivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
+		          profile_val.GetValue<bool>();
+		if (!enabled) {
+			return;
+		}
+		Value retention_val;
+		if (context.TryGetCurrentSetting("ivm_profile_retention_days", retention_val) && !retention_val.IsNull()) {
+			retention_days = std::max<int64_t>(0, retention_val.GetValue<int64_t>());
+		}
+		auto now = std::chrono::steady_clock::now().time_since_epoch();
+		refresh_id = "create_mv_" + to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+	}
+
+	bool Enabled() const {
+		return enabled;
+	}
+
+	void SetViewName(const string &view_name_p) {
+		if (view_name.empty()) {
+			view_name = view_name_p;
+			refresh_id = view_name + "_" + refresh_id;
+		}
+	}
+
+	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
+	             const string &detail = string()) {
+		if (!enabled) {
+			return;
+		}
+		auto duration_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		steps.push_back({next_step++, step_name, duration_ms, detail});
+	}
+
+	void AddTotal() {
+		AddStep("create_mv_total", total_start);
+	}
+
+	void Flush(DatabaseInstance &db) {
+		if (!enabled || flushed || view_name.empty() || steps.empty()) {
+			return;
+		}
+		flushed = true;
+		Connection profile_con(db);
+		profile_con.Query("DELETE FROM " + string(ivm::PROFILE_TABLE) +
+		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
+		                  to_string(retention_days) + " days'");
+		for (auto &step : steps) {
+			auto result = profile_con.Query(
+			    "INSERT OR REPLACE INTO " + string(ivm::PROFILE_TABLE) +
+			    " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
+			    OpenIVMUtils::EscapeValue(refresh_id) + "', '" + OpenIVMUtils::EscapeValue(view_name) + "', " +
+			    to_string(step.step_order) + ", '" + OpenIVMUtils::EscapeValue(step.step_name) + "', " +
+			    to_string(step.duration_ms) + ", '" + OpenIVMUtils::EscapeValue(step.detail) + "')");
+			if (result->HasError()) {
+				OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV step '%s': %s\n", step.step_name.c_str(),
+				                    result->GetError().c_str());
+				return;
+			}
+		}
+	}
+
+private:
+	bool enabled;
+	bool flushed = false;
+	int64_t retention_days;
+	string view_name;
+	string refresh_id;
+	int32_t next_step;
+	std::chrono::steady_clock::time_point total_start;
+	vector<CreateMVProfileStep> steps;
+};
+
+static void ParseCreateMVProfileMarker(const string &payload, string &view_name, string &step_name, string &detail) {
+	auto first = payload.find('\t');
+	auto second = first == string::npos ? string::npos : payload.find('\t', first + 1);
+	if (first == string::npos || second == string::npos) {
+		step_name = "create_mv_unclassified";
+		detail = payload;
+		return;
+	}
+	view_name = payload.substr(0, first);
+	step_name = payload.substr(first + 1, second - first - 1);
+	detail = payload.substr(second + 1);
+}
+
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	// DDL statements are passed via result.parameters from the plan function.
 	if (!input.inputs.empty()) {
 		auto &db = DatabaseInstance::GetDatabase(context);
 		auto conn = make_uniq<Connection>(db);
+		CreateMVProfiler profiler(context);
+		string current_profile_step = "create_mv_unclassified";
+		string current_profile_detail;
 		auto configure_openivm_connection = [&]() {
 			// OpenIVM-managed DDL materializes relational state where physical insertion
 			// order is not observable. Disabling order preservation avoids DuckDB holding
@@ -2083,6 +2186,15 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 			if (q.empty()) {
 				continue;
 			}
+			if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_PREFIX)) {
+				string marker_view_name;
+				ParseCreateMVProfileMarker(q.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), marker_view_name,
+				                           current_profile_step, current_profile_detail);
+				if (!marker_view_name.empty()) {
+					profiler.SetViewName(marker_view_name);
+				}
+				continue;
+			}
 			if (StringUtil::StartsWith(q, OPENIVM_DDL_CLEANUP_PREFIX)) {
 				cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 				continue;
@@ -2091,12 +2203,17 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 				// DuckLake keeps read transaction state on the connection. Reconnect
 				// between staged DuckLake reads and DuckLake writes so the write-side
 				// commit cannot self-block on an earlier read from the same CREATE MV.
+				auto reconnect_start = std::chrono::steady_clock::now();
 				conn = make_uniq<Connection>(db);
 				configure_openivm_connection();
+				profiler.AddStep("create_mv_reconnect", reconnect_start, current_profile_detail);
 				continue;
 			}
 			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
+			auto ddl_start = std::chrono::steady_clock::now();
 			auto r = conn->Query(q);
+			profiler.AddStep(current_profile_step, ddl_start,
+			                 current_profile_detail + "; bytes=" + to_string(q.size()));
 			if (r->HasError()) {
 				// The unique index on the MV data table is an upsert-time optimization
 				// (helps MERGE find the matching row quickly). If the classifier's
@@ -2113,9 +2230,13 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 					continue;
 				}
 				run_cleanup();
+				profiler.AddTotal();
+				profiler.Flush(db);
 				throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
 			}
 		}
+		profiler.AddTotal();
+		profiler.Flush(db);
 	}
 	names.emplace_back("MATERIALIZED VIEW CREATION");
 	return_types.emplace_back(LogicalType::BOOLEAN);
@@ -3077,8 +3198,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		auto add_cleanup = [&](const string &query) {
 			cleanup_ddl.push_back(string(OPENIVM_DDL_CLEANUP_PREFIX) + query);
 		};
+		auto add_profile_marker = [&](const string &step_name, const string &detail = string()) {
+			ddl.push_back(string(OPENIVM_DDL_PROFILE_PREFIX) + view_name + "\t" + step_name + "\t" + detail);
+		};
 
 		// --- System tables DDL ---
+		add_profile_marker("create_mv_system_tables",
+		                   "ivm_type=" + string(ParserIVMTypeName(ivm_type)) +
+		                       "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
 		// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 		// NULL unless ivm_enable_view_matching=true; populated by Stage I wiring.
 		ddl.push_back("create table if not exists " + string(ivm::VIEWS_TABLE) +
@@ -3172,6 +3299,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// --- OR REPLACE: drop old MV if it exists ---
 		if (ivm_parse_data.is_replace) {
+			add_profile_marker("create_mv_replace_cleanup");
 			string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 			string qdt_drop =
 			    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
@@ -3293,6 +3421,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// table name. The aux table is populated from the (DISTINCT-stripped) input SQL
 		// at CREATE time; refresh-time MERGE keeps it in sync with delta multiplicities.
 		if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+			add_profile_marker("create_mv_distinct_aux");
 			string aux_table = "_ivm_distinct_count_" + view_name;
 			string cols_csv;
 			for (size_t i = 0; i < distinct_extracted_cols.size(); i++) {
@@ -3332,6 +3461,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		if (ivm_type == IVMType::SEMI_ANTI_RECOMPUTE) {
+			add_profile_marker("create_mv_semi_anti_aux");
 			string aux_table = "_ivm_semi_anti_state_" + view_name;
 			auto qualify_source_table = [&](const string &table_name) {
 				if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||
@@ -3547,6 +3677,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
 		// Connection starts in the physical-default catalog, so apply USE before CREATE
 		// TABLE AS so those unqualified names resolve in the MV's catalog.
+		add_profile_marker("create_mv_initial_load", "sources=" + to_string(table_names.size()) +
+		                                                 "; generated_query_bytes=" + to_string(view_query.size()));
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			ddl.push_back("use " + current_catalog_schema);
 		}
@@ -3565,6 +3697,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		add_cleanup("DROP TABLE IF EXISTS " + qdt);
 		add_cleanup("DROP TABLE IF EXISTS " + qstage);
 		if (pac_loaded) {
+			add_profile_marker("create_mv_session_settings", "pac");
 			ddl.push_back("SET pac_check = false");
 			ddl.push_back("SET pac_rewrite = false");
 		}
@@ -3574,6 +3707,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// user-visible columns — no `_ivm_*` columns even if the rewritten plan
 		// would have added them via AVG/STDDEV decomposition. Skip the EXCLUDE
 		// list in that case; otherwise CREATE VIEW fails on nonexistent columns.
+		add_profile_marker("create_mv_user_view");
 		{
 			// Collect internal column names from the LPTS output
 			vector<string> internal_cols;
@@ -3603,6 +3737,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
+		add_profile_marker("create_mv_source_delta_tables", "source_count=" + to_string(table_names.size()));
 		for (const auto &table_name : table_names) {
 			// DuckLake tables don't need delta tables — change tracking is native.
 			// `ducklake_tables` stores the catalog-normalized (lowercase) name, so
@@ -3652,6 +3787,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		// Delta table for the MV — based on the DATA table (has all columns)
+		add_profile_marker("create_mv_mv_delta_table");
 		string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 		ddl.push_back("create table if not exists " + qdv + " as select *, 1::INTEGER as " +
 		              string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
@@ -3665,6 +3801,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// change tracking still skips this optional index.
 		if ((ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) &&
 		    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
+			add_profile_marker("create_mv_index", "columns=" + to_string(aggregate_columns.size()));
 			string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + ivm::INDEX_SUFFIX);
 			string index_query_view = "create unique index " + index_name + " on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
@@ -3682,11 +3819,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// inserted before `create table qdt as view_query` routed unqualified base
 		// tables through the user's catalog; flip back for the metadata UPDATE below.
 		if (!current_catalog.empty() && current_catalog != default_db) {
+			add_profile_marker("create_mv_restore_catalog");
 			ddl.push_back("use " + default_catalog_schema);
 		}
 
 		// Record source-table metadata only after physical MV objects exist. If a later
 		// DuckLake publish fails, the DDL executor removes these rows before the retry.
+		add_profile_marker("create_mv_source_metadata", "rows=" + to_string(source_metadata_ddl.size()));
 		ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
 		add_cleanup("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 		            OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
@@ -3694,6 +3833,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// After all tables are created and populated, update DuckLake snapshot IDs
 		// to the current snapshot. This ensures the first refresh only sees changes
 		// made AFTER the MV was created (not the initial data load).
+		add_profile_marker("create_mv_snapshot_metadata");
 		for (const auto &table_name : table_names) {
 			string table_lc = table_name;
 			std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
@@ -3722,6 +3862,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// and DuckLake's external metadata catalog, so OpenIVM cannot rely on a single
 		// cross-catalog transaction. The executor registers cleanup DDL up front and this
 		// late publish keeps incomplete attempts out of _duckdb_ivm_views.
+		add_profile_marker("create_mv_publish_metadata",
+		                   "rows=" + to_string(metadata_ddl.size() + aux_metadata_ddl.size()));
 		ddl.insert(ddl.end(), metadata_ddl.begin(), metadata_ddl.end());
 		ddl.insert(ddl.end(), aux_metadata_ddl.begin(), aux_metadata_ddl.end());
 		add_cleanup("DELETE FROM " + string(ivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
@@ -3740,12 +3882,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			string system_tables_sql;
 			// Compiled queries (everything after the system tables)
 			string compiled_sql;
+			idx_t visible_ddl_idx = 0;
 			for (size_t i = 0; i < ddl.size(); i++) {
-				if (i < 3) {
+				if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX)) {
+					continue;
+				}
+				if (visible_ddl_idx < 3) {
 					system_tables_sql += ddl[i] + ";\n\n";
 				} else {
 					compiled_sql += ddl[i] + ";\n\n";
 				}
+				visible_ddl_idx++;
 			}
 			OpenIVMUtils::WriteFile(base_path + "/ivm_system_tables.sql", false, system_tables_sql);
 			OpenIVMUtils::WriteFile(base_path + "/ivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
