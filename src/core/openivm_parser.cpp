@@ -43,7 +43,6 @@
 
 namespace duckdb {
 
-static constexpr const char *OPENIVM_DDL_RECONNECT = "__openivm_reconnect__";
 static constexpr const char *OPENIVM_DDL_CLEANUP_PREFIX = "__openivm_cleanup__:";
 static constexpr const char *OPENIVM_DDL_PROFILE_PREFIX = "__openivm_profile__:";
 
@@ -2213,16 +2212,6 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 				cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 				continue;
 			}
-			if (q == OPENIVM_DDL_RECONNECT) {
-				// DuckLake keeps read transaction state on the connection. Reconnect
-				// between staged DuckLake reads and DuckLake writes so the write-side
-				// commit cannot self-block on an earlier read from the same CREATE MV.
-				auto reconnect_start = std::chrono::steady_clock::now();
-				conn = make_uniq<Connection>(db);
-				configure_openivm_connection();
-				profiler.AddStep("create_mv_reconnect", reconnect_start, current_profile_detail);
-				continue;
-			}
 			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
 			auto ddl_start = std::chrono::steady_clock::now();
 			auto r = conn->Query(q);
@@ -3709,15 +3698,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			ddl.push_back("use " + current_catalog_schema);
 		}
+		ddl.push_back("create table " + qdt + " as " + view_query);
 		if (!view_catalog_prefix.empty()) {
-			// DuckLake can self-lock when the same connection both reads DuckLake tables
-			// and later publishes DuckLake metadata. Keep the reconnect boundary before
-			// the user-facing view publish.
-			ddl.push_back("create table " + qdt + " as " + view_query);
-			ddl.push_back(OPENIVM_DDL_RECONNECT);
+			// Keep the same connection after a DuckLake CTAS. Reopening here can force
+			// connection teardown while DuckLake still owns the transaction used by the
+			// CTAS, which surfaces as a self-inflicted SQLite metadata "database is
+			// locked" on complex chained MV creates.
 			ddl.push_back("use " + default_catalog_schema);
-		} else {
-			ddl.push_back("create table " + qdt + " as " + view_query);
 		}
 		add_cleanup("DROP VIEW IF EXISTS " + qvn);
 		add_cleanup("DROP TABLE IF EXISTS " + qdt);

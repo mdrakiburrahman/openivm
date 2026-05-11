@@ -160,6 +160,202 @@ SELECT count(*) FROM (
 ----
 0
 
+# Regression: chained DuckLake MV creation must not reconnect immediately after
+# DuckLake CTAS. Complex plans that read a DuckLake-backed MV and publish another
+# DuckLake MV can otherwise self-lock DuckLake's SQLite metadata catalog.
+statement ok
+CREATE TABLE dl.market_chain_src (
+    sym VARCHAR,
+    d DATE,
+    close_px DOUBLE,
+    volume INT
+);
+
+statement ok
+INSERT INTO dl.market_chain_src VALUES
+    ('AAA', '2026-01-01', 10.0, 100),
+    ('AAA', '2026-01-02', 12.0, 200),
+    ('AAA', '2026-01-03', 11.0, 150),
+    ('BBB', '2026-01-01', 20.0, 90),
+    ('BBB', '2026-01-02', 21.0, 110),
+    ('BBB', '2026-01-03', 22.0, 130);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.market_chain_base AS
+SELECT sym, d, close_px, volume
+FROM dl.market_chain_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.market_chain_scored AS
+WITH price_changes AS (
+    SELECT
+        sym,
+        d,
+        close_px,
+        volume,
+        LAG(close_px) OVER (PARTITION BY sym ORDER BY d) AS prev_close
+    FROM dl.market_chain_base
+),
+returns AS (
+    SELECT
+        sym,
+        d,
+        close_px,
+        volume,
+        CASE WHEN prev_close > 0 THEN (close_px - prev_close) / prev_close ELSE NULL END AS daily_return
+    FROM price_changes
+),
+symbol_stats AS (
+    SELECT
+        sym,
+        COUNT(*) AS trading_days,
+        AVG(daily_return) AS avg_return,
+        STDDEV(daily_return) AS return_volatility,
+        SUM(volume) AS total_volume
+    FROM returns
+    GROUP BY sym
+),
+global_stats AS (
+    SELECT
+        AVG(return_volatility) AS avg_volatility,
+        SUM(total_volume) AS market_volume
+    FROM symbol_stats
+)
+SELECT
+    ss.sym,
+    ss.trading_days,
+    ss.avg_return,
+    ss.return_volatility,
+    ss.total_volume,
+    ROUND(ss.return_volatility - gs.avg_volatility, 4) AS volatility_delta,
+    RANK() OVER (ORDER BY ss.total_volume DESC) AS volume_rank
+FROM symbol_stats ss
+CROSS JOIN global_stats gs;
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        sym,
+        trading_days,
+        ROUND(avg_return, 10) AS avg_return,
+        ROUND(return_volatility, 10) AS return_volatility,
+        total_volume,
+        volatility_delta,
+        volume_rank
+    FROM dl.market_chain_scored
+    EXCEPT ALL
+    SELECT * FROM (
+    WITH price_changes AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            LAG(close_px) OVER (PARTITION BY sym ORDER BY d) AS prev_close
+        FROM dl.market_chain_base
+    ),
+    returns AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            CASE WHEN prev_close > 0 THEN (close_px - prev_close) / prev_close ELSE NULL END AS daily_return
+        FROM price_changes
+    ),
+    symbol_stats AS (
+        SELECT
+            sym,
+            COUNT(*) AS trading_days,
+            AVG(daily_return) AS avg_return,
+            STDDEV(daily_return) AS return_volatility,
+            SUM(volume) AS total_volume
+        FROM returns
+        GROUP BY sym
+    ),
+    global_stats AS (
+        SELECT
+            AVG(return_volatility) AS avg_volatility,
+            SUM(total_volume) AS market_volume
+        FROM symbol_stats
+    )
+    SELECT
+        ss.sym,
+        ss.trading_days,
+        ROUND(ss.avg_return, 10) AS avg_return,
+        ROUND(ss.return_volatility, 10) AS return_volatility,
+        ss.total_volume,
+        ROUND(ss.return_volatility - gs.avg_volatility, 4) AS volatility_delta,
+        RANK() OVER (ORDER BY ss.total_volume DESC) AS volume_rank
+    FROM symbol_stats ss
+    CROSS JOIN global_stats gs
+    ) expected
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM (
+    WITH price_changes AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            LAG(close_px) OVER (PARTITION BY sym ORDER BY d) AS prev_close
+        FROM dl.market_chain_base
+    ),
+    returns AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            CASE WHEN prev_close > 0 THEN (close_px - prev_close) / prev_close ELSE NULL END AS daily_return
+        FROM price_changes
+    ),
+    symbol_stats AS (
+        SELECT
+            sym,
+            COUNT(*) AS trading_days,
+            AVG(daily_return) AS avg_return,
+            STDDEV(daily_return) AS return_volatility,
+            SUM(volume) AS total_volume
+        FROM returns
+        GROUP BY sym
+    ),
+    global_stats AS (
+        SELECT
+            AVG(return_volatility) AS avg_volatility,
+            SUM(total_volume) AS market_volume
+        FROM symbol_stats
+    )
+    SELECT
+        ss.sym,
+        ss.trading_days,
+        ROUND(ss.avg_return, 10) AS avg_return,
+        ROUND(ss.return_volatility, 10) AS return_volatility,
+        ss.total_volume,
+        ROUND(ss.return_volatility - gs.avg_volatility, 4) AS volatility_delta,
+        RANK() OVER (ORDER BY ss.total_volume DESC) AS volume_rank
+    FROM symbol_stats ss
+    CROSS JOIN global_stats gs
+    ) expected
+    EXCEPT ALL
+    SELECT
+        sym,
+        trading_days,
+        ROUND(avg_return, 10) AS avg_return,
+        ROUND(return_volatility, 10) AS return_volatility,
+        total_volume,
+        volatility_delta,
+        volume_rank
+    FROM dl.market_chain_scored
+);
+----
+0
+
 statement ok
 SET ivm_cascade_refresh = 'off';
 
