@@ -93,6 +93,7 @@ public:
 		explicit IVMBindData(bool result) : result(result) {
 		}
 		bool result;
+		vector<string> ddl;
 	};
 
 	struct IVMGlobalData : public GlobalTableFunctionState {

@@ -2167,83 +2167,91 @@ static void ParseCreateMVProfileMarker(const string &payload, string &view_name,
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	// DDL statements are passed via result.parameters from the plan function.
+	auto bind_data = make_uniq<IVMFunction::IVMBindData>(true);
 	if (!input.inputs.empty()) {
-		auto &db = DatabaseInstance::GetDatabase(context);
-		auto conn = make_uniq<Connection>(db);
-		CreateMVProfiler profiler(context);
-		string current_profile_step = "create_mv_unclassified";
-		string current_profile_detail;
-		auto configure_openivm_connection = [&]() {
-			// OpenIVM-managed DDL materializes relational state where physical insertion
-			// order is not observable. Disabling order preservation avoids DuckDB holding
-			// large ordering buffers for wide CTAS-style MV builds.
-			auto preserve_result = conn->Query("SET preserve_insertion_order=false");
-			if (preserve_result->HasError()) {
-				throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
-			}
-		};
-		configure_openivm_connection();
-		vector<string> cleanup_ddl;
-		auto run_cleanup = [&]() {
-			for (const auto &cleanup : cleanup_ddl) {
-				OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Cleanup DDL: %s\n", cleanup.c_str());
-				auto cleanup_result = conn->Query(cleanup);
-				if (cleanup_result->HasError()) {
-					OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Cleanup failed: %s\n",
-					                    cleanup_result->GetError().c_str());
-				}
-			}
-		};
 		for (auto &param : input.inputs) {
 			auto q = param.GetValue<string>();
 			if (q.empty()) {
 				continue;
 			}
-			if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_PREFIX)) {
-				string marker_view_name;
-				ParseCreateMVProfileMarker(q.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), marker_view_name,
-				                           current_profile_step, current_profile_detail);
-				if (!marker_view_name.empty()) {
-					profiler.SetViewName(marker_view_name);
-				}
-				continue;
-			}
-			if (StringUtil::StartsWith(q, OPENIVM_DDL_CLEANUP_PREFIX)) {
-				cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
-				continue;
-			}
-			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
-			auto ddl_start = std::chrono::steady_clock::now();
-			auto r = conn->Query(q);
-			profiler.AddStep(current_profile_step, ddl_start,
-			                 current_profile_detail + "; bytes=" + to_string(q.size()));
-			if (r->HasError()) {
-				// The unique index on the MV data table is an upsert-time optimization
-				// (helps MERGE find the matching row quickly). If the classifier's
-				// group_columns don't actually form a unique key for the MV (e.g. a
-				// CTE with GROUP BY joined against another table — the outer JOIN
-				// duplicates rows), CREATE UNIQUE INDEX fails with "Data contains
-				// duplicates". Skip just that statement and continue; the refresh
-				// still works via key-based MERGE, just a bit slower.
-				bool is_unique_index = StringUtil::Contains(StringUtil::Lower(q), "create unique index") &&
-				                       StringUtil::Contains(r->GetError(), "Data contains duplicates");
-				if (is_unique_index) {
-					Printer::Print("Warning: could not create unique index for MV — group_columns "
-					               "are not unique in MV output. Refresh will still work (no index).");
-					continue;
-				}
-				run_cleanup();
-				profiler.AddTotal();
-				profiler.Flush(db);
-				throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
-			}
+			bind_data->ddl.push_back(std::move(q));
 		}
-		profiler.AddTotal();
-		profiler.Flush(db);
 	}
 	names.emplace_back("MATERIALIZED VIEW CREATION");
 	return_types.emplace_back(LogicalType::BOOLEAN);
-	return make_uniq<IVMFunction::IVMBindData>(true);
+	return std::move(bind_data);
+}
+
+static void ExecuteIVMDDL(ClientContext &context, const vector<string> &ddl) {
+	if (ddl.empty()) {
+		return;
+	}
+	auto &db = DatabaseInstance::GetDatabase(context);
+	auto conn = make_uniq<Connection>(db);
+	CreateMVProfiler profiler(context);
+	string current_profile_step = "create_mv_unclassified";
+	string current_profile_detail;
+	auto configure_openivm_connection = [&]() {
+		// OpenIVM-managed DDL materializes relational state where physical insertion
+		// order is not observable. Disabling order preservation avoids DuckDB holding
+		// large ordering buffers for wide CTAS-style MV builds.
+		auto preserve_result = conn->Query("SET preserve_insertion_order=false");
+		if (preserve_result->HasError()) {
+			throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
+		}
+	};
+	configure_openivm_connection();
+	vector<string> cleanup_ddl;
+	auto run_cleanup = [&]() {
+		for (const auto &cleanup : cleanup_ddl) {
+			OPENIVM_DEBUG_PRINT("[IVMDDLExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
+			auto cleanup_result = conn->Query(cleanup);
+			if (cleanup_result->HasError()) {
+				OPENIVM_DEBUG_PRINT("[IVMDDLExecuteFunction] Cleanup failed: %s\n", cleanup_result->GetError().c_str());
+			}
+		}
+	};
+	for (auto &q : ddl) {
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_PREFIX)) {
+			string marker_view_name;
+			ParseCreateMVProfileMarker(q.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), marker_view_name,
+			                           current_profile_step, current_profile_detail);
+			if (!marker_view_name.empty()) {
+				profiler.SetViewName(marker_view_name);
+			}
+			continue;
+		}
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_CLEANUP_PREFIX)) {
+			cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
+			continue;
+		}
+		OPENIVM_DEBUG_PRINT("[IVMDDLExecuteFunction] Executing DDL: %s\n", q.c_str());
+		auto ddl_start = std::chrono::steady_clock::now();
+		auto r = conn->Query(q);
+		profiler.AddStep(current_profile_step, ddl_start, current_profile_detail + "; bytes=" + to_string(q.size()));
+		if (r->HasError()) {
+			// The unique index on the MV data table is an upsert-time optimization
+			// (helps MERGE find the matching row quickly). If the classifier's
+			// group_columns don't actually form a unique key for the MV (e.g. a
+			// CTE with GROUP BY joined against another table — the outer JOIN
+			// duplicates rows), CREATE UNIQUE INDEX fails with "Data contains
+			// duplicates". Skip just that statement and continue; the refresh
+			// still works via key-based MERGE, just a bit slower.
+			bool is_unique_index = StringUtil::Contains(StringUtil::Lower(q), "create unique index") &&
+			                       StringUtil::Contains(r->GetError(), "Data contains duplicates");
+			if (is_unique_index) {
+				Printer::Print("Warning: could not create unique index for MV — group_columns "
+				               "are not unique in MV output. Refresh will still work (no index).");
+				continue;
+			}
+			run_cleanup();
+			profiler.AddTotal();
+			profiler.Flush(db);
+			throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
+		}
+	}
+	profiler.AddTotal();
+	profiler.Flush(db);
 }
 
 static void IVMDDLExecuteFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
@@ -2252,6 +2260,7 @@ static void IVMDDLExecuteFunction(ClientContext &context, TableFunctionInput &da
 	if (gdata.offset >= 1) {
 		return;
 	}
+	ExecuteIVMDDL(context, bind_data.ddl);
 	output.SetValue(0, 0, Value::BOOLEAN(bind_data.result));
 	output.SetCardinality(1);
 	gdata.offset++;
