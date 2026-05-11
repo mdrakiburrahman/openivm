@@ -2188,6 +2188,23 @@ static void ExecuteIVMDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
+	bool suspended_autocommit_transaction = false;
+	auto restore_outer_transaction = [&]() {
+		if (suspended_autocommit_transaction && !context.transaction.HasActiveTransaction()) {
+			context.transaction.BeginTransaction();
+		}
+	};
+	if (context.transaction.IsAutoCommit() && context.transaction.HasActiveTransaction()) {
+		// CREATE MATERIALIZED VIEW is implemented as a parser-extension statement that
+		// returns a one-row table function. DuckDB opens an outer autocommit transaction
+		// for that statement before this function runs. If the MV reads from and writes
+		// to the same DuckLake catalog, that outer transaction can hold a DuckLake/SQLite
+		// metadata read lock while OpenIVM's internal DDL connection tries to commit the
+		// CTAS. Release only this synthetic autocommit transaction; explicit user
+		// transactions are left intact so their transactional semantics are not changed.
+		context.transaction.Rollback(nullptr);
+		suspended_autocommit_transaction = true;
+	}
 	CreateMVProfiler profiler(context);
 	string current_profile_step = "create_mv_unclassified";
 	string current_profile_detail;
@@ -2247,11 +2264,13 @@ static void ExecuteIVMDDL(ClientContext &context, const vector<string> &ddl) {
 			run_cleanup();
 			profiler.AddTotal();
 			profiler.Flush(db);
+			restore_outer_transaction();
 			throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
 		}
 	}
 	profiler.AddTotal();
 	profiler.Flush(db);
+	restore_outer_transaction();
 }
 
 static void IVMDDLExecuteFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
