@@ -3187,6 +3187,22 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			               "' has an unrecognized query pattern. Full refresh will be used.");
 		}
 
+		bool ducklake_window_partition =
+		    ivm_type == IVMType::WINDOW_PARTITION &&
+		    (target_is_ducklake || !dl_table_info_for_classification.empty());
+		if (ducklake_window_partition && !lpts_fallback) {
+			// Window-partition refresh recomputes affected partitions from the user's query,
+			// so the initial data table does not need LPTS-normalized SQL. For DuckLake,
+			// the normalized form can duplicate CTE/subplan work around global aggregates
+			// and cross joins; executing that shape as CTAS from inside CREATE MATERIALIZED
+			// VIEW can leave DuckLake's metadata commit waiting on its own transaction. Use
+			// the original SQL here, matching the refresh path and ordinary CTAS behavior.
+			view_query = original_view_query;
+			lpts_fallback = true;
+			OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake window MV uses original SQL for initial data table: %s\n",
+			                    view_query.c_str());
+		}
+
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
 		                    ivm_type == IVMType::AGGREGATE_GROUP        ? "AGGREGATE_GROUP"
 		                    : ivm_type == IVMType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
