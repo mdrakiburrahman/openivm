@@ -17,6 +17,7 @@
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -1169,9 +1170,33 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
 		auto start = std::chrono::steady_clock::now();
-		auto result = exec_con.Query(sql);
+		unique_ptr<MaterializedQueryResult> result;
+		idx_t executed_statement_count = 1;
+		if (profiler.Enabled()) {
+			// Diagnostic mode runs the generated batch one statement at a time so
+			// the profile table can show which refresh operation dominates runtime.
+			auto statements = SqlUtils::SplitSQLStatements(sql);
+			executed_statement_count = statements.size();
+			if (statements.empty()) {
+				result = exec_con.Query(sql);
+			}
+			for (idx_t stmt_idx = 0; stmt_idx < statements.size(); stmt_idx++) {
+				auto stmt_start = std::chrono::steady_clock::now();
+				result = exec_con.Query(statements[stmt_idx]);
+				profiler.AddStep("execute_refresh_sql_stmt", stmt_start,
+				                 "statement=" + to_string(stmt_idx + 1) + "/" + to_string(statements.size()) +
+				                     ", bytes=" + to_string(statements[stmt_idx].size()) +
+				                     ", sql=" + SqlUtils::SQLStatementPreview(statements[stmt_idx]));
+				if (result->HasError()) {
+					break;
+				}
+			}
+		} else {
+			result = exec_con.Query(sql);
+		}
 		auto end = std::chrono::steady_clock::now();
-		profiler.AddStep("execute_refresh_sql", start, "bytes=" + to_string(sql.size()));
+		profiler.AddStep("execute_refresh_sql", start,
+		                 "bytes=" + to_string(sql.size()) + ", statements=" + to_string(executed_statement_count));
 
 		if (result->HasError()) {
 			if (tx_open) {

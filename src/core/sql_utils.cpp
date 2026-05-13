@@ -30,6 +30,18 @@ static bool StartsWithKeyword(const string &sql, size_t pos, const string &keywo
 	return pos + keyword.size() == sql.size() || !IsIdentifierChar(sql[pos + keyword.size()]);
 }
 
+static string TrimSQLFragment(const string &input) {
+	idx_t start = 0;
+	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
+		start++;
+	}
+	idx_t end = input.size();
+	while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+		end--;
+	}
+	return input.substr(start, end - start);
+}
+
 static bool ReadCreateTargetName(const string &sql, const string &object_keyword, string &out) {
 	string lower = StringUtil::Lower(sql);
 	size_t pos = lower.find("create");
@@ -379,6 +391,104 @@ void SqlUtils::StripLineComments(string &query) {
 		}
 	}
 	query = std::move(out);
+}
+
+vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
+	vector<string> statements;
+	idx_t start = 0;
+	bool in_single_quote = false;
+	bool in_double_quote = false;
+	bool in_line_comment = false;
+	bool in_block_comment = false;
+
+	for (idx_t i = 0; i < sql.size(); i++) {
+		auto c = sql[i];
+		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
+
+		if (in_line_comment) {
+			if (c == '\n') {
+				in_line_comment = false;
+			}
+			continue;
+		}
+		if (in_block_comment) {
+			if (c == '*' && next == '/') {
+				in_block_comment = false;
+				i++;
+			}
+			continue;
+		}
+		if (in_single_quote) {
+			if (c == '\'' && next == '\'') {
+				i++;
+			} else if (c == '\'') {
+				in_single_quote = false;
+			}
+			continue;
+		}
+		if (in_double_quote) {
+			if (c == '"' && next == '"') {
+				i++;
+			} else if (c == '"') {
+				in_double_quote = false;
+			}
+			continue;
+		}
+
+		if (c == '-' && next == '-') {
+			in_line_comment = true;
+			i++;
+			continue;
+		}
+		if (c == '/' && next == '*') {
+			in_block_comment = true;
+			i++;
+			continue;
+		}
+		if (c == '\'') {
+			in_single_quote = true;
+			continue;
+		}
+		if (c == '"') {
+			in_double_quote = true;
+			continue;
+		}
+		if (c == ';') {
+			auto statement = TrimSQLFragment(sql.substr(start, i - start));
+			if (!statement.empty()) {
+				statements.push_back(std::move(statement));
+			}
+			start = i + 1;
+		}
+	}
+
+	auto statement = TrimSQLFragment(sql.substr(start));
+	if (!statement.empty()) {
+		statements.push_back(std::move(statement));
+	}
+	return statements;
+}
+
+string SqlUtils::SQLStatementPreview(const string &statement) {
+	auto trimmed = TrimSQLFragment(statement);
+	string preview;
+	bool in_space = false;
+	for (auto c : trimmed) {
+		if (std::isspace(static_cast<unsigned char>(c))) {
+			if (!in_space && !preview.empty()) {
+				preview += ' ';
+				in_space = true;
+			}
+			continue;
+		}
+		preview += c;
+		in_space = false;
+		if (preview.size() >= 120) {
+			preview += "...";
+			break;
+		}
+	}
+	return preview;
 }
 
 string SqlUtils::DeltaName(const string &name) {
