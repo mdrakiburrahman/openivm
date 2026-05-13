@@ -35,7 +35,7 @@ Each `(view, base_table)` pair tracks two timestamps in `openivm_delta_tables`:
 | Column | Set to | Used by |
 |---|---|---|
 | `last_update` | `MAX(openivm_timestamp) + 1µs` over rows visible in *this transaction's snapshot*. Falls back to `now()` if the snapshot saw zero delta rows. | The base-delta scan filter on the *next* refresh: `openivm_timestamp >= last_update`. |
-| `last_refresh_ts` | `now()` at refresh-transaction-start wall clock. | Filtering `delta_<view>` companion rows from chained refreshes (companion rows carry refresh-time timestamps, not base-row timestamps, so they need a separate cursor). |
+| `last_refresh_ts` | `now()` at refresh-transaction-start wall clock. | Filtering `openivm_delta_<view>` companion rows from chained refreshes (companion rows carry refresh-time timestamps, not base-row timestamps, so they need a separate cursor). |
 
 `last_update` is anchored to `MAX(base_ts)+1µs` rather than `now()` to make the cursor race-safe. The naive `now()` approach has a subtle bug:
 

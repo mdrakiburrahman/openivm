@@ -20,7 +20,7 @@ CREATE OR REPLACE MATERIALIZED VIEW regional_totals REFRESH EVERY '5 minutes' AS
 INSERT INTO sales VALUES ('US', 'Bolt', 50), ('JP', 'Gear', 300);
 
 -- Refresh manually at any time
-PRAGMA ivm('regional_totals');
+PRAGMA refresh('regional_totals');
 
 SELECT * FROM regional_totals ORDER BY region;
 -- EU  | 200 | 1
@@ -52,10 +52,10 @@ CREATE MATERIALIZED VIEW dl.top_products REFRESH EVERY '10 minutes' AS
     SELECT product, total FROM dl.product_totals WHERE total > 1000;
 
 -- Cascade modes (controls automatic refresh propagation):
-SET ivm_cascade_refresh = 'downstream';  -- default: refreshing product_totals also refreshes top_products
-SET ivm_cascade_refresh = 'upstream';    -- refreshing top_products first refreshes product_totals
-SET ivm_cascade_refresh = 'both';        -- refresh in both directions
-SET ivm_cascade_refresh = 'off';         -- no cascade, each view refreshes independently
+SET openivm_cascade_refresh = 'downstream';  -- default: refreshing product_totals also refreshes top_products
+SET openivm_cascade_refresh = 'upstream';    -- refreshing top_products first refreshes product_totals
+SET openivm_cascade_refresh = 'both';        -- refresh in both directions
+SET openivm_cascade_refresh = 'off';         -- no cascade, each view refreshes independently
 ```
 Note: without cascading refresh, views refreshing independently may see stale upstream data — results are consistent but not fresh until the next ordered refresh. See [pipelines](docs/refresh/pipelines.md).
 
@@ -86,29 +86,29 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 
 | Setting | Type | Default | Description | Documentation |
 |---------|------|---------|-------------|---------------|
-| `ivm_cascade_refresh` | VARCHAR | `downstream` | Cascade mode: `off`, `upstream`, `downstream`, `both` | [Pipelines](docs/refresh/pipelines.md) |
-| `ivm_refresh_mode` | VARCHAR | `incremental` | Refresh strategy: `incremental`, `full`, or `auto` | [Refresh strategies](docs/refresh/refresh-strategies.md) |
-| `ivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model (learned regression) | [Refresh strategies](docs/refresh/refresh-strategies.md) |
-| `ivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than interval | [Automatic refresh](docs/refresh/automatic-refresh.md) |
-| `ivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon | [Automatic refresh](docs/refresh/automatic-refresh.md) |
-| `ivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
+| `openivm_cascade_refresh` | VARCHAR | `downstream` | Cascade mode: `off`, `upstream`, `downstream`, `both` | [Pipelines](docs/refresh/pipelines.md) |
+| `openivm_refresh_mode` | VARCHAR | `incremental` | Refresh strategy: `incremental`, `full`, or `auto` | [Refresh strategies](docs/refresh/refresh-strategies.md) |
+| `openivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model (learned regression) | [Refresh strategies](docs/refresh/refresh-strategies.md) |
+| `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than interval | [Automatic refresh](docs/refresh/automatic-refresh.md) |
+| `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon | [Automatic refresh](docs/refresh/automatic-refresh.md) |
+| `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
 
 
 ## Pragmas
 
 | Pragma | Description |
 |--------|-------------|
-| `PRAGMA ivm('view_name')` | Refresh a materialized view |
-| `PRAGMA ivm_cost('view_name')` | Show IVM vs full recompute cost estimate (static + calibrated) |
-| `PRAGMA ivm_history('view_name')` | Show refresh execution history (for learned cost model) |
-| `PRAGMA ivm_options(catalog, schema, view_name)` | Refresh with explicit catalog/schema |
-| `PRAGMA ivm_status('view_name')` | Show refresh interval, last/next refresh, and status |
+| `PRAGMA refresh('view_name')` | Refresh a materialized view |
+| `PRAGMA refresh_cost('view_name')` | Show incremental refresh vs full recompute cost estimate (static + calibrated) |
+| `PRAGMA refresh_history('view_name')` | Show refresh execution history (for learned cost model) |
+| `PRAGMA refresh_options(catalog, schema, view_name)` | Refresh with explicit catalog/schema |
+| `PRAGMA refresh_status('view_name')` | Show refresh interval, last/next refresh, and status |
 
 ## Documentation
 
 - **[DuckLake integration](docs/ducklake.md)** — IVM over DuckLake tables with native change tracking
 - **[Operators](docs/operators/)** — How each SQL operator is incrementalized
-- **[Refresh](docs/refresh/)** — Refresh strategies and MV pipelines
+- **[Refresh](docs/refresh/)** — Refresh strategies and view pipelines
 - **[Optimizations](docs/optimizations/)** — Delta consolidation, FK pruning, empty-delta skip, indexing
 - **[Internals](docs/internals/)** — Delta tables, parser, concurrency
 - **[Limitations](docs/limitations.md)** — Unsupported operators, known restrictions

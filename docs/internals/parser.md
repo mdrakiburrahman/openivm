@@ -64,8 +64,8 @@ The parser produces a sequence of DDL statements executed during the bind phase:
 1. **System tables**: `CREATE TABLE IF NOT EXISTS openivm_views (...)` and `openivm_delta_tables (...)`.
 2. **Metadata inserts**: Registers the view name, query string, type, and source table mappings.
 3. **MV table**: `CREATE TABLE <view_name> AS <query>` to materialize the initial result.
-4. **Delta tables**: One `delta_<table_name>` per source table, with `openivm_multiplicity` and `openivm_timestamp` columns.
-5. **Delta view table**: `delta_<view_name>` for downstream chained MV support, with `DEFAULT now()` on the timestamp column.
+4. **Delta tables**: One `openivm_delta_<table_name>` per source table, with `openivm_multiplicity` and `openivm_timestamp` columns.
+5. **Delta view table**: `openivm_delta_<view_name>` for downstream chained MV support, with `DEFAULT now()` on the timestamp column.
 6. **Index** (AGGREGATE_GROUP only): A unique index on the GROUP BY columns, used by the MERGE INTO upsert strategy.
 
 ## System tables

@@ -45,7 +45,7 @@ optimizations activate automatically.
 
 ### Delta detection (no delta tables)
 
-Standard DuckDB tables use separate delta tables (`delta_<table>`) with a multiplicity
+Standard DuckDB tables use separate delta tables (`openivm_delta_<table>`) with a multiplicity
 column and timestamp. DuckLake tables don't need delta tables — DuckLake's built-in
 change tracking provides the same information natively.
 

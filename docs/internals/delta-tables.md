@@ -35,12 +35,12 @@ Delta rows are not removed immediately after a refresh: a base table's deltas ca
 
 When refreshing a MV, OpenIVM follows this sequence:
 
-1. **Scan delta tables.** Read rows from each `delta_<base_table>` where `openivm_timestamp >= last_refresh_timestamp`.
+1. **Scan delta tables.** Read rows from each `openivm_delta_<base_table>` where `openivm_timestamp >= last_refresh_timestamp`.
 2. **Compute the delta query.** Apply the view's incremental operator tree (filter, project, join, aggregate) to the delta rows. This produces the change to the materialized view — the "delta of the MV."
-3. **Write to delta view.** INSERT the computed delta rows into `delta_<view_name>` so that downstream chained views can consume them.
+3. **Write to delta view.** INSERT the computed delta rows into `openivm_delta_<view_name>` so that downstream chained views can consume them.
 4. **Upsert into the MV.** Apply the delta to the materialized view table using MERGE (grouped aggregates), counting-based INSERT/DELETE (projections), or single-row UPDATE (ungrouped aggregates). See the [operator docs](../operators/) for details on each strategy.
 5. **Clean up.** Advance the cursor in `openivm_delta_tables` and delete consumed delta rows. Two timestamps are bumped per `(view, table)`:
     - `last_update` is set to `MAX(openivm_timestamp) + 1µs` over rows visible in this transaction's snapshot — *not* `now()`. Using `now()` was unsafe because a row committed between transaction begin and snapshot read could end up with a timestamp ≤ `now()` while still being processed by the next refresh, double-applying it. Anchoring to `MAX(base_ts)+1µs` guarantees the next refresh's `ts ≥ last_update` filter both excludes everything we just processed and includes anything newer than our snapshot.
-    - `last_refresh_ts` is set to `now()` (transaction-start wall clock). This is used to filter `delta_<view>` companion rows produced by chained refreshes — companion rows carry timestamps near `now()` rather than base-row timestamps, so they need a separate cursor.
+    - `last_refresh_ts` is set to `now()` (transaction-start wall clock). This is used to filter `openivm_delta_<view>` companion rows produced by chained refreshes — companion rows carry timestamps near `now()` rather than base-row timestamps, so they need a separate cursor.
 
 For chained views, [companion rows](../optimizations/companion-rows.md) ensure downstream consumers see correct old-to-new state transitions. See [Pipelines](../refresh/pipelines.md) for cascade mode details.

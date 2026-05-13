@@ -26,7 +26,7 @@
 
 ## P3: Performance Evaluation
 
-- [ ] **IVM vs full recompute latency curves.** Measure refresh time at delta sizes 1%, 5%, 10%, 25%, 50% of base table for each operator type.
+- [ ] **Incremental refresh vs full recompute latency curves.** Measure refresh time at delta sizes 1%, 5%, 10%, 25%, 50% of base table for each operator type.
 - [ ] **Operator breakdown.** Profile where time is spent: delta scan, LPTS compilation, SQL generation, upsert execution. Identify bottlenecks.
 - [ ] **Chained MV overhead.** Measure the cost of companion row generation for 2-level and 3-level chains.
 - [ ] **Comparison with pg_ivm.** Run equivalent queries on PostgreSQL with pg_ivm to establish a baseline.
