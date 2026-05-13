@@ -1,11 +1,11 @@
-#include "match/mv_catalog_index.hpp"
+#include "match/view_catalog_index.hpp"
 
 namespace duckdb {
 namespace openivm {
 
-vector<MVCandidate> MVCatalogIndex::CandidatesForQuery(const vector<string> &query_source_tables,
-                                                       const vector<string> &query_group_columns,
-                                                       const vector<string> &query_output_columns) {
+vector<ViewCandidate> ViewCatalogIndex::CandidatesForQuery(const vector<string> &query_source_tables,
+                                                           const vector<string> &query_group_columns,
+                                                           const vector<string> &query_output_columns) {
 	(void)query_source_tables;
 	(void)query_group_columns;
 	(void)query_output_columns;
@@ -16,17 +16,17 @@ vector<MVCandidate> MVCatalogIndex::CandidatesForQuery(const vector<string> &que
 	return {};
 }
 
-void MVCatalogIndex::OnViewCreated(const string &view_name) {
+void ViewCatalogIndex::OnViewCreated(const string &view_name) {
 	(void)view_name;
 	dirty_ = true;
 }
 
-void MVCatalogIndex::OnViewDropped(const string &view_name) {
+void ViewCatalogIndex::OnViewDropped(const string &view_name) {
 	(void)view_name;
 	dirty_ = true;
 }
 
-void MVCatalogIndex::OnViewRefreshed(const string &view_name) {
+void ViewCatalogIndex::OnViewRefreshed(const string &view_name) {
 	(void)view_name;
 	// pending_row_estimate changes; tree structure unchanged.
 }

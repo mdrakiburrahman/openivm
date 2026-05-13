@@ -1,6 +1,6 @@
-// MV catalog index for fast view-matching candidate lookup.
+// view catalog index for fast view-matching candidate lookup.
 //
-// Goldstein-Larson §3.1 filter-tree implementation. Indexes registered MVs by
+// Goldstein-Larson §3.1 filter-tree implementation. Indexes registered views by
 // (source-table set, group-by columns, output columns) so the matcher can
 // prune the candidate set before doing full subsumption.
 //
@@ -11,15 +11,15 @@
 // Built lazily on first query; maintained on CREATE / DROP / REPLACE /
 // refresh events.
 
-#ifndef OPENIVM_MATCH_MV_CATALOG_INDEX_HPP
-#define OPENIVM_MATCH_MV_CATALOG_INDEX_HPP
+#ifndef OPENIVM_MATCH_VIEW_CATALOG_INDEX_HPP
+#define OPENIVM_MATCH_VIEW_CATALOG_INDEX_HPP
 
 #include "duckdb.hpp"
 
 namespace duckdb {
 namespace openivm {
 
-struct MVCandidate {
+struct ViewCandidate {
 	string view_name;
 	hash_t signature_hash = 0;
 	vector<string> source_tables;
@@ -27,13 +27,13 @@ struct MVCandidate {
 	int64_t pending_row_estimate = 0;
 };
 
-class MVCatalogIndex {
+class ViewCatalogIndex {
 public:
-	MVCatalogIndex() = default;
+	ViewCatalogIndex() = default;
 
-	vector<MVCandidate> CandidatesForQuery(const vector<string> &query_source_tables,
-	                                       const vector<string> &query_group_columns,
-	                                       const vector<string> &query_output_columns);
+	vector<ViewCandidate> CandidatesForQuery(const vector<string> &query_source_tables,
+	                                         const vector<string> &query_group_columns,
+	                                         const vector<string> &query_output_columns);
 
 	void OnViewCreated(const string &view_name);
 	void OnViewDropped(const string &view_name);

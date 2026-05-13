@@ -4105,7 +4105,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// native index.
 		if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
 		    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
-			add_profile_marker("create_mv_index", "columns=" + to_string(aggregate_columns.size()));
+			add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 			string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + openivm::INDEX_SUFFIX);
 			string index_query_view = "create unique index " + index_name + " on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
