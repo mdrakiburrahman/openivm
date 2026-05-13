@@ -6,7 +6,7 @@ require openivm
 
 # Explicit ordering — tests manage refresh order manually
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ============================================================
 # Two-level chain: table -> MV1 -> MV2
@@ -106,7 +106,7 @@ statement ok
 PRAGMA refresh('compact_proj');
 
 query I
-SELECT COUNT(*) FROM delta_compact_proj;
+SELECT COUNT(*) FROM openivm_delta_compact_proj;
 ----
 1
 
@@ -154,7 +154,7 @@ statement ok
 PRAGMA refresh('compact_cancel_proj');
 
 query I
-SELECT COUNT(*) FROM delta_compact_cancel_proj;
+SELECT COUNT(*) FROM openivm_delta_compact_cancel_proj;
 ----
 0
 
@@ -1122,7 +1122,7 @@ SELECT COUNT(*) FROM (
 statement ok
 CREATE TEMP TABLE ch_noop_l2_last_update AS
 SELECT last_update
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'ch_noop_l2';
 
 statement ok
@@ -1130,7 +1130,7 @@ PRAGMA refresh('ch_noop_l2');
 
 query I
 SELECT d.last_update = p.last_update
-FROM _duckdb_ivm_delta_tables d, ch_noop_l2_last_update p
+FROM openivm_delta_tables d, ch_noop_l2_last_update p
 WHERE d.view_name = 'ch_noop_l2';
 ----
 true

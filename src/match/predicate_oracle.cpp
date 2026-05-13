@@ -7,7 +7,7 @@ namespace ivm {
 
 PredicateOracle::PredicateOracle(ClientContext &context) : context_(context), oracle_mode_("interval") {
 	Value v;
-	if (context.TryGetCurrentSetting("ivm_predicate_oracle", v)) {
+	if (context.TryGetCurrentSetting("openivm_predicate_oracle", v)) {
 		auto s = v.ToString();
 		if (s == "syntactic" || s == "interval" || s == "sat") {
 			oracle_mode_ = s;

@@ -130,14 +130,14 @@ static string AppendFilterSQL(const string &predicate) {
 
 static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref, const string &delta_column,
                                  const JoinColumnRef &other_ref, const string &other_column) {
-	string delta_filter = delta_ref.get ? BuildPushedFilterSQL(*delta_ref.get, "_ivm_delta") : string();
-	string other_filter = other_ref.get ? BuildPushedFilterSQL(*other_ref.get, "_ivm_other") : string();
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("_ivm_delta", delta_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(delta_ref.delta_name) + " _ivm_delta WHERE " +
-	             QualifyColumn("_ivm_delta", ivm::TIMESTAMP_COL) + " >= '" +
+	string delta_filter = delta_ref.get ? BuildPushedFilterSQL(*delta_ref.get, "openivm_delta") : string();
+	string other_filter = other_ref.get ? BuildPushedFilterSQL(*other_ref.get, "openivm_other") : string();
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_delta", delta_column) +
+	             " AS openivm_key FROM " + OpenIVMUtils::QuoteIdentifier(delta_ref.delta_name) +
+	             " openivm_delta WHERE " + QualifyColumn("openivm_delta", ivm::TIMESTAMP_COL) + " >= '" +
 	             OpenIVMUtils::EscapeValue(delta_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(delta_filter) +
-	             ") _ivm_delta_keys JOIN " + OpenIVMUtils::QuoteIdentifier(other_ref.table_name) +
-	             " _ivm_other ON _ivm_delta_keys._ivm_key = " + QualifyColumn("_ivm_other", other_column) +
+	             ") openivm_delta_keys JOIN " + OpenIVMUtils::QuoteIdentifier(other_ref.table_name) +
+	             " openivm_other ON openivm_delta_keys.openivm_key = " + QualifyColumn("openivm_other", other_column) +
 	             (other_filter.empty() ? string() : " WHERE " + other_filter) + " LIMIT 1)";
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Key probe SQL: %s\n", sql.c_str());
 	auto result = con.Query(sql);
@@ -151,18 +151,18 @@ static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref
 
 static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref, const string &left_column,
                                   const JoinColumnRef &right_ref, const string &right_column) {
-	string left_filter = left_ref.get ? BuildPushedFilterSQL(*left_ref.get, "_ivm_left_delta") : string();
-	string right_filter = right_ref.get ? BuildPushedFilterSQL(*right_ref.get, "_ivm_right_delta") : string();
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("_ivm_left_delta", left_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(left_ref.delta_name) + " _ivm_left_delta WHERE " +
-	             QualifyColumn("_ivm_left_delta", ivm::TIMESTAMP_COL) + " >= '" +
+	string left_filter = left_ref.get ? BuildPushedFilterSQL(*left_ref.get, "openivm_left_delta") : string();
+	string right_filter = right_ref.get ? BuildPushedFilterSQL(*right_ref.get, "openivm_right_delta") : string();
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_left_delta", left_column) +
+	             " AS openivm_key FROM " + OpenIVMUtils::QuoteIdentifier(left_ref.delta_name) +
+	             " openivm_left_delta WHERE " + QualifyColumn("openivm_left_delta", ivm::TIMESTAMP_COL) + " >= '" +
 	             OpenIVMUtils::EscapeValue(left_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(left_filter) +
-	             ") _ivm_left_delta_keys JOIN (SELECT " + QualifyColumn("_ivm_right_delta", right_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(right_ref.delta_name) +
-	             " _ivm_right_delta WHERE " + QualifyColumn("_ivm_right_delta", ivm::TIMESTAMP_COL) + " >= '" +
+	             ") openivm_left_delta_keys JOIN (SELECT " + QualifyColumn("openivm_right_delta", right_column) +
+	             " AS openivm_key FROM " + OpenIVMUtils::QuoteIdentifier(right_ref.delta_name) +
+	             " openivm_right_delta WHERE " + QualifyColumn("openivm_right_delta", ivm::TIMESTAMP_COL) + " >= '" +
 	             OpenIVMUtils::EscapeValue(right_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(right_filter) +
-	             ") _ivm_right_delta_keys ON _ivm_left_delta_keys._ivm_key = "
-	             "_ivm_right_delta_keys._ivm_key LIMIT 1)";
+	             ") openivm_right_delta_keys ON openivm_left_delta_keys.openivm_key = "
+	             "openivm_right_delta_keys.openivm_key LIMIT 1)";
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Could not probe delta key-domain intersection: %s\n",
@@ -400,7 +400,7 @@ void DemoteLeftJoins(LogicalOperator *node) {
 // This subsumes the previous global demote conditions without over-demoting in
 // chained-LJ shapes. For FULL OUTER aggregate views the upsert MERGE relies on
 // the IE delta containing only the matched-via-Δ portion (the unmatched parts
-// are tracked separately via _ivm_match_count); failing to demote there would
+// are tracked separately via openivm_match_count); failing to demote there would
 // leak phantom unmatched rows for groups untouched by the delta.
 static bool SubtreeHasDeltaLeaf(const vector<JoinLeafInfo> &leaves, uint64_t mask, const vector<size_t> &prefix) {
 	for (size_t i = 0; i < leaves.size(); i++) {
@@ -680,7 +680,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	Value fk_pruning_val;
 	bool fk_pruning_enabled = true;
-	if (context.TryGetCurrentSetting("ivm_fk_pruning", fk_pruning_val) && !fk_pruning_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_fk_pruning", fk_pruning_val) && !fk_pruning_val.IsNull()) {
 		fk_pruning_enabled = fk_pruning_val.GetValue<bool>();
 	}
 	uint64_t skip_bits = 0;
@@ -700,7 +700,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	// A join with an empty input always produces zero rows.
 	Value skip_empty_val;
 	bool skip_empty_enabled = true;
-	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
 	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
@@ -1022,7 +1022,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	// Check if all leaves are DuckLake scans AND N-term telescoping is enabled.
 	bool all_ducklake = true;
 	Value nterm_val;
-	if (context.TryGetCurrentSetting("ivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull() &&
+	if (context.TryGetCurrentSetting("openivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull() &&
 	    !nterm_val.GetValue<bool>()) {
 		all_ducklake = false; // forced to inclusion-exclusion
 	} else {

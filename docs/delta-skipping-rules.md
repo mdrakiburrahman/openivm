@@ -1,6 +1,6 @@
 # Delta Skipping Rules
 
-`ivm_skip_empty_deltas` should gate all optimizations that prove a source delta
+`openivm_skip_empty_deltas` should gate all optimizations that prove a source delta
 cannot affect a refresh, or that a smaller equivalent delta can be used.
 
 ## 1. DuckLake Table No-Op Skip
@@ -42,7 +42,7 @@ term using that filtered delta is zero.
 ## 4. Unused-Right LEFT JOIN Rewrite
 
 Problem: for `A LEFT JOIN B ON ...` where `B` contributes no visible output
-columns, OpenIVM currently adds `_ivm_left_key` and recomputes all output rows for
+columns, OpenIVM currently adds `openivm_left_key` and recomputes all output rows for
 affected left keys. In TPC-DI `fact_market_history`, that key is `sk_company_id`,
 which is too coarse.
 

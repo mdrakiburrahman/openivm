@@ -34,20 +34,20 @@ UNION ALL is a **linear operator** — its incremental form is the same as the o
 ```sql
 -- Scan delta rows from the first UNION branch (US orders)
 WITH scan_0 (...) AS (
-    SELECT id, product, _duckdb_ivm_multiplicity
-    FROM delta_orders_us WHERE _duckdb_ivm_timestamp >= '...'
+    SELECT id, product, openivm_multiplicity
+    FROM openivm_delta_orders_us WHERE openivm_timestamp >= '...'
 ),
 -- Scan delta rows from the second UNION branch (EU orders)
 scan_2 (...) AS (
-    SELECT id, product, _duckdb_ivm_multiplicity
-    FROM delta_orders_eu WHERE _duckdb_ivm_timestamp >= '...'
+    SELECT id, product, openivm_multiplicity
+    FROM openivm_delta_orders_eu WHERE openivm_timestamp >= '...'
 ),
 -- Combine deltas from both branches — same as the original UNION ALL
 union_4 (...) AS (
     SELECT * FROM scan_0 UNION ALL SELECT * FROM scan_2
 )
 -- Write the combined delta into the delta view table
-INSERT INTO delta_all_orders (id, product, _duckdb_ivm_multiplicity)
+INSERT INTO openivm_delta_all_orders (id, product, openivm_multiplicity)
 SELECT * FROM union_4;
 ```
 
@@ -57,13 +57,13 @@ The UNION ALL delta is a projection (no aggregation), so the upsert uses the sam
 
 ```sql
 -- Compute the net change per distinct tuple across both branches
-WITH _ivm_net AS (
+WITH openivm_net AS (
     SELECT id, product,
-        SUM(_duckdb_ivm_multiplicity) AS _net
-    FROM delta_all_orders
-    WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
+        SUM(openivm_multiplicity) AS _net
+    FROM openivm_delta_all_orders
+    WHERE openivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, product
-    HAVING SUM(_duckdb_ivm_multiplicity) != 0
+    HAVING SUM(openivm_multiplicity) != 0
 )
 -- Delete net-removed copies
 DELETE FROM all_orders WHERE rowid IN (
@@ -71,24 +71,24 @@ DELETE FROM all_orders WHERE rowid IN (
         SELECT rowid, id, product,
             ROW_NUMBER() OVER (PARTITION BY id, product ORDER BY rowid) AS _rn
         FROM all_orders
-    ) v JOIN _ivm_net d
+    ) v JOIN openivm_net d
         ON v.id IS NOT DISTINCT FROM d.id
        AND v.product IS NOT DISTINCT FROM d.product
     WHERE d._net < 0 AND v._rn <= -d._net
 );
 
 -- Insert net-added copies
-WITH _ivm_net AS (
+WITH openivm_net AS (
     SELECT id, product,
-        SUM(_duckdb_ivm_multiplicity) AS _net
-    FROM delta_all_orders
-    WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
+        SUM(openivm_multiplicity) AS _net
+    FROM openivm_delta_all_orders
+    WHERE openivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, product
-    HAVING SUM(_duckdb_ivm_multiplicity) != 0
+    HAVING SUM(openivm_multiplicity) != 0
 )
 INSERT INTO all_orders SELECT id, product
-FROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)
-WHERE _ivm_net._net > 0;
+FROM openivm_net, generate_series(1, openivm_net._net::BIGINT)
+WHERE openivm_net._net > 0;
 ```
 
 ## Composability

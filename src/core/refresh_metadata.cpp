@@ -108,7 +108,7 @@ vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
 		auto delta_tables = GetDeltaTables(vn);
 		for (auto &dt : delta_tables) {
 			// Extract source MV name from delta table name.
-			// Standard: "delta_<source>", DuckLake: "_ivm_data_<source>"
+			// Standard: "delta_<source>", DuckLake: "openivm_data_<source>"
 			string source;
 			static const string delta_prefix(ivm::DELTA_PREFIX);
 			static const string data_prefix(ivm::DATA_TABLE_PREFIX);
@@ -129,8 +129,8 @@ vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
 }
 
 vector<string> IVMMetadata::GetDownstreamViews(const string &view_name) {
-	// Find all views that depend on delta_<view_name> or _ivm_data_<view_name> as a source.
-	// DuckLake chained MVs use _ivm_data_* (data table) instead of delta_* (delta table).
+	// Find all views that depend on delta_<view_name> or openivm_data_<view_name> as a source.
+	// DuckLake chained MVs use openivm_data_* (data table) instead of delta_* (delta table).
 	vector<string> result;
 	unordered_set<string> visited;
 

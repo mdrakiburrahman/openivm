@@ -622,7 +622,7 @@ CREATE MATERIALIZED VIEW dl.mv_hav_scalar AS
     JOIN dl.hav_customer c ON o.w = c.w AND o.d = c.d AND o.c = c.c;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_hav_scalar';
+SELECT type FROM openivm_views WHERE view_name = 'mv_hav_scalar';
 ----
 6
 
@@ -700,7 +700,7 @@ CREATE MATERIALIZED VIEW dl.mv_gr_distinct AS
     GROUP BY i.category;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_gr_distinct';
+SELECT type FROM openivm_views WHERE view_name = 'mv_gr_distinct';
 ----
 6
 

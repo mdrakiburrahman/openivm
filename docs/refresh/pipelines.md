@@ -24,7 +24,7 @@ This creates the chain: `sales` -> `region_totals` -> `top_regions` -> `top_regi
 
 ## Cascade modes
 
-The `ivm_cascade_refresh` setting controls how `PRAGMA refresh()` handles dependent views in a pipeline.
+The `openivm_cascade_refresh` setting controls how `PRAGMA refresh()` handles dependent views in a pipeline.
 
 | Mode | Behavior |
 |---|---|
@@ -38,7 +38,7 @@ The `ivm_cascade_refresh` setting controls how `PRAGMA refresh()` handles depend
 Each view is refreshed independently. The user must call `PRAGMA refresh()` in the correct order.
 
 ```sql
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 INSERT INTO sales VALUES ('east', 500);
 
@@ -53,7 +53,7 @@ PRAGMA refresh('top_region_count');
 Refreshing an upstream view automatically refreshes all views that depend on it.
 
 ```sql
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 INSERT INTO sales VALUES ('east', 500);
 
@@ -66,7 +66,7 @@ PRAGMA refresh('region_totals');
 Refreshing a downstream view first refreshes all ancestor views that feed into it, ensuring it sees the latest data.
 
 ```sql
-SET ivm_cascade_refresh = 'upstream';
+SET openivm_cascade_refresh = 'upstream';
 
 INSERT INTO sales VALUES ('east', 500);
 
@@ -79,7 +79,7 @@ PRAGMA refresh('top_region_count');
 Combines upstream and downstream: ancestors are refreshed first, then the target, then descendants.
 
 ```sql
-SET ivm_cascade_refresh = 'both';
+SET openivm_cascade_refresh = 'both';
 
 INSERT INTO sales VALUES ('east', 500);
 
@@ -108,4 +108,4 @@ CREATE MATERIALIZED VIEW chain_b AS
   SELECT region FROM base_summary WHERE cnt > 100;
 ```
 
-With `ivm_cascade_refresh = 'downstream'`, refreshing `base_summary` automatically refreshes both `chain_a` and `chain_b`.
+With `openivm_cascade_refresh = 'downstream'`, refreshing `base_summary` automatically refreshes both `chain_a` and `chain_b`.

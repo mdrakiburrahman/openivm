@@ -508,8 +508,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			}
 			// Drop orphaned data/delta tables from all catalogs
 			auto orphaned = con.Query("SELECT table_catalog, table_name FROM information_schema.tables "
-			                          "WHERE (table_name LIKE '_ivm_data_mv_q%' OR table_name LIKE 'delta_mv_q%'"
-			                          "    OR table_name LIKE 'ivm_delta_mv_q%') AND table_schema = 'main'");
+			                          "WHERE (table_name LIKE 'openivm_data_mv_q%' OR table_name LIKE "
+			                          "'openivm_delta_mv_q%') AND table_schema = 'main'");
 			if (orphaned && !orphaned->HasError()) {
 				for (idx_t r = 0; r < orphaned->RowCount(); r++) {
 					string cat = orphaned->GetValue(0, r).ToString();
@@ -518,8 +518,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				}
 			}
 			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM _duckdb_ivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM _duckdb_ivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
+			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
 		}
 
 		int delta_idx = 0;
@@ -644,7 +644,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
 						auto check_result = con.Query("SELECT type FROM " + native_catalog +
-						                              "._duckdb_ivm_views WHERE view_name = '" + mv_name + "'");
+						                              ".openivm_views WHERE view_name = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t ivm_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (ivm_type != 3) ? 1 : 0;

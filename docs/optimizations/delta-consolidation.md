@@ -18,14 +18,14 @@ Group by all projected columns and sum the (signed integer) multiplicity to get 
 
 ```sql
 -- Collapse multiple entries for the same tuple into a single net change
--- _duckdb_ivm_multiplicity is the signed Z-set weight: +1 for insertion, -1 for deletion
+-- openivm_multiplicity is the signed Z-set weight: +1 for insertion, -1 for deletion
 WITH consolidated AS (
     SELECT col1, col2, ...,
-        SUM(_duckdb_ivm_multiplicity) AS _net
-    FROM delta_table
-    WHERE _duckdb_ivm_timestamp >= '{ts}'
+        SUM(openivm_multiplicity) AS _net
+    FROM openivm_delta_table
+    WHERE openivm_timestamp >= '{ts}'
     GROUP BY col1, col2, ...
-    HAVING SUM(_duckdb_ivm_multiplicity) != 0
+    HAVING SUM(openivm_multiplicity) != 0
 )
 -- _net > 0: net insert (the tuple gained copies)
 -- _net < 0: net delete (the tuple lost copies)
@@ -58,11 +58,11 @@ Consolidation groups by (id, name, price):
 -- (1, Widget, 15): +1            = 1 → net insert
 WITH consolidated AS (
     SELECT id, name, price,
-        SUM(_duckdb_ivm_multiplicity) AS _net
-    FROM delta_products
-    WHERE _duckdb_ivm_timestamp >= '{ts}'
+        SUM(openivm_multiplicity) AS _net
+    FROM openivm_delta_products
+    WHERE openivm_timestamp >= '{ts}'
     GROUP BY id, name, price
-    HAVING SUM(_duckdb_ivm_multiplicity) != 0
+    HAVING SUM(openivm_multiplicity) != 0
 )
 -- Result: only (1, Widget, 15, _net=1) survives
 -- The old price (10) fully cancelled out — no wasted work
@@ -77,9 +77,9 @@ Group by the aggregation keys and fold the value by multiplying the column by th
 -- This produces one row per group key, ready for MERGE into the view.
 WITH consolidated AS (
     SELECT key1, key2,
-           SUM(_duckdb_ivm_multiplicity * agg_val) AS _net_val
-    FROM delta_table
-    WHERE _duckdb_ivm_timestamp >= '{ts}'
+           SUM(openivm_multiplicity * agg_val) AS _net_val
+    FROM openivm_delta_table
+    WHERE openivm_timestamp >= '{ts}'
     GROUP BY key1, key2
 )
 -- Each row is a single signed delta: positive means the group's aggregate increased,
@@ -95,7 +95,7 @@ spurious net insert or net delete. To prevent that, the insert rule emits both r
 **single multi-row INSERT** with `UNION ALL` (sharing one transaction and one `now()`):
 
 ```sql
-INSERT INTO delta_t (..., _duckdb_ivm_multiplicity, _duckdb_ivm_timestamp)
+INSERT INTO openivm_delta_t (..., openivm_multiplicity, openivm_timestamp)
 SELECT * FROM (... old row select with mul=-1 ...)
 UNION ALL
 SELECT * FROM (... new row select with mul=+1 ...);

@@ -72,15 +72,15 @@ STALE_RES = (
 	"    SELECT o_region, revenue, cnt FROM mv_b "
 	"    UNION ALL "
 	"    SELECT o.o_region, "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 	"                    ELSE -dl.l_qty*dl.l_price END), "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) "
-	"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) "
+	"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 	"    GROUP BY o.o_region "
 	") x GROUP BY o_region;"
 )
 CASCADE = (
-	"SET ivm_cascade_refresh='downstream';\n"
+	"SET openivm_cascade_refresh='downstream';\n"
 	"PRAGMA refresh('mv_a');\n"
 )
 
@@ -138,15 +138,15 @@ def scenario_hybrid(db: str, n_queries: int) -> float:
 	return time.perf_counter() - start
 
 
-def one_run(n_orders: int, avg_li: int, delta_fraction: float, n_queries: int, strategy: str) -> float:
+def one_run(n_orders: int, avg_li: int, openivm_delta_fraction: float, n_queries: int, strategy: str) -> float:
 	n_lineitem = n_orders * avg_li
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
 		out, err, rc = run_sql(db, setup(n_orders, avg_li))
 		if rc != 0:
 			raise RuntimeError(f"setup: {err}")
-		delta_rows = max(1, int(n_lineitem * delta_fraction))
-		run_sql(db, insert_delta_sql(n_lineitem, delta_rows, n_orders))
+		openivm_delta_rows = max(1, int(n_lineitem * openivm_delta_fraction))
+		run_sql(db, insert_delta_sql(n_lineitem, openivm_delta_rows, n_orders))
 		if strategy == "bypass_N":
 			return scenario_bypass_N(db, n_queries)
 		elif strategy == "cascade_once_N":

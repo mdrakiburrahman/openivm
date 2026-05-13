@@ -39,7 +39,7 @@ SELECT * FROM dl.product_summary ORDER BY pname;
 ### Detection
 
 OpenIVM automatically detects DuckLake tables at view creation time. When a base table
-is backed by a DuckLake catalog, its entry in `_duckdb_ivm_delta_tables` is stored with
+is backed by a DuckLake catalog, its entry in `openivm_delta_tables` is stored with
 `catalog_type = 'ducklake'`. No user configuration is needed — DuckLake-specific
 optimizations activate automatically.
 
@@ -53,7 +53,7 @@ OpenIVM reads rows inserted and deleted between two snapshots directly from Duck
 Insertions get multiplicity `true`; deletions get multiplicity `false`. This produces
 the same delta format as standard delta tables but without maintaining a separate copy.
 
-The last-refreshed snapshot ID is stored in `_duckdb_ivm_delta_tables` and updated
+The last-refreshed snapshot ID is stored in `openivm_delta_tables` and updated
 after each refresh. The next refresh reads changes between the stored snapshot and the
 current one.
 
@@ -84,7 +84,7 @@ This is algebraically equivalent to inclusion-exclusion but avoids the exponenti
 | 4 | 15 | 4 |
 | 5 | 31 | 5 |
 
-N-term telescoping can be disabled with `SET ivm_ducklake_nterm = false`, which falls
+N-term telescoping can be disabled with `SET openivm_ducklake_nterm = false`, which falls
 back to the standard 2^N - 1 inclusion-exclusion rule (also works with DuckLake tables).
 
 ### Empty-delta term skipping

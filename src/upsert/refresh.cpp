@@ -168,14 +168,14 @@ static string BuildFullOuterAffectedGroupsSubquery(IVMMetadata &metadata, const 
 			}
 			string q_delta = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(delta_table);
 			changed_keys += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(join_col) +
-			                " AS _ivm_foj_key FROM " + q_delta + where_clause;
+			                " AS openivm_foj_key FROM " + q_delta + where_clause;
 		};
 		append_changed_keys(foj.dt_left_name, foj.left_col, delta_where_left);
 		append_changed_keys(foj.dt_right_name, foj.right_col, delta_where_right);
 		if (!changed_keys.empty()) {
 			affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM (" + view_query_sql +
-			            ") _ivm_foj_groups WHERE _ivm_foj_groups." + key_col + " IN (SELECT _ivm_foj_key FROM (\n  " +
-			            changed_keys + "\n  ) _ivm_changed_foj_keys)";
+			            ") openivm_foj_groups WHERE openivm_foj_groups." + key_col +
+			            " IN (SELECT openivm_foj_key FROM (\n  " + changed_keys + "\n  ) openivm_changed_foj_keys)";
 		}
 	}
 
@@ -473,7 +473,7 @@ static string BuildFullOuterProjectionRefresh(IVMMetadata &metadata, const strin
 	string rk = KeywordHelper::WriteOptionallyQuoted(string(ivm::RIGHT_KEY_COL));
 
 	auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
-	// DuckLake base tables lack `_duckdb_ivm_timestamp` — drop the ts filter when the
+	// DuckLake base tables lack `openivm_timestamp` — drop the ts filter when the
 	// delta source is a DuckLake base (delta_table_names stores the base name itself).
 	bool dt_left_is_ducklake = !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
 	bool dt_right_is_ducklake = !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
@@ -498,14 +498,14 @@ static string BuildFullOuterProjectionRefresh(IVMMetadata &metadata, const strin
 	string where_clause;
 	string affected_ctes;
 	if (!union_parts.empty()) {
-		affected_ctes = "WITH _ivm_affected AS (\n  " + union_parts + "\n)\n";
-		where_clause = lk + " IN (SELECT _k FROM _ivm_affected) OR " + rk + " IN (SELECT _k FROM _ivm_affected)";
+		affected_ctes = "WITH openivm_affected AS (\n  " + union_parts + "\n)\n";
+		where_clause = lk + " IN (SELECT _k FROM openivm_affected) OR " + rk + " IN (SELECT _k FROM openivm_affected)";
 	} else {
 		where_clause = "TRUE";
 	}
 
 	return affected_ctes + "DELETE FROM " + data_table + " WHERE " + where_clause + ";\n" + affected_ctes +
-	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_foj\nWHERE " + where_clause +
+	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_foj\nWHERE " + where_clause +
 	       ";\n";
 }
 
@@ -517,8 +517,8 @@ static string BuildLeftJoinProjectionRefresh(const string &view_name, const stri
 	string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
 	string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
 	return "DELETE FROM " + data_table + " WHERE " + affected + data_table + "." + lk + delta_where + ");\n" +
-	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_lj\nWHERE " + affected +
-	       "_ivm_lj." + lk + delta_where + ");\n";
+	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_lj\nWHERE " + affected +
+	       "openivm_lj." + lk + delta_where + ");\n";
 }
 
 static string CompileProjectionRefresh(IVMMetadata &metadata, const string &view_name,
@@ -994,11 +994,12 @@ public:
 	    : enabled(false), retention_days(31), view_name(std::move(view_name_p)), next_step(0),
 	      total_start(std::chrono::steady_clock::now()) {
 		Value profile_val;
-		enabled = context.TryGetCurrentSetting("ivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
+		enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
 		          profile_val.GetValue<bool>();
 		if (enabled) {
 			Value retention_val;
-			if (context.TryGetCurrentSetting("ivm_profile_retention_days", retention_val) && !retention_val.IsNull()) {
+			if (context.TryGetCurrentSetting("openivm_profile_retention_days", retention_val) &&
+			    !retention_val.IsNull()) {
 				retention_days = std::max<int64_t>(0, retention_val.GetValue<int64_t>());
 			}
 			auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -1064,7 +1065,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
                                  string *out_pre_meta = nullptr, string *out_post_meta = nullptr);
 
 // Generate and execute refresh SQL for a single view under its per-view lock.
-// When ivm_adaptive_refresh is on, also computes a cost estimate before execution
+// When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
 static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
@@ -1100,7 +1101,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		bool record_history = false;
 		IVMCostEstimate cost_estimate = {};
 		Value adaptive_val;
-		if (context.TryGetCurrentSetting("ivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull() &&
+		if (context.TryGetCurrentSetting("openivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull() &&
 		    adaptive_val.GetValue<bool>()) {
 			auto adaptive_start = std::chrono::steady_clock::now();
 			// Compute cost estimate before refresh (for history recording).
@@ -1243,7 +1244,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			auto history_start = std::chrono::steady_clock::now();
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 			// Determine which method was used. Priority:
-			//   1) `ivm_refresh_mode = 'full'` overrides everything → "full".
+			//   1) `openivm_refresh_mode = 'full'` overrides everything → "full".
 			//   2) `cost_estimate.strategy_label` if set (group_recompute, window_partition).
 			//      For these fixed-strategy views the IVM-vs-full decision never fires.
 			//   3) For "incremental" views, the adaptive cost model may have picked full recompute.
@@ -1252,7 +1253,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 				method = "full";
 			}
 			Value mode_val;
-			if (context.TryGetCurrentSetting("ivm_refresh_mode", mode_val) && !mode_val.IsNull()) {
+			if (context.TryGetCurrentSetting("openivm_refresh_mode", mode_val) && !mode_val.IsNull()) {
 				auto mode = StringUtil::Lower(mode_val.ToString());
 				if (mode == "full") {
 					method = "full";
@@ -1353,7 +1354,7 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	}
 
 	// cross_system detection: the view's catalog differs from the fresh connection's physical
-	// default. Metadata tables (_duckdb_ivm_views etc.) live in the physical default; data/view
+	// default. Metadata tables (openivm_views etc.) live in the physical default; data/view
 	// tables live in view_catalog_name. DuckDB forbids cross-catalog writes in one transaction,
 	// so RefreshViewLocked must split the refresh SQL into data ops and metadata ops.
 	if (!view_catalog_name.empty()) {
@@ -1371,7 +1372,7 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	// Check cascade mode
 	string cascade_mode = "downstream";
 	Value cascade_val;
-	if (context.TryGetCurrentSetting("ivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
 		cascade_mode = StringUtil::Lower(cascade_val.ToString());
 	}
 
@@ -1395,7 +1396,7 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	// our delta tables before we check.
 	Value skip_empty_val;
 	bool skip_empty_enabled = true;
-	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
 	if (skip_empty_enabled) {
@@ -1435,7 +1436,7 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					                   OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
 					                   OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
 					                   OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-					                   to_string(ducklake_current_snap) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)");
+					                   to_string(ducklake_current_snap) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)");
 					if (has_changes->HasError() || has_changes->RowCount() == 0 ||
 					    has_changes->GetValue(0, 0).IsNull() || has_changes->GetValue(0, 0).GetValue<bool>()) {
 						all_empty = false;
@@ -1477,7 +1478,7 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	string hook_sql;
 	string hook_mode;
 	{
-		auto hook_r = con.Query("SELECT hook_sql, mode FROM _duckdb_ivm_refresh_hooks WHERE view_name = '" +
+		auto hook_r = con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks WHERE view_name = '" +
 		                        OpenIVMUtils::EscapeValue(view_name) + "'");
 		if (!hook_r->HasError() && hook_r->RowCount() > 0) {
 			hook_sql = hook_r->GetValue(0, 0).ToString();
@@ -1530,11 +1531,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	Connection con(*context.db.get());
 	Value skip_empty_val;
 	bool skip_empty_enabled = true;
-	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
 	// Catalog-qualified prefix for OpenIVM internal state. DuckLake-targeted MVs store
-	// _ivm_data_* and delta_<mv> in DuckLake so initial load and refresh data writes use
+	// openivm_data_* and delta_<mv> in DuckLake so initial load and refresh data writes use
 	// the same storage path as DuckLake CTAS. Metadata remains in the physical default DB.
 	string default_db;
 	string default_schema = "main";
@@ -1621,22 +1622,22 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// HAVING needs recompute because groups may enter/leave the result set after aggregate changes.
 	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
 	// HAVING needs recompute because groups may enter/leave the result set.
-	// LEFT JOIN aggregates: group-recompute unless ivm_left_join_merge is on (Larson & Zhou).
-	// FULL OUTER JOIN aggregates: group-recompute unless ivm_full_outer_merge is on (Zhang & Larson).
+	// LEFT JOIN aggregates: group-recompute unless openivm_left_join_merge is on (Larson & Zhou).
+	// FULL OUTER JOIN aggregates: group-recompute unless openivm_full_outer_merge is on (Zhang & Larson).
 	bool source_has_left_join = metadata.HasLeftJoin(view_name);
 	// Only query has_full_outer when the view has an outer join (avoids extra SQL for INNER-only views)
 	bool source_has_full_outer = source_has_left_join && metadata.HasFullOuter(view_name);
 	bool left_join_merge = false;
 	Value lj_merge_val;
 	if (source_has_left_join && !source_has_full_outer) {
-		if (context.TryGetCurrentSetting("ivm_left_join_merge", lj_merge_val) && !lj_merge_val.IsNull()) {
+		if (context.TryGetCurrentSetting("openivm_left_join_merge", lj_merge_val) && !lj_merge_val.IsNull()) {
 			left_join_merge = lj_merge_val.GetValue<bool>();
 		}
 	}
 	bool full_outer_merge = false;
 	if (source_has_full_outer) {
 		Value foj_merge_val;
-		if (context.TryGetCurrentSetting("ivm_full_outer_merge", foj_merge_val) && !foj_merge_val.IsNull()) {
+		if (context.TryGetCurrentSetting("openivm_full_outer_merge", foj_merge_val) && !foj_merge_val.IsNull()) {
 			full_outer_merge = foj_merge_val.GetValue<bool>();
 		}
 	}
@@ -1644,10 +1645,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	                  (source_has_left_join && !source_has_full_outer && !left_join_merge) ||
 	                  (source_has_full_outer && !full_outer_merge);
 
-	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
+	// Check openivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;
 	bool force_full_refresh = false;
-	if (context.TryGetCurrentSetting("ivm_refresh_mode", refresh_mode_val) && !refresh_mode_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_refresh_mode", refresh_mode_val) && !refresh_mode_val.IsNull()) {
 		auto mode = StringUtil::Lower(refresh_mode_val.ToString());
 		if (mode == "full") {
 			force_full_refresh = true;
@@ -1660,10 +1661,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	}
 
 	// Adaptive cost model (experimental): estimate IVM vs full recompute cost.
-	// Gated by ivm_adaptive_refresh setting (default off — always use IVM).
+	// Gated by openivm_adaptive_refresh setting (default off — always use IVM).
 	Value ivm_adaptive_val;
 	bool ivm_adaptive = false;
-	if (context.TryGetCurrentSetting("ivm_adaptive_refresh", ivm_adaptive_val) && !ivm_adaptive_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_adaptive_refresh", ivm_adaptive_val) && !ivm_adaptive_val.IsNull()) {
 		ivm_adaptive = ivm_adaptive_val.GetValue<bool>();
 	}
 	if (ivm_adaptive) {
@@ -1724,7 +1725,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Check if the delta view has a timestamp column (present when created via CREATE MATERIALIZED VIEW)
 	bool has_ts_col =
 	    std::find(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)) != column_names.end();
-	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support).
+	// Remove openivm_timestamp — it's auto-filled by DEFAULT (for chained MV support).
 	// Keep column_names and column_types aligned: drop the type at the same position.
 	auto it = std::find(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL));
 	if (it != column_names.end()) {
@@ -1750,10 +1751,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// here would under-filter and let prior companion rows get re-processed.
 	string delta_ts_filter = BuildDeltaTimestampFilter(con, view_name, has_ts_col);
 
-	// Detect LEFT JOIN: the parser adds _ivm_left_key as a hidden column for LEFT/RIGHT JOIN views.
+	// Detect LEFT JOIN: the parser adds openivm_left_key as a hidden column for LEFT/RIGHT JOIN views.
 	// If the MV has this column, use it for the partial recompute filter.
 	bool has_left_join = std::find(column_names.begin(), column_names.end(), ivm::LEFT_KEY_COL) != column_names.end();
-	// Detect FULL OUTER JOIN: the parser also adds _ivm_right_key for bidirectional recompute.
+	// Detect FULL OUTER JOIN: the parser also adds openivm_right_key for bidirectional recompute.
 	bool has_full_outer = std::find(column_names.begin(), column_names.end(), ivm::RIGHT_KEY_COL) != column_names.end();
 	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d has_full_outer=%d\n", has_left_join, has_full_outer);
 
@@ -1869,15 +1870,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	bool skip_agg_delete = insert_only;
 	bool skip_proj_delete = insert_only;
 	bool minmax_incremental = insert_only;
-	if (context.TryGetCurrentSetting("ivm_skip_aggregate_delete", skip_agg_del_val) && !skip_agg_del_val.IsNull() &&
+	if (context.TryGetCurrentSetting("openivm_skip_aggregate_delete", skip_agg_del_val) && !skip_agg_del_val.IsNull() &&
 	    !skip_agg_del_val.GetValue<bool>()) {
 		skip_agg_delete = false;
 	}
-	if (context.TryGetCurrentSetting("ivm_skip_projection_delete", skip_proj_del_val) && !skip_proj_del_val.IsNull() &&
-	    !skip_proj_del_val.GetValue<bool>()) {
+	if (context.TryGetCurrentSetting("openivm_skip_projection_delete", skip_proj_del_val) &&
+	    !skip_proj_del_val.IsNull() && !skip_proj_del_val.GetValue<bool>()) {
 		skip_proj_delete = false;
 	}
-	if (context.TryGetCurrentSetting("ivm_minmax_incremental", minmax_incr_val) && !minmax_incr_val.IsNull() &&
+	if (context.TryGetCurrentSetting("openivm_minmax_incremental", minmax_incr_val) && !minmax_incr_val.IsNull() &&
 	    !minmax_incr_val.GetValue<bool>()) {
 		minmax_incremental = false;
 	}
@@ -1885,7 +1886,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	                    insert_only, skip_agg_delete, skip_proj_delete, minmax_incremental);
 
 	// All DML (INSERT, DELETE, UPDATE, MERGE) targets the physical data table,
-	// not the user-facing VIEW which excludes internal _ivm_* columns.
+	// not the user-facing VIEW which excludes internal openivm_* columns.
 	// The compile functions receive view_name and compute data_table internally.
 	// GROUP BY columns: from index (standard) or metadata (DuckLake fallback).
 	auto group_cols = metadata.GetGroupColumns(view_name);
@@ -1897,12 +1898,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", IVMTypeName(view_query_type));
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
-		// When ivm_having_merge is enabled, the data table stores ALL groups (HAVING filter
+		// When openivm_having_merge is enabled, the data table stores ALL groups (HAVING filter
 		// is in the VIEW). Use standard MERGE — same as AGGREGATE_GROUP.
 		// When disabled, fall back to group-recompute (has_minmax=true forces delete+re-insert).
 		Value having_merge_val;
 		bool having_merge = true;
-		if (context.TryGetCurrentSetting("ivm_having_merge", having_merge_val) && !having_merge_val.IsNull()) {
+		if (context.TryGetCurrentSetting("openivm_having_merge", having_merge_val) && !having_merge_val.IsNull()) {
 			having_merge = having_merge_val.GetValue<bool>();
 		}
 		if (having_merge) {
@@ -1925,10 +1926,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			// join keys. Matching uses IS NOT DISTINCT FROM so NULL-padded groups are covered.
 			upsert_query = BuildFullOuterAffectedGroupRefresh(metadata, view_name, delta_table_names, group_cols,
 			                                                  data_table, view_query_sql, delta_ts_filter,
-			                                                  internal_catalog_prefix, "_ivm_recompute");
+			                                                  internal_catalog_prefix, "openivm_recompute");
 		} else if (source_has_full_outer && full_outer_merge) {
 			// Zhang & Larson MERGE for FULL OUTER JOIN aggregates:
-			// Phase 1: MERGE handles matched-row changes via _ivm_match_count
+			// Phase 1: MERGE handles matched-row changes via openivm_match_count
 			//          (same as LEFT JOIN MERGE — INNER-demoted delta view)
 			// Phase 2: Recompute groups affected by UNMATCHED changes
 			//          (left delta table + right→left join key mapping + NULL group)
@@ -1942,7 +1943,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			// Phase 2: recompute groups affected by unmatched/full-outer transfers.
 			upsert_query += BuildFullOuterAffectedGroupRefresh(metadata, view_name, delta_table_names, group_cols,
 			                                                   data_table, view_query_sql, delta_ts_filter,
-			                                                   internal_catalog_prefix, "_ivm_unmatched");
+			                                                   internal_catalog_prefix, "openivm_unmatched");
 		} else {
 			// Standard path: MIN/MAX group-recompute or incremental MERGE
 			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
@@ -2022,7 +2023,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 		}
 		// For DuckLake base tables the delta source isn't a `delta_<T>` twin with
-		// `_duckdb_ivm_timestamp` — the delta_table_names entry is the DuckLake base name
+		// `openivm_timestamp` — the delta_table_names entry is the DuckLake base name
 		// itself. Build the affected-partition filter via DuckLake snapshot diff instead:
 		// symmetric difference between current and last_snapshot_id.
 		bool any_ducklake = false;
@@ -2093,10 +2094,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				    "(" + affected_tuple + ") IN (SELECT " + affected_cols + " FROM " + qtemp_affected + ")";
 			}
 			upsert_query = "CREATE TEMP TABLE " + qtemp_affected + " AS SELECT DISTINCT " + affected_cols + " FROM ((" +
-			               insertions + ") UNION ALL (" + deletions + ")) _ivm_changed_partitions;\n";
+			               insertions + ") UNION ALL (" + deletions + ")) openivm_changed_partitions;\n";
 			upsert_query += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
 			upsert_query += "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
-			                ") _ivm_recompute\nWHERE " + affected_filter + ";\n";
+			                ") openivm_recompute\nWHERE " + affected_filter + ";\n";
 			upsert_query += "DROP TABLE " + qtemp_affected + ";\n";
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake change-feed, %zu "
 			                    "partition cols, old_snap=%ld, current_snap=%ld)\n",
@@ -2117,11 +2118,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				key_cols += output_col;
 				key_tuple += output_col;
 			}
-			string current_rows = "SELECT * FROM (" + view_query_sql + ") _ivm_current_rows";
-			string old_rows = "SELECT * FROM (" + old_view_query + ") _ivm_old_rows";
+			string current_rows = "SELECT * FROM (" + view_query_sql + ") openivm_current_rows";
+			string old_rows = "SELECT * FROM (" + old_view_query + ") openivm_old_rows";
 			string changed_rows = "((" + current_rows + ") EXCEPT ALL (" + old_rows + ")) UNION ALL ((" + old_rows +
 			                      ") EXCEPT ALL (" + current_rows + "))";
-			string affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") _ivm_changed_rows";
+			string affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") openivm_changed_rows";
 			string affected_filter;
 			if (partition_cols.size() == 1) {
 				affected_filter = key_tuple + " IN (" + affected_keys + ")";
@@ -2129,7 +2130,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				affected_filter = "(" + key_tuple + ") IN (" + affected_keys + ")";
 			}
 			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n" + "INSERT INTO " +
-			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
+			               data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_recompute\nWHERE " +
 			               affected_filter + ";\n";
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 			                    "partition cols, %zu sources)\n",
@@ -2154,8 +2155,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// time (aux_table, distinct_cols, source/filter, single-SUM spec) and emits a
 		// multi-statement batch:
 		//   1) Δinput temp table (per-distinct-tuple net multiplicity from source delta)
-		//   2) MERGE Δagg into _ivm_data_<view> (Δdistinct = ±1 transitions × sum_arg)
-		//   3) DELETE rows whose _ivm_count_star fell to 0
+		//   2) MERGE Δagg into openivm_data_<view> (Δdistinct = ±1 transitions × sum_arg)
+		//   3) DELETE rows whose openivm_count_star fell to 0
 		//   4) MERGE Δinput into the aux table; DELETE rows with _count ≤ 0
 		// If metadata is missing (older view created before this column landed) we fall
 		// through to GROUP_RECOMPUTE so the view still refreshes correctly.
@@ -2368,17 +2369,17 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// recompute of the MV — semantically correct, slower, but safe. Without
 		// this fallback the whole PRAGMA refresh() call would surface "Invalid Error:
 		// map::at" and the user gets a cryptic crash instead of a working refresh.
-		string raw_ivm_sql;
+		string raw_refresh_sql;
 		if (IsEmptyDeltaPlan(plan.get())) {
-			raw_ivm_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types);
+			raw_refresh_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Delta plan is empty; generated no-op delta insert for '%s'\n",
 			                    view_name.c_str());
 		} else {
 			try {
 				auto ast = LogicalPlanToAst(con_ctx, plan);
 				auto cte_list = AstToCteList(*ast);
-				raw_ivm_sql = cte_list->ToQuery(false);
-				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
+				raw_refresh_sql = cte_list->ToQuery(false);
+				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_refresh_sql.c_str());
 			} catch (const std::exception &e) {
 				Printer::Print("Warning: materialized view '" + view_name +
 				               "' uses constructs not supported by IVM's SQL serializer (" + e.what() +
@@ -2391,15 +2392,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 		}
 
-		// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
+		// Use explicit column list in INSERT INTO delta_view, excluding openivm_timestamp
 		// so the DEFAULT now() fills it in (for chained MV support)
 		string insert_target_bare = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name);
-		auto insert_pos = raw_ivm_sql.find(insert_target_bare);
+		auto insert_pos = raw_refresh_sql.find(insert_target_bare);
 		if (insert_pos != string::npos) {
 			// Replace bare delta table name with catalog-qualified version
 			if (!internal_catalog_prefix.empty()) {
-				raw_ivm_sql.replace(insert_pos, insert_target_bare.size(), "INSERT INTO " + delta_view_name);
-				insert_pos = raw_ivm_sql.find("INSERT INTO " + delta_view_name);
+				raw_refresh_sql.replace(insert_pos, insert_target_bare.size(), "INSERT INTO " + delta_view_name);
+				insert_pos = raw_refresh_sql.find("INSERT INTO " + delta_view_name);
 			}
 			string col_list = "(";
 			for (size_t i = 0; i < column_names.size(); i++) {
@@ -2410,9 +2411,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 			col_list += ") ";
 			string full_insert = "INSERT INTO " + delta_view_name;
-			raw_ivm_sql.insert(insert_pos + full_insert.size(), " " + col_list);
+			raw_refresh_sql.insert(insert_pos + full_insert.size(), " " + col_list);
 		}
-		ivm_query += raw_ivm_sql;
+		ivm_query += raw_refresh_sql;
 
 		if (has_downstream && view_query_type == IVMType::SIMPLE_AGGREGATE) {
 			build_snapshot_companion();
@@ -2475,7 +2476,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
 	// example: if two views A and B are on the same table T, we can only remove tuples from T
 	// if both A and B have been refreshed (up to some timestamp)
-	// to check this, we extract the minimum timestamp from _duckdb_ivm_delta_tables
+	// to check this, we extract the minimum timestamp from openivm_delta_tables
 	string delete_from_delta_table_query;
 	// CONCURRENCY-SAFE TIMESTAMP ADVANCE:
 	// The next refresh's delta-scan filter uses `ts >= last_update`. If we set
@@ -2508,7 +2509,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string update_timestamp_query;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
-			// DuckLake doesn't use _duckdb_ivm_timestamp; keep now() semantics.
+			// DuckLake doesn't use openivm_timestamp; keep now() semantics.
 			update_timestamp_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
 			                          " SET last_update = now(), last_refresh_ts = now() WHERE view_name = '" +
 			                          OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
@@ -2601,11 +2602,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		clean_query = meta_pre_sql + data_sql + meta_post_sql;
 	}
 
-	// Write reference SQL to disk only if ivm_files_path is explicitly set
+	// Write reference SQL to disk only if openivm_files_path is explicitly set
 	Value files_path_val;
-	if (context.TryGetCurrentSetting("ivm_files_path", files_path_val) && !files_path_val.IsNull()) {
-		string ivm_file_path = files_path_val.ToString() + "/ivm_upsert_queries_" + view_name + ".sql";
-		duckdb::OpenIVMUtils::WriteFile(ivm_file_path, false, clean_query);
+	if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
+		string refresh_file_path = files_path_val.ToString() + "/openivm_upsert_queries_" + view_name + ".sql";
+		duckdb::OpenIVMUtils::WriteFile(refresh_file_path, false, clean_query);
 	}
 
 	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", clean_query.c_str());

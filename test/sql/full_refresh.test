@@ -5,7 +5,7 @@
 require openivm
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ============================================================
 # Setup
@@ -57,7 +57,7 @@ CREATE MATERIALIZED VIEW mv_unnest_values AS
 SELECT unnest(['BC', 'GC']) AS credit_type;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_unnest_values';
+SELECT type FROM openivm_views WHERE view_name = 'mv_unnest_values';
 ----
 2
 
@@ -89,7 +89,7 @@ EXCEPT ALL
 SELECT a, b FROM t1;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_except_all';
+SELECT type FROM openivm_views WHERE view_name = 'mv_except_all';
 ----
 3
 

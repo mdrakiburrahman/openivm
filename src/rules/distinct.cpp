@@ -32,7 +32,7 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 
 	// 2. Build a LOGICAL_AGGREGATE_AND_GROUP_BY that replaces the DISTINCT node.
 	// Group-by keys = all child columns EXCEPT multiplicity
-	// Aggregate = COUNT(*) as _ivm_distinct_count
+	// Aggregate = COUNT(*) as openivm_distinct_count
 	// Multiplicity is added as a group-by key (same as IvmAggregateRule)
 	idx_t group_index = binder.GenerateTableIndex();
 	idx_t aggregate_index = binder.GenerateTableIndex();

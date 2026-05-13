@@ -5,7 +5,7 @@
 require openivm
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ============================================================
 # Setup
@@ -598,7 +598,7 @@ SELECT COUNT(*) FROM (
 
 # ==========================================
 # LEFT JOIN aggregate: incremental MERGE (Larson & Zhou)
-# Tests NULL↔value transitions with _ivm_match_count
+# Tests NULL↔value transitions with openivm_match_count
 # ==========================================
 
 statement ok
@@ -715,7 +715,7 @@ SELECT count(*) FROM (
 
 # --- Fallback: disable flag, should use group-recompute ---
 statement ok
-SET ivm_left_join_merge = false;
+SET openivm_left_join_merge = false;
 
 statement ok
 INSERT INTO lj_ord VALUES (8,3,100);
@@ -733,7 +733,7 @@ SELECT count(*) FROM (
 0
 
 statement ok
-SET ivm_left_join_merge = true;
+SET openivm_left_join_merge = true;
 
 # --- COUNT(*) on unmatched groups survives no-op UPDATE (q0059 regression) ---
 # Bug: the LJ MERGE applied `CASE mc_new > 0 THEN update ELSE null_val` to
@@ -916,7 +916,7 @@ SELECT count(*) FROM (SELECT c.cid, COUNT(*), SUM(COALESCE(h.hamt, 0))::DECIMAL(
 # Multi-LEFT-JOIN cascade: deeper-right delta must propagate
 # (regression — pre-fix the global DemoteLeftJoins collapsed
 # every LJ in the IE term to INNER, so a Δ in the rightmost
-# table never reached _ivm_left_key for keys whose intermediate
+# table never reached openivm_left_key for keys whose intermediate
 # LJ produced NULL — the affected rows stayed stale.)
 # ============================================================
 

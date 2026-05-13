@@ -31,13 +31,13 @@ CREATE MATERIALIZED VIEW dl.mv_snap AS SELECT grp, SUM(val) as total, COUNT(*) a
 
 # Snapshot should be set after CREATE MV
 query I
-SELECT last_snapshot_id IS NOT NULL FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT last_snapshot_id IS NOT NULL FROM openivm_delta_tables WHERE view_name = 'mv_snap';
 ----
 true
 
 # Record the initial snapshot (value varies, just check it's positive)
 query I
-SELECT last_snapshot_id > 0 FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT last_snapshot_id > 0 FROM openivm_delta_tables WHERE view_name = 'mv_snap';
 ----
 true
 
@@ -46,14 +46,14 @@ INSERT INTO dl.snap_test VALUES (3, 'A', 30);
 
 # Save pre-refresh snapshot for comparison
 statement ok
-CREATE TEMP TABLE snap_before AS SELECT last_snapshot_id AS snap FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+CREATE TEMP TABLE snap_before AS SELECT last_snapshot_id AS snap FROM openivm_delta_tables WHERE view_name = 'mv_snap';
 
 statement ok
 PRAGMA refresh('mv_snap');
 
 # Snapshot should have advanced after refresh
 query I
-SELECT last_snapshot_id > (SELECT snap FROM snap_before) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT last_snapshot_id > (SELECT snap FROM snap_before) FROM openivm_delta_tables WHERE view_name = 'mv_snap';
 ----
 true
 
@@ -83,13 +83,13 @@ SELECT count(*) FROM (SELECT grp, SUM(val), COUNT(*) FROM dl.snap_test GROUP BY 
 # ==========================================
 
 query I
-SELECT sql_string NOT LIKE '%AT (VERSION%' FROM _duckdb_ivm_views WHERE view_name = 'mv_snap';
+SELECT sql_string NOT LIKE '%AT (VERSION%' FROM openivm_views WHERE view_name = 'mv_snap';
 ----
 true
 
 # Catalog type should be ducklake
 query I
-SELECT catalog_type FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT catalog_type FROM openivm_delta_tables WHERE view_name = 'mv_snap';
 ----
 ducklake
 
@@ -218,7 +218,7 @@ west	200	1
 statement ok
 CREATE TEMP TABLE replay_after_insert AS
 SELECT last_snapshot_id AS snap
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'mv_replay_sales';
 
 statement ok
@@ -236,7 +236,7 @@ west	200	1
 
 query I
 SELECT last_snapshot_id > (SELECT snap FROM replay_after_insert)
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'mv_replay_sales';
 ----
 true
@@ -244,7 +244,7 @@ true
 statement ok
 CREATE TEMP TABLE replay_after_delete AS
 SELECT last_snapshot_id AS snap
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'mv_replay_sales';
 
 statement ok
@@ -252,7 +252,7 @@ PRAGMA refresh('mv_replay_sales');
 
 query I
 SELECT last_snapshot_id = (SELECT snap FROM replay_after_delete)
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'mv_replay_sales';
 ----
 true
@@ -309,23 +309,23 @@ SELECT count(*) FROM dl.blocked_publish_mv;
 
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE database_name = current_database() AND table_name LIKE '_ivm_stage_blocked_publish_mv%';
+WHERE database_name = current_database() AND table_name LIKE 'openivm_stage_blocked_publish_mv%';
 ----
 0
 
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE database_name = current_database() AND table_name IN ('_ivm_data_blocked_publish_mv', 'delta_blocked_publish_mv');
+WHERE database_name = current_database() AND table_name IN ('openivm_data_blocked_publish_mv', 'openivm_delta_blocked_publish_mv');
 ----
 0
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'blocked_publish_mv';
+SELECT count(*) FROM openivm_views WHERE view_name = 'blocked_publish_mv';
 ----
 0
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'blocked_publish_mv';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'blocked_publish_mv';
 ----
 0
 
@@ -351,10 +351,10 @@ b	20
 # ==========================================
 
 statement ok
-SET ivm_files_path='__TEST_DIR__';
+SET openivm_files_path='__TEST_DIR__';
 
 statement ok
-SET ivm_skip_empty_deltas=true;
+SET openivm_skip_empty_deltas=true;
 
 statement ok
 CREATE TABLE dl.skip_base (id INTEGER, v INTEGER);
@@ -372,7 +372,7 @@ SELECT id, v FROM dl.skip_base;
 statement ok
 CREATE TEMP TABLE skip_base_snapshot AS
 SELECT last_snapshot_id AS snap
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'mv_skip_base';
 
 statement ok
@@ -383,7 +383,7 @@ PRAGMA refresh('mv_skip_base');
 
 query I
 SELECT last_snapshot_id = (SELECT snap FROM skip_base_snapshot)
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'mv_skip_base';
 ----
 true
@@ -416,17 +416,17 @@ statement ok
 PRAGMA refresh('mv_skip_unchanged_join');
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_unchanged_join.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_unchanged_join.sql');
 ----
 0
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_unchanged_join.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_unchanged_join.sql');
 ----
 0
 
 query I
-SELECT contains(content, 'ducklake_table_insertions(''dl'', ''main'', ''skip_right''') FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_unchanged_join.sql');
+SELECT contains(content, 'ducklake_table_insertions(''dl'', ''main'', ''skip_right''') FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_unchanged_join.sql');
 ----
 false
 
@@ -473,12 +473,12 @@ statement ok
 PRAGMA refresh('mv_skip_disjoint_key');
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_disjoint_key.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_disjoint_key.sql');
 ----
 0
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_disjoint_key.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_disjoint_key.sql');
 ----
 0
 

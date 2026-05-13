@@ -4,10 +4,10 @@
 
 require openivm
 
-load __TEST_DIR__/ivm_parser_test.db
+load __TEST_DIR__/openivm_parser_test.db
 
 statement ok
-SET ivm_files_path='__TEST_DIR__';
+SET openivm_files_path='__TEST_DIR__';
 
 # ==========================================
 # Test 1: Basic SUM + COUNT with GROUP BY
@@ -31,23 +31,23 @@ west	200	1
 
 # System tables should be populated
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_sales';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_sales';
 ----
 1
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_sales';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv_sales';
 ----
 1
 
 # Delta tables should exist
 query I
-SELECT count(*) FROM delta_sales;
+SELECT count(*) FROM openivm_delta_sales;
 ----
 0
 
 query I
-SELECT count(*) FROM delta_mv_sales;
+SELECT count(*) FROM openivm_delta_mv_sales;
 ----
 0
 
@@ -376,8 +376,8 @@ CREATE MATERIALIZED VIEW mv_sales AS SELECT region, sum(amount) as total FROM sa
 already exists
 
 # Note: IF NOT EXISTS on the table itself works, but the system table insert
-# (_duckdb_ivm_delta_tables) is unconditional, so it still errors on duplicate.
-# TODO: use INSERT OR IGNORE for _duckdb_ivm_delta_tables when IF NOT EXISTS is used.
+# (openivm_delta_tables) is unconditional, so it still errors on duplicate.
+# TODO: use INSERT OR IGNORE for openivm_delta_tables when IF NOT EXISTS is used.
 
 # Original data should be unaffected by the failed duplicate attempt
 query III
@@ -387,12 +387,12 @@ east	300	3
 west	200	1
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_sales';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_sales';
 ----
 1
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE table_name = '_ivm_data_mv_sales';
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_mv_sales';
 ----
 1
 
@@ -777,7 +777,7 @@ CREATE MATERIALIZED VIEW mv_t31_5min REFRESH EVERY '5 minutes' AS
 
 # refresh_interval should be 300 seconds
 query I
-SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_5min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_5min';
 ----
 300
 
@@ -786,7 +786,7 @@ CREATE MATERIALIZED VIEW mv_t31_2hr REFRESH EVERY '2 hours' AS
     SELECT val, SUM(val) AS total FROM t31 GROUP BY val;
 
 query I
-SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_2hr';
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_2hr';
 ----
 7200
 
@@ -795,7 +795,7 @@ CREATE MATERIALIZED VIEW mv_t31_1day REFRESH EVERY '1 day' AS
     SELECT id, val FROM t31;
 
 query I
-SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_1day';
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_1day';
 ----
 86400
 
@@ -808,7 +808,7 @@ CREATE MATERIALIZED VIEW mv_t31_manual AS
     SELECT val, COUNT(*) AS cnt FROM t31 GROUP BY val;
 
 query I
-SELECT refresh_interval IS NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_manual';
+SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = 'mv_t31_manual';
 ----
 true
 
@@ -867,7 +867,7 @@ CREATE MATERIALIZED VIEW mv_t31_1min REFRESH EVERY '1 minute' AS
     SELECT id FROM t31;
 
 query I
-SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_1min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_1min';
 ----
 60
 
@@ -879,7 +879,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_t31_5min SET REFRESH EVERY '10 minutes';
 
 query I
-SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_5min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_5min';
 ----
 600
 
@@ -891,7 +891,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_t31_5min SET REFRESH MANUAL;
 
 query I
-SELECT refresh_interval IS NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_5min';
+SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = 'mv_t31_5min';
 ----
 true
 
@@ -912,7 +912,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_t31_1min SET REFRESH EVERY '2 hours';
 
 query I
-SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_1min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_1min';
 ----
 7200
 
@@ -1004,7 +1004,7 @@ CREATE OR REPLACE MATERIALIZED VIEW mv_t41 REFRESH EVERY '3 hours' AS
     SELECT grp, SUM(val) AS total FROM t41 GROUP BY grp;
 
 query I
-SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t41';
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t41';
 ----
 10800
 

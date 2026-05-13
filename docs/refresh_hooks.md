@@ -4,10 +4,10 @@ Refresh hooks allow extensions and users to register custom SQL that runs on mat
 
 ## Hook Table
 
-Hooks are stored in the `_duckdb_ivm_refresh_hooks` system table:
+Hooks are stored in the `openivm_refresh_hooks` system table:
 
 ```sql
-CREATE TABLE _duckdb_ivm_refresh_hooks(
+CREATE TABLE openivm_refresh_hooks(
     view_name VARCHAR PRIMARY KEY,   -- MV name
     hook_sql  VARCHAR NOT NULL,      -- SQL to execute
     mode      VARCHAR NOT NULL       -- 'before', 'after', or 'replace'
@@ -28,7 +28,7 @@ CREATE TABLE _duckdb_ivm_refresh_hooks(
 ```sql
 CREATE TABLE refresh_log(view_name VARCHAR, refreshed_at TIMESTAMP);
 
-INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
+INSERT INTO openivm_refresh_hooks VALUES(
     'my_view',
     'INSERT INTO refresh_log VALUES(''my_view'', now()::TIMESTAMP)',
     'after'
@@ -38,7 +38,7 @@ INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
 ### Replace-hook: Custom flush logic (SIDRA)
 ```sql
 -- Register SIDRA's flush as the refresh action for a centralized MV
-INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
+INSERT INTO openivm_refresh_hooks VALUES(
     'daily_steps',
     'PRAGMA flush(''daily_steps'', ''duckdb'')',
     'replace'
@@ -47,9 +47,9 @@ INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
 
 ### Before-hook: Validate data before refresh
 ```sql
-INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
+INSERT INTO openivm_refresh_hooks VALUES(
     'my_view',
-    'SELECT CASE WHEN COUNT(*) = 0 THEN error(''No delta data'') END FROM delta_my_table',
+    'SELECT CASE WHEN COUNT(*) = 0 THEN error(''No delta data'') END FROM openivm_delta_my_table',
     'before'
 );
 ```
@@ -66,7 +66,7 @@ PRAGMA refresh('my_view');
 
 -- Step 2: Copy the SQL, modify as needed, register as hook
 SET execute = true;
-INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
+INSERT INTO openivm_refresh_hooks VALUES(
     'my_view',
     '<paste modified SQL here>',
     'replace'
@@ -76,7 +76,7 @@ INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
 ## Removing a Hook
 
 ```sql
-DELETE FROM _duckdb_ivm_refresh_hooks WHERE view_name = 'my_view';
+DELETE FROM openivm_refresh_hooks WHERE view_name = 'my_view';
 ```
 
 After removal, `PRAGMA refresh()` reverts to default IVM behavior.

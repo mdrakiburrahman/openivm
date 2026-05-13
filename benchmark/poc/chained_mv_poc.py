@@ -121,13 +121,13 @@ def time_strategy(db_path: str, strategy: str) -> float:
 		# rely on OpenIVM's cascade setting (default 'downstream' — refreshing mv_a
 		# propagates to mv_b). We still need to trigger the lowest level.
 		sql = (
-			"SET ivm_cascade_refresh='downstream';\n"
+			"SET openivm_cascade_refresh='downstream';\n"
 			"PRAGMA refresh('mv_a');\n"
 			"SELECT * FROM mv_b;"
 		)
 	elif strategy == "stale_plus_residual":
 		# The Tier 2 novelty: DO NOT refresh. Read stale mv_b + compute delta
-		# contribution inline from delta_lineitem + orders, then aggregate.
+		# contribution inline from openivm_delta_lineitem + orders, then aggregate.
 		# Correct under bag semantics because mv_b = Q(T_old) and delta gives
 		# the diff to Q(T_new), so re-aggregating their union yields Q(T_new).
 		# Multiplicity = true means insert (+1), false means delete (-1).
@@ -137,10 +137,10 @@ def time_strategy(db_path: str, strategy: str) -> float:
 			"    SELECT o_region, revenue, cnt FROM mv_b "
 			"    UNION ALL "
 			"    SELECT o.o_region, "
-			"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+			"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 			"                    ELSE -dl.l_qty*dl.l_price END) AS revenue, "
-			"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
-			"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id = o.o_id "
+			"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
+			"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id = o.o_id "
 			"    GROUP BY o.o_region "
 			") x GROUP BY o_region;"
 		)
@@ -154,7 +154,7 @@ def time_strategy(db_path: str, strategy: str) -> float:
 	return elapsed
 
 
-def one_run(n_orders: int, avg_li: int, delta_fraction: float, strategy: str) -> float:
+def one_run(n_orders: int, avg_li: int, openivm_delta_fraction: float, strategy: str) -> float:
 	n_lineitem = n_orders * avg_li
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
@@ -168,9 +168,9 @@ def one_run(n_orders: int, avg_li: int, delta_fraction: float, strategy: str) ->
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}\n----\n{out}")
-		delta_rows = max(1, int(n_lineitem * delta_fraction))
+		openivm_delta_rows = max(1, int(n_lineitem * openivm_delta_fraction))
 		out, err, rc = run_sql(
-			db, insert_delta_sql(start_li=n_lineitem, count=delta_rows, n_orders=n_orders)
+			db, insert_delta_sql(start_li=n_lineitem, count=openivm_delta_rows, n_orders=n_orders)
 		)
 		if rc != 0:
 			raise RuntimeError(f"delta failed: {err}")
@@ -199,8 +199,8 @@ def run_matrix(n_orders: int, avg_li: int, deltas: list[float], reps: int) -> li
 			rows.append({
 				"n_orders": n_orders,
 				"n_lineitem": n_lineitem,
-				"delta_fraction": f,
-				"delta_rows": max(1, int(n_lineitem * f)),
+				"openivm_delta_fraction": f,
+				"openivm_delta_rows": max(1, int(n_lineitem * f)),
 				"strategy": strategy,
 				"reps": len(samples),
 				"median_s": statistics.median(samples),
@@ -213,13 +213,13 @@ def run_matrix(n_orders: int, avg_li: int, deltas: list[float], reps: int) -> li
 def summarize(rows: list[dict]) -> None:
 	print("\n=== Chained MV (mv_b on mv_a) crossover ===")
 	header = (
-		f"{'delta_frac':>10}  {'bypass':>8}  {'stale_b':>8}  "
+		f"{'openivm_delta_frac':>10}  {'bypass':>8}  {'stale_b':>8}  "
 		f"{'cascade':>8}  {'casc_auto':>10}  {'stl+res':>8}  winner        speedup"
 	)
 	print(header)
 	by_frac: dict[float, dict[str, float]] = {}
 	for r in rows:
-		by_frac.setdefault(r["delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
+		by_frac.setdefault(r["openivm_delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
 	for f in sorted(by_frac):
 		d = by_frac[f]
 		# stale_b is not a correct strategy (wrong answer); exclude from winner search.
@@ -265,8 +265,8 @@ def main() -> int:
 			fieldnames=[
 				"n_orders",
 				"n_lineitem",
-				"delta_fraction",
-				"delta_rows",
+				"openivm_delta_fraction",
+				"openivm_delta_rows",
 				"strategy",
 				"reps",
 				"median_s",

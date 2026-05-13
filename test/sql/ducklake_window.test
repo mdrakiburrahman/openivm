@@ -42,7 +42,7 @@ WHERE H_AMOUNT > 0;
 # The partition source column is the fifth source column, but it is the first MV
 # output column. Refresh must filter affected partitions on H_W_ID, not H_D_ID.
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_history_window';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_history_window';
 ----
 H_W_ID=H_W_ID
 
@@ -124,7 +124,7 @@ LEFT JOIN dl.window_join_codes c
     ON e.code = c.code;
 
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_window_join';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_window_join';
 ----
 acct_id=acct_id
 
@@ -357,7 +357,7 @@ SELECT count(*) FROM (
 0
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 statement ok
 CREATE TABLE dl.accounts_crm_src (
@@ -418,7 +418,7 @@ LEFT JOIN "dl"."main"."accounts_tax" ltx
 WHERE c.ca_id IS NOT NULL;
 
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_accounts_like';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_accounts_like';
 ----
 account_id=ca_id
 
@@ -521,11 +521,11 @@ CREATE TABLE dl.retry_window_src (
 );
 
 statement ok
-INSERT INTO _duckdb_ivm_views (view_name, sql_string, type, last_update)
+INSERT INTO openivm_views (view_name, sql_string, type, last_update)
 VALUES ('mv_retry_window', 'stale interrupted create', 5, now());
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_retry_window';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_retry_window';
 ----
 1
 
@@ -538,7 +538,7 @@ SELECT
 FROM dl.retry_window_src;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_retry_window';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_retry_window';
 ----
 1
 
@@ -625,12 +625,12 @@ SELECT count(*) FROM dl.mv_ducklake_stage_lock;
 20
 
 query I
-SELECT count(*) FROM information_schema.tables WHERE table_name = '_ivm_stage_mv_ducklake_stage_lock';
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_stage_mv_ducklake_stage_lock';
 ----
 0
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE TABLE dl.cascade_accounts_crm_src (
@@ -751,7 +751,7 @@ SELECT count(*) FROM (
 0
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE TABLE dl.window_upstream_src (
@@ -781,7 +781,7 @@ SELECT
 FROM dl.window_upstream_base;
 
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_window_upstream';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_window_upstream';
 ----
 acct_id=acct_id
 

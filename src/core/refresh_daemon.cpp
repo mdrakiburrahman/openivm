@@ -100,7 +100,7 @@ void IVMRefreshDaemon::Run() {
 								                    verify->GetValue(0, 0).ToString().c_str());
 							}
 							// Also try direct table query
-							auto test = con.Query("SELECT count(*) FROM _duckdb_ivm_views");
+							auto test = con.Query("SELECT count(*) FROM openivm_views");
 							OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Direct query: %s\n",
 							                    test->HasError() ? test->GetError().c_str()
 							                                     : test->GetValue(0, 0).ToString().c_str());
@@ -112,13 +112,13 @@ void IVMRefreshDaemon::Run() {
 			// Read cascade setting from the DB config
 			string cascade_mode = "downstream";
 			Value cascade_val;
-			if (con.context->TryGetCurrentSetting("ivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
+			if (con.context->TryGetCurrentSetting("openivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
 				cascade_mode = StringUtil::Lower(cascade_val.ToString());
 			}
 
 			// Read adaptive backoff setting
 			Value backoff_val;
-			if (con.context->TryGetCurrentSetting("ivm_adaptive_backoff", backoff_val) && !backoff_val.IsNull()) {
+			if (con.context->TryGetCurrentSetting("openivm_adaptive_backoff", backoff_val) && !backoff_val.IsNull()) {
 				adaptive_backoff_ = backoff_val.GetValue<bool>();
 			}
 
@@ -185,7 +185,7 @@ void IVMRefreshDaemon::Run() {
 
 					// Check for refresh hooks
 					auto hook_r =
-					    refresh_con.Query("SELECT hook_sql, mode FROM _duckdb_ivm_refresh_hooks WHERE view_name = '" +
+					    refresh_con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks WHERE view_name = '" +
 					                      OpenIVMUtils::EscapeValue(sv.view_name) + "'");
 					string hook_sql;
 					string hook_mode;
@@ -255,7 +255,7 @@ void IVMRefreshDaemon::Run() {
 					Printer::Print("Warning: refresh of '" + sv.view_name + "' took " + to_string(duration_seconds) +
 					               "s (interval: " + to_string(sv.interval_seconds) +
 					               "s). Increasing effective interval to " + to_string(new_interval) +
-					               "s. Set ivm_adaptive_backoff = false to disable.");
+					               "s. Set openivm_adaptive_backoff = false to disable.");
 				} else if (adaptive_backoff_.load()) {
 					std::lock_guard<std::mutex> guard(backoff_mutex_);
 					effective_intervals_.erase(sv.view_name);

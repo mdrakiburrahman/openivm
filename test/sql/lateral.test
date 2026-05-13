@@ -28,7 +28,7 @@ CREATE MATERIALIZED VIEW mv_lat AS
 
 # DELIM/DEPENDENT aggregate views use affected-key recompute, not scalar aggregate upsert.
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_lat';
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat';
 ----
 6
 
@@ -75,7 +75,7 @@ CREATE MATERIALIZED VIEW mv_lat_scalar AS
     FROM numbers;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_lat_scalar';
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_scalar';
 ----
 6
 
@@ -182,7 +182,7 @@ CREATE MATERIALIZED VIEW mv_lat_series AS
     ) t(slot);
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_lat_series';
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_series';
 ----
 2
 

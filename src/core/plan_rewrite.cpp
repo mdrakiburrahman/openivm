@@ -394,7 +394,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		string alias = bound.alias.empty() ? (bound.function.name + "_" + bound.children[0]->GetName()) : bound.alias;
 		// Sanitize alias for use as a SQL identifier. DuckDB auto-sets alias to the expression
 		// string (e.g. "avg(C_BALANCE)") for unaliased aggregates. Parens and other non-identifier
-		// characters break column names like _ivm_sum_avg(C_BALANCE) in SELECT * EXCLUDE (...).
+		// characters break column names like openivm_sum_avg(C_BALANCE) in SELECT * EXCLUDE (...).
 		// Use same algorithm as parser.cpp output_names sanitization so that helper column
 		// suffixes (e.g. "avg_C_BALANCE") match the sanitized visible column name.
 		{
@@ -634,7 +634,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Derived aggregates → hidden columns, %zu decompositions\n", decomps.size());
 }
 
-/// Inject a hidden COUNT(*) (alias `_ivm_count_star`) into AGGREGATE_GROUP
+/// Inject a hidden COUNT(*) (alias `openivm_count_star`) into AGGREGATE_GROUP
 /// aggregates that don't already have a reliable total-row-count aggregate.
 ///
 /// Why: the post-MERGE cleanup in CompileAggregateGroups needs a per-group
@@ -645,7 +645,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 /// predicate, even though the group still exists. We can't use SUM=0 either
 /// (CASE expressions can legitimately yield 0).
 ///
-/// The column is prefixed `_ivm_` so `column_hider` auto-excludes it from
+/// The column is prefixed `openivm_` so `column_hider` auto-excludes it from
 /// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
 /// via ivm::COUNT_STAR_COL.
 static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
@@ -667,7 +667,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	//     COUNT(col) / COUNT(CASE WHEN p THEN x END) have function name "count"
 	//     (with children) and are unreliable: they return 0 when no rows match
 	//     the condition even though the group is non-empty. Do NOT skip for those.
-	//   - _ivm_count_star or _ivm_distinct_count already injected by an earlier
+	//   - openivm_count_star or openivm_distinct_count already injected by an earlier
 	//     pass (e.g. DISTINCT rewrite).
 	bool has_argminmax = false;
 	for (auto &expr : agg.expressions) {
@@ -688,7 +688,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 		}
 	}
 	// ARG_MIN/ARG_MAX always use group-recompute (LPTS can't round-trip the two-arg form,
-	// so view_query_sql is the original SQL without _ivm_count_star). Skip injection so
+	// so view_query_sql is the original SQL without openivm_count_star). Skip injection so
 	// the data table schema matches. Checked after the loop so count_star / distinct_count
 	// in the same view still short-circuit correctly regardless of expression order.
 	if (has_argminmax) {
@@ -711,7 +711,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	proj.expressions.push_back(std::move(count_pt));
 	proj.ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Injected _ivm_count_star for AGGREGATE_GROUP\n");
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Injected openivm_count_star for AGGREGATE_GROUP\n");
 }
 
 /// Returns true if `alias` is one of the reserved IVM-hidden-column prefixes
@@ -722,14 +722,14 @@ static bool IsHiddenAggregateAlias(const string &alias) {
 	       alias.find(ivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(ivm::SUM_SQP_COL_PREFIX) == 0;
 }
 
-/// Propagate hidden aggregate columns (_ivm_sum_*, _ivm_count_*, …) added by
+/// Propagate hidden aggregate columns (openivm_sum_*, openivm_count_*, …) added by
 /// DecomposeAvgStddev up through any chain of pass-through PROJECTIONs that
 /// sits between the decomposed projection and the plan root.
 ///
 /// Why: CTE inlining + projection stacking can leave a plan like
 ///   PROJECTION (user SELECT: ROUND(avg_bal, 2), cnt, …)   <- top
 ///     PROJECTION (pass-through BCRs)                       <- middle
-///       PROJECTION (CTE body, holds _ivm_sum_* from decomp) <- inner
+///       PROJECTION (CTE body, holds openivm_sum_* from decomp) <- inner
 ///         AGGREGATE
 /// Without propagation, middle and top strip the hidden columns, so the MV
 /// data table stores only the final AVG and the MERGE computes `v.avg + d.avg`
@@ -927,7 +927,7 @@ static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &pla
 	binding = current;
 }
 
-/// Add _ivm_left_key (and _ivm_right_key for FULL OUTER) projection at the top of the plan.
+/// Add openivm_left_key (and openivm_right_key for FULL OUTER) projection at the top of the plan.
 static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan, const OuterJoinBindings &outer_join) {
 	bool is_full_outer = outer_join.is_full_outer;
 	auto key_binding = outer_join.preserved_key_binding;
@@ -952,10 +952,10 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(top_types[i], top_bindings[i]));
 	}
 
-	// Always add _ivm_left_key as a separate extra column.
+	// Always add openivm_left_key as a separate extra column.
 	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(ivm::LEFT_KEY_COL, key_type, key_binding));
 
-	// For FULL OUTER: also add _ivm_right_key in the same projection.
+	// For FULL OUTER: also add openivm_right_key in the same projection.
 	if (is_full_outer) {
 		proj_exprs.push_back(
 		    make_uniq<BoundColumnRefExpression>(ivm::RIGHT_KEY_COL, right_key_type, right_key_binding));
@@ -968,12 +968,12 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	projection->ResolveOperatorTypes();
 	plan = std::move(projection);
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added _ivm_left_key%s projection\n",
-	                    is_full_outer ? " + _ivm_right_key" : "");
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added openivm_left_key%s projection\n",
+	                    is_full_outer ? " + openivm_right_key" : "");
 }
 
-/// For LEFT/OUTER JOIN aggregate views: add COUNT(null_side_key) AS _ivm_match_count.
-/// For FULL OUTER JOINs, also add COUNT(left_key) AS _ivm_right_match_count.
+/// For LEFT/OUTER JOIN aggregate views: add COUNT(null_side_key) AS openivm_match_count.
+/// For FULL OUTER JOINs, also add COUNT(left_key) AS openivm_right_match_count.
 /// These hidden aggregates track how many rows match from each side (Larson & Zhou / Zhang & Larson).
 /// When match_count=0, aggregate columns from that side should be NULL.
 static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
@@ -999,7 +999,7 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	}
 	auto &agg = agg_search->Cast<LogicalAggregate>();
 
-	// Add COUNT(null_side_key) as _ivm_match_count (tracks right-side matches for LEFT/OUTER).
+	// Add COUNT(null_side_key) as openivm_match_count (tracks right-side matches for LEFT/OUTER).
 	auto count_func = BindAggregateByName(context, "count", {null_side_type});
 	vector<unique_ptr<Expression>> count_args;
 	count_args.push_back(make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding));
@@ -1009,7 +1009,7 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	idx_t match_count_idx = agg.expressions.size();
 	agg.expressions.push_back(std::move(count_expr));
 
-	// For FULL OUTER: add COUNT(left_key) as _ivm_right_match_count (tracks left-side matches).
+	// For FULL OUTER: add COUNT(left_key) as openivm_right_match_count (tracks left-side matches).
 	idx_t right_match_count_idx = 0;
 	if (is_full_outer) {
 		auto right_count_func = BindAggregateByName(context, "count", {left_side_type});
@@ -1046,8 +1046,8 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 
 	proj.ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added _ivm_match_count%s for outer join aggregate\n",
-	                    is_full_outer ? " + _ivm_right_match_count" : "");
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added openivm_match_count%s for outer join aggregate\n",
+	                    is_full_outer ? " + openivm_right_match_count" : "");
 }
 
 static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
@@ -1264,7 +1264,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 		// AGGREGATE is intentionally excluded: HAVING is always a FILTER *above* its AGGREGATE,
 		// never inside it. Descending into AGGREGATE children would find a nested HAVING from
 		// an inner subquery or a DISTINCT-rewrite-introduced outer AGGREGATE, and erroneously
-		// expose _ivm_having_N columns that are invisible in the outer output.
+		// expose openivm_having_N columns that are invisible in the outer output.
 		if (node->type != LogicalOperatorType::LOGICAL_PROJECTION &&
 		    node->type != LogicalOperatorType::LOGICAL_FILTER && node->type != LogicalOperatorType::LOGICAL_ORDER_BY &&
 		    node->type != LogicalOperatorType::LOGICAL_LIMIT && node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
@@ -1324,7 +1324,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 			if (b.second >= agg_child.expressions.size()) {
 				continue;
 			}
-			string hidden_name = "_ivm_having_" + std::to_string(next_hidden++);
+			string hidden_name = "openivm_having_" + std::to_string(next_hidden++);
 			auto col_type = agg_child.expressions[b.second]->return_type;
 			auto hidden_expr =
 			    make_uniq<BoundColumnRefExpression>(hidden_name, col_type, ColumnBinding(b.first, b.second));

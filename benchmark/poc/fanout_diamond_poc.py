@@ -101,10 +101,10 @@ FANOUT_STALE_RES = (
 	"    SELECT o_region, revenue, cnt FROM mv_region "
 	"    UNION ALL "
 	"    SELECT o.o_region, "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 	"                    ELSE -dl.l_qty*dl.l_price END), "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) "
-	"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) "
+	"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 	"    GROUP BY o.o_region "
 	") x GROUP BY o_region;"
 )
@@ -154,10 +154,10 @@ DIAMOND_STALE_RES = (
 	"    SELECT l_product, revenue, cnt FROM mv_top "
 	"    UNION ALL "
 	"    SELECT dl.l_product, "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 	"                    ELSE -dl.l_qty*dl.l_price END), "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) "
-	"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) "
+	"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 	"    GROUP BY dl.l_product "
 	") x GROUP BY l_product;"
 )
@@ -196,7 +196,7 @@ def insert_delta(start: int, count: int, n_orders: int) -> str:
 	)
 
 
-def one_run(topology: str, n_orders: int, avg_li: int, delta_fraction: float, strategy: str) -> float:
+def one_run(topology: str, n_orders: int, avg_li: int, openivm_delta_fraction: float, strategy: str) -> float:
 	cfg = TOPOLOGIES[topology]
 	n_lineitem = n_orders * avg_li
 	with tempfile.TemporaryDirectory() as tmp:
@@ -207,8 +207,8 @@ def one_run(topology: str, n_orders: int, avg_li: int, delta_fraction: float, st
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup: {err}")
-		delta_rows = max(1, int(n_lineitem * delta_fraction))
-		run_sql(db, insert_delta(n_lineitem, delta_rows, n_orders))
+		openivm_delta_rows = max(1, int(n_lineitem * openivm_delta_fraction))
+		run_sql(db, insert_delta(n_lineitem, openivm_delta_rows, n_orders))
 		sql = cfg["strategies"][strategy]
 		start = time.perf_counter()
 		out, err, rc = run_sql(db, sql)
@@ -257,7 +257,7 @@ def main() -> int:
 				if samples:
 					rows.append({
 						"topology": top,
-						"delta_fraction": f,
+						"openivm_delta_fraction": f,
 						"strategy": strategy,
 						"reps": len(samples),
 						"median_s": statistics.median(samples),
@@ -267,7 +267,7 @@ def main() -> int:
 	with Path(args.out).open("w", newline="") as fp:
 		w = csv.DictWriter(
 			fp,
-			fieldnames=["topology", "delta_fraction", "strategy", "reps", "median_s"],
+			fieldnames=["topology", "openivm_delta_fraction", "strategy", "reps", "median_s"],
 			extrasaction="ignore",
 		)
 		w.writeheader()
@@ -284,7 +284,7 @@ def main() -> int:
 		for r in rows:
 			if r["topology"] != top:
 				continue
-			by_f.setdefault(r["delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
+			by_f.setdefault(r["openivm_delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
 		for f in sorted(by_f):
 			d = by_f[f]
 			winner = min(d, key=d.get)

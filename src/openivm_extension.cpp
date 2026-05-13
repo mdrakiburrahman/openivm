@@ -111,53 +111,54 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// explicitly because pre-existing local settings override global defaults.
 	db_config.SetOption(PreserveInsertionOrderSetting::SettingIndex, Value::BOOLEAN(false));
 
-	db_config.AddExtensionOption("ivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: incremental, full, or auto",
+	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
+	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
 	                             LogicalType::VARCHAR, Value("incremental"));
-	db_config.AddExtensionOption("ivm_adaptive_refresh",
+	db_config.AddExtensionOption("openivm_adaptive_refresh",
 	                             "experimental: enable adaptive cost model (when off, always use IVM)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("ivm_cascade_refresh", "cascade mode: off, upstream, downstream, or both",
+	db_config.AddExtensionOption("openivm_cascade_refresh", "cascade mode: off, upstream, downstream, or both",
 	                             LogicalType::VARCHAR, Value("downstream"));
-	db_config.AddExtensionOption("ivm_adaptive_backoff",
+	db_config.AddExtensionOption("openivm_adaptive_backoff",
 	                             "auto-increase refresh interval when refresh takes longer than the interval",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
+	db_config.AddExtensionOption("openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Per-optimization flags (default: all enabled)
-	db_config.AddExtensionOption("ivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
+	db_config.AddExtensionOption("openivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_compact_deltas",
+	db_config.AddExtensionOption("openivm_compact_deltas",
 	                             "compact raw delta rows into net logical Z-set deltas before refresh",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_ducklake_nterm",
+	db_config.AddExtensionOption("openivm_ducklake_nterm",
 	                             "use N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
+	db_config.AddExtensionOption("openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_skip_aggregate_delete",
+	db_config.AddExtensionOption("openivm_skip_aggregate_delete",
 	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_skip_projection_delete",
+	db_config.AddExtensionOption("openivm_skip_projection_delete",
 	                             "skip DELETE and consolidation for projections when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_minmax_incremental", "use GREATEST/LEAST for MIN/MAX when deltas are insert-only",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_having_merge",
+	db_config.AddExtensionOption("openivm_minmax_incremental",
+	                             "use GREATEST/LEAST for MIN/MAX when deltas are insert-only", LogicalType::BOOLEAN,
+	                             Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_having_merge",
 	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
 	                             "instead of group-recompute",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
-	db_config.AddExtensionOption("ivm_left_join_merge",
+	db_config.AddExtensionOption("openivm_left_join_merge",
 	                             "use incremental MERGE for LEFT JOIN aggregates (Larson & Zhou) "
 	                             "instead of group-recompute",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_full_outer_merge",
+	db_config.AddExtensionOption("openivm_full_outer_merge",
 	                             "use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) "
 	                             "instead of group-recompute",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_distinct_aux_state",
+	db_config.AddExtensionOption("openivm_distinct_aux_state",
 	                             "use auxiliary count state for inner DISTINCT under aggregate (DBSP "
 	                             "distinct(R)=sgn(R[t]) — emit ±1 only on count transitions across zero) "
 	                             "instead of GROUP_RECOMPUTE. Single-source views only in v0; multi-source "
@@ -165,42 +166,43 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Learned cost model
-	db_config.AddExtensionOption("ivm_cost_decay",
+	db_config.AddExtensionOption("openivm_cost_decay",
 	                             "decay factor for learned cost model regression (0.0-1.0, higher = slower adaptation)",
 	                             LogicalType::DOUBLE, Value::DOUBLE(0.9));
 
 	// View matching (master flag — ALL matcher behavior gated by this).
 	// Default false. See `feedback_view_matching_flag` memory note.
-	db_config.AddExtensionOption("ivm_enable_view_matching", "enable smart view matching at query time (master flag)",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("ivm_predicate_oracle",
+	db_config.AddExtensionOption("openivm_enable_view_matching",
+	                             "enable smart view matching at query time (master flag)", LogicalType::BOOLEAN,
+	                             Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_predicate_oracle",
 	                             "predicate implication oracle: 'syntactic', 'interval' (default), or 'sat' (stub)",
 	                             LogicalType::VARCHAR, Value("interval"));
-	db_config.AddExtensionOption("ivm_match_strategies",
+	db_config.AddExtensionOption("openivm_match_strategies",
 	                             "allowed strategies (csv): 'tier1','tier2','tier3','partial','full' or 'all'",
 	                             LogicalType::VARCHAR, Value("all"));
-	db_config.AddExtensionOption("ivm_match_estimate_ttl_ms",
+	db_config.AddExtensionOption("openivm_match_estimate_ttl_ms",
 	                             "max staleness (ms) for cached pending-delta-row estimate before refresh",
 	                             LogicalType::BIGINT, Value::BIGINT(5000));
-	db_config.AddExtensionOption("ivm_match_log_decisions", "log per-query matcher decisions to _duckdb_ivm_match_log",
+	db_config.AddExtensionOption("openivm_match_log_decisions", "log per-query matcher decisions to openivm_match_log",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("ivm_match_log_retention", "max rows per query_hash retained in _duckdb_ivm_match_log",
+	db_config.AddExtensionOption("openivm_match_log_retention", "max rows per query_hash retained in openivm_match_log",
 	                             LogicalType::BIGINT, Value::BIGINT(50));
-	db_config.AddExtensionOption("ivm_profile_refresh", "record per-step materialized view refresh timings",
+	db_config.AddExtensionOption("openivm_profile_refresh", "record per-step materialized view refresh timings",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("ivm_profile_retention_days",
+	db_config.AddExtensionOption("openivm_profile_retention_days",
 	                             "delete refresh profile rows older than this many days when profiling is written",
 	                             LogicalType::BIGINT, Value::BIGINT(31));
-	db_config.AddExtensionOption("ivm_explain_initial_load",
+	db_config.AddExtensionOption("openivm_explain_initial_load",
 	                             "print CREATE MATERIALIZED VIEW initial-load SQL and EXPLAIN plans",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("ivm_explain_initial_load_only",
+	db_config.AddExtensionOption("openivm_explain_initial_load_only",
 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	Connection con(instance);
 
-	// Migration: add new columns to existing _duckdb_ivm_views tables
+	// Migration: add new columns to existing openivm_views tables
 	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
@@ -396,7 +398,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	bool daemon_disabled = false;
 	{
 		Value disable_val;
-		if (con.context->TryGetCurrentSetting("ivm_disable_daemon", disable_val) && !disable_val.IsNull()) {
+		if (con.context->TryGetCurrentSetting("openivm_disable_daemon", disable_val) && !disable_val.IsNull()) {
 			daemon_disabled = disable_val.GetValue<bool>();
 		}
 	}

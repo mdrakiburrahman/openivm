@@ -122,23 +122,23 @@ def time_strategy(db_path: str, strategy: str) -> float:
 	return elapsed
 
 
-def one_run(base_rows: int, delta_fraction: float, strategy: str) -> float:
+def one_run(base_rows: int, openivm_delta_fraction: float, strategy: str) -> float:
 	"""Single trial: fresh DB, populate, create MV, sync, insert delta, time strategy."""
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
 
-		# Setup: base table + MV + sync so delta_orders starts empty.
+		# Setup: base table + MV + sync so openivm_delta_orders starts empty.
 		setup_sql = make_base_sql(base_rows) + MV_DEFINITION + "PRAGMA refresh('mv');\n"
 		out, err, rc = run_sql(db, setup_sql)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}")
 
-		# Insert delta rows (they flow into delta_orders automatically).
-		delta_rows = int(base_rows * delta_fraction)
-		if delta_rows < 1:
-			delta_rows = 1
-		delta_sql = insert_delta_sql(start_id=base_rows, count=delta_rows)
-		out, err, rc = run_sql(db, delta_sql)
+		# Insert delta rows (they flow into openivm_delta_orders automatically).
+		openivm_delta_rows = int(base_rows * openivm_delta_fraction)
+		if openivm_delta_rows < 1:
+			openivm_delta_rows = 1
+		openivm_delta_sql = insert_delta_sql(start_id=base_rows, count=openivm_delta_rows)
+		out, err, rc = run_sql(db, openivm_delta_sql)
 		if rc != 0:
 			raise RuntimeError(f"delta insert failed: {err}")
 
@@ -155,7 +155,7 @@ def run_matrix(base_rows: int, deltas: list[float], reps: int) -> list[dict]:
 					t = one_run(base_rows, f, strategy)
 					samples.append(t)
 					print(
-						f"  delta_frac={f:.4f} strategy={strategy:<7} "
+						f"  openivm_delta_frac={f:.4f} strategy={strategy:<7} "
 						f"rep={rep+1}/{reps} t={t*1000:8.1f}ms",
 						file=sys.stderr,
 					)
@@ -165,8 +165,8 @@ def run_matrix(base_rows: int, deltas: list[float], reps: int) -> list[dict]:
 				continue
 			rows.append({
 				"base_rows": base_rows,
-				"delta_fraction": f,
-				"delta_rows": int(base_rows * f) if int(base_rows * f) else 1,
+				"openivm_delta_fraction": f,
+				"openivm_delta_rows": int(base_rows * f) if int(base_rows * f) else 1,
 				"strategy": strategy,
 				"reps": len(samples),
 				"median_s": statistics.median(samples),
@@ -179,10 +179,10 @@ def run_matrix(base_rows: int, deltas: list[float], reps: int) -> list[dict]:
 def summarize(rows: list[dict]) -> None:
 	"""Print a simple crossover table per delta fraction."""
 	print("\n=== Crossover summary ===")
-	print(f"{'delta_frac':>10}  {'ivm(ms)':>10}  {'bypass(ms)':>12}  winner  ratio(bypass/ivm)")
+	print(f"{'openivm_delta_frac':>10}  {'ivm(ms)':>10}  {'bypass(ms)':>12}  winner  ratio(bypass/ivm)")
 	by_frac: dict[float, dict[str, float]] = {}
 	for r in rows:
-		by_frac.setdefault(r["delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
+		by_frac.setdefault(r["openivm_delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
 	for f in sorted(by_frac):
 		pair = by_frac[f]
 		winner = min(pair, key=pair.get)
@@ -224,8 +224,8 @@ def main() -> int:
 			fp,
 			fieldnames=[
 				"base_rows",
-				"delta_fraction",
-				"delta_rows",
+				"openivm_delta_fraction",
+				"openivm_delta_rows",
 				"strategy",
 				"reps",
 				"median_s",

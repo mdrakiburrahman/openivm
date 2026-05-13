@@ -34,7 +34,7 @@ statement ok
 CREATE TABLE hook_log (msg VARCHAR);
 
 statement ok
-INSERT INTO _duckdb_ivm_refresh_hooks VALUES ('mv', 'INSERT INTO hook_log VALUES(''after-hook ran'')', 'after');
+INSERT INTO openivm_refresh_hooks VALUES ('mv', 'INSERT INTO hook_log VALUES(''after-hook ran'')', 'after');
 
 statement ok
 INSERT INTO t VALUES (2, 200);
@@ -62,7 +62,7 @@ statement ok
 DELETE FROM hook_log;
 
 statement ok
-UPDATE _duckdb_ivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''before-hook ran'')', mode = 'before' WHERE view_name = 'mv';
+UPDATE openivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''before-hook ran'')', mode = 'before' WHERE view_name = 'mv';
 
 statement ok
 INSERT INTO t VALUES (3, 300);
@@ -90,7 +90,7 @@ statement ok
 DELETE FROM hook_log;
 
 statement ok
-UPDATE _duckdb_ivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''replace-hook ran'')', mode = 'replace' WHERE view_name = 'mv';
+UPDATE openivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''replace-hook ran'')', mode = 'replace' WHERE view_name = 'mv';
 
 statement ok
 INSERT INTO t VALUES (4, 400);
@@ -115,7 +115,7 @@ replace-hook ran
 # ============================================================
 
 statement ok
-DELETE FROM _duckdb_ivm_refresh_hooks WHERE view_name = 'mv';
+DELETE FROM openivm_refresh_hooks WHERE view_name = 'mv';
 
 statement ok
 DELETE FROM hook_log;

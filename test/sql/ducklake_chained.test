@@ -17,7 +17,7 @@ ATTACH '__TEST_DIR__/ducklake_chained.db' AS dl (TYPE ducklake);
 
 # Disable auto cascade — refresh each MV explicitly in order
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ==========================================
 # 2-level chain: dl.sales → dl.mv_region → dl.mv_top
@@ -107,7 +107,7 @@ SELECT count(*) FROM (
 # ==========================================
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 statement ok
 ATTACH '__TEST_DIR__/ducklake_chain_a.db' AS chain_a (TYPE ducklake);
@@ -132,14 +132,14 @@ SELECT id, amount, amount * 2 AS doubled FROM chain_b.pipeline_l1;
 query II rowsort
 SELECT table_catalog, table_name
 FROM information_schema.tables
-WHERE table_name IN ('_ivm_data_pipeline_l1', 'delta_pipeline_l1',
-                     '_ivm_data_pipeline_l2', 'delta_pipeline_l2')
+WHERE table_name IN ('openivm_data_pipeline_l1', 'openivm_delta_pipeline_l1',
+                     'openivm_data_pipeline_l2', 'openivm_delta_pipeline_l2')
 ORDER BY table_catalog, table_name;
 ----
-chain_a	_ivm_data_pipeline_l2
-chain_a	delta_pipeline_l2
-chain_b	_ivm_data_pipeline_l1
-chain_b	delta_pipeline_l1
+chain_a	openivm_data_pipeline_l2
+chain_a	openivm_delta_pipeline_l2
+chain_b	openivm_data_pipeline_l1
+chain_b	openivm_delta_pipeline_l1
 
 statement ok
 INSERT INTO chain_a.pipeline_src VALUES (3, 30);
@@ -295,7 +295,7 @@ SELECT count(*) FROM (
 # ==========================================
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE SCHEMA dl.bronze;
@@ -318,7 +318,7 @@ CREATE MATERIALIZED VIEW dl.silver.cross_schema_l1 AS
 
 statement ok
 CREATE MATERIALIZED VIEW dl.gold.cross_schema_l2 AS
-  SELECT id, amount FROM dl.silver._ivm_data_cross_schema_l1;
+  SELECT id, amount FROM dl.silver.openivm_data_cross_schema_l1;
 
 statement ok
 INSERT INTO dl.bronze.cross_schema_base VALUES (2, 20);
@@ -340,7 +340,7 @@ SELECT id, amount FROM dl.gold.cross_schema_l2 ORDER BY id;
 2	20
 
 statement ok
-SET ivm_cascade_refresh = 'upstream';
+SET openivm_cascade_refresh = 'upstream';
 
 statement ok
 INSERT INTO dl.bronze.cross_schema_base VALUES (3, 30);
@@ -364,9 +364,9 @@ SELECT id, amount FROM dl.gold.cross_schema_l2 ORDER BY id;
 3	30
 
 # Explicit refresh after an upstream delete/rewrite must not duplicate rows in the downstream schema.
-# This covers gold views that read silver._ivm_data_* tables, as in the benchmark.
+# This covers gold views that read silver.openivm_data_* tables, as in the benchmark.
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 statement ok
 DELETE FROM dl.bronze.cross_schema_base WHERE id = 2;
@@ -453,11 +453,11 @@ CREATE MATERIALIZED VIEW dl.silver.catalog_chain_l2 AS
 
 query II
 SELECT table_name, source_catalog
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'catalog_chain_l2'
 ORDER BY table_name;
 ----
-_ivm_data_catalog_chain_l1	dl
+openivm_data_catalog_chain_l1	dl
 
 statement ok
 INSERT INTO dl.bronze.catalog_chain_base VALUES (3, 30);
@@ -521,21 +521,21 @@ CREATE MATERIALIZED VIEW dl.silver.catalog_window_l2 AS
   FROM dl.bronze.catalog_window_l1;
 
 statement ok
-UPDATE _duckdb_ivm_delta_tables
-SET table_name = 'delta_catalog_window_l1',
+UPDATE openivm_delta_tables
+SET table_name = 'openivm_delta_catalog_window_l1',
     catalog_type = 'duckdb',
     source_catalog = 'dl',
     source_schema = 'bronze'
 WHERE view_name = 'catalog_window_l2'
-  AND table_name = '_ivm_data_catalog_window_l1';
+  AND table_name = 'openivm_data_catalog_window_l1';
 
 query II
 SELECT table_name, source_schema
-FROM _duckdb_ivm_delta_tables
+FROM openivm_delta_tables
 WHERE view_name = 'catalog_window_l2'
 ORDER BY table_name;
 ----
-delta_catalog_window_l1	bronze
+openivm_delta_catalog_window_l1	bronze
 
 statement ok
 INSERT INTO dl.bronze.catalog_window_base VALUES
@@ -549,7 +549,7 @@ PRAGMA refresh_options('dl', 'bronze', 'catalog_window_l1');
 # snapshots. Seed the companion delta table to emulate the benchmark's persisted
 # delta_<upstream_mv> dependency and force the downstream refresh to read it.
 statement ok
-INSERT INTO dl.bronze.delta_catalog_window_l1
+INSERT INTO dl.bronze.openivm_delta_catalog_window_l1
 SELECT sym, trade_date, low_price, high_price, 1, now()
 FROM dl.bronze.catalog_window_l1
 WHERE trade_date IN (DATE '2026-01-02', DATE '2026-01-03');
@@ -616,7 +616,7 @@ SELECT count(*) FROM (
 # ==========================================
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 INSERT INTO dl.sales VALUES (8, 'east', 1000);
@@ -659,7 +659,7 @@ SELECT count(*) FROM (
 # ==========================================
 
 statement ok
-SET ivm_cascade_refresh = 'upstream';
+SET openivm_cascade_refresh = 'upstream';
 
 statement ok
 INSERT INTO dl.sales VALUES (9, 'west', 300);

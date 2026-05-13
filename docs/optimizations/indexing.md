@@ -26,19 +26,19 @@ works correctly — it just relies on hash matching rather than the index.
 
 **DuckLake tables:** ART index creation is skipped for DuckLake-backed views because
 DuckLake does not support DuckDB-native index types. Group column identification falls
-back to metadata stored in `_duckdb_ivm_views`.
+back to metadata stored in `openivm_views`.
 
-## Zone Maps on `_duckdb_ivm_timestamp`
+## Zone Maps on `openivm_timestamp`
 
-Every delta table includes a `_duckdb_ivm_timestamp` column that records when each
+Every delta table includes a `openivm_timestamp` column that records when each
 delta row was produced. DuckDB's built-in zone maps (min/max metadata per row group)
 enable efficient filtering on this column.
 
 During refresh, OpenIVM filters deltas by timestamp range:
 
 ```sql
-WHERE _duckdb_ivm_timestamp > last_refresh_ts
-  AND _duckdb_ivm_timestamp <= current_ts
+WHERE openivm_timestamp > last_refresh_ts
+  AND openivm_timestamp <= current_ts
 ```
 
 Zone maps allow DuckDB to skip row groups whose timestamp range falls entirely outside
@@ -50,4 +50,4 @@ many refresh cycles.
 | Index type | Target | Created on | Purpose |
 |---|---|---|---|
 | ART index | GROUP BY columns | MV creation | Fast MERGE key lookup |
-| Zone maps | `_duckdb_ivm_timestamp` | Automatic (DuckDB) | Delta timestamp filtering |
+| Zone maps | `openivm_timestamp` | Automatic (DuckDB) | Delta timestamp filtering |

@@ -10,8 +10,8 @@ namespace duckdb {
 
 /// Naming conventions for IVM internal vs user-facing tables.
 ///
-/// The MV data lives in `_ivm_data_<name>` (physical table with all columns
-/// including _ivm_left_key, _ivm_distinct_count, etc.). The user sees `<name>`
+/// The MV data lives in `openivm_data_<name>` (physical table with all columns
+/// including openivm_left_key, openivm_distinct_count, etc.). The user sees `<name>`
 /// (a VIEW that excludes internal columns via SELECT * EXCLUDE).
 ///
 /// All IVM-internal operations (upsert, delta, rewrite) use the data table.
@@ -25,7 +25,7 @@ struct IVMTableNames {
 	/// Returns true if a column name is an internal IVM column that should be
 	/// hidden from users (excluded from the view).
 	static bool IsInternalColumn(const std::string &name) {
-		return StringUtil::StartsWith(name, "_ivm_");
+		return StringUtil::StartsWith(name, "openivm_");
 	}
 
 	/// Returns true if a table name is an IVM data table.

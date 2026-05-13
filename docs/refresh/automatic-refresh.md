@@ -25,7 +25,7 @@ Manual `PRAGMA refresh()` still works on views with `REFRESH EVERY` — the two 
 The refresh daemon is a background `std::thread` started at extension load. It:
 
 1. Wakes every 30 seconds
-2. Queries `_duckdb_ivm_views` for views with `refresh_interval IS NOT NULL`
+2. Queries `openivm_views` for views with `refresh_interval IS NOT NULL`
 3. For each view where `now() - last_update >= interval`: calls `PRAGMA refresh('view_name')`
 4. Skips views that are already being refreshed (via `TryLockView`)
 
@@ -54,18 +54,18 @@ When a refresh takes longer than its interval (e.g., a 3-minute refresh on a 1-m
 
 ```
 Warning: refresh of 'mv_sales' took 185s (interval: 60s).
-Increasing effective interval to 120s. Set ivm_adaptive_backoff = false to disable.
+Increasing effective interval to 120s. Set openivm_adaptive_backoff = false to disable.
 ```
 
 Backoff is runtime-only — the configured `refresh_interval` in metadata is never modified. Restarting the database resets all backoffs. Disable with:
 
 ```sql
-SET ivm_adaptive_backoff = false;
+SET openivm_adaptive_backoff = false;
 ```
 
 ## Crash safety
 
-If the process crashes mid-refresh (after the MERGE updates the MV but before `last_update` is advanced), the same deltas could be double-applied on restart. OpenIVM detects this via a `refresh_in_progress` flag in `_duckdb_ivm_views`:
+If the process crashes mid-refresh (after the MERGE updates the MV but before `last_update` is advanced), the same deltas could be double-applied on restart. OpenIVM detects this via a `refresh_in_progress` flag in `openivm_views`:
 
 - Set to `true` before the IVM query starts
 - Cleared after `last_update` is set
@@ -89,17 +89,17 @@ Automatic refresh uses the same per-view locking as manual `PRAGMA refresh()`:
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `ivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than the interval |
+| `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than the interval |
 
 The refresh interval itself is per-view, set at creation time via `REFRESH EVERY`.
 
 ## Metadata
 
-The `refresh_interval` and `refresh_in_progress` columns are stored in `_duckdb_ivm_views`:
+The `refresh_interval` and `refresh_in_progress` columns are stored in `openivm_views`:
 
 ```sql
 SELECT view_name, refresh_interval, refresh_in_progress
-FROM _duckdb_ivm_views
+FROM openivm_views
 WHERE refresh_interval IS NOT NULL;
 ```
 

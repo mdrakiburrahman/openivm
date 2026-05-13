@@ -61,7 +61,7 @@ CREATE MATERIALIZED VIEW mv_list_filter AS
     FROM list_filter_items GROUP BY grp;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_list_filter';
+SELECT type FROM openivm_views WHERE view_name = 'mv_list_filter';
 ----
 6
 

@@ -6,7 +6,7 @@ require openivm
 
 # Use explicit refresh for correctness tests (no auto-cascade)
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ============================================================
 # Setup: 3-level chain  table → mv1 → mv2 → mv3
@@ -82,7 +82,7 @@ INSERT INTO events VALUES ('charlie', 'buy', 300);
 statement ok
 PRAGMA refresh('user_count');
 
-# user_count should NOT change — delta_user_totals is empty (user_totals wasn't refreshed)
+# user_count should NOT change — openivm_delta_user_totals is empty (user_totals wasn't refreshed)
 query I
 SELECT num_users FROM user_count;
 ----
@@ -174,7 +174,7 @@ INSERT INTO events VALUES ('eve', 'buy', 500);
 statement ok
 PRAGMA refresh('global_total');
 
-# global_total unchanged (delta_user_totals empty because user_totals wasn't refreshed)
+# global_total unchanged (openivm_delta_user_totals empty because user_totals wasn't refreshed)
 query I
 SELECT grand_total FROM global_total;
 ----
@@ -369,7 +369,7 @@ SELECT grand FROM overall;
 # ============================================================
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE TABLE cascade_base (grp VARCHAR, val INT);
@@ -432,7 +432,7 @@ SELECT SUM(val) FROM cascade_base;
 # ============================================================
 
 statement ok
-SET ivm_cascade_refresh = 'upstream';
+SET openivm_cascade_refresh = 'upstream';
 
 statement ok
 CREATE TABLE up_base (x INT);
@@ -481,7 +481,7 @@ SELECT doubled FROM up_l2;
 # ============================================================
 
 statement ok
-SET ivm_cascade_refresh = 'both';
+SET openivm_cascade_refresh = 'both';
 
 statement ok
 CREATE TABLE both_base (k VARCHAR, v INT);
@@ -514,7 +514,7 @@ SELECT grand FROM both_l2;
 # ============================================================
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 statement ok
 INSERT INTO cascade_base VALUES ('d', 50);
@@ -542,7 +542,7 @@ SELECT grand FROM cascade_l2;
 # ============================================================
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE TABLE pipe_empty (user_id VARCHAR, value INT);
@@ -694,7 +694,7 @@ SELECT COUNT(*) FROM (
 # ============================================================
 
 statement ok
-SET ivm_cascade_refresh = 'upstream';
+SET openivm_cascade_refresh = 'upstream';
 
 statement ok
 CREATE TABLE pipe_up (k VARCHAR, v INT);

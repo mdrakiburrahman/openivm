@@ -4,10 +4,10 @@
 
 require openivm
 
-load __TEST_DIR__/ivm_metadata_test.db
+load __TEST_DIR__/openivm_metadata_test.db
 
 statement ok
-SET ivm_files_path='__TEST_DIR__';
+SET openivm_files_path='__TEST_DIR__';
 
 # ==========================================
 # Setup: Create base tables and materialized views
@@ -36,21 +36,21 @@ CREATE MATERIALIZED VIEW mv2 AS SELECT id, name FROM t2;
 # ==========================================
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views;
+SELECT count(*) FROM openivm_views;
 ----
 2
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables;
+SELECT count(*) FROM openivm_delta_tables;
 ----
 2
 
 # ==========================================
-# Test 2: _duckdb_ivm_views has correct entries
+# Test 2: openivm_views has correct entries
 # ==========================================
 
 query II
-SELECT view_name, type FROM _duckdb_ivm_views ORDER BY view_name;
+SELECT view_name, type FROM openivm_views ORDER BY view_name;
 ----
 mv1	0
 mv2	2
@@ -59,41 +59,41 @@ mv2	2
 
 # Verify the stored SQL is non-empty and contains the expected table/column references
 query I
-SELECT sql_string IS NOT NULL AND LENGTH(sql_string) > 0 AND sql_string LIKE '%sum%' AND sql_string LIKE '%grp%' FROM _duckdb_ivm_views WHERE view_name = 'mv1';
+SELECT sql_string IS NOT NULL AND LENGTH(sql_string) > 0 AND sql_string LIKE '%sum%' AND sql_string LIKE '%grp%' FROM openivm_views WHERE view_name = 'mv1';
 ----
 true
 
 # ==========================================
-# Test 3: _duckdb_ivm_delta_tables has correct entries
+# Test 3: openivm_delta_tables has correct entries
 # ==========================================
 
 query II
-SELECT view_name, table_name FROM _duckdb_ivm_delta_tables ORDER BY view_name;
+SELECT view_name, table_name FROM openivm_delta_tables ORDER BY view_name;
 ----
-mv1	delta_t1
-mv2	delta_t2
+mv1	openivm_delta_t1
+mv2	openivm_delta_t2
 
 # ==========================================
 # Test 4: Delta tables exist
 # ==========================================
 
 query I
-SELECT count(*) FROM delta_t1;
+SELECT count(*) FROM openivm_delta_t1;
 ----
 0
 
 query I
-SELECT count(*) FROM delta_t2;
+SELECT count(*) FROM openivm_delta_t2;
 ----
 0
 
 query I
-SELECT count(*) FROM delta_mv1;
+SELECT count(*) FROM openivm_delta_mv1;
 ----
 0
 
 query I
-SELECT count(*) FROM delta_mv2;
+SELECT count(*) FROM openivm_delta_mv2;
 ----
 0
 
@@ -102,12 +102,12 @@ SELECT count(*) FROM delta_mv2;
 # ==========================================
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE last_update IS NOT NULL;
+SELECT count(*) FROM openivm_views WHERE last_update IS NOT NULL;
 ----
 2
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE last_update IS NOT NULL;
+SELECT count(*) FROM openivm_delta_tables WHERE last_update IS NOT NULL;
 ----
 2
 
@@ -134,38 +134,38 @@ b	20
 statement ok
 DROP VIEW mv1;
 
-# Entry should be removed from _duckdb_ivm_views
+# Entry should be removed from openivm_views
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv1';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv1';
 ----
 0
 
-# Entries should be removed from _duckdb_ivm_delta_tables
+# Entries should be removed from openivm_delta_tables
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv1';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv1';
 ----
 0
 
 # Delta view for the MV should be dropped
 statement error
-SELECT count(*) FROM delta_mv1;
+SELECT count(*) FROM openivm_delta_mv1;
 ----
 does not exist
 
-# delta_t1 should be dropped since no other MV uses t1
+# openivm_delta_t1 should be dropped since no other MV uses t1
 statement error
-SELECT count(*) FROM delta_t1;
+SELECT count(*) FROM openivm_delta_t1;
 ----
 does not exist
 
 # mv2 metadata should be untouched
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv2';
 ----
 1
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv2';
 ----
 1
 
@@ -196,7 +196,7 @@ b	20
 c	100
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv1';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv1';
 ----
 1
 
@@ -204,28 +204,28 @@ SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv1';
 # Test 10: DROP second MV, delta table cleanup
 # ==========================================
 
-# Drop mv2 — delta_t2 should be cleaned up since no other MV uses t2
+# Drop mv2 — openivm_delta_t2 should be cleaned up since no other MV uses t2
 statement ok
 DROP VIEW mv2;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv2';
 ----
 0
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv2';
 ----
 0
 
 statement error
-SELECT count(*) FROM delta_mv2;
+SELECT count(*) FROM openivm_delta_mv2;
 ----
 does not exist
 
-# delta_t2 should be dropped since no MV depends on t2 anymore
+# openivm_delta_t2 should be dropped since no MV depends on t2 anymore
 statement error
-SELECT count(*) FROM delta_t2;
+SELECT count(*) FROM openivm_delta_t2;
 ----
 does not exist
 
@@ -241,22 +241,22 @@ statement ok
 CREATE MATERIALIZED VIEW mv_shared2 AS SELECT grp, count(val) as c FROM t1 GROUP BY grp;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE table_name = 'delta_t1';
+SELECT count(*) FROM openivm_delta_tables WHERE table_name = 'openivm_delta_t1';
 ----
 3
 
-# Drop one — delta_t1 should remain (mv1 and mv_shared2 still use it)
+# Drop one — openivm_delta_t1 should remain (mv1 and mv_shared2 still use it)
 statement ok
 DROP VIEW mv_shared1;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE table_name = 'delta_t1';
+SELECT count(*) FROM openivm_delta_tables WHERE table_name = 'openivm_delta_t1';
 ----
 2
 
-# delta_t1 still exists
+# openivm_delta_t1 still exists
 query I
-SELECT count(*) FROM delta_t1;
+SELECT count(*) FROM openivm_delta_t1;
 ----
 0
 
@@ -288,7 +288,7 @@ statement ok
 CREATE MATERIALIZED VIEW mv_t3 AS SELECT sum(val) as total FROM t3;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_t3';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_t3';
 ----
 1
 
@@ -305,23 +305,23 @@ does not exist
 
 # Metadata should be cleaned up
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_t3';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_t3';
 ----
 0
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_t3';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv_t3';
 ----
 0
 
 # Delta tables should be gone
 statement error
-SELECT count(*) FROM delta_t3;
+SELECT count(*) FROM openivm_delta_t3;
 ----
 does not exist
 
 statement error
-SELECT count(*) FROM delta_mv_t3;
+SELECT count(*) FROM openivm_delta_mv_t3;
 ----
 does not exist
 
@@ -346,12 +346,12 @@ statement ok
 DROP VIEW mv_shared2;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views;
+SELECT count(*) FROM openivm_views;
 ----
 0
 
 query I
-SELECT count(*) FROM _duckdb_ivm_delta_tables;
+SELECT count(*) FROM openivm_delta_tables;
 ----
 0
 
@@ -374,7 +374,7 @@ SELECT total FROM mv_fresh;
 42
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views;
+SELECT count(*) FROM openivm_views;
 ----
 1
 
@@ -457,8 +457,8 @@ INSERT INTO view_test VALUES (1, 10), (2, 20);
 statement ok
 CREATE MATERIALIZED VIEW mv_view_test AS SELECT DISTINCT val FROM view_test;
 
-# The MV is a VIEW over _ivm_data_mv_view_test. Internal columns should be hidden.
-# SELECT * should return only user-facing columns (val), not _ivm_distinct_count.
+# The MV is a VIEW over openivm_data_mv_view_test. Internal columns should be hidden.
+# SELECT * should return only user-facing columns (val), not openivm_distinct_count.
 query I
 SELECT COUNT(*) FROM (SELECT * FROM mv_view_test);
 ----
@@ -466,7 +466,7 @@ SELECT COUNT(*) FROM (SELECT * FROM mv_view_test);
 
 # Verify the data table exists separately
 query I
-SELECT COUNT(*) FROM _ivm_data_mv_view_test;
+SELECT COUNT(*) FROM openivm_data_mv_view_test;
 ----
 2
 
@@ -485,17 +485,17 @@ CREATE MATERIALIZED VIEW mv_drop_test AS SELECT val FROM drop_test;
 
 # Verify everything exists
 query I
-SELECT COUNT(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_views WHERE view_name = 'mv_drop_test';
 ----
 1
 
 query I
-SELECT COUNT(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_delta_tables WHERE view_name = 'mv_drop_test';
 ----
 1
 
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_ivm_data_mv_drop_test';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_data_mv_drop_test';
 ----
 1
 
@@ -504,21 +504,21 @@ statement ok
 DROP VIEW mv_drop_test;
 
 query I
-SELECT COUNT(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_views WHERE view_name = 'mv_drop_test';
 ----
 0
 
 query I
-SELECT COUNT(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_delta_tables WHERE view_name = 'mv_drop_test';
 ----
 0
 
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_ivm_data_mv_drop_test';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_data_mv_drop_test';
 ----
 0
 
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'delta_mv_drop_test';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_delta_mv_drop_test';
 ----
 0

@@ -1,7 +1,7 @@
 // Constraint cache for view matching.
 //
 // Lazy cache of `TableCatalogEntry::GetConstraints()` per table, persisted in
-// `_duckdb_ivm_constraints_cache`. Adds RELY-style trusted-but-not-enforced
+// `openivm_constraints_cache`. Adds RELY-style trusted-but-not-enforced
 // FK declarations (Oracle/DB2 pattern) via `PRAGMA ivm_declare_rely_fk(...)`,
 // used by the matcher for join elimination.
 

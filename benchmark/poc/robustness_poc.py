@@ -102,7 +102,7 @@ BYPASS = (
 	"FROM lineitem l JOIN orders o ON l.l_order_id=o.o_id GROUP BY o.o_region;"
 )
 CASCADE = (
-	"SET ivm_cascade_refresh='downstream';\n"
+	"SET openivm_cascade_refresh='downstream';\n"
 	"PRAGMA refresh('mv_a');\n"
 	"SELECT * FROM mv_c;"
 )
@@ -111,10 +111,10 @@ STALE_RES = (
 	"    SELECT o_region, revenue, cnt FROM mv_c "
 	"    UNION ALL "
 	"    SELECT o.o_region, "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 	"                    ELSE -dl.l_qty*dl.l_price END), "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) "
-	"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) "
+	"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 	"    GROUP BY o.o_region "
 	") x GROUP BY o_region;"
 )
@@ -152,16 +152,16 @@ def insert_skewed_lineitem(start: int, count: int, n_orders: int) -> str:
 
 
 def apply_workload(db: str, scenario: str, n_orders: int, n_lineitem: int, frac: float) -> None:
-	delta_li = max(1, int(n_lineitem * frac))
+	openivm_delta_li = max(1, int(n_lineitem * frac))
 	if scenario == "multi_table_delta":
 		# Small delta on orders (10% of lineitem delta), bigger delta on lineitem
-		delta_o = max(1, delta_li // 10)
-		sql = insert_orders(n_orders, delta_o) + "\n" + insert_lineitem(n_lineitem, delta_li, n_orders + delta_o)
+		openivm_delta_o = max(1, openivm_delta_li // 10)
+		sql = insert_orders(n_orders, openivm_delta_o) + "\n" + insert_lineitem(n_lineitem, openivm_delta_li, n_orders + openivm_delta_o)
 	elif scenario == "heavy_delete":
-		# Delete delta_li lowest-id rows
-		sql = f"DELETE FROM lineitem WHERE l_id < {delta_li};"
+		# Delete openivm_delta_li lowest-id rows
+		sql = f"DELETE FROM lineitem WHERE l_id < {openivm_delta_li};"
 	elif scenario == "skewed_data":
-		sql = insert_skewed_lineitem(n_lineitem, delta_li, n_orders)
+		sql = insert_skewed_lineitem(n_lineitem, openivm_delta_li, n_orders)
 	else:
 		raise ValueError(scenario)
 	out, err, rc = run_sql(db, sql)
@@ -225,7 +225,7 @@ def main() -> int:
 				if samples:
 					rows.append({
 						"scenario": scen,
-						"delta_fraction": f,
+						"openivm_delta_fraction": f,
 						"strategy": strategy,
 						"reps": len(samples),
 						"median_s": statistics.median(samples),
@@ -237,7 +237,7 @@ def main() -> int:
 	with Path(args.out).open("w", newline="") as fp:
 		w = csv.DictWriter(
 			fp,
-			fieldnames=["scenario", "delta_fraction", "strategy", "reps", "median_s", "min_s", "max_s"],
+			fieldnames=["scenario", "openivm_delta_fraction", "strategy", "reps", "median_s", "min_s", "max_s"],
 			extrasaction="ignore",
 		)
 		w.writeheader()
@@ -250,7 +250,7 @@ def main() -> int:
 		for r in rows:
 			if r["scenario"] != scen:
 				continue
-			by_f.setdefault(r["delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
+			by_f.setdefault(r["openivm_delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
 		for f in sorted(by_f):
 			d = by_f[f]
 			winner = min(d, key=d.get)

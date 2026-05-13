@@ -39,7 +39,7 @@ static AggregateFunction BindAggregateByName(ClientContext &context, const strin
 
 static bool CompactDeltasEnabled(ClientContext &context) {
 	Value compact_val;
-	if (context.TryGetCurrentSetting("ivm_compact_deltas", compact_val) && !compact_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_compact_deltas", compact_val) && !compact_val.IsNull()) {
 		return compact_val.GetValue<bool>();
 	}
 	return true;

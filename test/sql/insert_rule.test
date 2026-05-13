@@ -14,8 +14,8 @@ CREATE TABLE staff (id INT, name VARCHAR, dept VARCHAR, salary INT);
 statement ok
 INSERT INTO staff VALUES (1, 'Alice', 'eng', 100), (2, 'Bob', 'sales', 200);
 
-# CREATE MATERIALIZED VIEW auto-populates _duckdb_ivm_views, _duckdb_ivm_delta_tables,
-# creates delta_staff, _ivm_data_mv_staff, delta_mv_staff, and the mv_staff view.
+# CREATE MATERIALIZED VIEW auto-populates openivm_views, openivm_delta_tables,
+# creates openivm_delta_staff, openivm_data_mv_staff, openivm_delta_mv_staff, and the mv_staff view.
 statement ok
 CREATE MATERIALIZED VIEW mv_staff AS SELECT id, name, dept, salary FROM staff;
 
@@ -290,13 +290,13 @@ statement ok
 CREATE TABLE ab (id INT, val INT);
 
 statement ok
-CREATE TABLE delta_ab AS SELECT *, 1::INTEGER AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM ab LIMIT 0;
+CREATE TABLE openivm_delta_ab AS SELECT *, 1::INTEGER AS openivm_multiplicity, now()::timestamp AS openivm_timestamp FROM ab LIMIT 0;
 
 statement ok
 INSERT INTO ab VALUES (1, 42);
 
 query I
-SELECT count(*) FROM delta_ab;
+SELECT count(*) FROM openivm_delta_ab;
 ----
 1
 
@@ -966,13 +966,13 @@ statement ok
 CREATE TABLE agg_target (id INT, name VARCHAR, dept VARCHAR, salary INT);
 
 statement ok
-CREATE TABLE delta_agg_target AS SELECT *, 1::INTEGER AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM agg_target LIMIT 0;
+CREATE TABLE openivm_delta_agg_target AS SELECT *, 1::INTEGER AS openivm_multiplicity, now()::timestamp AS openivm_timestamp FROM agg_target LIMIT 0;
 
 statement ok
 INSERT INTO agg_target SELECT 999, dept, dept, SUM(salary) FROM staff WHERE dept = 'eng' GROUP BY dept;
 
 query I
-SELECT count(*) FROM delta_agg_target;
+SELECT count(*) FROM openivm_delta_agg_target;
 ----
 1
 
@@ -991,7 +991,7 @@ statement ok
 DELETE FROM staff WHERE dept IN (SELECT 'temp');
 
 query I
-SELECT count(*) FROM delta_staff WHERE dept = 'temp' AND _duckdb_ivm_multiplicity = -1;
+SELECT count(*) FROM openivm_delta_staff WHERE dept = 'temp' AND openivm_multiplicity = -1;
 ----
 2
 

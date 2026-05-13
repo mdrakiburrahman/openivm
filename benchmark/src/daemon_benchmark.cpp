@@ -656,23 +656,23 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			ctx.summary.delta_sanity_checks++;
 		}
 		// Fetch (view_name, table_name, delta_table, last_update, last_dml_ts).
-		// last_dml_ts = MAX(_duckdb_ivm_timestamp) across rows currently in the
+		// last_dml_ts = MAX(openivm_timestamp) across rows currently in the
 		// delta_<table>. If last_dml_ts > last_update, the refresh hasn't caught
 		// up yet — delta should have rows. If last_dml_ts <= last_update globally
 		// across ALL views referencing this delta, the rows should have been
 		// cleaned by the DELETE FROM delta_<table> WHERE ts < MIN(last_update).
 		auto meta = con.Query(
-		    "SELECT view_name, table_name, last_update FROM _duckdb_ivm_delta_tables "
+		    "SELECT view_name, table_name, last_update FROM openivm_delta_tables "
 		    "WHERE catalog_type = 'duckdb' OR catalog_type IS NULL");
 		if (!meta || meta->HasError()) continue;
 		for (idx_t i = 0; i < meta->RowCount(); i++) {
 			string view_name = meta->GetValue(0, i).ToString();
 			string base_table = meta->GetValue(1, i).ToString();
 			string last_update = meta->GetValue(2, i).IsNull() ? "" : meta->GetValue(2, i).ToString();
-			string delta_table = "delta_" + base_table;
+			string delta_table = "openivm_delta_" + base_table;
 			// Count delta rows newer than last_update
 			string key = view_name + "|" + delta_table;
-			string newer_q = "SELECT COUNT(*) FROM " + delta_table + " WHERE _duckdb_ivm_timestamp > '" +
+			string newer_q = "SELECT COUNT(*) FROM " + delta_table + " WHERE openivm_timestamp > '" +
 			                  last_update + "'::TIMESTAMP";
 			auto newer_r = con.Query(newer_q);
 			if (!newer_r || newer_r->HasError()) continue;
@@ -682,7 +682,7 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			if (!total_r || total_r->HasError()) continue;
 			int64_t total_count = total_r->GetValue(0, 0).GetValue<int64_t>();
 			// Invariant 1: if total > 0 and last_update is < MAX(ts in delta), newer_count > 0
-			auto maxts_r = con.Query("SELECT MAX(_duckdb_ivm_timestamp) FROM " + delta_table);
+			auto maxts_r = con.Query("SELECT MAX(openivm_timestamp) FROM " + delta_table);
 			if (!maxts_r || maxts_r->HasError() || maxts_r->RowCount() == 0 || maxts_r->GetValue(0, 0).IsNull()) {
 				missing_streak[key] = 0;
 			} else {
@@ -703,11 +703,11 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			// Invariant 2: delta rows older than MIN(last_update) across all
 			// views using this delta should have been cleaned up.
 			auto minlu_r =
-			    con.Query("SELECT MIN(last_update) FROM _duckdb_ivm_delta_tables WHERE table_name = '" + base_table + "'");
+			    con.Query("SELECT MIN(last_update) FROM openivm_delta_tables WHERE table_name = '" + base_table + "'");
 			if (minlu_r && !minlu_r->HasError() && minlu_r->RowCount() > 0 && !minlu_r->GetValue(0, 0).IsNull()) {
 				string min_lu = minlu_r->GetValue(0, 0).ToString();
 				auto stale_r = con.Query("SELECT COUNT(*) FROM " + delta_table +
-				                          " WHERE _duckdb_ivm_timestamp < '" + min_lu + "'::TIMESTAMP");
+				                          " WHERE openivm_timestamp < '" + min_lu + "'::TIMESTAMP");
 				if (stale_r && !stale_r->HasError()) {
 					int64_t stale_count = stale_r->GetValue(0, 0).GetValue<int64_t>();
 					if (stale_count > 0) {
@@ -731,11 +731,11 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 
 static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 	duckdb::Connection con(*ctx.db);
-	// Refresh bumps `_duckdb_ivm_delta_tables.last_update` (one row per source
+	// Refresh bumps `openivm_delta_tables.last_update` (one row per source
 	// table per MV). Per MV we track MAX(last_update) across its source tables.
 	map<string, string> prev_update;
 	auto r0 = con.Query(
-	    "SELECT view_name, MAX(last_update) FROM _duckdb_ivm_delta_tables GROUP BY view_name");
+	    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 	if (r0 && !r0->HasError()) {
 		for (idx_t i = 0; i < r0->RowCount(); i++) {
 			prev_update[r0->GetValue(0, i).ToString()] =
@@ -744,7 +744,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 	}
 	while (!ctx.stop.load()) {
 		auto r = con.Query(
-		    "SELECT view_name, MAX(last_update) FROM _duckdb_ivm_delta_tables GROUP BY view_name");
+		    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 		if (r && !r->HasError()) {
 			for (idx_t i = 0; i < r->RowCount(); i++) {
 				string vn = r->GetValue(0, i).ToString();
@@ -756,7 +756,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 					ctx.summary.refresh_events++;
 					ctx.summary.per_mv_refreshes[vn]++;
 					// Duration from refresh_history if populated (adaptive mode); else 0
-					auto hr = con.Query("SELECT actual_duration_ms FROM _duckdb_ivm_refresh_history "
+					auto hr = con.Query("SELECT actual_duration_ms FROM openivm_refresh_history "
 					                    "WHERE view_name = '" + vn +
 					                    "' ORDER BY refresh_timestamp DESC LIMIT 1");
 					double dur = 0;
@@ -836,21 +836,21 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			return 2;
 		}
 		// Clear any stale refresh_in_progress from previous crashed runs.
-		con.Query("UPDATE _duckdb_ivm_views SET refresh_in_progress = false");
+		con.Query("UPDATE openivm_views SET refresh_in_progress = false");
 
 		// Per-subtest cascade mode + daemon settings
 		if (subtest == "S1") ctx.cascade_mode = "upstream";
 		else if (subtest == "S2") ctx.cascade_mode = "downstream";
 		else if (subtest == "S3") ctx.cascade_mode = "both";
 		else if (subtest == "S9") ctx.cascade_mode = "upstream";
-		con.Query("SET GLOBAL ivm_cascade_refresh = '" + ctx.cascade_mode + "'");
+		con.Query("SET GLOBAL openivm_cascade_refresh = '" + ctx.cascade_mode + "'");
 		// Enable adaptive refresh GLOBALLY so the daemon (its own connection)
-		// and all worker threads see the flag and populate `_duckdb_ivm_refresh_history`.
-		con.Query("SET GLOBAL ivm_adaptive_refresh = true");
+		// and all worker threads see the flag and populate `openivm_refresh_history`.
+		con.Query("SET GLOBAL openivm_adaptive_refresh = true");
 		ctx.summary.cascade_mode = ctx.cascade_mode;
 
 		if (subtest == "S4" || subtest == "S5" || subtest == "S6" || subtest == "S11") {
-			con.Query("SET ivm_disable_daemon = true");
+			con.Query("SET openivm_disable_daemon = true");
 			ctx.disable_daemon = true;
 		}
 
@@ -859,8 +859,8 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		// artifacts left by S9/S10/S11 don't leak into the next sub-test.
 		auto leftover = con.Query(
 		    "SELECT table_catalog, table_schema, table_name FROM information_schema.tables "
-		    "WHERE table_name LIKE 'mv_%' OR table_name LIKE '_ivm_data_mv_%' OR table_name LIKE 'delta_mv_%' "
-		    "  OR table_name LIKE 'ivm_delta_mv_%'");
+		    "WHERE table_name LIKE 'mv_%' OR table_name LIKE 'openivm_data_mv_%' OR table_name LIKE "
+		    "'openivm_delta_mv_%'");
 		if (leftover && !leftover->HasError()) {
 			for (idx_t i = 0; i < leftover->RowCount(); i++) {
 				string cat = leftover->GetValue(0, i).ToString();
@@ -871,10 +871,10 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				con.Query("DROP TABLE IF EXISTS " + full);
 			}
 		}
-		con.Query("DELETE FROM _duckdb_ivm_views WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM _duckdb_ivm_delta_tables WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM _duckdb_ivm_refresh_history WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM _duckdb_ivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
+		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%'");
+		con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_%'");
+		con.Query("DELETE FROM openivm_refresh_history WHERE view_name LIKE 'mv_%'");
+		con.Query("DELETE FROM openivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
 
 		// DuckLake attach for S9/S10/S11
 		if (subtest == "S9" || subtest == "S10" || subtest == "S11") {
@@ -1082,7 +1082,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					// vs the refresh applied something wrong.
 					string diag;
 					auto dt_r = fin_con.Query(
-					    "SELECT table_name, last_update FROM _duckdb_ivm_delta_tables WHERE view_name = '" +
+					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name = '" +
 					    v.name + "'");
 					if (dt_r && !dt_r->HasError()) {
 						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
@@ -1092,7 +1092,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 							int64_t c = (cnt_r && !cnt_r->HasError()) ? cnt_r->GetValue(0, 0).GetValue<int64_t>() : -1;
 							auto newer_r = fin_con.Query(
 							    "SELECT COUNT(*) FROM delta_" + tn +
-							    " WHERE _duckdb_ivm_timestamp >= '" + lu + "'::TIMESTAMP");
+							    " WHERE openivm_timestamp >= '" + lu + "'::TIMESTAMP");
 							int64_t nc = (newer_r && !newer_r->HasError()) ? newer_r->GetValue(0, 0).GetValue<int64_t>() : -1;
 							if (!diag.empty()) diag += ", ";
 							diag += tn + "(rows=" + std::to_string(c) + " >=last=" + std::to_string(nc) +

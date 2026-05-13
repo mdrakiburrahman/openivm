@@ -5,7 +5,7 @@
 require openivm
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ============================================================
 # Basic DISTINCT
@@ -714,18 +714,18 @@ SELECT COUNT(*) FROM (
 # `decision = group_recompute` (verified manually — sqllogictest can't run
 # PRAGMA inside CREATE TABLE AS, so the test only asserts the type column).
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'idist_mv';
+SELECT type FROM openivm_views WHERE view_name = 'idist_mv';
 ----
 6
 
-# Flag `ivm_distinct_aux_state` routes single-source inner-DISTINCT-under-AGG
+# Flag `openivm_distinct_aux_state` routes single-source inner-DISTINCT-under-AGG
 # views to IVMType::DISTINCT_INCREMENTAL (8) at CREATE time. The actual
 # aux-state SQL pipeline isn't wired yet — it falls through to the
 # GROUP_RECOMPUTE compile path as a stub — but the classification surface
 # is stable so the eventual implementation can replace just the upsert SQL
 # without touching parser/dispatch.
 statement ok
-SET ivm_distinct_aux_state = true;
+SET openivm_distinct_aux_state = true;
 
 statement ok
 CREATE TABLE idist_u2 (grp INT, machine VARCHAR, cores INT);
@@ -741,7 +741,7 @@ CREATE MATERIALIZED VIEW idist_mv_aux AS
 
 # Single-source view classifies as DISTINCT_INCREMENTAL (type 8).
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'idist_mv_aux';
+SELECT type FROM openivm_views WHERE view_name = 'idist_mv_aux';
 ----
 8
 
@@ -774,14 +774,14 @@ SELECT COUNT(*) FROM (
 0
 
 statement ok
-SET ivm_distinct_aux_state = false;
+SET openivm_distinct_aux_state = false;
 
 # Aux-table assertions: with the flag on, the aux state actually evolves on each
 # refresh and reflects per-distinct-tuple counts. Pre-fix the dispatch fell
 # through to GROUP_RECOMPUTE so no aux table was consulted; this asserts the
 # full DBSP pipeline runs.
 statement ok
-SET ivm_distinct_aux_state = true;
+SET openivm_distinct_aux_state = true;
 
 statement ok
 CREATE TABLE idist_u3 (grp INT, machine VARCHAR, cores INT);
@@ -798,7 +798,7 @@ CREATE MATERIALIZED VIEW idist_aux_v3 AS
 # Aux table seeded from the (DISTINCT-stripped) input subquery: (1,m1,8) has
 # count 2 (two duplicate input rows), (1,m2,16) has count 1.
 query III
-SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
 ----
 m1	8	2
 m2	16	1
@@ -817,7 +817,7 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	24
 
 query III
-SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
 ----
 m1	8	3
 m2	16	1
@@ -835,7 +835,7 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	124
 
 query III
-SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
 ----
 m1	8	3
 m2	16	1
@@ -854,7 +854,7 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	124
 
 query III
-SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
 ----
 m1	8	2
 m2	16	1
@@ -873,10 +873,10 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	116
 
 query III
-SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
 ----
 m2	16	1
 m9	100	1
 
 statement ok
-SET ivm_distinct_aux_state = false;
+SET openivm_distinct_aux_state = false;

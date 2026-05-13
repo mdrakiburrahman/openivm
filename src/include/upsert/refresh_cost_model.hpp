@@ -51,7 +51,7 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 string IVMCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters);
 
 // =============================================================================
-// View-matching extension (gated by `ivm_enable_view_matching`).
+// View-matching extension (gated by `openivm_enable_view_matching`).
 // =============================================================================
 
 enum class MatchStrategy : uint8_t {
@@ -70,9 +70,9 @@ struct StrategyCostEstimate {
 };
 
 /// For a query that matched `view_name`, score each candidate strategy.
-/// Reads pending-delta-row estimate from `_duckdb_ivm_delta_tables` and
-/// per-strategy regression from `_duckdb_ivm_refresh_history`. Returns an
-/// empty vector if `ivm_enable_view_matching` is off.
+/// Reads pending-delta-row estimate from `openivm_delta_tables` and
+/// per-strategy regression from `openivm_refresh_history`. Returns an
+/// empty vector if `openivm_enable_view_matching` is off.
 vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const string &view_name,
                                               LogicalOperator &query_plan);
 

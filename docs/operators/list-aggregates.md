@@ -41,17 +41,17 @@ For `LIST(...) FILTER`, DuckDB's list aggregate keeps NULL elements. Rewriting t
 -- Aggregate delta rows per group, preserving multiplicity
 -- The LIST aggregate collects all readings for each sensor
 WITH scan_0 (...) AS (
-    SELECT sensor, readings, _duckdb_ivm_multiplicity
-    FROM delta_measurements
-    WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
+    SELECT sensor, readings, openivm_multiplicity
+    FROM openivm_delta_measurements
+    WHERE openivm_timestamp >= '{ts}'::TIMESTAMP
 ),
 aggregate_1 (...) AS (
-    SELECT sensor, LIST(readings) AS all_readings, _duckdb_ivm_multiplicity
+    SELECT sensor, LIST(readings) AS all_readings, openivm_multiplicity
     FROM scan_0
-    GROUP BY sensor, _duckdb_ivm_multiplicity
+    GROUP BY sensor, openivm_multiplicity
 )
-INSERT INTO delta_sensor_totals (sensor, all_readings, _duckdb_ivm_multiplicity)
-SELECT sensor, all_readings, _duckdb_ivm_multiplicity FROM aggregate_1;
+INSERT INTO openivm_delta_sensor_totals (sensor, all_readings, openivm_multiplicity)
+SELECT sensor, all_readings, openivm_multiplicity FROM aggregate_1;
 ```
 
 ### Upsert (CTE consolidation + MERGE)
@@ -64,11 +64,11 @@ SELECT sensor, all_readings, _duckdb_ivm_multiplicity FROM aggregate_1;
 WITH ivm_cte AS (
     SELECT sensor,
         list_reduce(list(
-            list_transform(all_readings, lambda x: _duckdb_ivm_multiplicity * x)
+            list_transform(all_readings, lambda x: openivm_multiplicity * x)
         ), lambda a, b: list_transform(
             list_zip(a, b), lambda x: x[1] + x[2]
         )) AS all_readings
-    FROM delta_sensor_totals
+    FROM openivm_delta_sensor_totals
     GROUP BY sensor
 )
 -- MERGE: add corresponding elements of existing and delta lists

@@ -8,7 +8,7 @@
 namespace duckdb {
 
 // Centralized access to IVM metadata stored in system tables.
-// Wraps all raw SQL queries to _duckdb_ivm_views and _duckdb_ivm_delta_tables
+// Wraps all raw SQL queries to openivm_views and openivm_delta_tables
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class IVMMetadata {
 	Connection &con;
@@ -74,7 +74,7 @@ public:
 
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
 	// target: the (possibly schema-qualified) table to delete from.
-	// metadata_key: the name used in _duckdb_ivm_delta_tables (unqualified delta name).
+	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key);
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
@@ -117,7 +117,7 @@ public:
 	// --- Aux-state DISTINCT (IVMType::DISTINCT_INCREMENTAL) ---
 
 	// Metadata captured at CREATE-MV time for the aux-state DISTINCT pipeline.
-	// `aux_table` is the per-tuple count table (e.g. `_ivm_distinct_count_<view>`);
+	// `aux_table` is the per-tuple count table (e.g. `openivm_distinct_count_<view>`);
 	// `cols` are the columns being deduplicated; `input_sql` is the DISTINCT subquery
 	// body with the DISTINCT keyword stripped; `source` is the base table referenced
 	// by `input_sql`'s FROM clause; `filter` is the WHERE predicate (empty if none);

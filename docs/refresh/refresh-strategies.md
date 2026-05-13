@@ -4,7 +4,7 @@ OpenIVM supports three refresh strategies for materialized views: **auto**, **in
 
 ## Refresh modes
 
-The `ivm_refresh_mode` setting controls which strategy is used at refresh time.
+The `openivm_refresh_mode` setting controls which strategy is used at refresh time.
 
 | Mode            | Behavior |
 |-----------------|---|
@@ -14,15 +14,15 @@ The `ivm_refresh_mode` setting controls which strategy is used at refresh time.
 
 ```sql
 -- Use incremental refresh (default)
-SET ivm_refresh_mode = 'incremental';
+SET openivm_refresh_mode = 'incremental';
 PRAGMA refresh('monthly_totals');
 
 -- Let the system decide (incremental when supported, full otherwise)
-SET ivm_refresh_mode = 'auto';
+SET openivm_refresh_mode = 'auto';
 PRAGMA refresh('monthly_totals');
 
 -- Force full recomputation
-SET ivm_refresh_mode = 'full';
+SET openivm_refresh_mode = 'full';
 PRAGMA refresh('monthly_totals');
 ```
 
@@ -47,14 +47,14 @@ MERGE requires a key to match source and target rows. `AGGREGATE_GROUP` views ha
 
 > **Note:** This feature is experimental. The cost model heuristics may change in future releases.
 
-When `ivm_adaptive_refresh` is enabled, OpenIVM estimates the cost of incremental refresh versus full recomputation before each refresh and picks the cheaper option. This is useful when delta sizes vary unpredictably.
+When `openivm_adaptive_refresh` is enabled, OpenIVM estimates the cost of incremental refresh versus full recomputation before each refresh and picks the cheaper option. This is useful when delta sizes vary unpredictably.
 
 ```sql
-SET ivm_adaptive_refresh = true;
+SET openivm_adaptive_refresh = true;
 PRAGMA refresh('monthly_totals');
 ```
 
-The cost model compares estimated cardinalities of the delta tables against the base tables. When `ivm_adaptive_refresh` is `false` (the default), the system always uses IVM for views that support it.
+The cost model compares estimated cardinalities of the delta tables against the base tables. When `openivm_adaptive_refresh` is `false` (the default), the system always uses IVM for views that support it.
 
 For FULL OUTER JOIN views, the static model applies higher upsert cost multipliers (3x for aggregates, 1.5x for projections) to account for the additional recompute phases (unmatched-row key extraction, NULL group recompute). The learned regression model self-corrects from execution history after a few refreshes.
 

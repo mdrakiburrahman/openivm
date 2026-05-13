@@ -5,7 +5,7 @@
 require openivm
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ============================================================
 # Basic: MV with aggregate (LPTS generates CTEs internally)
@@ -386,7 +386,7 @@ CREATE MATERIALIZED VIEW mv_cte_joinagg AS
     FROM customer_segments cs JOIN cte_joinagg_wh wh ON cs.w = wh.w;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_joinagg';
+SELECT type FROM openivm_views WHERE view_name = 'mv_cte_joinagg';
 ----
 6
 
@@ -536,7 +536,7 @@ SELECT count(*) FROM (
 # Duplicate column names in SELECT.
 # `SELECT W_ID, W_ID …` and `SELECT col, col, COUNT(*) GROUP BY col, col`
 # generate LPTS output with duplicate output columns; without dedup,
-# `CREATE TABLE _ivm_data_mv AS <view_query>` rejects duplicates.
+# `CREATE TABLE openivm_data_mv AS <view_query>` rejects duplicates.
 # Both output_names AND aggregate_columns get `_N` suffixes so:
 #   1. The data table has unique columns.
 #   2. The unique index and MERGE ON/UPDATE SET clauses reference the deduped
@@ -686,7 +686,7 @@ SELECT COUNT(*) FROM (
 
 # Classification: SIMPLE_PROJECTION (type 2), not FULL_REFRESH.
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'selfjoin_mv';
+SELECT type FROM openivm_views WHERE view_name = 'selfjoin_mv';
 ----
 2
 
@@ -716,7 +716,7 @@ CREATE MATERIALIZED VIEW mv_jia AS
 
 # Verify classification is GROUP_RECOMPUTE (6)
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_jia';
+SELECT type FROM openivm_views WHERE view_name = 'mv_jia';
 ----
 6
 
@@ -807,7 +807,7 @@ CREATE MATERIALIZED VIEW mv_cra AS
 
 # Verify classification is GROUP_RECOMPUTE (6): outer COUNT(*) counts inner groups (non-linear over source deltas)
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_cra';
+SELECT type FROM openivm_views WHERE view_name = 'mv_cra';
 ----
 6
 
@@ -864,12 +864,12 @@ CREATE MATERIALIZED VIEW mv_fgc AS
     SELECT * FROM step3;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_fgc';
+SELECT type FROM openivm_views WHERE view_name = 'mv_fgc';
 ----
 1
 
 query I
-SELECT aggregate_decomposition_json IS NOT NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_fgc';
+SELECT aggregate_decomposition_json IS NOT NULL FROM openivm_views WHERE view_name = 'mv_fgc';
 ----
 true
 
@@ -972,12 +972,12 @@ JOIN cte_dist d ON w.w_id = d.d_w_id
 JOIN ol_by_district od ON d.d_w_id = od.ol_w_id AND d.d_id = od.ol_d_id;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_join_keys';
+SELECT type FROM openivm_views WHERE view_name = 'mv_cte_join_keys';
 ----
 6
 
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_join_keys';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_cte_join_keys';
 ----
 w_id,d_id
 

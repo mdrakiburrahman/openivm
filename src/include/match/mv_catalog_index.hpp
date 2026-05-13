@@ -4,8 +4,8 @@
 // (source-table set, group-by columns, output columns) so the matcher can
 // prune the candidate set before doing full subsumption.
 //
-// Backed by `_duckdb_ivm_views` (signature_hash, source_tables_json,
-// output_columns_json) plus `_duckdb_ivm_delta_tables.pending_row_estimate`
+// Backed by `openivm_views` (signature_hash, source_tables_json,
+// output_columns_json) plus `openivm_delta_tables.pending_row_estimate`
 // for freshness-aware ranking.
 //
 // Built lazily on first query; maintained on CREATE / DROP / REPLACE /

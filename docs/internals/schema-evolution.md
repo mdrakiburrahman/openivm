@@ -14,7 +14,7 @@ OpenIVM handles `ALTER TABLE` on base tables that have materialized views depend
 
 ## How "referenced" is determined
 
-The check plans the stored `sql_string` from `_duckdb_ivm_views`, walks the logical plan tree, and inspects `LOGICAL_GET` nodes for the target table. If the column appears in the node's bound column references (`GetColumnIds()`), it's referenced. This is precise — no regex or string matching.
+The check plans the stored `sql_string` from `openivm_views`, walks the logical plan tree, and inspects `LOGICAL_GET` nodes for the target table. If the column appears in the node's bound column references (`GetColumnIds()`), it's referenced. This is precise — no regex or string matching.
 
 ## How it works
 
@@ -27,7 +27,7 @@ The `IVMInsertRule` optimizer extension intercepts `LOGICAL_ALTER` nodes. For ea
 
 ## Column ordering
 
-Delta tables store base table columns first, followed by `_duckdb_ivm_multiplicity` and `_duckdb_ivm_timestamp`. After `ALTER TABLE ADD COLUMN`, DuckDB appends the new column at the end of the delta table (after the metadata columns). The insert rule uses explicit column lists in its `INSERT INTO delta_t` statements, so the column ordering mismatch is handled correctly.
+Delta tables store base table columns first, followed by `openivm_multiplicity` and `openivm_timestamp`. After `ALTER TABLE ADD COLUMN`, DuckDB appends the new column at the end of the delta table (after the metadata columns). The insert rule uses explicit column lists in its `INSERT INTO openivm_delta_t` statements, so the column ordering mismatch is handled correctly.
 
 ## Limitations
 

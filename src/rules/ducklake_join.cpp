@@ -105,18 +105,19 @@ static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, con
 	string cur_snap = to_string(current_snapshot);
 	string sql = "SELECT EXISTS(SELECT 1 FROM ("
 	             "SELECT " +
-	             delta_col + " AS _ivm_key FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog) +
+	             delta_col + " AS openivm_key FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog) +
 	             "', '" + OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
 	             old_snap + ", " + cur_snap +
 	             ") "
 	             "UNION ALL "
 	             "SELECT " +
-	             delta_col + " AS _ivm_key FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog) +
+	             delta_col + " AS openivm_key FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog) +
 	             "', '" + OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
 	             old_snap + ", " + cur_snap +
-	             ")) _ivm_delta_keys "
+	             ")) openivm_delta_keys "
 	             "JOIN (SELECT * FROM " +
-	             other_relation + ") _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." + other_col + " LIMIT 1)";
+	             other_relation + ") openivm_other ON openivm_delta_keys.openivm_key = openivm_other." + other_col +
+	             " LIMIT 1)";
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe key-domain intersection: %s\n",
@@ -183,7 +184,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 	// Check if empty-delta term skipping is enabled.
 	bool skip_empty_enabled = true;
 	Value skip_empty_val;
-	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
 
@@ -220,7 +221,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			    "(SELECT 1 FROM ducklake_table_deletions('" +
 			    OpenIVMUtils::EscapeValue(table_catalogs[i]) + "', '" + OpenIVMUtils::EscapeValue(table_schemas[i]) +
 			    "', '" + OpenIVMUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
-			    to_string(current_snapshot) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)";
+			    to_string(current_snapshot) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
 			auto has_changes = con.Query(has_changes_sql);
 			if (has_changes->HasError()) {
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe changes for %s.%s.%s: %s\n",

@@ -43,16 +43,16 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 
 | Construct | Strategy |
 |---|---|
-| `GROUP BY … ORDER BY col LIMIT k` (aggregate top-k) | Genuinely incremental O(D + G): all groups are maintained in `_ivm_data_<mv>` via the normal `AGGREGATE_GROUP` path; `ORDER BY … LIMIT k` is applied by the VIEW at read time. Empty-delta skip avoids any work when no rows changed. See [operators/top-k.md](operators/top-k.md). |
+| `GROUP BY … ORDER BY col LIMIT k` (aggregate top-k) | Genuinely incremental O(D + G): all groups are maintained in `openivm_data_<mv>` via the normal `AGGREGATE_GROUP` path; `ORDER BY … LIMIT k` is applied by the VIEW at read time. Empty-delta skip avoids any work when no rows changed. See [operators/top-k.md](operators/top-k.md). |
 | `SELECT cols … ORDER BY col LIMIT k` (projection top-k, no GROUP BY) | Incremental maintenance over the unlimited `SIMPLE_PROJECTION` result. The user-facing view applies `ORDER BY … LIMIT k` at read time. See [operators/top-k.md](operators/top-k.md). |
 | `UNION ALL` over per-branch aggregates | Classified as `SIMPLE_AGGREGATE` when there is no reliable single group-key set. The MERGE formula applies delta sums over all output columns without a per-group key index. Z-set-correct, but less precise than a branch-aware aggregate path. |
-| Inner `DISTINCT` directly inside a subquery feeding an outer `AGGREGATE` (e.g. `SELECT g, SUM(c) FROM (SELECT DISTINCT g, m, c FROM t) GROUP BY g`) | Two paths are available. **Default (`GROUP_RECOMPUTE`)**: for each base table with a non-empty delta, the LPTS view query is scoped to delta-touched rows; the affected-keys set drives `DELETE` + `INSERT` on `_ivm_data_<mv>`. Correct but does more work than strictly necessary. **Aux-state path (`ivm_distinct_aux_state = true`, `IVMType::DISTINCT_INCREMENTAL`)**: DBSP-correct Z-set maintenance via a per-tuple count auxiliary table `_ivm_distinct_count_<view>`. Δdistinct fires only when the input count crosses zero (`sgn(R[t])`), driving ±1 into the parent SUM/COUNT MERGE. Strictly minimal delta; only v0 (single base-table DISTINCT, single SUM aggregate). Multi-source DISTINCT demotes to `GROUP_RECOMPUTE`. |
+| Inner `DISTINCT` directly inside a subquery feeding an outer `AGGREGATE` (e.g. `SELECT g, SUM(c) FROM (SELECT DISTINCT g, m, c FROM t) GROUP BY g`) | Two paths are available. **Default (`GROUP_RECOMPUTE`)**: for each base table with a non-empty delta, the LPTS view query is scoped to delta-touched rows; the affected-keys set drives `DELETE` + `INSERT` on `openivm_data_<mv>`. Correct but does more work than strictly necessary. **Aux-state path (`openivm_distinct_aux_state = true`, `IVMType::DISTINCT_INCREMENTAL`)**: DBSP-correct Z-set maintenance via a per-tuple count auxiliary table `openivm_distinct_count_<view>`. Δdistinct fires only when the input count crosses zero (`sgn(R[t])`), driving ±1 into the parent SUM/COUNT MERGE. Strictly minimal delta; only v0 (single base-table DISTINCT, single SUM aggregate). Multi-source DISTINCT demotes to `GROUP_RECOMPUTE`. |
 | `LATERAL` / correlated subquery shapes represented as `DELIM_JOIN` / `DEPENDENT_JOIN` | Affected-key `GROUP_RECOMPUTE`: visible correlated output columns are used as recompute keys, then only those keys are deleted/reinserted from the view query. This supports correlated aggregate lateral shapes and scalar correlated subqueries planned as `SINGLE` `DELIM_JOIN`. It is correct and incremental, but less precise than a fully algebraic correlated delta. |
 | Window functions (`ROW_NUMBER`, `RANK`, `NTILE`, `LAG`, `LEAD`, …) on a single table | Partition-recompute: only partitions with delta rows are re-evaluated. See [operators/window-functions.md](operators/window-functions.md). **Caveat**: NTILE / RANK / ROW_NUMBER with ties on the `ORDER BY` key are inherently non-deterministic — multiple recomputes of the same data may legitimately produce different bucket / rank assignments. |
 | Window functions over JOINs | Full recompute (partition columns may come from a joined table whose delta doesn't carry them, so we can't identify affected partitions). |
-| `LEFT JOIN` / `RIGHT JOIN` aggregates | Incremental MERGE for supported aggregate shapes when `ivm_left_join_merge=true`; group-recompute fallback for shapes where NULL-padding does not compose with delta MERGE. See [operators/left-join.md](operators/left-join.md). |
+| `LEFT JOIN` / `RIGHT JOIN` aggregates | Incremental MERGE for supported aggregate shapes when `openivm_left_join_merge=true`; group-recompute fallback for shapes where NULL-padding does not compose with delta MERGE. See [operators/left-join.md](operators/left-join.md). |
 | `FULL OUTER JOIN` projection views | Bidirectional key-based partial recompute (Zhang & Larson). |
-| `FULL OUTER JOIN` aggregate views | MERGE plus targeted recompute for unmatched changes when `ivm_full_outer_merge=true`; group-recompute fallback is available when the setting is disabled or the aggregate shape is unsafe. |
+| `FULL OUTER JOIN` aggregate views | MERGE plus targeted recompute for unmatched changes when `openivm_full_outer_merge=true`; group-recompute fallback is available when the setting is disabled or the aggregate shape is unsafe. |
 
 ## Join limitations
 
@@ -82,14 +82,14 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 | `AGG(...) FILTER (WHERE p)` | Yes | Rewritten by `RewriteAggregateFilters` to `AGG(CASE WHEN p THEN arg END)` before plan analysis. All COUNT/SUM/AVG/MIN/MAX/STDDEV variants work; group-recompute is used when the rewritten aggregate makes the column non-summable. |
 | `LIST`, `LIST(x ORDER BY y)` | Yes | Numeric fixed-shape list-valued outputs can use element-wise list arithmetic. `LIST(...) FILTER` and non-summable list shapes use affected-group recompute so DuckDB's NULL-element semantics are preserved. |
 | Any visible MV column with a non-summable type (VARCHAR literal, UPPER(group_col), CASE over aggregate, BOOLEAN predicate on aggregate, LIST) | Yes (via group-recompute) | The delta `sum(case mult=false then -col else col end)` formula can't type-check for these columns; detected in `CompileAggregateGroups` via the delta-view column types and routed to group-recompute. Unified path with `LIST` and `MIN`/`MAX` above. |
-| `HAVING` | Partial | Group-recompute for affected groups; `ivm_having_merge=true` (default) uses the MERGE path when the stored data table holds all groups. |
+| `HAVING` | Partial | Group-recompute for affected groups; `openivm_having_merge=true` (default) uses the MERGE path when the stored data table holds all groups. |
 
 ## Other limitations
 
 - **DROP MATERIALIZED VIEW** is not fully implemented. Dropping the view via `DROP VIEW`
   removes the view but leaves behind the data table, delta tables, and metadata entries.
   Use `DROP TABLE` on the data table and delta tables manually, and clean up
-  `_duckdb_ivm_delta_tables` and `_duckdb_ivm_views`.
+  `openivm_delta_tables` and `openivm_views`.
 
 - **Schema evolution** is supported for `ADD COLUMN`, `DROP COLUMN`, and `RENAME COLUMN`
   on base tables. `ALTER COLUMN TYPE` is not handled. Dropping or renaming a column

@@ -125,7 +125,7 @@ def time_strategy(db_path: str, strategy: str) -> float:
 	return elapsed
 
 
-def one_run(n_orders: int, avg_li: int, delta_fraction: float, strategy: str) -> float:
+def one_run(n_orders: int, avg_li: int, openivm_delta_fraction: float, strategy: str) -> float:
 	n_lineitem = n_orders * avg_li
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
@@ -133,8 +133,8 @@ def one_run(n_orders: int, avg_li: int, delta_fraction: float, strategy: str) ->
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}")
-		delta_rows = max(1, int(n_lineitem * delta_fraction))
-		delta = insert_delta_sql(start_li=n_lineitem, count=delta_rows, n_orders=n_orders)
+		openivm_delta_rows = max(1, int(n_lineitem * openivm_delta_fraction))
+		delta = insert_delta_sql(start_li=n_lineitem, count=openivm_delta_rows, n_orders=n_orders)
 		out, err, rc = run_sql(db, delta)
 		if rc != 0:
 			raise RuntimeError(f"delta failed: {err}")
@@ -163,8 +163,8 @@ def run_matrix(n_orders: int, avg_li: int, deltas: list[float], reps: int) -> li
 			rows.append({
 				"n_orders": n_orders,
 				"n_lineitem": n_lineitem,
-				"delta_fraction": f,
-				"delta_rows": max(1, int(n_lineitem * f)),
+				"openivm_delta_fraction": f,
+				"openivm_delta_rows": max(1, int(n_lineitem * f)),
 				"strategy": strategy,
 				"reps": len(samples),
 				"median_s": statistics.median(samples),
@@ -176,10 +176,10 @@ def run_matrix(n_orders: int, avg_li: int, deltas: list[float], reps: int) -> li
 
 def summarize(rows: list[dict]) -> None:
 	print("\n=== Crossover summary (2-way join) ===")
-	print(f"{'delta_frac':>10}  {'ivm(ms)':>10}  {'bypass(ms)':>12}  winner   speedup(bypass/ivm)")
+	print(f"{'openivm_delta_frac':>10}  {'ivm(ms)':>10}  {'bypass(ms)':>12}  winner   speedup(bypass/ivm)")
 	by_frac: dict[float, dict[str, float]] = {}
 	for r in rows:
-		by_frac.setdefault(r["delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
+		by_frac.setdefault(r["openivm_delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
 	for f in sorted(by_frac):
 		pair = by_frac[f]
 		winner = min(pair, key=pair.get)
@@ -224,8 +224,8 @@ def main() -> int:
 			fieldnames=[
 				"n_orders",
 				"n_lineitem",
-				"delta_fraction",
-				"delta_rows",
+				"openivm_delta_fraction",
+				"openivm_delta_rows",
 				"strategy",
 				"reps",
 				"median_s",

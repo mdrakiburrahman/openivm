@@ -113,7 +113,7 @@ def classify_query(con, query: str, mv_name: str) -> tuple[str, str]:
         return ("create_failed", msg)
     try:
         row = con.execute(
-            f"SELECT ivm_type FROM _duckdb_ivm_views WHERE view_name = '{mv_name}'"
+            f"SELECT ivm_type FROM openivm_views WHERE view_name = '{mv_name}'"
         ).fetchone()
         if row is None:
             ivm_type = "UNKNOWN"

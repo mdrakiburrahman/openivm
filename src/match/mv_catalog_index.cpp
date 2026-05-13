@@ -9,10 +9,10 @@ vector<MVCandidate> MVCatalogIndex::CandidatesForQuery(const vector<string> &que
 	(void)query_source_tables;
 	(void)query_group_columns;
 	(void)query_output_columns;
-	// TODO: when dirty_, rebuild the filter tree from `_duckdb_ivm_views`;
+	// TODO: when dirty_, rebuild the filter tree from `openivm_views`;
 	// descend by (source-table bitmap → group cols → output cols) to a small
-	// leaf set; populate pending_row_estimate from `_duckdb_ivm_delta_tables`
-	// (refreshed if older than `ivm_match_estimate_ttl_ms`).
+	// leaf set; populate pending_row_estimate from `openivm_delta_tables`
+	// (refreshed if older than `openivm_match_estimate_ttl_ms`).
 	return {};
 }
 

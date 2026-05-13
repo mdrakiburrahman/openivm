@@ -1459,7 +1459,7 @@ SELECT COUNT(*) FROM (
 
 # --- AVG without explicit alias (column name sanitization) ---
 # Regression test: DuckDB auto-sets bound.alias = "avg(col)" for unaliased AVG.
-# Before fix, this produced _ivm_sum_avg(col) — invalid SQL identifier in EXCLUDE clause.
+# Before fix, this produced openivm_sum_avg(col) — invalid SQL identifier in EXCLUDE clause.
 
 statement ok
 CREATE TABLE avg_noalias (val DECIMAL(10,2));
@@ -2176,7 +2176,7 @@ SELECT count(*) FROM (
 
 # MV should have hidden sum+count columns (decomposition succeeded).
 query I
-SELECT count(*) FROM pragma_table_info('_ivm_data_mv_hva') WHERE name LIKE '_ivm_sum_%';
+SELECT count(*) FROM pragma_table_info('openivm_data_mv_hva') WHERE name LIKE 'openivm_sum_%';
 ----
 1
 
@@ -2206,7 +2206,7 @@ SELECT count(*) FROM (
 # ============================================================
 # HAVING that references aggregates NOT in the SELECT list.
 # The stripped predicate must reference hidden columns we add to the
-# projection (`_ivm_having_N`) — otherwise it falls back to rendering
+# projection (`openivm_having_N`) — otherwise it falls back to rendering
 # the aggregate's raw text (`sum(COALESCE(H_AMOUNT, 0))`, `count_star()`)
 # into the view WHERE clause, where the base columns don't exist.
 # ============================================================
@@ -2315,7 +2315,7 @@ SELECT count(*) FROM (
 
 # Fix B: CTE with AVG/STDDEV + non-pass-through expression in outer SELECT.
 # The CTE alias (avg_bal) differs from the top-level alias (avg after ROUND),
-# so the hidden _ivm_sum_avg_bal / _ivm_count_avg_bal columns can't directly
+# so the hidden openivm_sum_avg_bal / openivm_count_avg_bal columns can't directly
 # reconstruct `avg`. CompileAggregateGroups detects the orphan derived alias
 # and falls back to group-recompute (delete affected groups, re-insert via the
 # full view query).
@@ -2521,7 +2521,7 @@ SELECT count(*) FROM (SELECT grp, BOOL_AND(flag), BOOL_OR(flag) FROM bool_t GROU
 
 # ============================================================
 # Aggregate top-k: GROUP BY + ORDER BY + LIMIT
-# All groups maintained in _ivm_data_mv; ORDER BY LIMIT k
+# All groups maintained in openivm_data_mv; ORDER BY LIMIT k
 # applied in the VIEW definition at read time.
 # ============================================================
 
@@ -2580,7 +2580,7 @@ CREATE MATERIALIZED VIEW mv_count_distinct_constant AS
   GROUP BY o.id;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_count_distinct_constant';
+SELECT type FROM openivm_views WHERE view_name = 'mv_count_distinct_constant';
 ----
 6
 

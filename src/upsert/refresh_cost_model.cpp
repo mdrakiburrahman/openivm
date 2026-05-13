@@ -361,10 +361,10 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	Value nterm_val, fk_val;
 	bool nterm_enabled = true;
 	bool fk_enabled = true;
-	if (context.TryGetCurrentSetting("ivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull()) {
 		nterm_enabled = nterm_val.GetValue<bool>();
 	}
-	if (context.TryGetCurrentSetting("ivm_fk_pruning", fk_val) && !fk_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_fk_pruning", fk_val) && !fk_val.IsNull()) {
 		fk_enabled = fk_val.GetValue<bool>();
 	}
 
@@ -377,7 +377,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		try {
 			view_type = vt_meta.GetViewType(view_name);
 		} catch (...) {
-			// view_name not in _duckdb_ivm_views — keep default
+			// view_name not in openivm_views — keep default
 		}
 	}
 
@@ -543,14 +543,14 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	double recompute_total = recompute_compute + recompute_replace;
 
 	// 5. Learned cost model: calibrate predictions using execution history
-	//    Gated by ivm_adaptive_refresh (same gate as the cost model decision).
+	//    Gated by openivm_adaptive_refresh (same gate as the cost model decision).
 	double ivm_predicted_ms = ivm_total;
 	double recompute_predicted_ms = recompute_total;
 	bool calibrated = false;
 
 	Value adaptive_val;
 	bool adaptive_on = false;
-	if (context.TryGetCurrentSetting("ivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull()) {
 		adaptive_on = adaptive_val.GetValue<bool>();
 	}
 
@@ -558,7 +558,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		// Read decay setting
 		double decay = 0.9;
 		Value decay_val;
-		if (context.TryGetCurrentSetting("ivm_cost_decay", decay_val) && !decay_val.IsNull()) {
+		if (context.TryGetCurrentSetting("openivm_cost_decay", decay_val) && !decay_val.IsNull()) {
 			decay = decay_val.GetValue<double>();
 			if (decay < 0.0 || decay > 1.0) {
 				decay = 0.9;
@@ -695,9 +695,10 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 	Connection con(db);
 
 	// Propagate user session settings to the cost estimation connection.
-	// The new connection has defaults, so settings like ivm_adaptive_refresh
+	// The new connection has defaults, so settings like openivm_adaptive_refresh
 	// must be copied from the calling context for calibration to activate.
-	for (auto &setting_name : {"ivm_adaptive_refresh", "ivm_cost_decay", "ivm_ducklake_nterm", "ivm_fk_pruning"}) {
+	for (auto &setting_name :
+	     {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm", "openivm_fk_pruning"}) {
 		Value v;
 		if (context.TryGetCurrentSetting(setting_name, v) && !v.IsNull()) {
 			con.Query("SET " + string(setting_name) + " = " + v.ToString());
@@ -758,12 +759,13 @@ vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const stri
 	(void)view_name;
 	(void)query_plan;
 	Value flag;
-	if (!context.TryGetCurrentSetting("ivm_enable_view_matching", flag) || flag.IsNull() || !BooleanValue::Get(flag)) {
+	if (!context.TryGetCurrentSetting("openivm_enable_view_matching", flag) || flag.IsNull() ||
+	    !BooleanValue::Get(flag)) {
 		return {};
 	}
 	// TODO: reuse EstimateIVMCost() for the static ivm/recompute components,
-	// then read pending_row_estimate from `_duckdb_ivm_delta_tables` and
-	// per-strategy regression from `_duckdb_ivm_refresh_history` (filtered by
+	// then read pending_row_estimate from `openivm_delta_tables` and
+	// per-strategy regression from `openivm_refresh_history` (filtered by
 	// `strategy`) to score each MatchStrategy.
 	return {};
 }

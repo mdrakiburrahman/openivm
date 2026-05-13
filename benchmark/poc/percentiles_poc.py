@@ -52,15 +52,15 @@ PRAGMA refresh('mv_a'); PRAGMA refresh('mv_b'); PRAGMA refresh('mv_c');
 
 
 BYPASS = "SELECT o.o_region, SUM(l.l_qty*l.l_price), COUNT(*) FROM lineitem l JOIN orders o ON l.l_order_id=o.o_id GROUP BY o.o_region;"
-CASCADE = "SET ivm_cascade_refresh='downstream';\nPRAGMA ivm('mv_a');\nSELECT * FROM mv_c;"
+CASCADE = "SET openivm_cascade_refresh='downstream';\nPRAGMA ivm('mv_a');\nSELECT * FROM mv_c;"
 STALE_RES = (
 	"SELECT o_region, SUM(revenue), SUM(cnt) FROM ( "
 	"  SELECT o_region, revenue, cnt FROM mv_c "
 	"  UNION ALL "
 	"  SELECT o.o_region, "
-	"    SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price ELSE -dl.l_qty*dl.l_price END), "
-	"    SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) "
-	"  FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id GROUP BY o.o_region "
+	"    SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price ELSE -dl.l_qty*dl.l_price END), "
+	"    SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) "
+	"  FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id GROUP BY o.o_region "
 	") x GROUP BY o_region;"
 )
 
@@ -131,7 +131,7 @@ def main() -> int:
 			if not samples:
 				continue
 			rows.append({
-				"delta_fraction": f,
+				"openivm_delta_fraction": f,
 				"strategy": strategy,
 				"n_samples": len(samples),
 				"min_ms": min(samples) * 1000,
@@ -156,7 +156,7 @@ def main() -> int:
 		w = csv.DictWriter(
 			fp,
 			fieldnames=[
-				"delta_fraction", "strategy", "n_samples",
+				"openivm_delta_fraction", "strategy", "n_samples",
 				"min_ms", "p50_ms", "p90_ms", "p95_ms", "p99_ms", "max_ms",
 				"mean_ms", "stdev_ms",
 			],
@@ -173,7 +173,7 @@ def main() -> int:
 	)
 	for r in rows:
 		print(
-			f"{r['delta_fraction']:>6.3f}  "
+			f"{r['openivm_delta_fraction']:>6.3f}  "
 			f"{r['strategy']:<15}  "
 			f"{r['p50_ms']:>6.1f}  "
 			f"{r['p90_ms']:>6.1f}  "

@@ -1,7 +1,7 @@
 // IVM Column Hider — view creation/drop helpers for hiding internal IVM columns.
 //
-// The MV data table (_ivm_data_<name>) stores all columns including internal ones
-// (_ivm_left_key, _ivm_distinct_count, etc.). A user-facing VIEW (<name>) exposes
+// The MV data table (openivm_data_<name>) stores all columns including internal ones
+// (openivm_left_key, openivm_distinct_count, etc.). A user-facing VIEW (<name>) exposes
 // only the user's columns via SELECT * EXCLUDE (...).
 //
 // This file is intentionally minimal — the naming logic lives in ivm_column_hider.hpp.

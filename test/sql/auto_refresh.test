@@ -5,7 +5,7 @@
 require openivm
 
 statement ok
-SET ivm_files_path='__TEST_DIR__';
+SET openivm_files_path='__TEST_DIR__';
 
 # ==========================================
 # Test 1: Projection — small delta → IVM path
@@ -48,7 +48,7 @@ SELECT id, name FROM mv_proj WHERE id = 101;
 101	new_name
 
 statement ok
-SET ivm_profile_refresh = true;
+SET openivm_profile_refresh = true;
 
 statement ok
 CREATE TABLE profile_proj_base (id INT, name VARCHAR);
@@ -60,12 +60,12 @@ statement ok
 CREATE MATERIALIZED VIEW mv_profile_proj AS SELECT id, name FROM profile_proj_base;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_initial_load' AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_initial_load' AND duration_ms >= 0;
 ----
 1
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_total' AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_total' AND duration_ms >= 0;
 ----
 1
 
@@ -76,22 +76,22 @@ statement ok
 PRAGMA refresh('mv_profile_proj');
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'total_refresh';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'total_refresh';
 ----
 1
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'adaptive_cost_estimate';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'adaptive_cost_estimate';
 ----
 0
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('acquire_locks', 'generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('acquire_locks', 'generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
 ----
 4
 
 statement ok
-SET ivm_profile_refresh = false;
+SET openivm_profile_refresh = false;
 
 # ==========================================
 # Test 2: Projection — large delta → recompute path
@@ -606,7 +606,7 @@ PRAGMA refresh_cost('mv_cost');
 incremental	0.000000	1604.000000	0.000000	1604.000000	false
 
 # ==========================================
-# Test 12: ivm_refresh_mode = 'full' — force full recompute
+# Test 12: openivm_refresh_mode = 'full' — force full recompute
 # ==========================================
 
 statement ok
@@ -626,7 +626,7 @@ odd	625	25
 
 # Small delta — cost model would pick IVM, but we force full
 statement ok
-SET ivm_refresh_mode = 'full';
+SET openivm_refresh_mode = 'full';
 
 statement ok
 INSERT INTO mode_base VALUES (51, 'even', 999);
@@ -654,11 +654,11 @@ even	1649	26
 odd	625	25
 
 # ==========================================
-# Test 13: ivm_refresh_mode = 'incremental' — force IVM
+# Test 13: openivm_refresh_mode = 'incremental' — force IVM
 # ==========================================
 
 statement ok
-SET ivm_refresh_mode = 'incremental';
+SET openivm_refresh_mode = 'incremental';
 
 # Delta of 300 rows — cost model still picks incremental (304 < 357)
 statement ok
@@ -686,11 +686,11 @@ even	1649	26
 odd	925	325
 
 # ==========================================
-# Test 14: ivm_refresh_mode = 'auto' — default, cost model decides
+# Test 14: openivm_refresh_mode = 'auto' — default, cost model decides
 # ==========================================
 
 statement ok
-SET ivm_refresh_mode = 'auto';
+SET openivm_refresh_mode = 'auto';
 
 statement ok
 INSERT INTO mode_base VALUES (999, 'even', 1);
@@ -824,7 +824,7 @@ SELECT id, val FROM sel_base WHERE val > 9900 EXCEPT ALL SELECT * FROM mv_selfil
 # ==========================================
 
 statement ok
-SET ivm_adaptive_refresh = true;
+SET openivm_adaptive_refresh = true;
 
 statement ok
 CREATE TABLE lt (id INT, grp INT, val INT);
@@ -856,18 +856,18 @@ PRAGMA refresh('mv_lt');
 
 # History recorded: 3 incremental entries with non-negative durations
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt' AND method = 'incremental' AND actual_duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt' AND method = 'incremental' AND actual_duration_ms >= 0;
 ----
 3
 
 # Profiling is off by default.
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt';
 ----
 0
 
 statement ok
-SET ivm_profile_refresh = true;
+SET openivm_profile_refresh = true;
 
 statement ok
 INSERT INTO lt VALUES (103, 2, 500);
@@ -876,17 +876,17 @@ statement ok
 PRAGMA refresh('mv_lt');
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh');
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh');
 ----
 3
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
 ----
 6
 
 statement ok
-INSERT INTO _duckdb_ivm_refresh_profile
+INSERT INTO openivm_refresh_profile
   (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail)
 VALUES ('old_profile_row', 'mv_lt', current_timestamp::TIMESTAMP - INTERVAL '32 days', 0, 'old', 0, '');
 
@@ -897,12 +897,12 @@ statement ok
 PRAGMA refresh('mv_lt');
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE refresh_id = 'old_profile_row';
+SELECT count(*) FROM openivm_refresh_profile WHERE refresh_id = 'old_profile_row';
 ----
 0
 
 statement ok
-SET ivm_profile_retention_days = 0;
+SET openivm_profile_retention_days = 0;
 
 statement ok
 INSERT INTO lt VALUES (105, 4, 500);
@@ -911,20 +911,20 @@ statement ok
 PRAGMA refresh('mv_lt');
 
 query I
-SELECT count(DISTINCT refresh_id) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt';
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile WHERE view_name = 'mv_lt';
 ----
 1
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'total_refresh';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'total_refresh';
 ----
 1
 
 statement ok
-SET ivm_profile_retention_days = 31;
+SET openivm_profile_retention_days = 31;
 
 statement ok
-SET ivm_profile_refresh = false;
+SET openivm_profile_refresh = false;
 
 # Correctness preserved through learned cost model
 query II
@@ -962,7 +962,7 @@ incremental	8.643856	401.000000	8.643856	401.000000	false
 # ==========================================
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt';
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
 ----
 6
 
@@ -970,12 +970,12 @@ statement ok
 CREATE OR REPLACE MATERIALIZED VIEW mv_lt AS SELECT grp, sum(val) as total FROM lt GROUP BY grp;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt';
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
 ----
 0
 
 statement ok
-SET ivm_adaptive_refresh = false;
+SET openivm_adaptive_refresh = false;
 
 # ==========================================
 # Test 21: Empty-delta term skipping — 3-way join, only 1 table changes

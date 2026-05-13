@@ -5,7 +5,7 @@
 require openivm
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+SET openivm_cascade_refresh = 'off';
 
 # ============================================================
 # Setup
@@ -391,11 +391,11 @@ SELECT COUNT(*) FROM (
 0
 
 # ============================================================
-# MERGE mode: Zhang & Larson incremental MERGE (ivm_full_outer_merge)
+# MERGE mode: Zhang & Larson incremental MERGE (openivm_full_outer_merge)
 # ============================================================
 
 statement ok
-SET ivm_full_outer_merge = true;
+SET openivm_full_outer_merge = true;
 
 statement ok
 CREATE TABLE items (id INT, category VARCHAR);

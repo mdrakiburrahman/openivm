@@ -55,7 +55,7 @@ Some of these passes independently traverse the full tree and depend on prior pa
 Why it matters:
 - Repeated walks are not the main performance bottleneck, but they make rewrite ordering fragile.
 - Hidden-column propagation and aggregate decomposition are especially easy to break because later passes infer meaning
-from column names such as `_ivm_sum_*`, `_ivm_count_*`, and `_ivm_match_count`.
+from column names such as `openivm_sum_*`, `openivm_count_*`, and `openivm_match_count`.
 - The codebase has several comments explaining why a pass exists, which is a sign the invariant is not encoded locally.
 
 Fix direction:
@@ -111,13 +111,13 @@ Fix direction:
 
 Location: `src/upsert/refresh_compiler.cpp:550`
 
-The LEFT JOIN MERGE path contains detailed logic around `_ivm_match_count`, including a comment that left-side non-count
+The LEFT JOIN MERGE path contains detailed logic around `openivm_match_count`, including a comment that left-side non-count
 aggregates are "incorrect for those but rare in practice" and another known limitation for folded projections around
 NULL-padded transitions.
 
 Why it matters:
 - This is not just style debt; it describes possible wrong results.
-- The default settings enable `ivm_left_join_merge` and `ivm_full_outer_merge` in `src/openivm_extension.cpp:142`, so
+- The default settings enable `openivm_left_join_merge` and `openivm_full_outer_merge` in `src/openivm_extension.cpp:142`, so
 MERGE paths are not merely experimental unless the classifier forces group-recompute.
 - Some computed aggregate cases are forced to group-recompute, but the guarantee is spread across parser classification,
 metadata flags, and compiler checks.
@@ -139,7 +139,7 @@ Locations:
 - `src/upsert/refresh_cost_model.cpp:752`
 
 The match subsystem exposes settings and system tables, but core components return empty/default results or
-`UNDECIDED`. This is gated by `ivm_enable_view_matching=false`, but the code looks production-adjacent.
+`UNDECIDED`. This is gated by `openivm_enable_view_matching=false`, but the code looks production-adjacent.
 
 Why it matters:
 - Future work can accidentally rely on a subsystem that appears wired but has no useful semantics.
@@ -193,7 +193,7 @@ invariants, and unsupported-shape rationale. Move historical notes into regressi
 
 Location: `src/upsert/refresh_cost_model.cpp:356`
 
-The cost model is a heuristic with learned regression fallback. It is gated by `ivm_adaptive_refresh`, which is good.
+The cost model is a heuristic with learned regression fallback. It is gated by `openivm_adaptive_refresh`, which is good.
 However, the comments and estimates should be treated as operational tuning only. It should never compensate for
 classifier uncertainty. If a shape is correctness-risky, route it to a correctness-preserving strategy first, then cost it.
 

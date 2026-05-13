@@ -58,17 +58,17 @@ static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
 }
 
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
-/// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
+/// AVG(x) is stored as openivm_sum_<alias>, openivm_count_<alias>, and <alias>.
 /// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the function type:
-///   _ivm_sum_sq_  = stddev_samp (apply sqrt, denominator N-1)
-///   _ivm_var_sq_  = var_samp    (no sqrt, denominator N-1)
-///   _ivm_sum_sqp_ = stddev_pop  (apply sqrt, denominator N)
-///   _ivm_var_sqp_ = var_pop     (no sqrt, denominator N)
+///   openivm_sum_sq_  = stddev_samp (apply sqrt, denominator N-1)
+///   openivm_var_sq_  = var_samp    (no sqrt, denominator N-1)
+///   openivm_sum_sqp_ = stddev_pop  (apply sqrt, denominator N)
+///   openivm_var_sqp_ = var_pop     (no sqrt, denominator N)
 struct DerivedAggDecomposition {
 	unordered_set<string> derived_cols;        // aliases to skip in MERGE
-	unordered_map<string, string> sum_cols;    // alias → _ivm_sum_<alias>
-	unordered_map<string, string> sum_sq_cols; // alias → _ivm_*_sq*_<alias>
-	unordered_map<string, string> count_cols;  // alias → _ivm_count_<alias>
+	unordered_map<string, string> sum_cols;    // alias → openivm_sum_<alias>
+	unordered_map<string, string> sum_sq_cols; // alias → openivm_*_sq*_<alias>
+	unordered_map<string, string> count_cols;  // alias → openivm_count_<alias>
 	// Per-alias flags decoded from the sum_sq prefix
 	unordered_map<string, bool> needs_sqrt;    // alias → true if stddev (not variance)
 	unordered_map<string, bool> is_population; // alias → true if population variant
@@ -93,7 +93,7 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	static const string var_sq_prefix(ivm::VAR_SQ_COL_PREFIX);   // var_samp
 
 	for (auto &col : columns) {
-		// Check sum-of-squares prefixes BEFORE sum (they start with _ivm_sum_ or _ivm_var_)
+		// Check sum-of-squares prefixes BEFORE sum (they start with openivm_sum_ or openivm_var_)
 		// Assignments moved out of if-conditions to satisfy bugprone-assignment-in-if-condition.
 		string alias;
 		alias = MatchPrefix(col, sum_sqp_prefix);
@@ -214,12 +214,12 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	// Detect AVG/STDDEV-derived columns that can't be maintained incrementally.
 	//
-	// Case 1 — "orphan derived": hidden _ivm_sum_<alias> + _ivm_count_<alias> exist
+	// Case 1 — "orphan derived": hidden openivm_sum_<alias> + openivm_count_<alias> exist
 	// but no user-visible column has that alias. Happens when the user wraps
 	// AVG/STDDEV in a non-pass-through expression at the top SELECT so the
 	// top-level alias diverges from the CTE's alias (query_0540 shape:
 	// CTE `avg_bal` → top `ROUND(avg_bal, 2) AS avg`). The MERGE formula
-	// `avg = _ivm_sum_avg / _ivm_count_avg` can't reconstruct ROUND without
+	// `avg = openivm_sum_avg / openivm_count_avg` can't reconstruct ROUND without
 	// re-deriving.
 	//
 	// Case 2 — "computed over derived": the view has derived aggregates AND a
@@ -258,8 +258,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		static const unordered_set<string> DECOMPOSED_TYPES_CHK = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
 		                                                           "variance", "var_samp", "var_pop"};
 		// Pass 1 — "type excess": more non-decomposed aggregate types than
-		// aggregate columns (INCLUDING hidden helpers like _ivm_match_count and
-		// _ivm_*) means at least one aggregate is consumed inside a computed
+		// aggregate columns (INCLUDING hidden helpers like openivm_match_count and
+		// openivm_*) means at least one aggregate is consumed inside a computed
 		// expression (query_1987 `ROUND(SUM(x) / COUNT(y), 2) AS avg_bal`, two
 		// underlying aggregates but one output column). Hidden helper columns get
 		// counted because they DO correspond to aggregate_types entries (e.g.
@@ -274,7 +274,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		for (auto &column : aggregates) {
 			if (decomp.derived_cols.count(column)) {
 				// Derived user columns (avg_b, std_b) don't consume aggregate_types slots —
-				// their hidden _ivm_sum_* / _ivm_count_* companions do.
+				// their hidden openivm_sum_* / openivm_count_* companions do.
 				continue;
 			}
 			if (column.find(string(ivm::SUM_COL_PREFIX)) == 0 || column.find(string(ivm::SUM_SQ_COL_PREFIX)) == 0 ||
@@ -287,7 +287,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				// Same — the COUNT half of an AVG/STDDEV decomposition.
 				continue;
 			}
-			// _ivm_match_count / _ivm_right_match_count are added by
+			// openivm_match_count / openivm_right_match_count are added by
 			// RewriteLeftJoinMatchCount *after* AnalyzePlan captures aggregate_types,
 			// so aggregate_types does NOT include them. Exclude them here for a
 			// like-with-like comparison.
@@ -310,7 +310,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		if (!has_computed_over_derived && !decomp.derived_cols.empty()) {
 			idx_t probe_idx = 0;
 			for (auto &column : aggregates) {
-				if (decomp.derived_cols.count(column) || column.find("_ivm_") != string::npos) {
+				if (decomp.derived_cols.count(column) || column.find("openivm_") != string::npos) {
 					continue;
 				}
 				while (probe_idx < aggregate_types.size() && DECOMPOSED_TYPES_CHK.count(aggregate_types[probe_idx])) {
@@ -375,7 +375,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
 		for (auto &column : aggregates) {
-			if (decomp.derived_cols.count(column) || column.find("_ivm_") != string::npos) {
+			if (decomp.derived_cols.count(column) || column.find("openivm_") != string::npos) {
 				continue;
 			}
 			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)
@@ -410,17 +410,17 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				match_delete += " AND ";
 				match_insert += " AND ";
 			}
-			match_delete += "_ivm_aff." + keys[i] + " IS NOT DISTINCT FROM _ivm_tgt." + keys[i];
-			match_insert += "_ivm_aff." + keys[i] + " IS NOT DISTINCT FROM _ivm_recompute." + keys[i];
+			match_delete += "openivm_aff." + keys[i] + " IS NOT DISTINCT FROM openivm_tgt." + keys[i];
+			match_insert += "openivm_aff." + keys[i] + " IS NOT DISTINCT FROM openivm_recompute." + keys[i];
 		}
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
 		string affected_block = "(\n  " + affected + "\n)";
-		string delete_query = "delete from " + data_table + " AS _ivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " +
-		                      affected_block + " AS _ivm_aff WHERE " + match_delete + "\n);\n";
+		string delete_query = "delete from " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " +
+		                      affected_block + " AS openivm_aff WHERE " + match_delete + "\n);\n";
 		string insert_query = "insert into " + data_table + "\n" + "select * from (" + view_query_sql +
-		                      ") _ivm_recompute\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_block +
-		                      " AS _ivm_aff WHERE " + match_insert + "\n);\n";
+		                      ") openivm_recompute\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_block +
+		                      " AS openivm_aff WHERE " + match_insert + "\n);\n";
 		return delete_query + "\n" + insert_query;
 	}
 
@@ -480,7 +480,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	auto &d_sum_sq_cols = decomp.sum_sq_cols;
 	auto &d_count_cols = decomp.count_cols;
 
-	// Detect _ivm_match_count for LEFT JOIN incremental MERGE (Larson & Zhou).
+	// Detect openivm_match_count for LEFT JOIN incremental MERGE (Larson & Zhou).
 	// When present, use COALESCE(v.col, 0) for aggregate updates to handle NULL→value transitions.
 	string match_count_col;
 	bool has_match_count = false;
@@ -621,7 +621,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			}
 			// Determine if this column should be 0 (count-like) or NULL (sum-like) when unmatched.
 			// Check both the aggregate_types metadata AND the hidden column prefix
-			// (hidden _ivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
+			// (hidden openivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
 			bool is_count = (agg_type == "count" || col.find(string(ivm::COUNT_COL_PREFIX)) == 0);
 			string null_val = is_count ? "0" : "NULL";
 			// Three-way CASE:
@@ -691,11 +691,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// legitimately returns 0 for every row when C_YTD_PAYMENT is always 0. Skip the
 	// cleanup in that case to avoid deleting valid rows.
 	// Also skip when insert_only (groups can't reach zero from inserts alone) and when
-	// _ivm_match_count is present (LEFT JOIN preserved-side NULL aggregates are valid).
+	// openivm_match_count is present (LEFT JOIN preserved-side NULL aggregates are valid).
 	if (!insert_only && !has_match_count) {
 		// Find COUNT-type columns. aggregate_types is parallel to the user-facing aggregate
 		// list; col_agg_type maps column name -> aggregate function. Also consider hidden
-		// _ivm_count_<N> columns from AVG/STDDEV decomposition.
+		// openivm_count_<N> columns from AVG/STDDEV decomposition.
 		vector<string> count_cols;
 		for (auto &entry : col_agg_type) {
 			if (entry.second == "count" || entry.second == "count_star") {
@@ -762,7 +762,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	auto &d_count = decomp.count_cols;
 
 	// Single CTE consolidates all delta columns in one pass.
-	string cte = "WITH _ivm_delta AS (\n  SELECT ";
+	string cte = "WITH openivm_delta AS (\n  SELECT ";
 	string update_set;
 	bool first = true;
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
@@ -785,12 +785,12 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])), " + zeros_list +
 			       ") AS d_" + column;
 			update_set += column + " = list_transform(list_zip(" + column + ", (SELECT d_" + column +
-			              " FROM _ivm_delta)), lambda x: x[1] + x[2])";
+			              " FROM openivm_delta)), lambda x: x[1] + x[2])";
 		} else {
 			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
 			cte += "SUM(" + mul + " * " + column + ") AS d_" + column;
 			update_set +=
-			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM _ivm_delta), 0)";
+			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
 		}
 	}
 	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
@@ -872,35 +872,36 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER. Join
 	// negative net tuples to the MV first so duplicate ranking only touches affected
 	// candidates, not the whole materialized view.
-	string delete_query = "WITH _ivm_net AS (\n  " + cte_body +
+	string delete_query = "WITH openivm_net AS (\n  " + cte_body +
 	                      "\n)\n"
-	                      ", _ivm_delete_net AS (\n"
-	                      "  SELECT * FROM _ivm_net WHERE _net < 0\n"
-	                      "), _ivm_delete_candidates AS (\n"
+	                      ", openivm_delete_net AS (\n"
+	                      "  SELECT * FROM openivm_net WHERE _net < 0\n"
+	                      "), openivm_delete_candidates AS (\n"
 	                      "  SELECT v.rowid, " +
 	                      delete_candidate_columns +
 	                      ", d._net\n"
 	                      "  FROM " +
-	                      data_table + " v JOIN _ivm_delete_net d ON " + match_conditions +
-	                      "\n), _ivm_ranked_deletes AS (\n"
+	                      data_table + " v JOIN openivm_delete_net d ON " + match_conditions +
+	                      "\n), openivm_ranked_deletes AS (\n"
 	                      "  SELECT rowid, _net,\n"
 	                      "    ROW_NUMBER() OVER (PARTITION BY " +
 	                      select_columns +
 	                      " ORDER BY rowid) AS _rn\n"
-	                      "  FROM _ivm_delete_candidates\n"
+	                      "  FROM openivm_delete_candidates\n"
 	                      ")\n"
 	                      "DELETE FROM " +
 	                      data_table +
 	                      " WHERE rowid IN (\n"
-	                      "  SELECT rowid FROM _ivm_ranked_deletes WHERE _rn <= -_net\n"
+	                      "  SELECT rowid FROM openivm_ranked_deletes WHERE _rn <= -_net\n"
 	                      ");\n\n";
 
 	// INSERT: replicate each net-insert tuple _net times using generate_series.
-	string insert_query = "WITH _ivm_net AS (\n  " + cte_body +
-	                      "\n)\n"
-	                      "INSERT INTO " +
-	                      data_table + " SELECT " + select_columns +
-	                      "\nFROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)\nWHERE _ivm_net._net > 0;\n";
+	string insert_query =
+	    "WITH openivm_net AS (\n  " + cte_body +
+	    "\n)\n"
+	    "INSERT INTO " +
+	    data_table + " SELECT " + select_columns +
+	    "\nFROM openivm_net, generate_series(1, openivm_net._net::BIGINT)\nWHERE openivm_net._net > 0;\n";
 
 	return delete_query + insert_query;
 }
@@ -1152,20 +1153,20 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 				affected_subquery += "  ";
 			}
 			affected_subquery += "SELECT DISTINCT " + group_csv + " FROM (" + filtered_variants[occurrence] +
-			                     ") _ivm_src_" + to_string(i) + "_" + to_string(occurrence);
+			                     ") openivm_src_" + to_string(i) + "_" + to_string(occurrence);
 		}
 	}
 
 	// EXISTS-based, NULL-safe match (IS NOT DISTINCT FROM). DuckDB inlines the subquery into both
 	// the DELETE and the INSERT — the affected-keys set is computed once per usage in practice but
 	// the planner can fuse them; if profiling shows this is hot, materialize to a TEMP TABLE first.
-	string match_clause = BuildNullSafeMatch(group_columns, "_ivm_aff", "_ivm_tgt");
+	string match_clause = BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
 	string aff_block = "(\n" + affected_subquery + "\n)";
 
-	string delete_query = "DELETE FROM " + data_table + " AS _ivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + aff_block +
-	                      " AS _ivm_aff WHERE " + match_clause + "\n);\n";
+	string delete_query = "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " +
+	                      aff_block + " AS openivm_aff WHERE " + match_clause + "\n);\n";
 	string insert_query = "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
-	                      ") AS _ivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + aff_block + " AS _ivm_aff WHERE " +
+	                      ") AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + aff_block + " AS openivm_aff WHERE " +
 	                      match_clause + "\n);\n";
 
 	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas\n", group_columns.size(),
@@ -1193,10 +1194,10 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	string group_cols_csv = JoinQuotedColumns(group_columns);
 	string mv_match = BuildNullSafeMatch(group_columns, "v", "d");
 
-	// Δinput temp table — `_ivm_dinput_<view>`. Each row is a distinct tuple plus its net
+	// Δinput temp table — `openivm_dinput_<view>`. Each row is a distinct tuple plus its net
 	// multiplicity change since last refresh. CREATE OR REPLACE so the previous refresh's
 	// leftover (if any rolled back) is wiped first.
-	string dinput_table = "_ivm_dinput_" + view_name;
+	string dinput_table = "openivm_dinput_" + view_name;
 	string ts_filter =
 	    " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP";
 	string filter_clause = filter_sql.empty() ? "" : " AND (" + filter_sql + ")";
@@ -1289,10 +1290,10 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	bool has_left_delta = !left_delta_source.empty() && !left_last_update.empty();
 	string left_delta_q = catalog_prefix + Q(left_delta_source);
 	string right_delta_q = catalog_prefix + Q(right_delta_source);
-	string dleft_table = "_ivm_saj_dleft_" + view_name;
-	string dright_table = "_ivm_saj_dright_" + view_name;
-	string old_table = "_ivm_saj_old_" + view_name;
-	string aff_table = "_ivm_saj_aff_" + view_name;
+	string dleft_table = "openivm_saj_dleft_" + view_name;
+	string dright_table = "openivm_saj_dright_" + view_name;
+	string old_table = "openivm_saj_old_" + view_name;
+	string aff_table = "openivm_saj_aff_" + view_name;
 	bool is_anti = StringUtil::Lower(join_type) == "anti";
 	string visible = is_anti ? "_match_count = 0" : "_match_count > 0";
 	string cur_visible = is_anti ? "_cur._match_count = 0" : "_cur._match_count > 0";
@@ -1408,34 +1409,34 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string aux_q = catalog_prefix + Q(aux_table);
 	string delta_q = catalog_prefix + Q(delta_source);
-	string dsum_table = "_ivm_fgc_delta_" + view_name;
+	string dsum_table = "openivm_fgc_delta_" + view_name;
 	string group_q = Q(group_col);
 	string sum_q = Q(sum_col);
 	string output_q = Q(output_col);
 	string dsum_expr = "SUM(" + string(ivm::MULTIPLICITY_COL) + " * " + sum_q + ")";
-	string old_sum = "COALESCE(_aux._ivm_sum, 0)";
-	string new_sum = "(" + old_sum + " + d._ivm_delta_sum)";
+	string old_sum = "COALESCE(_aux.openivm_sum, 0)";
+	string new_sum = "(" + old_sum + " + d.openivm_delta_sum)";
 	string old_visible = "CASE WHEN " + old_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
 	string new_visible = "CASE WHEN " + new_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
 	string aux_match = BuildNullSafeMatch(vector<string> {group_col}, "_aux", "d");
 
 	string sql;
 	sql += "CREATE OR REPLACE TEMP TABLE " + Q(dsum_table) + " AS\n  SELECT " + group_q + ", " + dsum_expr +
-	       " AS _ivm_delta_sum\n  FROM " + delta_q + "\n  WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
+	       " AS openivm_delta_sum\n  FROM " + delta_q + "\n  WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
 	       OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP\n  GROUP BY " + group_q + "\n  HAVING " + dsum_expr +
 	       " <> 0;\n\n";
 
-	sql += "WITH _ivm_transition AS (\n  SELECT SUM((" + new_visible + ") - (" + old_visible +
-	       ")) AS _ivm_delta_count\n  FROM " + Q(dsum_table) + " d LEFT JOIN " + aux_q + " _aux ON " + aux_match +
+	sql += "WITH openivm_transition AS (\n  SELECT SUM((" + new_visible + ") - (" + old_visible +
+	       ")) AS openivm_delta_count\n  FROM " + Q(dsum_table) + " d LEFT JOIN " + aux_q + " _aux ON " + aux_match +
 	       "\n)\nUPDATE " + data_table + " SET " + output_q + " = COALESCE(" + output_q +
-	       ", 0) + COALESCE((SELECT _ivm_delta_count FROM _ivm_transition), 0);\n\n";
+	       ", 0) + COALESCE((SELECT openivm_delta_count FROM openivm_transition), 0);\n\n";
 
 	sql += "MERGE INTO " + aux_q + " _aux USING " + Q(dsum_table) + " d ON " + aux_match +
-	       "\nWHEN MATCHED THEN UPDATE SET _ivm_sum = COALESCE(_aux._ivm_sum, 0) + d._ivm_delta_sum\n"
+	       "\nWHEN MATCHED THEN UPDATE SET openivm_sum = COALESCE(_aux.openivm_sum, 0) + d.openivm_delta_sum\n"
 	       "WHEN NOT MATCHED THEN INSERT (" +
-	       group_q + ", _ivm_sum) VALUES (d." + group_q + ", d._ivm_delta_sum);\n\n";
+	       group_q + ", openivm_sum) VALUES (d." + group_q + ", d.openivm_delta_sum);\n\n";
 
-	sql += "DELETE FROM " + aux_q + " WHERE _ivm_sum = 0;\n";
+	sql += "DELETE FROM " + aux_q + " WHERE openivm_sum = 0;\n";
 	sql += "DROP TABLE IF EXISTS " + Q(dsum_table) + ";\n";
 
 	OPENIVM_DEBUG_PRINT("[CompileFilteredGroupCount] group=%s, sum=%s, op=%s, aux=%s\n", group_col.c_str(),
@@ -1467,7 +1468,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 
 	string delete_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
 	string insert_query = "INSERT INTO " + data_table + "\n" + "SELECT * FROM (" + view_query_sql +
-	                      ") _ivm_recompute\n" + "WHERE " + affected_filter + ";\n";
+	                      ") openivm_recompute\n" + "WHERE " + affected_filter + ";\n";
 
 	OPENIVM_DEBUG_PRINT("[CompileWindowRecompute] Partition columns: %zu\n", partition_columns.size());
 	return delete_query + "\n" + insert_query;

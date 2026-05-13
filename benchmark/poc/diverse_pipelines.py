@@ -102,10 +102,10 @@ FROM range({n_lineitem}) t(i);
 		"    SELECT o_region, revenue, cnt FROM mv_c "
 		"    UNION ALL "
 		"    SELECT o.o_region, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 		"                    ELSE -dl.l_qty*dl.l_price END) AS revenue, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
-		"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
+		"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 		"    GROUP BY o.o_region "
 		") x GROUP BY o_region;"
 	)
@@ -160,10 +160,10 @@ FROM range({n_lineitem}) t(i);
 		"    SELECT c_country, p_category, revenue, cnt FROM mv_star "
 		"    UNION ALL "
 		"    SELECT c.c_country, p.p_category, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 		"                    ELSE -dl.l_qty*dl.l_price END) AS revenue, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
-		"    FROM delta_lineitem dl "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
+		"    FROM openivm_delta_lineitem dl "
 		"    JOIN orders o ON dl.l_order_id=o.o_id "
 		"    JOIN customer c ON o.o_customer=c.c_id "
 		"    JOIN product p ON dl.l_product=p.p_id "
@@ -210,10 +210,10 @@ FROM range({n_lineitem}) t(i);
 		"    SELECT o_customer, revenue, cnt FROM mv_b "
 		"    UNION ALL "
 		"    SELECT o.o_customer, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 		"                    ELSE -dl.l_qty*dl.l_price END) AS revenue, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
-		"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
+		"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 		"    GROUP BY o.o_customer "
 		") x GROUP BY o_customer;"
 	)
@@ -272,17 +272,17 @@ FROM range({n_lineitem}) t(i);
 		"    SELECT o_region, revenue, cnt FROM mv_d "
 		"    UNION ALL "
 		"    SELECT o.o_region, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 		"                    ELSE -dl.l_qty*dl.l_price END) AS revenue, "
-		"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
-		"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+		"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
+		"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 		"    GROUP BY o.o_region "
 		") x GROUP BY o_region;"
 	)
 	return Scenario("chain4", setup, [mv_a, mv_b, mv_c, mv_d], bypass, stl_res, "mv_d")
 
 
-def delta_sql_lineitem(start_li: int, count: int, n_orders: int) -> str:
+def openivm_delta_sql_lineitem(start_li: int, count: int, n_orders: int) -> str:
 	return (
 		f"INSERT INTO lineitem "
 		f"SELECT {start_li}+i, ({start_li}+i)%{n_orders}, "
@@ -298,7 +298,7 @@ def time_strategy(db: str, s: Scenario, strategy: str) -> float:
 	elif strategy == "cascade_auto":
 		# refresh deepest MV; OpenIVM cascades downstream
 		sql = (
-			"SET ivm_cascade_refresh='downstream';\n"
+			"SET openivm_cascade_refresh='downstream';\n"
 			f"PRAGMA refresh('{s.mv_sqls[0].split()[3]}');\n"  # first MV's name (ugly but works)
 			f"SELECT * FROM {s.top_mv};"
 		)
@@ -306,7 +306,7 @@ def time_strategy(db: str, s: Scenario, strategy: str) -> float:
 		# directly from the SQL.
 		first_mv_name = s.mv_sqls[0].split("CREATE MATERIALIZED VIEW ")[1].split(" ")[0]
 		sql = (
-			"SET ivm_cascade_refresh='downstream';\n"
+			"SET openivm_cascade_refresh='downstream';\n"
 			f"PRAGMA refresh('{first_mv_name}');\n"
 			f"SELECT * FROM {s.top_mv};"
 		)
@@ -322,7 +322,7 @@ def time_strategy(db: str, s: Scenario, strategy: str) -> float:
 	return elapsed
 
 
-def one_run(scenario_factory, n_orders: int, avg_li: int, delta_fraction: float, strategy: str) -> float:
+def one_run(scenario_factory, n_orders: int, avg_li: int, openivm_delta_fraction: float, strategy: str) -> float:
 	s = scenario_factory(n_orders, avg_li)
 	n_lineitem = n_orders * avg_li
 	with tempfile.TemporaryDirectory() as tmp:
@@ -338,8 +338,8 @@ def one_run(scenario_factory, n_orders: int, avg_li: int, delta_fraction: float,
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}\n----\n{out}")
 		# Insert delta
-		delta_rows = max(1, int(n_lineitem * delta_fraction))
-		out, err, rc = run_sql(db, delta_sql_lineitem(n_lineitem, delta_rows, n_orders))
+		openivm_delta_rows = max(1, int(n_lineitem * openivm_delta_fraction))
+		out, err, rc = run_sql(db, openivm_delta_sql_lineitem(n_lineitem, openivm_delta_rows, n_orders))
 		if rc != 0:
 			raise RuntimeError(f"delta failed: {err}")
 		return time_strategy(db, s, strategy)
@@ -368,8 +368,8 @@ def run_scenario(name: str, factory, n_orders: int, avg_li: int, deltas: list[fl
 				"scenario": name,
 				"n_orders": n_orders,
 				"n_lineitem": n_lineitem,
-				"delta_fraction": f,
-				"delta_rows": max(1, int(n_lineitem * f)),
+				"openivm_delta_fraction": f,
+				"openivm_delta_rows": max(1, int(n_lineitem * f)),
 				"strategy": strategy,
 				"reps": len(samples),
 				"median_s": statistics.median(samples),
@@ -382,12 +382,12 @@ def run_scenario(name: str, factory, n_orders: int, avg_li: int, deltas: list[fl
 def summarize(all_rows: list[dict]) -> None:
 	by = {}
 	for r in all_rows:
-		by.setdefault(r["scenario"], {}).setdefault(r["delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
+		by.setdefault(r["scenario"], {}).setdefault(r["openivm_delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
 
 	for scenario_name in sorted(by):
 		print(f"\n=== {scenario_name} ===")
 		print(
-			f"{'delta_frac':>10}  {'bypass':>8}  {'cascade':>8}  {'stl+res':>8}  "
+			f"{'openivm_delta_frac':>10}  {'bypass':>8}  {'cascade':>8}  {'stl+res':>8}  "
 			f"winner              speedup"
 		)
 		for f in sorted(by[scenario_name]):
@@ -446,8 +446,8 @@ def main() -> int:
 				"scenario",
 				"n_orders",
 				"n_lineitem",
-				"delta_fraction",
-				"delta_rows",
+				"openivm_delta_fraction",
+				"openivm_delta_rows",
 				"strategy",
 				"reps",
 				"median_s",

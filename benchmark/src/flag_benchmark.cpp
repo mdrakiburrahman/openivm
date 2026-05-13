@@ -497,9 +497,9 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 
 	// 3. Apply flag config
 	if (!all_on) {
-		const char *flags[] = {"ivm_skip_empty_deltas",    "ivm_fk_pruning",      "ivm_skip_aggregate_delete",
-		                        "ivm_skip_projection_delete", "ivm_minmax_incremental", "ivm_having_merge",
-		                        "ivm_ducklake_nterm"};
+		const char *flags[] = {"openivm_skip_empty_deltas",    "openivm_fk_pruning",      "openivm_skip_aggregate_delete",
+		                        "openivm_skip_projection_delete", "openivm_minmax_incremental", "openivm_having_merge",
+		                        "openivm_ducklake_nterm"};
 		for (const char *f : flags) {
 			con.Query(string("SET ") + f + " = false");
 		}

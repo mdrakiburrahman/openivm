@@ -319,7 +319,7 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 			table_name = full_table_name;
 		}
 
-		std::string new_table_name = prefix + "delta_" + table_name;
+		std::string new_table_name = prefix + string(ivm::DELTA_PREFIX) + table_name;
 
 		if (std::regex_search(columns, match, primary_key_re)) {
 			primary_key = match[0].str();
@@ -383,7 +383,7 @@ void OpenIVMUtils::StripLineComments(string &query) {
 
 string OpenIVMUtils::DeltaName(const string &name) {
 	// Delta tables use the user-facing view name, not the internal data table name.
-	// Strip _ivm_data_ prefix if present (handles LPTS-generated SQL that references
+	// Strip openivm_data_ prefix if present (handles LPTS-generated SQL that references
 	// the data table directly via VIEW expansion).
 	static const string data_prefix(ivm::DATA_TABLE_PREFIX);
 	if (name.size() > data_prefix.size() && name.rfind(data_prefix, 0) == 0) {
@@ -406,7 +406,8 @@ string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, 
 }
 
 bool OpenIVMUtils::IsDelta(const string &name) {
-	return name.size() >= 6 && name.rfind("delta_", 0) == 0;
+	static const string prefix(ivm::DELTA_PREFIX);
+	return name.size() >= prefix.size() && name.rfind(prefix, 0) == 0;
 }
 
 int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {

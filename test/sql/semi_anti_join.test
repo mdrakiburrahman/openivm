@@ -389,7 +389,7 @@ CREATE MATERIALIZED VIEW mv_exists_anti AS
     ) AND l.keep;
 
 query I
-SELECT COUNT(*) FROM _duckdb_ivm_views
+SELECT COUNT(*) FROM openivm_views
 WHERE view_name IN ('mv_exists_semi', 'mv_exists_anti') AND semi_anti_aux_meta_json IS NOT NULL;
 ----
 2
@@ -514,7 +514,7 @@ CREATE MATERIALIZED VIEW mv_exists_union AS
     ) AND l.grp = 3;
 
 query I
-SELECT COUNT(*) FROM _duckdb_ivm_views
+SELECT COUNT(*) FROM openivm_views
 WHERE view_name IN ('mv_exists_group', 'mv_exists_union') AND semi_anti_aux_meta_json IS NOT NULL;
 ----
 0

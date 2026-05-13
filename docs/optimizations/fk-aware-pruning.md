@@ -85,7 +85,7 @@ A term with bitmask `mask` is pruned if:
 
 where `skip_bits` is the OR of all PK leaf bits that satisfy:
 1. The PK leaf is the referenced side of a FOREIGN KEY declared in the join
-2. The PK leaf's delta is insert-only (no `_duckdb_ivm_multiplicity < 0` rows)
+2. The PK leaf's delta is insert-only (no `openivm_multiplicity < 0` rows)
 
 This is a single bitmask check per term — O(1).
 
@@ -117,13 +117,13 @@ build + hash join probe + UNION ALL branch.
   joins, the [N-term telescoping](../ducklake.md#n-term-telescoping-join-rule) rule is used
   instead, with [empty-delta term skipping](empty-delta-skip.md) covering the common case of
   unchanged dimension tables.
-- `ivm_fk_pruning` is set to `false`
+- `openivm_fk_pruning` is set to `false`
 
 ## Setting
 
 | Setting | Default | Description |
 |---|---|---|
-| `ivm_fk_pruning` | `true` | Prune inclusion-exclusion join terms using FK constraints |
+| `openivm_fk_pruning` | `true` | Prune inclusion-exclusion join terms using FK constraints |
 
 ## How it works
 

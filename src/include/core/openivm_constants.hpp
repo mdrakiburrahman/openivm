@@ -7,51 +7,51 @@ namespace duckdb {
 namespace ivm {
 
 // System table names
-constexpr const char *VIEWS_TABLE = "_duckdb_ivm_views";
-constexpr const char *DELTA_TABLES_TABLE = "_duckdb_ivm_delta_tables";
-constexpr const char *HISTORY_TABLE = "_duckdb_ivm_refresh_history";
-constexpr const char *PROFILE_TABLE = "_duckdb_ivm_refresh_profile";
+constexpr const char *VIEWS_TABLE = "openivm_views";
+constexpr const char *DELTA_TABLES_TABLE = "openivm_delta_tables";
+constexpr const char *HISTORY_TABLE = "openivm_refresh_history";
+constexpr const char *PROFILE_TABLE = "openivm_refresh_profile";
 
 // View-matching system tables.
-constexpr const char *MV_DEPS_TABLE = "_duckdb_ivm_mv_dependencies";
-constexpr const char *CONSTRAINTS_CACHE_TABLE = "_duckdb_ivm_constraints_cache";
-constexpr const char *MATCH_LOG_TABLE = "_duckdb_ivm_match_log";
+constexpr const char *MV_DEPS_TABLE = "openivm_mv_dependencies";
+constexpr const char *CONSTRAINTS_CACHE_TABLE = "openivm_constraints_cache";
+constexpr const char *MATCH_LOG_TABLE = "openivm_match_log";
 
 // IVM metadata column names
-constexpr const char *MULTIPLICITY_COL = "_duckdb_ivm_multiplicity";
-constexpr const char *TIMESTAMP_COL = "_duckdb_ivm_timestamp";
+constexpr const char *MULTIPLICITY_COL = "openivm_multiplicity";
+constexpr const char *TIMESTAMP_COL = "openivm_timestamp";
 
 // Prefixes
-constexpr const char *DELTA_PREFIX = "delta_";
-constexpr const char *DATA_TABLE_PREFIX = "_ivm_data_";
+constexpr const char *DELTA_PREFIX = "openivm_delta_";
+constexpr const char *DATA_TABLE_PREFIX = "openivm_data_";
 
 // Internal column names (added by IVM plan rewrites, hidden from users via VIEW)
-constexpr const char *LEFT_KEY_COL = "_ivm_left_key";
-constexpr const char *RIGHT_KEY_COL = "_ivm_right_key";
-constexpr const char *DISTINCT_COUNT_COL = "_ivm_distinct_count";
+constexpr const char *LEFT_KEY_COL = "openivm_left_key";
+constexpr const char *RIGHT_KEY_COL = "openivm_right_key";
+constexpr const char *DISTINCT_COUNT_COL = "openivm_distinct_count";
 
 // Internal column prefixes (for AVG and STDDEV/VARIANCE decomposition)
-constexpr const char *SUM_COL_PREFIX = "_ivm_sum_";
-constexpr const char *SUM_SQ_COL_PREFIX = "_ivm_sum_sq_";   // STDDEV: apply sqrt in upsert
-constexpr const char *VAR_SQ_COL_PREFIX = "_ivm_var_sq_";   // VARIANCE: no sqrt in upsert
-constexpr const char *SUM_SQP_COL_PREFIX = "_ivm_sum_sqp_"; // STDDEV_POP: sqrt + population denominator
-constexpr const char *VAR_SQP_COL_PREFIX = "_ivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
-constexpr const char *COUNT_COL_PREFIX = "_ivm_count_";
+constexpr const char *SUM_COL_PREFIX = "openivm_sum_";
+constexpr const char *SUM_SQ_COL_PREFIX = "openivm_sum_sq_";   // STDDEV: apply sqrt in upsert
+constexpr const char *VAR_SQ_COL_PREFIX = "openivm_var_sq_";   // VARIANCE: no sqrt in upsert
+constexpr const char *SUM_SQP_COL_PREFIX = "openivm_sum_sqp_"; // STDDEV_POP: sqrt + population denominator
+constexpr const char *VAR_SQP_COL_PREFIX = "openivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
+constexpr const char *COUNT_COL_PREFIX = "openivm_count_";
 
 // Hidden COUNT(*) injected into AGGREGATE_GROUP MVs that don't already have a
 // count aggregate. Tracks per-group cardinality so the cleanup can delete rows
 // whose group reaches 0 remaining tuples (without confusing legitimate SUM=0).
-constexpr const char *COUNT_STAR_COL = "_ivm_count_star";
+constexpr const char *COUNT_STAR_COL = "openivm_count_star";
 
 // Match count columns for outer join incremental MERGE (Larson & Zhou / Zhang & Larson)
-constexpr const char *MATCH_COUNT_COL = "_ivm_match_count";
-constexpr const char *RIGHT_MATCH_COUNT_COL = "_ivm_right_match_count";
+constexpr const char *MATCH_COUNT_COL = "openivm_match_count";
+constexpr const char *RIGHT_MATCH_COUNT_COL = "openivm_right_match_count";
 
 // Index suffix for GROUP BY unique index on MV data tables
-constexpr const char *INDEX_SUFFIX = "_ivm_index";
+constexpr const char *INDEX_SUFFIX = "openivm_index";
 
 // Temporary table prefix for companion row snapshots
-constexpr const char *TEMP_TABLE_PREFIX = "_ivm_old_";
+constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;
@@ -71,7 +71,7 @@ enum class IVMType : uint8_t {
 	WINDOW_PARTITION, // window functions — partition-level recompute
 	GROUP_RECOMPUTE, // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
 	TOP_K,           // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
-	DISTINCT_INCREMENTAL, // inner-DISTINCT-under-AGG with aux state (ivm_distinct_aux_state=true): DBSP-correct
+	DISTINCT_INCREMENTAL, // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
 	                      // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
 	SEMI_ANTI_RECOMPUTE   // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
 };

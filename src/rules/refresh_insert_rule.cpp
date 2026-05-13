@@ -101,7 +101,8 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	if (!subquery_string.empty() && subquery_string.back() == ';') {
 		subquery_string.pop_back();
 	}
-	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM (" + subquery_string + ") _ivm_deleted_rows";
+	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM (" + subquery_string +
+	       ") openivm_deleted_rows";
 }
 
 static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, const string &col_name) {
@@ -552,7 +553,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 							}
 							insert_string = prefix_del + " SELECT " + data_cols + ", -1, now()::timestamp FROM " +
 							                full_table_name + " WHERE rowid IN (SELECT rowid FROM (" + subquery_string +
-							                ") _ivm_delete_rows)";
+							                ") openivm_delete_rows)";
 						} catch (...) {
 							throw NotImplementedException(
 							    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
