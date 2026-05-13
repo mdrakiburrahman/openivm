@@ -40,7 +40,7 @@ static AggregateFunction BindAggregateByName(ClientContext &context, const strin
 	ErrorData error;
 	auto best = binder.BindFunction(entry.name, entry.functions, arg_types, error);
 	if (!best.IsValid()) {
-		throw InternalException("IVMPlanRewrite: failed to bind aggregate '%s'", name);
+		throw InternalException("PlanRewrite: failed to bind aggregate '%s'", name);
 	}
 	return entry.functions.GetFunctionByOffset(best.GetIndex());
 }
@@ -56,7 +56,7 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 
 	auto &distinct = node->Cast<LogicalDistinct>();
 	if (node->children.empty()) {
-		OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] DISTINCT has no children — skipping\n");
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT has no children — skipping\n");
 		return;
 	}
 	auto &child = node->children[0];
@@ -69,7 +69,7 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	vector<unique_ptr<Expression>> count_args;
 	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star), std::move(count_args), nullptr,
 	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = ivm::DISTINCT_COUNT_COL;
+	count_expr->alias = openivm::DISTINCT_COUNT_COL;
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(count_expr));
@@ -91,7 +91,7 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	agg_node->children.push_back(std::move(child));
 	agg_node->ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
 }
 
@@ -112,21 +112,21 @@ static bool IsStddevVariant(const string &name) {
 /// Encodes both stddev-vs-variance (sqrt) and sample-vs-population (denominator).
 static const char *SumSqPrefix(const string &func_name) {
 	if (func_name == "stddev_pop") {
-		return ivm::SUM_SQP_COL_PREFIX;
+		return openivm::SUM_SQP_COL_PREFIX;
 	}
 	if (func_name == "var_pop") {
-		return ivm::VAR_SQP_COL_PREFIX;
+		return openivm::VAR_SQP_COL_PREFIX;
 	}
 	if (func_name == "variance" || func_name == "var_samp") {
-		return ivm::VAR_SQ_COL_PREFIX;
+		return openivm::VAR_SQ_COL_PREFIX;
 	}
-	return ivm::SUM_SQ_COL_PREFIX; // stddev, stddev_samp
+	return openivm::SUM_SQ_COL_PREFIX; // stddev, stddev_samp
 }
 
 /// Inline every `LOGICAL_CTE_REF` in the plan with a fresh deep copy of its CTE
 /// definition, then collapse `LOGICAL_MATERIALIZED_CTE` wrapper nodes. This makes
 /// IVM see N independent leaves for an N-way self-join through a CTE, instead of
-/// one materialized intermediate referenced N times — without it, `IvmJoinRule`'s
+/// one materialized intermediate referenced N times — without it, `IncrementalJoinRule`'s
 /// inclusion-exclusion can't generate the cross-terms (Δt ⋈ t_now and t_now ⋈ Δt)
 /// needed to produce new pairs from a single base-table delta.
 ///
@@ -194,7 +194,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 			auto wrapper = make_uniq<LogicalProjection>(ref.table_index, std::move(proj_exprs));
 			wrapper->children.push_back(std::move(renumbered.op));
 			wrapper->ResolveOperatorTypes();
-			OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Inlined CTE_REF cte_index=%lu (table_index=%lu, %zu cols)\n",
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Inlined CTE_REF cte_index=%lu (table_index=%lu, %zu cols)\n",
 			                    (unsigned long)ref.cte_index, (unsigned long)ref.table_index, (size_t)cols);
 			node = std::move(wrapper);
 			return;
@@ -206,8 +206,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 	visit(plan->children[1]);
 	// Replace this MATERIALIZED_CTE node with its (now fully inlined) consumer.
 	plan = std::move(plan->children[1]);
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Collapsed MATERIALIZED_CTE wrapper (cte_index=%lu)\n",
-	                    (unsigned long)cte_index);
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Collapsed MATERIALIZED_CTE wrapper (cte_index=%lu)\n", (unsigned long)cte_index);
 }
 
 /// @public — also called from parser.cpp on the full CREATE plan before AnalyzePlan.
@@ -278,7 +277,7 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 		return;
 	}
 	agg.ResolveOperatorTypes();
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Rewrote FILTER aggregates to CASE expressions\n");
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Rewrote FILTER aggregates to CASE expressions\n");
 }
 
 static LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan, bool allow_having_filter) {
@@ -430,7 +429,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		sum_args.push_back(bound.children[0]->Copy());
 		auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
 		                                                    AggregateType::NON_DISTINCT);
-		sum_expr->alias = string(ivm::SUM_COL_PREFIX) + alias;
+		sum_expr->alias = string(openivm::SUM_COL_PREFIX) + alias;
 		d.sum_idx = new_exprs.size();
 		new_exprs.push_back(std::move(sum_expr));
 
@@ -453,7 +452,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		count_args.push_back(bound.children[0]->Copy());
 		auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
 		                                                      nullptr, AggregateType::NON_DISTINCT);
-		count_expr->alias = string(ivm::COUNT_COL_PREFIX) + alias;
+		count_expr->alias = string(openivm::COUNT_COL_PREFIX) + alias;
 		d.count_idx = new_exprs.size();
 		new_exprs.push_back(std::move(count_expr));
 
@@ -614,7 +613,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 			}
 		}
 		auto sum_pt = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
-		sum_pt->alias = string(ivm::SUM_COL_PREFIX) + col_suffix;
+		sum_pt->alias = string(openivm::SUM_COL_PREFIX) + col_suffix;
 		proj.expressions.push_back(std::move(sum_pt));
 
 		if (d.kind == DecompKind::STDDEV) {
@@ -626,12 +625,12 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		}
 
 		auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-		count_pt->alias = string(ivm::COUNT_COL_PREFIX) + col_suffix;
+		count_pt->alias = string(openivm::COUNT_COL_PREFIX) + col_suffix;
 		proj.expressions.push_back(std::move(count_pt));
 	}
 	proj.ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Derived aggregates → hidden columns, %zu decompositions\n", decomps.size());
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Derived aggregates → hidden columns, %zu decompositions\n", decomps.size());
 }
 
 /// Inject a hidden COUNT(*) (alias `openivm_count_star`) into AGGREGATE_GROUP
@@ -647,7 +646,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 ///
 /// The column is prefixed `openivm_` so `column_hider` auto-excludes it from
 /// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
-/// via ivm::COUNT_STAR_COL.
+/// via openivm::COUNT_STAR_COL.
 static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	// Only inject at the top of the plan — the AGGREGATE_GROUP compile path only
 	// runs when the MV root is PROJECTION → [FILTER] → AGGREGATE. Inner aggregates
@@ -680,7 +679,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 			return;
 		}
 		// Already-injected reliable hidden count.
-		if (bound.alias == ivm::COUNT_STAR_COL || bound.alias == ivm::DISTINCT_COUNT_COL) {
+		if (bound.alias == openivm::COUNT_STAR_COL || bound.alias == openivm::DISTINCT_COUNT_COL) {
 			return;
 		}
 		if (bound.function.name == "arg_min" || bound.function.name == "arg_max") {
@@ -698,7 +697,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	vector<unique_ptr<Expression>> count_args;
 	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
 	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = ivm::COUNT_STAR_COL;
+	count_expr->alias = openivm::COUNT_STAR_COL;
 	auto count_type = count_expr->return_type;
 	idx_t new_agg_idx = agg.expressions.size();
 	agg.expressions.push_back(std::move(count_expr));
@@ -706,20 +705,20 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 
 	ColumnBinding count_binding(agg.aggregate_index, new_agg_idx);
 	auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-	count_pt->alias = ivm::COUNT_STAR_COL;
+	count_pt->alias = openivm::COUNT_STAR_COL;
 	auto &proj = plan->Cast<LogicalProjection>();
 	proj.expressions.push_back(std::move(count_pt));
 	proj.ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Injected openivm_count_star for AGGREGATE_GROUP\n");
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Injected openivm_count_star for AGGREGATE_GROUP\n");
 }
 
 /// Returns true if `alias` is one of the reserved IVM-hidden-column prefixes
 /// added by DecomposeAvgStddev. Used to decide whether to propagate a child
 /// projection's expression up through a pass-through parent projection.
 static bool IsHiddenAggregateAlias(const string &alias) {
-	return alias.find(ivm::SUM_COL_PREFIX) == 0 || alias.find(ivm::COUNT_COL_PREFIX) == 0 ||
-	       alias.find(ivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(ivm::SUM_SQP_COL_PREFIX) == 0;
+	return alias.find(openivm::SUM_COL_PREFIX) == 0 || alias.find(openivm::COUNT_COL_PREFIX) == 0 ||
+	       alias.find(openivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(openivm::SUM_SQP_COL_PREFIX) == 0;
 }
 
 /// Propagate hidden aggregate columns (openivm_sum_*, openivm_count_*, …) added by
@@ -953,12 +952,12 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	}
 
 	// Always add openivm_left_key as a separate extra column.
-	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(ivm::LEFT_KEY_COL, key_type, key_binding));
+	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(openivm::LEFT_KEY_COL, key_type, key_binding));
 
 	// For FULL OUTER: also add openivm_right_key in the same projection.
 	if (is_full_outer) {
 		proj_exprs.push_back(
-		    make_uniq<BoundColumnRefExpression>(ivm::RIGHT_KEY_COL, right_key_type, right_key_binding));
+		    make_uniq<BoundColumnRefExpression>(openivm::RIGHT_KEY_COL, right_key_type, right_key_binding));
 	}
 
 	// Use a table index that won't conflict (high number)
@@ -968,7 +967,7 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	projection->ResolveOperatorTypes();
 	plan = std::move(projection);
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added openivm_left_key%s projection\n",
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Added openivm_left_key%s projection\n",
 	                    is_full_outer ? " + openivm_right_key" : "");
 }
 
@@ -1005,7 +1004,7 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	count_args.push_back(make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding));
 	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
 	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = string(ivm::MATCH_COUNT_COL);
+	count_expr->alias = string(openivm::MATCH_COUNT_COL);
 	idx_t match_count_idx = agg.expressions.size();
 	agg.expressions.push_back(std::move(count_expr));
 
@@ -1017,7 +1016,7 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 		right_count_args.push_back(make_uniq<BoundColumnRefExpression>(left_side_type, left_side_binding));
 		auto right_count_expr = make_uniq<BoundAggregateExpression>(
 		    std::move(right_count_func), std::move(right_count_args), nullptr, nullptr, AggregateType::NON_DISTINCT);
-		right_count_expr->alias = string(ivm::RIGHT_MATCH_COUNT_COL);
+		right_count_expr->alias = string(openivm::RIGHT_MATCH_COUNT_COL);
 		right_match_count_idx = agg.expressions.size();
 		agg.expressions.push_back(std::move(right_count_expr));
 	}
@@ -1033,20 +1032,20 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	ColumnBinding match_binding = agg_bindings[group_count + match_count_idx];
 	LogicalType match_type = agg_types[group_count + match_count_idx];
 	auto match_pt = make_uniq<BoundColumnRefExpression>(match_type, match_binding);
-	match_pt->alias = string(ivm::MATCH_COUNT_COL);
+	match_pt->alias = string(openivm::MATCH_COUNT_COL);
 	proj.expressions.push_back(std::move(match_pt));
 
 	if (is_full_outer) {
 		ColumnBinding right_match_binding = agg_bindings[group_count + right_match_count_idx];
 		LogicalType right_match_type = agg_types[group_count + right_match_count_idx];
 		auto right_match_pt = make_uniq<BoundColumnRefExpression>(right_match_type, right_match_binding);
-		right_match_pt->alias = string(ivm::RIGHT_MATCH_COUNT_COL);
+		right_match_pt->alias = string(openivm::RIGHT_MATCH_COUNT_COL);
 		proj.expressions.push_back(std::move(right_match_pt));
 	}
 
 	proj.ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added openivm_match_count%s for outer join aggregate\n",
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Added openivm_match_count%s for outer join aggregate\n",
 	                    is_full_outer ? " + openivm_right_match_count" : "");
 }
 
@@ -1085,9 +1084,9 @@ static bool HasTopLevelDistinct(const unique_ptr<LogicalOperator> &plan) {
 }
 
 static void RunRewritePass(const PlanRewritePassEntry &pass, PlanRewriteContext &rewrite_context) {
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Pass start: %s\n", pass.name);
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Pass start: %s\n", pass.name);
 	pass.rewrite(rewrite_context);
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Pass done: %s\n", pass.name);
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Pass done: %s\n", pass.name);
 }
 
 static void RewritePassInlineCteRefs(PlanRewriteContext &rewrite_context) {
@@ -1102,7 +1101,7 @@ static void RewritePassDistinct(PlanRewriteContext &rewrite_context) {
 	bool had_distinct = HasTopLevelDistinct(rewrite_context.plan);
 	RewriteDistinct(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
 	if (had_distinct) {
-		rewrite_context.planner_names.push_back(ivm::DISTINCT_COUNT_COL);
+		rewrite_context.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 	}
 }
 
@@ -1139,12 +1138,12 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	}
 }
 
-void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                    vector<string> &planner_names) {
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
+void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                 vector<string> &planner_names) {
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Starting\n");
 	PlanRewriteContext rewrite_context {context, binder, plan, planner_names};
 	RunRewritePipeline(rewrite_context);
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Done\n");
 }
 
 // ============================================================================

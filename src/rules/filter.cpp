@@ -5,8 +5,9 @@
 
 namespace duckdb {
 
-ModifiedPlan IvmFilterRule::Rewrite(PlanWrapper pw) {
-	OPENIVM_DEBUG_PRINT("[IvmFilterRule] Rewriting FILTER node, %zu filter expressions\n", pw.plan->expressions.size());
+ModifiedPlan IncrementalFilterRule::Rewrite(PlanWrapper pw) {
+	OPENIVM_DEBUG_PRINT("[IncrementalFilterRule] Rewriting FILTER node, %zu filter expressions\n",
+	                    pw.plan->expressions.size());
 
 	// HAVING clause: FILTER above AGGREGATE (possibly with intermediate PROJECTIONs).
 	// Strip the filter from the delta plan — the delta only needs to identify affected
@@ -17,19 +18,19 @@ ModifiedPlan IvmFilterRule::Rewrite(PlanWrapper pw) {
 			walk = walk->children[0].get();
 		}
 		if (walk->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-			OPENIVM_DEBUG_PRINT("[IvmFilterRule] HAVING filter above AGGREGATE — stripping from delta\n");
-			auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
+			OPENIVM_DEBUG_PRINT("[IncrementalFilterRule] HAVING filter above AGGREGATE — stripping from delta\n");
+			auto child_mul = IncrementalRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
 			return child_mul;
 		}
 	}
 
 	// Recurse into child first
-	auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
+	auto child_mul = IncrementalRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
 	pw.plan->children[0] = std::move(child_mul.op);
 	ColumnBinding child_mul_binding = child_mul.mul_binding;
 
 	if (pw.plan->expressions.empty()) {
-		OPENIVM_DEBUG_PRINT("[IvmFilterRule] Empty filter, passing through child directly\n");
+		OPENIVM_DEBUG_PRINT("[IncrementalFilterRule] Empty filter, passing through child directly\n");
 		pw.plan->children[0]->Verify(pw.input.context);
 		return {std::move(pw.plan->children[0]), child_mul_binding};
 	}
@@ -37,7 +38,7 @@ ModifiedPlan IvmFilterRule::Rewrite(PlanWrapper pw) {
 	auto plan_as_filter = unique_ptr_cast<LogicalOperator, LogicalFilter>(std::move(pw.plan));
 	plan_as_filter->ResolveOperatorTypes();
 	if (!plan_as_filter->projection_map.empty()) {
-		OPENIVM_DEBUG_PRINT("[IvmFilterRule] Filter has projection_map, adding mul column index\n");
+		OPENIVM_DEBUG_PRINT("[IncrementalFilterRule] Filter has projection_map, adding mul column index\n");
 		auto child_binds = plan_as_filter->children[0]->GetColumnBindings();
 		idx_t mul_index = child_binds.size();
 		bool mul_found = false;
@@ -52,7 +53,7 @@ ModifiedPlan IvmFilterRule::Rewrite(PlanWrapper pw) {
 		}
 		plan_as_filter->projection_map.emplace_back(mul_index);
 	}
-	OPENIVM_DEBUG_PRINT("[IvmFilterRule] Done, mul_binding: table=%lu col=%lu\n",
+	OPENIVM_DEBUG_PRINT("[IncrementalFilterRule] Done, mul_binding: table=%lu col=%lu\n",
 	                    (unsigned long)child_mul_binding.table_index, (unsigned long)child_mul_binding.column_index);
 	return {std::move(plan_as_filter), child_mul_binding};
 }

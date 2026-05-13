@@ -3,7 +3,7 @@
 #include "duckdb/common/types/hash.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 PlanCanonicalizer::PlanCanonicalizer(ClientContext &context) : context_(context) {
 }
@@ -32,5 +32,5 @@ unique_ptr<LogicalOperator> PlanCanonicalizer::Normalize(unique_ptr<LogicalOpera
 	return plan;
 }
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb

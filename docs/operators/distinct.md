@@ -42,7 +42,7 @@ The view is classified as `AGGREGATE_GROUP` and maintained incrementally using t
 - **Delete the last copy:** `openivm_distinct_count` reaches 0. The row is removed from the MV.
 - **Insert a new value:** `openivm_distinct_count` starts at 1. The row appears in the MV.
 
-There is no separate `DISTINCT` enum in `IVMType` — it reuses `AGGREGATE_GROUP`.
+There is no separate `DISTINCT` enum in `RefreshType` — it reuses `AGGREGATE_GROUP`.
 
 ## Compiled SQL
 
@@ -66,14 +66,14 @@ The upsert is identical to [grouped aggregates](grouped-aggregates.md):
 
 ```sql
 -- Consolidate deltas per distinct value (Z-set bag-aware sum: weight × count)
-WITH ivm_cte AS (
+WITH refresh_cte AS (
     SELECT color,
         SUM(openivm_multiplicity * openivm_distinct_count) AS openivm_distinct_count
     FROM openivm_delta_distinct_colors
     GROUP BY color
 )
 -- MERGE: increment/decrement the hidden count, insert new values
-MERGE INTO distinct_colors v USING ivm_cte d
+MERGE INTO distinct_colors v USING refresh_cte d
 ON v.color IS NOT DISTINCT FROM d.color
 WHEN MATCHED THEN UPDATE SET
     openivm_distinct_count = v.openivm_distinct_count + d.openivm_distinct_count

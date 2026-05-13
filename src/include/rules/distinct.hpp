@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmDistinctRule : public IvmRule {
+class IncrementalDistinctRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 	// DISTINCT (δ in DBSP) drops duplicates and negative weights — non-linear

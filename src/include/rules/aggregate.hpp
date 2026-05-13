@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmAggregateRule : public IvmRule {
+class IncrementalAggregateRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 	// SUM/COUNT are linear in weights (DBSP §6); MIN/MAX/AVG/STDDEV are not —

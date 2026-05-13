@@ -12,7 +12,7 @@
 #include "rules/window.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/planner/operator/logical_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "upsert/refresh_index_regen.hpp"
@@ -48,9 +48,9 @@ static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, c
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
 		if (ref.cte_index == cte_table_index &&
-		    (ref.bound_columns.empty() || ref.bound_columns.back() != ivm::MULTIPLICITY_COL)) {
+		    (ref.bound_columns.empty() || ref.bound_columns.back() != openivm::MULTIPLICITY_COL)) {
 			ref.chunk_types.push_back(mul_type);
-			ref.bound_columns.push_back(ivm::MULTIPLICITY_COL);
+			ref.bound_columns.push_back(openivm::MULTIPLICITY_COL);
 			OPENIVM_DEBUG_PRINT("[CTE]   Updated CTE_REF cte_index=%lu with mul column\n",
 			                    (unsigned long)cte_table_index);
 		}
@@ -60,8 +60,8 @@ static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, c
 	}
 }
 
-void IVMRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                                   string &view_name, string &view_catalog_name, string &view_schema_name) {
+void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                                           string &view_name, string &view_catalog_name, string &view_schema_name) {
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("\nAdd the insert node to the plan...\n");
 	OPENIVM_DEBUG_PRINT("Plan:\n%s\nParameters:", plan->ToString().c_str());
@@ -72,8 +72,8 @@ void IVMRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, uniqu
 #endif
 
 	auto table = Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name,
-	                                                  OpenIVMUtils::DeltaName(view_name),
-	                                                  OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
+	                                                  SqlUtils::DeltaName(view_name), OnEntryNotFound::THROW_EXCEPTION,
+	                                                  QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, binder.GenerateTableIndex());
 
 	Value value;
@@ -89,8 +89,8 @@ void IVMRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, uniqu
 	plan = std::move(insert_node);
 }
 
-ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
-                                         string &view, LogicalOperator *&root) {
+ModifiedPlan IncrementalRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
+                                                 string &view, LogicalOperator *&root) {
 	PlanWrapper pw(input, plan, view, root);
 
 	OPENIVM_DEBUG_PRINT("[RewritePlan] Visiting node: %s\n", LogicalOperatorToString(plan->type).c_str());
@@ -98,49 +98,49 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 
 	switch (plan->type) {
 	case LogicalOperatorType::LOGICAL_GET: {
-		IvmScanRule rule;
+		IncrementalScanRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
 	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
-		IvmJoinRule rule;
+		IncrementalJoinRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN: {
-		IvmDelimJoinRule rule;
+		IncrementalDelimJoinRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		IvmProjectionRule rule;
+		IncrementalProjectionRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-		IvmAggregateRule rule;
+		IncrementalAggregateRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
-		IvmFilterRule rule;
+		IncrementalFilterRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_UNION: {
-		IvmUnionRule rule;
+		IncrementalUnionRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
-		IvmDistinctRule rule;
+		IncrementalDistinctRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_WINDOW: {
-		IvmWindowRule rule;
+		IncrementalWindowRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_TOP_N:
 	case LogicalOperatorType::LOGICAL_LIMIT:
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {
-		IvmTopKRule rule;
+		IncrementalTopKRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
@@ -176,7 +176,7 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	}
 	case LogicalOperatorType::LOGICAL_CHUNK_GET: {
 		// CHUNK_GET is a constant in-memory VALUES node (used for IN-list MARK joins, etc.).
-		// It has no delta table. DetectDeltaStatus marks it as empty so IvmJoinRule skips all
+		// It has no delta table. DetectDeltaStatus marks it as empty so IncrementalJoinRule skips all
 		// terms that include this leaf in the delta mask. If we somehow reach here anyway, return
 		// it unchanged with a dummy multiplicity binding (column 0 of the chunk).
 		auto bindings = pw.plan->GetColumnBindings();
@@ -212,7 +212,8 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	}
 }
 
-void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan) {
+void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionInput &input,
+                                                            duckdb::unique_ptr<LogicalOperator> &plan) {
 	if (plan->children.empty()) {
 		return;
 	}
@@ -221,7 +222,7 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	while (!child->children.empty()) {
 		child = child->children[0].get();
 	}
-	if (!StringUtil::StartsWith(child->GetName(), "DOIVM")) {
+	if (!StringUtil::StartsWith(child->GetName(), "COMPUTEDELTA")) {
 		return;
 	}
 
@@ -231,17 +232,17 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 
 	auto child_get = dynamic_cast<LogicalGet *>(child);
 	if (!child_get) {
-		throw InternalException("DOIVM marker must be represented as a logical get");
+		throw InternalException("ComputeDelta marker must be represented as a logical get");
 	}
 	auto view = child_get->named_parameters["view_name"].ToString();
 	auto view_catalog = child_get->named_parameters["view_catalog_name"].ToString();
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
 
 	Connection con(*input.context.db);
-	con.Query("SET disabled_optimizers='" + string(ivm::DISABLED_OPTIMIZERS) + "';");
+	con.Query("SET disabled_optimizers='" + string(openivm::DISABLED_OPTIMIZERS) + "';");
 
-	auto v = con.Query("select sql_string from " + string(ivm::VIEWS_TABLE) + " where view_name = '" +
-	                   OpenIVMUtils::EscapeValue(view) + "';");
+	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
+	                   SqlUtils::EscapeValue(view) + "';");
 	if (v->HasError()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: cannot read view definition for '" + view + "': " + v->GetError());
@@ -281,7 +282,7 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	}
 
 	// Advance the main binder past all table indices in the plan to prevent collisions.
-	// IvmJoinRule uses input.optimizer.binder which may not have been advanced by the
+	// IncrementalJoinRule uses input.optimizer.binder which may not have been advanced by the
 	// local optimizer. Walk the plan to find the highest table index used.
 	{
 		idx_t max_idx = FindMaxTableIndex(optimized_plan.get());

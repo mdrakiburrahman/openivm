@@ -525,7 +525,7 @@ SELECT COUNT(*) FROM (
 
 # ============================================================
 # DISTINCT with parent operators that referenced the pre-rewrite bindings.
-# IVMPlanRewrite replaces LogicalDistinct with LogicalAggregate, but parent
+# PlanRewrite replaces LogicalDistinct with LogicalAggregate, but parent
 # nodes (ORDER BY, MARK JOIN, FILTER) keep their original column bindings
 # because DISTINCT was a pass-through. LPTS must re-resolve these through
 # the aggregate's new group-output column names — otherwise the generated
@@ -622,7 +622,7 @@ SELECT COUNT(*) FROM (
 
 # ============================================================
 # Inner DISTINCT under an outer aggregate (regression — pre-fix
-# IvmDistinctRule turned DISTINCT into GROUP BY all_cols COUNT(*),
+# IncrementalDistinctRule turned DISTINCT into GROUP BY all_cols COUNT(*),
 # which emits a +1 row for every duplicate input. A parent SUM
 # then double-counted duplicates that the underlying DISTINCT
 # would dedup. The classifier now routes such views to RECOMPUTE.)
@@ -719,7 +719,7 @@ SELECT type FROM openivm_views WHERE view_name = 'idist_mv';
 6
 
 # Flag `openivm_distinct_aux_state` routes single-source inner-DISTINCT-under-AGG
-# views to IVMType::DISTINCT_INCREMENTAL (8) at CREATE time. The actual
+# views to RefreshType::DISTINCT_INCREMENTAL (8) at CREATE time. The actual
 # aux-state SQL pipeline isn't wired yet — it falls through to the
 # GROUP_RECOMPUTE compile path as a stub — but the classification surface
 # is stable so the eventual implementation can replace just the upsert SQL

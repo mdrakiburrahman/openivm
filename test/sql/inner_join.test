@@ -923,7 +923,7 @@ SELECT COUNT(*) FROM (
 # into a pure conjunction of comparisons. DuckDB plans patterns
 # like `FROM A CROSS JOIN B WHERE cond`, `CROSS JOIN table_func`,
 # or `A JOIN B ON f(a.x, b.y)` as LOGICAL_ANY_JOIN. The rewrite
-# dispatcher must route it to IvmJoinRule; CollectJoinLeaves
+# dispatcher must route it to IncrementalJoinRule; CollectJoinLeaves
 # must descend through it; LPTS must serialize it back as a
 # regular JOIN with the opaque condition.
 # ============================================================

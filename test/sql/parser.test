@@ -4,7 +4,7 @@
 
 require openivm
 
-load __TEST_DIR__/openivm_parser_test.db
+load __TEST_DIR__/openmaterialized_view_parser_test.db
 
 statement ok
 SET openivm_files_path='__TEST_DIR__';

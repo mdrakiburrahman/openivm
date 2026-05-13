@@ -16,7 +16,7 @@
 #include "match/equivalence_classes.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 struct CanonicalPlanResult {
 	hash_t signature_hash = 0;
@@ -39,7 +39,7 @@ private:
 	unique_ptr<LogicalOperator> Normalize(unique_ptr<LogicalOperator> plan);
 };
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb
 
 #endif

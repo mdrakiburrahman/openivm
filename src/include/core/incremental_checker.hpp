@@ -8,7 +8,7 @@ namespace duckdb {
 
 /// Result of a single-pass plan analysis: IVM compatibility check + metadata extraction.
 struct PlanAnalysis {
-	bool ivm_compatible = true;
+	bool incremental_compatible = true;
 	bool found_aggregation = false;
 	bool found_projection = false;
 	bool found_having = false;
@@ -44,11 +44,11 @@ struct PlanAnalysis {
 
 /// Walk the logical plan tree once, validating IVM compatibility AND extracting
 /// metadata (aggregation type, join type, group-by columns, etc.).
-/// Replaces the separate ValidateIVMPlan + parser stack walk.
+/// Replaces the separate ValidateIncrementalPlan + parser stack walk.
 PlanAnalysis AnalyzePlan(LogicalOperator *plan);
 
 /// Thin wrapper for backward compatibility. Returns true if the plan is fully IVM-compatible.
-bool ValidateIVMPlan(LogicalOperator *plan);
+bool ValidateIncrementalPlan(LogicalOperator *plan);
 
 } // namespace duckdb
 

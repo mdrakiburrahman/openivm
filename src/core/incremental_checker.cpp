@@ -44,7 +44,7 @@ static string OrderByColumnName(const Expression &expr) {
 }
 
 /// Populate top_k_order_columns / top_k_order_desc from a vector<BoundOrderByNode>.
-/// Returns false if any entry is non-column-ref (caller should mark ivm_compatible=false).
+/// Returns false if any entry is non-column-ref (caller should mark incremental_compatible=false).
 static bool ExtractOrderBy(const vector<BoundOrderByNode> &orders, PlanAnalysis &result) {
 	result.top_k_order_columns.clear();
 	result.top_k_order_desc.clear();
@@ -134,7 +134,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_FILTER:
 		// Check for volatile functions
 		if (HasVolatileExpression(node->expressions)) {
-			result.ivm_compatible = false;
+			result.incremental_compatible = false;
 		}
 		// Detect HAVING: a FILTER above an AGGREGATE
 		if (!node->children.empty() && node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -145,23 +145,23 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 		result.found_projection = true;
 		if (HasVolatileExpression(node->expressions)) {
-			result.ivm_compatible = false;
+			result.incremental_compatible = false;
 		}
 		if (HasNonFoldableUnnestExpression(node->expressions)) {
-			result.ivm_compatible = false;
+			result.incremental_compatible = false;
 		}
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNION:
 		if (HasVolatileExpression(node->expressions)) {
-			result.ivm_compatible = false;
+			result.incremental_compatible = false;
 		}
 		break;
 
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		result.found_distinct = true;
 		if (HasVolatileExpression(node->expressions)) {
-			result.ivm_compatible = false;
+			result.incremental_compatible = false;
 		}
 		// DISTINCT columns become group-by keys after IVM rewrite
 		auto *distinct_node = dynamic_cast<LogicalDistinct *>(node);
@@ -195,7 +195,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
 			    join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI &&
 			    join->join_type != JoinType::MARK && join->join_type != JoinType::SINGLE) {
-				result.ivm_compatible = false;
+				result.incremental_compatible = false;
 			}
 			if (join->join_type == JoinType::SINGLE) {
 				result.found_single_join = true;
@@ -231,7 +231,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					const bool scalar_subquery_first =
 					    bound_agg.function.name == "first" && result.group_index != DConstants::INVALID_INDEX;
 					if (supported.find(bound_agg.function.name) == supported.end() && !scalar_subquery_first) {
-						result.ivm_compatible = false;
+						result.incremental_compatible = false;
 					}
 					// COUNT(DISTINCT x) can't be summed from delta counts, but group-recompute
 					// (delete affected groups + re-insert from original query) is correct.
@@ -247,7 +247,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 						} else {
 							// Other FILTER aggregates should have been normalized before the
 							// checker runs. If one reaches here, use full refresh.
-							result.ivm_compatible = false;
+							result.incremental_compatible = false;
 						}
 					}
 					if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
@@ -273,7 +273,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 				}
 			}
 			if (HasVolatileExpression(agg->groups)) {
-				result.ivm_compatible = false;
+				result.incremental_compatible = false;
 			}
 			// Record group count and group_index for the outermost (first-found) aggregate only.
 			// In plans with nested aggregates the DFS visits the outer aggregate first; overwriting
@@ -336,7 +336,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		result.top_k_limit = top_n.limit;
 		result.top_k_offset = top_n.offset;
 		if (!ExtractOrderBy(top_n.orders, result)) {
-			result.ivm_compatible = false; // non-column ORDER BY: fall through to FULL_REFRESH
+			result.incremental_compatible = false; // non-column ORDER BY: fall through to FULL_REFRESH
 		}
 		if (!node->children.empty()) {
 			AnalyzeNode(node->children[0].get(), result);
@@ -346,7 +346,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {
 		// ORDER BY alone (without LIMIT) is meaningless on an MV (a table has no inherent
-		// order). The IvmTopKRule drops the node from the delta plan; we still capture
+		// order). The IncrementalTopKRule drops the node from the delta plan; we still capture
 		// the order columns so a sibling LIMIT below this node — see plan shapes where
 		// LPTS keeps them as separate ORDER_BY → LIMIT nodes — has them available for
 		// top-k suffix handling.
@@ -381,7 +381,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 
 	default:
 		// Unsupported operator type
-		result.ivm_compatible = false;
+		result.incremental_compatible = false;
 		break;
 	}
 
@@ -396,8 +396,8 @@ PlanAnalysis AnalyzePlan(LogicalOperator *plan) {
 	return result;
 }
 
-bool ValidateIVMPlan(LogicalOperator *plan) {
-	return AnalyzePlan(plan).ivm_compatible;
+bool ValidateIncrementalPlan(LogicalOperator *plan) {
+	return AnalyzePlan(plan).incremental_compatible;
 }
 
 } // namespace duckdb

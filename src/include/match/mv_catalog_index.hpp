@@ -17,7 +17,7 @@
 #include "duckdb.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 struct MVCandidate {
 	string view_name;
@@ -43,7 +43,7 @@ private:
 	bool dirty_ = true;
 };
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb
 
 #endif

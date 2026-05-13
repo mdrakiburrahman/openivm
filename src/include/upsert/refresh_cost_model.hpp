@@ -6,35 +6,35 @@
 
 namespace duckdb {
 
-struct IVMCostEstimate {
+struct RefreshCostEstimate {
 	// Static model components
-	double ivm_compute;
-	double ivm_upsert;
+	double incremental_compute;
+	double incremental_upsert;
 	double recompute_compute;
 	double recompute_replace;
 
 	// Totals (static model)
-	double ivm_cost;       // = ivm_compute + ivm_upsert
-	double recompute_cost; // = recompute_compute + recompute_replace
+	double incremental_cost; // = incremental_compute + incremental_upsert
+	double recompute_cost;   // = recompute_compute + recompute_replace
 
 	// Calibrated predictions (from regression, or == static totals if uncalibrated)
-	double ivm_predicted_ms;
+	double incremental_predicted_ms;
 	double recompute_predicted_ms;
 
 	// Whether regression was used (true) or static fallback (false)
 	bool calibrated;
 
 	// Strategy this view actually uses on refresh — drives both the history label
-	// and the meaning of `ivm_compute` / `ivm_upsert`. For most views this is
-	// "incremental" (delta-driven IVM); for `IVMType::GROUP_RECOMPUTE` views
+	// and the meaning of `incremental_compute` / `incremental_upsert`. For most views this is
+	// "incremental" (delta-driven IVM); for `RefreshType::GROUP_RECOMPUTE` views
 	// (inner DISTINCT under aggregate) it's "group_recompute" and the IVM cost
 	// fields hold the affected-groups recompute cost instead. For
-	// `IVMType::WINDOW_PARTITION` it's "window_partition" (partition recompute).
+	// `RefreshType::WINDOW_PARTITION` it's "window_partition" (partition recompute).
 	// Always one of: "incremental", "group_recompute", "window_partition".
 	string strategy_label;
 
 	bool ShouldRecompute() const {
-		return recompute_predicted_ms < ivm_predicted_ms;
+		return recompute_predicted_ms < incremental_predicted_ms;
 	}
 };
 
@@ -42,7 +42,7 @@ struct IVMCostEstimate {
 /// Walks the plan tree, collects base table and delta table cardinalities,
 /// and computes a cost estimate for both strategies. If sufficient execution
 /// history exists, applies learned regression to calibrate predictions.
-IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
+RefreshCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
 
 /// Pragma function: returns the IVM cost estimate for a view as a string.
 string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters);

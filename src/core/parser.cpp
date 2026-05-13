@@ -4,7 +4,7 @@
 #include "core/plan_rewrite.hpp"
 #include "core/openivm_constants.hpp"
 #include "lpts_pipeline.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -43,8 +43,8 @@
 
 namespace duckdb {
 
-static constexpr const char *OPENIVM_DDL_CLEANUP_PREFIX = "__openivm_cleanup__:";
-static constexpr const char *OPENIVM_DDL_PROFILE_PREFIX = "__openivm_profile__:";
+static constexpr const char *OPENIVM_DDL_CLEANUP_PREFIX = "openivm_cleanup:";
+static constexpr const char *OPENIVM_DDL_PROFILE_PREFIX = "openivm_profile:";
 
 /// Build "ORDER BY col1 ASC, col2 DESC LIMIT k [OFFSET n]".
 /// Works for both LOGICAL_TOP_N (fused) and separate LOGICAL_ORDER_BY + LOGICAL_LIMIT nodes.
@@ -131,27 +131,27 @@ static bool BoolSetting(ClientContext &context, const string &name) {
 	return context.TryGetCurrentSetting(name, value) && !value.IsNull() && BooleanValue::Get(value);
 }
 
-static const char *ParserIVMTypeName(IVMType type) {
+static const char *ParserRefreshTypeName(RefreshType type) {
 	switch (type) {
-	case IVMType::AGGREGATE_HAVING:
+	case RefreshType::AGGREGATE_HAVING:
 		return "AGGREGATE_HAVING";
-	case IVMType::AGGREGATE_GROUP:
+	case RefreshType::AGGREGATE_GROUP:
 		return "AGGREGATE_GROUP";
-	case IVMType::SIMPLE_AGGREGATE:
+	case RefreshType::SIMPLE_AGGREGATE:
 		return "SIMPLE_AGGREGATE";
-	case IVMType::SIMPLE_PROJECTION:
+	case RefreshType::SIMPLE_PROJECTION:
 		return "SIMPLE_PROJECTION";
-	case IVMType::WINDOW_PARTITION:
+	case RefreshType::WINDOW_PARTITION:
 		return "WINDOW_PARTITION";
-	case IVMType::GROUP_RECOMPUTE:
+	case RefreshType::GROUP_RECOMPUTE:
 		return "GROUP_RECOMPUTE";
-	case IVMType::DISTINCT_INCREMENTAL:
+	case RefreshType::DISTINCT_INCREMENTAL:
 		return "DISTINCT_INCREMENTAL";
-	case IVMType::SEMI_ANTI_RECOMPUTE:
+	case RefreshType::SEMI_ANTI_RECOMPUTE:
 		return "SEMI_ANTI_RECOMPUTE";
-	case IVMType::TOP_K:
+	case RefreshType::TOP_K:
 		return "TOP_K";
-	case IVMType::FULL_REFRESH:
+	case RefreshType::FULL_REFRESH:
 		return "FULL_REFRESH";
 	default:
 		return "UNKNOWN";
@@ -177,8 +177,7 @@ static string ExplainInitialLoadQuery(Connection &con, const string &label, cons
 	auto explain = con.Query("EXPLAIN " + sql);
 	if (old_explain && !old_explain->HasError() && old_explain->RowCount() > 0 &&
 	    !old_explain->GetValue(0, 0).IsNull()) {
-		con.Query("SET explain_output='" + OpenIVMUtils::EscapeSingleQuotes(old_explain->GetValue(0, 0).ToString()) +
-		          "'");
+		con.Query("SET explain_output='" + SqlUtils::EscapeSingleQuotes(old_explain->GetValue(0, 0).ToString()) + "'");
 	}
 	string result = label + "\n";
 	if (!explain || explain->HasError()) {
@@ -387,20 +386,20 @@ static bool HasRepeatedCteRefUnderJoin(const LogicalOperator *plan) {
 	return false;
 }
 
-struct OpenIVMDuckLakeTableInfo {
+struct DuckLakeSourceTableInfo {
 	string table_name;   // actual name as stored in DuckLake (case-preserved)
 	string catalog_name; // DuckLake catalog name (e.g., "dl")
 	string schema_name;  // DuckLake schema name
 };
 
-struct OpenIVMSourceTableInfo {
+struct SourceTableInfo {
 	string table_name;
 	string catalog_name;
 	string schema_name;
 };
 
 struct MVClassificationState {
-	bool ivm_compatible;
+	bool incremental_compatible;
 	bool found_aggregation;
 	bool found_projection;
 	bool found_distinct;
@@ -419,7 +418,7 @@ struct MVClassificationState {
 	bool found_single_join;
 
 	explicit MVClassificationState(const PlanAnalysis &analysis)
-	    : ivm_compatible(analysis.ivm_compatible), found_aggregation(analysis.found_aggregation),
+	    : incremental_compatible(analysis.incremental_compatible), found_aggregation(analysis.found_aggregation),
 	      found_projection(analysis.found_projection), found_distinct(analysis.found_distinct),
 	      found_having(analysis.found_having),
 	      found_minmax(analysis.found_minmax || analysis.found_count_distinct || analysis.found_list),
@@ -433,7 +432,7 @@ struct MVClassificationState {
 };
 
 static void CollectDuckLakeTables(LogicalOperator *op, const string &current_catalog,
-                                  unordered_map<string, OpenIVMDuckLakeTableInfo> &dl_table_info) {
+                                  unordered_map<string, DuckLakeSourceTableInfo> &dl_table_info) {
 	if (!op) {
 		return;
 	}
@@ -466,7 +465,7 @@ static void CollectDuckLakeTables(LogicalOperator *op, const string &current_cat
 	}
 }
 
-static void CollectSourceTables(LogicalOperator *op, unordered_map<string, OpenIVMSourceTableInfo> &source_table_info) {
+static void CollectSourceTables(LogicalOperator *op, unordered_map<string, SourceTableInfo> &source_table_info) {
 	if (!op) {
 		return;
 	}
@@ -476,7 +475,7 @@ static void CollectSourceTables(LogicalOperator *op, unordered_map<string, OpenI
 		if (table_ref.get()) {
 			auto &table = *table_ref.get();
 			string table_name = table.name;
-			if (!table_name.empty() && !OpenIVMUtils::IsDelta(table_name)) {
+			if (!table_name.empty() && !SqlUtils::IsDelta(table_name)) {
 				source_table_info[table_name] = {table_name, table.ParentCatalog().GetName(), table.schema.name};
 			}
 		}
@@ -516,7 +515,7 @@ static bool CatalogIsDuckLake(Connection &con, const string &catalog_name) {
 		return false;
 	}
 	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
-	                        OpenIVMUtils::EscapeValue(catalog_name) + "' LIMIT 1");
+	                        SqlUtils::EscapeValue(catalog_name) + "' LIMIT 1");
 	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
 }
@@ -569,7 +568,7 @@ static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t exp
 		return expr->alias;
 	}
 	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
-	    !IVMTableNames::IsInternalColumn(output_names[expr_index])) {
+	    !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
 		return output_names[expr_index];
 	}
 	return bcr.GetName();
@@ -602,7 +601,7 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
 			continue;
 		}
 		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
-		if (!IVMTableNames::IsInternalColumn(col_name)) {
+		if (!IncrementalTableNames::IsInternalColumn(col_name)) {
 			group_names.push_back(col_name);
 			matched = true;
 		}
@@ -645,7 +644,7 @@ static vector<string> DeriveGroupColumnNames(LogicalOperator *plan, idx_t group_
 	vector<string> group_names;
 	if (has_union_over_agg) {
 		for (size_t i = 0; i < group_count && i < output_names.size(); i++) {
-			if (!IVMTableNames::IsInternalColumn(output_names[i])) {
+			if (!IncrementalTableNames::IsInternalColumn(output_names[i])) {
 				group_names.push_back(output_names[i]);
 			}
 		}
@@ -714,12 +713,12 @@ static vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, con
 			if (!key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
 				continue;
 			}
-			if (!output_names[expr_idx].empty() && !IVMTableNames::IsInternalColumn(output_names[expr_idx])) {
+			if (!output_names[expr_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_idx])) {
 				AddUniqueGroupNames(group_names, vector<string> {output_names[expr_idx]});
 			}
 		}
 	}
-	if (group_names.empty() && !output_names.empty() && !IVMTableNames::IsInternalColumn(output_names[0])) {
+	if (group_names.empty() && !output_names.empty() && !IncrementalTableNames::IsInternalColumn(output_names[0])) {
 		// Scalar correlated subqueries normally project the duplicate-eliminated outer keys
 		// first. Use that shape as a fallback if binding aliases were hidden by projection
 		// rewrites.
@@ -865,7 +864,7 @@ static void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<stri
 				continue;
 			}
 			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
-			if (!output_col.empty() && !IVMTableNames::IsInternalColumn(output_col)) {
+			if (!output_col.empty() && !IncrementalTableNames::IsInternalColumn(output_col)) {
 				partition_column = output_col + "=" + partition_column;
 			}
 			break;
@@ -902,7 +901,7 @@ static void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, v
 			continue;
 		}
 		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
-		if (output_col.empty() || IVMTableNames::IsInternalColumn(output_col)) {
+		if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
 			continue;
 		}
 		string parent = FindBindingParent(parents, BindingKey(*bcr));
@@ -1021,7 +1020,7 @@ static string ExtractFullOuterJoinMetadata(LogicalOperator *plan) {
 }
 
 static string SanitizeOutputName(const string &name) {
-	if (IVMTableNames::IsInternalColumn(name)) {
+	if (IncrementalTableNames::IsInternalColumn(name)) {
 		return name;
 	}
 	string clean;
@@ -1108,7 +1107,7 @@ static void AppendHiddenOutputNames(LogicalOperator *plan, vector<string> &outpu
 static void DeduplicateOutputNames(vector<string> &output_names) {
 	unordered_set<string> seen;
 	for (auto &name : output_names) {
-		if (IVMTableNames::IsInternalColumn(name)) {
+		if (IncrementalTableNames::IsInternalColumn(name)) {
 			continue;
 		}
 		string candidate = name;
@@ -2331,16 +2330,16 @@ public:
 		}
 		flushed = true;
 		Connection profile_con(db);
-		profile_con.Query("DELETE FROM " + string(ivm::PROFILE_TABLE) +
+		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
 		for (auto &step : steps) {
 			auto result = profile_con.Query(
-			    "INSERT OR REPLACE INTO " + string(ivm::PROFILE_TABLE) +
+			    "INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
 			    " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
-			    OpenIVMUtils::EscapeValue(refresh_id) + "', '" + OpenIVMUtils::EscapeValue(view_name) + "', " +
-			    to_string(step.step_order) + ", '" + OpenIVMUtils::EscapeValue(step.step_name) + "', " +
-			    to_string(step.duration_ms) + ", '" + OpenIVMUtils::EscapeValue(step.detail) + "')");
+			    SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) + "', " +
+			    to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
+			    to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')");
 			if (result->HasError()) {
 				OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV step '%s': %s\n", step.step_name.c_str(),
 				                    result->GetError().c_str());
@@ -2373,10 +2372,10 @@ static void ParseCreateMVProfileMarker(const string &payload, string &view_name,
 	detail = payload.substr(second + 1);
 }
 
-static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+static unique_ptr<FunctionData> DDLExecutorBindFunction(ClientContext &context, TableFunctionBindInput &input,
+                                                        vector<LogicalType> &return_types, vector<string> &names) {
 	// DDL statements are passed via result.parameters from the plan function.
-	auto bind_data = make_uniq<IVMFunction::IVMBindData>(true);
+	auto bind_data = make_uniq<DDLExecutorFunction::DDLExecutorBindData>(true);
 	if (!input.inputs.empty()) {
 		for (auto &param : input.inputs) {
 			auto q = param.GetValue<string>();
@@ -2391,7 +2390,7 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 	return std::move(bind_data);
 }
 
-static void ExecuteIVMDDL(ClientContext &context, const vector<string> &ddl) {
+static void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	if (ddl.empty()) {
 		return;
 	}
@@ -2430,10 +2429,11 @@ static void ExecuteIVMDDL(ClientContext &context, const vector<string> &ddl) {
 	vector<string> cleanup_ddl;
 	auto run_cleanup = [&]() {
 		for (const auto &cleanup : cleanup_ddl) {
-			OPENIVM_DEBUG_PRINT("[IVMDDLExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
+			OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
 			auto cleanup_result = conn->Query(cleanup);
 			if (cleanup_result->HasError()) {
-				OPENIVM_DEBUG_PRINT("[IVMDDLExecuteFunction] Cleanup failed: %s\n", cleanup_result->GetError().c_str());
+				OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Cleanup failed: %s\n",
+				                    cleanup_result->GetError().c_str());
 			}
 		}
 	};
@@ -2451,7 +2451,7 @@ static void ExecuteIVMDDL(ClientContext &context, const vector<string> &ddl) {
 			cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 			continue;
 		}
-		OPENIVM_DEBUG_PRINT("[IVMDDLExecuteFunction] Executing DDL: %s\n", q.c_str());
+		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL: %s\n", q.c_str());
 		auto ddl_start = std::chrono::steady_clock::now();
 		auto r = conn->Query(q);
 		profiler.AddStep(current_profile_step, ddl_start, current_profile_detail + "; bytes=" + to_string(q.size()));
@@ -2482,26 +2482,27 @@ static void ExecuteIVMDDL(ClientContext &context, const vector<string> &ddl) {
 	restore_outer_transaction();
 }
 
-static void IVMDDLExecuteFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<IVMFunction::IVMBindData>();
-	auto &gdata = dynamic_cast<IVMFunction::IVMGlobalData &>(*data_p.global_state);
+static void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<DDLExecutorFunction::DDLExecutorBindData>();
+	auto &gdata = dynamic_cast<DDLExecutorFunction::DDLExecutorGlobalData &>(*data_p.global_state);
 	if (gdata.offset >= 1) {
 		return;
 	}
-	ExecuteIVMDDL(context, bind_data.ddl);
+	ExecuteDDL(context, bind_data.ddl);
 	output.SetValue(0, 0, Value::BOOLEAN(bind_data.result));
 	output.SetCardinality(1);
 	gdata.offset++;
 }
 
-ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionInfo *info, const string &query) {
-	auto query_lower = OpenIVMUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
+ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(ParserExtensionInfo *info,
+                                                                          const string &query) {
+	auto query_lower = SqlUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
 	StringUtil::Trim(query_lower);
 	// Strip SQL line comments (-- to end of line) before whitespace normalization.
 	// RemoveRedundantWhitespaces collapses '\n' to ' ', which would turn
 	// "-- comment\n rest" into "-- comment rest" where the rest is eaten by the comment.
-	OpenIVMUtils::StripLineComments(query_lower);
-	OpenIVMUtils::RemoveRedundantWhitespaces(query_lower);
+	SqlUtils::StripLineComments(query_lower);
+	SqlUtils::RemoveRedundantWhitespaces(query_lower);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
 	if (StringUtil::Contains(query_lower, "alter materialized view")) {
@@ -2521,19 +2522,19 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 		string refresh_type = StringUtil::Lower(match[2].str());
 		string update_sql;
 		if (refresh_type == "manual") {
-			update_sql = "UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_interval = NULL WHERE view_name = '" +
-			             OpenIVMUtils::EscapeSingleQuotes(alter_view_name) + "'";
+			update_sql = "UPDATE " + string(openivm::VIEWS_TABLE) + " SET refresh_interval = NULL WHERE view_name = '" +
+			             SqlUtils::EscapeSingleQuotes(alter_view_name) + "'";
 		} else {
-			int64_t interval = OpenIVMUtils::ParseRefreshInterval(match[3].str());
-			update_sql = "UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_interval = " + to_string(interval) +
-			             " WHERE view_name = '" + OpenIVMUtils::EscapeSingleQuotes(alter_view_name) + "'";
+			int64_t interval = SqlUtils::ParseRefreshInterval(match[3].str());
+			update_sql = "UPDATE " + string(openivm::VIEWS_TABLE) + " SET refresh_interval = " + to_string(interval) +
+			             " WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(alter_view_name) + "'";
 		}
-		// Pass the UPDATE SQL through IVMParseData; IVMPlanFunction will execute it
+		// Pass the UPDATE SQL through MaterializedViewParseData; PlanFunction will execute it
 		Parser alter_parser;
 		alter_parser.ParseQuery("SELECT 1");
-		auto parse_data =
-		    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(alter_parser.statements[0]), true);
-		dynamic_cast<IVMParseData &>(*parse_data).alter_sql = update_sql;
+		auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(
+		    std::move(alter_parser.statements[0]), true);
+		dynamic_cast<MaterializedViewParseData &>(*parse_data).alter_sql = update_sql;
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
@@ -2551,43 +2552,44 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 		is_replace = true;
 		// Strip "or replace" so the rest of the pipeline sees "create materialized view"
 		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+"), "");
-		OpenIVMUtils::RemoveRedundantWhitespaces(query_lower);
+		SqlUtils::RemoveRedundantWhitespaces(query_lower);
 	}
 
 	// Extract REFRESH EVERY clause before structural rewrite (strips it from the query)
-	int64_t refresh_interval = OpenIVMUtils::ExtractRefreshInterval(query_lower);
+	int64_t refresh_interval = SqlUtils::ExtractRefreshInterval(query_lower);
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Refresh interval: %lld seconds\n", (long long)refresh_interval);
 
-	OpenIVMUtils::ReplaceMaterializedView(query_lower);
+	SqlUtils::ReplaceMaterializedView(query_lower);
 	// All other rewrites (DISTINCT, AVG, LEFT JOIN key, aggregate aliases) are done
-	// at the plan level in IVMPlanFunction via IVMPlanRewrite + LPTS.
+	// at the plan level in PlanFunction via PlanRewrite + LPTS.
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());
 
 	Parser p;
 	p.ParseQuery(query_lower);
 
-	auto parse_data =
-	    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(p.statements[0]), true, refresh_interval);
-	dynamic_cast<IVMParseData &>(*parse_data).is_replace = is_replace;
+	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
+	                                                                                      true, refresh_interval);
+	dynamic_cast<MaterializedViewParseData &>(*parse_data).is_replace = is_replace;
 	return ParserExtensionParseResult(std::move(parse_data));
 }
 
-ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInfo *info, ClientContext &context,
-                                                              unique_ptr<ParserExtensionParseData> parse_data) {
+ParserExtensionPlanResult
+MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientContext &context,
+                                              unique_ptr<ParserExtensionParseData> parse_data) {
 	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
 	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
 	// whole execution path on DuckDB's lower-memory unordered mode.
 	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
 	                                                              Value::BOOLEAN(false));
-	auto &ivm_parse_data = dynamic_cast<IVMParseData &>(*parse_data);
-	auto statement = dynamic_cast<SQLStatement *>(ivm_parse_data.statement.get());
+	auto &parse_data_ref = dynamic_cast<MaterializedViewParseData &>(*parse_data);
+	auto statement = dynamic_cast<SQLStatement *>(parse_data_ref.statement.get());
 
 	ParserExtensionPlanResult result;
 
-	if (ivm_parse_data.plan) {
+	if (parse_data_ref.plan) {
 		Connection con(*context.db.get());
 
-		// Capture the current catalog/schema from the originating context. IVMDDLBindFunction
+		// Capture the current catalog/schema from the originating context. DDLExecutorBindFunction
 		// creates a fresh Connection that reflects the DatabaseInstance's physical default
 		// catalog (not the session's USE setting). We only inject "USE catalog.schema" when
 		// the session's active catalog differs from that physical default — e.g. when DuckLake
@@ -2620,14 +2622,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		                                KeywordHelper::WriteOptionallyQuoted(current_schema);
 
 		// Handle ALTER MATERIALIZED VIEW — just execute the metadata UPDATE
-		if (!ivm_parse_data.alter_sql.empty()) {
-			auto r = con.Query(ivm_parse_data.alter_sql);
+		if (!parse_data_ref.alter_sql.empty()) {
+			auto r = con.Query(parse_data_ref.alter_sql);
 			if (r->HasError()) {
 				throw CatalogException("Failed to alter materialized view: " + r->GetError());
 			}
 			// Return via the DDL executor with no DDL to run (the UPDATE already executed)
-			result.function = TableFunction("openivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction,
-			                                IVMFunction::IVMInit);
+			result.function = TableFunction("openivm_ddl_executor", {}, DDLExecutorExecuteFunction,
+			                                DDLExecutorBindFunction, DDLExecutorFunction::DDLExecutorInit);
 			result.requires_valid_transaction = true;
 			result.return_type = StatementReturnType::QUERY_RESULT;
 			return result;
@@ -2638,14 +2640,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool pac_loaded = IsPacLoaded(context);
 		ForwardPacSettingsIfLoaded(context, con);
 
-		auto full_view_name = OpenIVMUtils::ExtractTableName(statement->query);
+		auto full_view_name = SqlUtils::ExtractTableName(statement->query);
 		bool statement_needs_original_sql_for_lpts = QueryNeedsOriginalSqlForLpts(statement->query);
 		// Keep the user's raw AS-query as the source of truth for original-SQL fallback.
 		// Do not recover this from DuckDB's parsed QueryNode::ToString(): that path is a
 		// best-effort pretty-printer and has segfaulted on set-operation query nodes with
 		// incomplete CTE/query internals. LPTS remains the normalized serializer below
 		// for supported logical plans; this string is only the safe fallback input.
-		auto original_view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
+		auto original_view_query = SqlUtils::ExtractViewQuery(statement->query);
 
 		// Split catalog-qualified name (e.g. "dl.mv_totals") into prefix and bare name.
 		string view_catalog_prefix; // e.g. "dl." or "" for default catalog
@@ -2683,7 +2685,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory") {
 			internal_catalog_prefix = QualifiedTablePrefix(default_db, default_schema);
 		}
-		string data_table = IVMTableNames::DataTableName(view_name);
+		string data_table = IncrementalTableNames::DataTableName(view_name);
 		string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
 		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
@@ -2698,7 +2700,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			con.Query("USE " + current_catalog + "." + current_schema);
 		}
 
-		if (!ivm_parse_data.is_replace) {
+		if (!parse_data_ref.is_replace) {
 			// Fail before registering cleanup DDL. Otherwise a duplicate CREATE attempt
 			// can fail on the pre-existing backing table and then cleanup would drop the
 			// original MV's user-facing view/data table.
@@ -2732,7 +2734,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// (The SELECT-only `select_plan` below does the same for LPTS serialization.)
 		InlineCtesIfPresent(context, *planner.binder, plan);
 
-		unordered_map<string, OpenIVMSourceTableInfo> source_table_info;
+		unordered_map<string, SourceTableInfo> source_table_info;
 		CollectSourceTables(plan.get(), source_table_info);
 		if (!source_table_info.empty()) {
 			table_names.clear();
@@ -2740,7 +2742,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				table_names.insert(entry.second.table_name);
 			}
 		}
-		unordered_map<string, OpenIVMDuckLakeTableInfo> dl_table_info_for_classification;
+		unordered_map<string, DuckLakeSourceTableInfo> dl_table_info_for_classification;
 		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info_for_classification);
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
@@ -2775,7 +2777,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
-			IVMPlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
+			PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
 
 			output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 			// Strip HAVING filter from plan — data table stores all groups.
@@ -2897,8 +2899,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
 
 		// Normalize FILTER aggregates in the full plan before analysis so the checker
-		// sees CASE expressions instead of raw FILTER and doesn't set ivm_compatible=false.
-		// (IVMPlanRewrite already rewrote select_plan for the LPTS view_query above.)
+		// sees CASE expressions instead of raw FILTER and doesn't set incremental_compatible=false.
+		// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
 		RewriteAggregateFilters(context, plan);
 
 		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
@@ -2907,7 +2909,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (analysis.found_delim_join && !classification.found_aggregation && !analysis.found_single_join) {
 			// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
 			// round-trip lateral table functions, but its CTE-normalized SQL lowers them
-			// into ordinary joins/table-function scans; that bypasses IvmDelimJoinRule
+			// into ordinary joins/table-function scans; that bypasses IncrementalDelimJoinRule
 			// and sends the refresh plan through the generic N-way join rule instead.
 			view_query = original_view_query;
 			lpts_fallback = true;
@@ -2985,7 +2987,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		    output_names.size() > analysis.aggregate_types.size()) {
 			idx_t key_count = output_names.size() - analysis.aggregate_types.size();
 			for (idx_t i = 0; i < key_count; i++) {
-				if (!output_names[i].empty() && !IVMTableNames::IsInternalColumn(output_names[i])) {
+				if (!output_names[i].empty() && !IncrementalTableNames::IsInternalColumn(output_names[i])) {
 					aggregate_columns.push_back(output_names[i]);
 				}
 			}
@@ -3016,7 +3018,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (classification.found_nested_aggregate && aggregate_columns.empty()) {
 			auto nested_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, false);
 			for (auto &name : nested_group_names) {
-				if (!IVMTableNames::IsInternalColumn(name)) {
+				if (!IncrementalTableNames::IsInternalColumn(name)) {
 					aggregate_columns.push_back(name);
 				}
 			}
@@ -3032,7 +3034,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (classification.found_aggregation && aggregate_columns.empty()) {
 			auto cte_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, true);
 			for (auto &name : cte_group_names) {
-				if (!IVMTableNames::IsInternalColumn(name)) {
+				if (!IncrementalTableNames::IsInternalColumn(name)) {
 					aggregate_columns.push_back(name);
 				}
 			}
@@ -3054,7 +3056,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		{
 			unordered_set<string> seen_group;
 			for (auto &name : aggregate_columns) {
-				if (IVMTableNames::IsInternalColumn(name)) {
+				if (IncrementalTableNames::IsInternalColumn(name)) {
 					continue;
 				}
 				string candidate = name;
@@ -3106,12 +3108,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					if (!expr->alias.empty()) {
 						col_name = expr->alias;
 					} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
-					           !IVMTableNames::IsInternalColumn(output_names[expr_i])) {
+					           !IncrementalTableNames::IsInternalColumn(output_names[expr_i])) {
 						col_name = output_names[expr_i];
 					} else {
 						col_name = bcr.GetName();
 					}
-					if (!IVMTableNames::IsInternalColumn(col_name)) {
+					if (!IncrementalTableNames::IsInternalColumn(col_name)) {
 						bool exists = false;
 						for (auto &existing : aggregate_columns) {
 							if (StringUtil::CIEquals(existing, col_name)) {
@@ -3159,7 +3161,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				// planning a chained MV, the scan is physical even though the source's change
 				// tracking is still DuckLake-backed.
 				bool is_ducklake_mv_backing =
-				    !view_catalog_prefix.empty() && StringUtil::StartsWith(table_name, ivm::DATA_TABLE_PREFIX);
+				    !view_catalog_prefix.empty() && StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX);
 				if (!is_ducklake_scan && !is_ducklake_mv_backing) {
 					all_sources_are_ducklake = false;
 					break;
@@ -3203,7 +3205,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Materialized CTE referenced 2+ times below a JOIN: the planner emits one
 		// base-table scan inside the CTE and shares it via CTE_REF nodes, so the
-		// IvmJoinRule sees a single physical scan instead of an N-way self-join.
+		// IncrementalJoinRule sees a single physical scan instead of an N-way self-join.
 		// Inclusion-exclusion can't generate the right delta terms — rows for the
 		// shared scan aren't replicated across both join sides. Route to RECOMPUTE.
 		// Catches ducklake_0240 (CTE referenced twice on both sides of an INNER JOIN).
@@ -3218,7 +3220,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			lpts_fallback = true;
 		}
 
-		IVMType ivm_type;
+		RefreshType refresh_type;
 		// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
 		vector<string> distinct_extracted_cols;
 		string distinct_extracted_input_sql;
@@ -3238,27 +3240,27 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract);
 
 		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
-			ivm_type = IVMType::FULL_REFRESH;
+			refresh_type = RefreshType::FULL_REFRESH;
 		} else if (classification.found_window) {
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
-			ivm_type = IVMType::WINDOW_PARTITION;
+			refresh_type = RefreshType::WINDOW_PARTITION;
 		} else if (classification.found_grouping_sets) {
 			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
 			// maintain them by recomputing the grouping-set keys touched by source
 			// deltas.
-			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
+			refresh_type = aggregate_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 		} else if (classification.found_semi_anti_join && classification.found_aggregation) {
 			// SEMI/ANTI joins are thresholded by match-count transitions. The aux-state path below
 			// supports projection/filter stacks over one left base table; aggregates over SEMI/ANTI
 			// need a separate transition-to-aggregate compiler. Use full recompute until that lands.
-			ivm_type = IVMType::FULL_REFRESH;
+			refresh_type = RefreshType::FULL_REFRESH;
 		} else if (classification.found_semi_anti_join && !classification.found_aggregation) {
 			if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
 				string left_table_name = LastIdentifierPart(semi_anti_extract.left_table);
 				auto col_result =
 				    con.Query("SELECT column_name FROM information_schema.columns WHERE lower(table_name) = lower('" +
-				              OpenIVMUtils::EscapeSingleQuotes(left_table_name) + "') AND table_schema = '" +
-				              OpenIVMUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
+				              SqlUtils::EscapeSingleQuotes(left_table_name) + "') AND table_schema = '" +
+				              SqlUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
 				auto add_semi_anti_left_col = [&](const string &col_name) {
 					for (auto &existing : semi_anti_left_cols) {
 						if (StringUtil::CIEquals(existing, col_name)) {
@@ -3281,29 +3283,30 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 							add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
 						}
 					}
-					ivm_type = semi_anti_left_cols.empty() ? IVMType::FULL_REFRESH : IVMType::SEMI_ANTI_RECOMPUTE;
+					refresh_type =
+					    semi_anti_left_cols.empty() ? RefreshType::FULL_REFRESH : RefreshType::SEMI_ANTI_RECOMPUTE;
 				} else if (!col_result->HasError() && col_result->RowCount() > 0) {
 					for (idx_t i = 0; i < col_result->RowCount(); i++) {
 						add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
 					}
-					ivm_type = IVMType::SEMI_ANTI_RECOMPUTE;
+					refresh_type = RefreshType::SEMI_ANTI_RECOMPUTE;
 				} else {
-					ivm_type = IVMType::FULL_REFRESH;
+					refresh_type = RefreshType::FULL_REFRESH;
 				}
 			} else {
-				ivm_type = IVMType::FULL_REFRESH;
+				refresh_type = RefreshType::FULL_REFRESH;
 			}
-		} else if (!classification.ivm_compatible) {
-			ivm_type = IVMType::FULL_REFRESH;
+		} else if (!classification.incremental_compatible) {
+			refresh_type = RefreshType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
 		} else if (classification.found_filtered_list && !aggregate_columns.empty()) {
-			ivm_type = IVMType::GROUP_RECOMPUTE;
+			refresh_type = RefreshType::GROUP_RECOMPUTE;
 		} else if (classification.found_filtered_list) {
-			ivm_type = IVMType::FULL_REFRESH;
+			refresh_type = RefreshType::FULL_REFRESH;
 		} else if (classification.found_count_distinct && !aggregate_columns.empty()) {
-			ivm_type = IVMType::GROUP_RECOMPUTE;
+			refresh_type = RefreshType::GROUP_RECOMPUTE;
 		} else if (classification.found_distinct && !distinct_at_top && classification.found_aggregation) {
 			// Inner DISTINCT under an aggregate. Two paths:
 			//   - `openivm_distinct_aux_state = true` AND single-source body → DISTINCT_INCREMENTAL.
@@ -3323,18 +3326,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 			bool single_source = table_names.size() == 1;
 			if (aux_enabled && single_source) {
-				ivm_type = IVMType::DISTINCT_INCREMENTAL;
+				refresh_type = RefreshType::DISTINCT_INCREMENTAL;
 			} else {
-				ivm_type = IVMType::GROUP_RECOMPUTE;
+				refresh_type = RefreshType::GROUP_RECOMPUTE;
 			}
 			// Try to extract the DISTINCT subquery from the user's original SQL. If the
 			// shape isn't recognised (multi-source body, subquery FROM, etc.), demote to
 			// GROUP_RECOMPUTE — the aux pipeline is single-source-only in v0.
-			if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+			if (refresh_type == RefreshType::DISTINCT_INCREMENTAL) {
 				vector<string> dcols;
 				string d_input_sql, d_source, d_filter;
 				if (!ExtractInnerDistinct(original_view_query, dcols, d_input_sql, d_source, d_filter)) {
-					ivm_type = IVMType::GROUP_RECOMPUTE;
+					refresh_type = RefreshType::GROUP_RECOMPUTE;
 					OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL extractor failed — demoting to "
 					                    "GROUP_RECOMPUTE\n");
 				} else {
@@ -3345,10 +3348,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 			// Walk the rewritten plan for the outer aggregate's expressions. v0 supports
-			// exactly one SUM(<arg>) — `openivm_count_star` (auto-injected by IVMPlanRewrite)
+			// exactly one SUM(<arg>) — `openivm_count_star` (auto-injected by PlanRewrite)
 			// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
 			// demotes back to GROUP_RECOMPUTE.
-			if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+			if (refresh_type == RefreshType::DISTINCT_INCREMENTAL) {
 				LogicalAggregate *outer_agg = FindOuterAggregate(plan.get());
 				int sum_count = 0;
 				bool unsupported_agg = false;
@@ -3360,7 +3363,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 						auto &bound = expr->Cast<BoundAggregateExpression>();
 						const string &fname = bound.function.name;
 						if (fname == "count_star") {
-							continue; // injected by IvmPlanRewrite — fine
+							continue; // injected by PlanRewrite — fine
 						}
 						if (fname != "sum") {
 							unsupported_agg = true;
@@ -3378,7 +3381,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 				}
 				if (!outer_agg || unsupported_agg || sum_count != 1) {
-					ivm_type = IVMType::GROUP_RECOMPUTE;
+					refresh_type = RefreshType::GROUP_RECOMPUTE;
 					distinct_sum_arg.clear();
 					distinct_sum_out.clear();
 					OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL outer-agg not single-SUM — demoting "
@@ -3397,11 +3400,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// UNION DISTINCT over grouped aggregate outputs must recompute by the branch
 			// aggregate key, not by the full distinct output tuple. The old aggregate value
 			// is no longer discoverable from delta-filtered recompute after an update.
-			ivm_type = IVMType::GROUP_RECOMPUTE;
+			refresh_type = RefreshType::GROUP_RECOMPUTE;
 		} else if (classification.found_distinct && distinct_at_top && !aggregate_columns.empty()) {
-			ivm_type = IVMType::AGGREGATE_GROUP;
+			refresh_type = RefreshType::AGGREGATE_GROUP;
 		} else if (classification.found_having && classification.found_aggregation && !aggregate_columns.empty()) {
-			ivm_type = IVMType::AGGREGATE_HAVING;
+			refresh_type = RefreshType::AGGREGATE_HAVING;
 		} else if ((has_union_over_agg || join_key_group_fallback || delim_aggregate_group_fallback ||
 		            scalar_delim_projection_group_fallback || join_aggregate_projection_fallback ||
 		            nested_aggregate_group_fallback || repeated_cte_aggregate_group_fallback ||
@@ -3415,21 +3418,21 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// so linear delta is incorrect. These use GROUP_RECOMPUTE — not AGGREGATE_GROUP —
 			// because non-key output columns may be pass-through attributes or non-linear
 			// functions over inner/correlated expressions.
-			ivm_type = IVMType::GROUP_RECOMPUTE;
+			refresh_type = RefreshType::GROUP_RECOMPUTE;
 		} else if (classification.found_aggregation && !aggregate_columns.empty()) {
-			ivm_type = IVMType::AGGREGATE_GROUP;
+			refresh_type = RefreshType::AGGREGATE_GROUP;
 		} else if (classification.found_aggregation && aggregate_columns.empty()) {
-			ivm_type = IVMType::SIMPLE_AGGREGATE;
+			refresh_type = RefreshType::SIMPLE_AGGREGATE;
 		} else if (classification.found_projection && !classification.found_aggregation) {
-			ivm_type = IVMType::SIMPLE_PROJECTION;
+			refresh_type = RefreshType::SIMPLE_PROJECTION;
 		} else {
-			ivm_type = IVMType::FULL_REFRESH;
+			refresh_type = RefreshType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' has an unrecognized query pattern. Full refresh will be used.");
 		}
 
-		bool ducklake_window_partition =
-		    ivm_type == IVMType::WINDOW_PARTITION && (target_is_ducklake || !dl_table_info_for_classification.empty());
+		bool ducklake_window_partition = refresh_type == RefreshType::WINDOW_PARTITION &&
+		                                 (target_is_ducklake || !dl_table_info_for_classification.empty());
 		if (ducklake_window_partition && !lpts_fallback) {
 			// Window-partition refresh recomputes affected partitions from the user's query,
 			// so the initial data table does not need LPTS-normalized SQL. For DuckLake,
@@ -3444,15 +3447,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
-		                    ivm_type == IVMType::AGGREGATE_GROUP        ? "AGGREGATE_GROUP"
-		                    : ivm_type == IVMType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
-		                    : ivm_type == IVMType::SIMPLE_PROJECTION    ? "SIMPLE_PROJECTION"
-		                    : ivm_type == IVMType::FULL_REFRESH         ? "FULL_REFRESH"
-		                    : ivm_type == IVMType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
-		                    : ivm_type == IVMType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
-		                    : ivm_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
-		                    : ivm_type == IVMType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
-		                                                                : "UNKNOWN",
+		                    refresh_type == RefreshType::AGGREGATE_GROUP        ? "AGGREGATE_GROUP"
+		                    : refresh_type == RefreshType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
+		                    : refresh_type == RefreshType::SIMPLE_PROJECTION    ? "SIMPLE_PROJECTION"
+		                    : refresh_type == RefreshType::FULL_REFRESH         ? "FULL_REFRESH"
+		                    : refresh_type == RefreshType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
+		                    : refresh_type == RefreshType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
+		                    : refresh_type == RefreshType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
+		                    : refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
+		                                                                        : "UNKNOWN",
 		                    (int)classification.found_aggregation, (int)classification.found_projection,
 		                    aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
@@ -3475,11 +3478,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// --- System tables DDL ---
 		add_profile_marker("create_mv_system_tables",
-		                   "ivm_type=" + string(ParserIVMTypeName(ivm_type)) +
+		                   "refresh_type=" + string(ParserRefreshTypeName(refresh_type)) +
 		                       "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
 		// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 		// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
-		ddl.push_back("create table if not exists " + string(ivm::VIEWS_TABLE) +
+		ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
 		              " (view_name varchar primary key, sql_string varchar, type tinyint,"
 		              " has_minmax boolean default false, has_left_join boolean default false,"
 		              " last_update timestamp, refresh_interval bigint default null,"
@@ -3501,13 +3504,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " semi_anti_aux_meta_json varchar default null)");
 		// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 		// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
-		ddl.push_back("alter table " + string(ivm::VIEWS_TABLE) +
+		ddl.push_back("alter table " + string(openivm::VIEWS_TABLE) +
 		              " add column if not exists distinct_aux_meta_json varchar default null");
-		ddl.push_back("alter table " + string(ivm::VIEWS_TABLE) +
+		ddl.push_back("alter table " + string(openivm::VIEWS_TABLE) +
 		              " add column if not exists semi_anti_aux_meta_json varchar default null");
-		if (!ivm_parse_data.is_replace) {
-			string escaped_view_name = OpenIVMUtils::EscapeSingleQuotes(view_name);
-			string escaped_data_table = OpenIVMUtils::EscapeSingleQuotes(IVMTableNames::DataTableName(view_name));
+		if (!parse_data_ref.is_replace) {
+			string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
+			string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
 			string stale_mv_condition =
 			    "view_name = '" + escaped_view_name +
 			    "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" + escaped_view_name +
@@ -3517,8 +3520,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// a DuckDB file lock after writing metadata but before creating the physical
 			// DuckLake/default-catalog objects, a retry should clean that stale row rather
 			// than report a misleading duplicate MV.
-			ddl.push_back("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
-			ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(ivm::VIEWS_TABLE) +
+			ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
+			ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
 			              " WHERE view_name = '" + escaped_view_name +
 			              "') THEN error('Duplicate key: materialized view \"" + escaped_view_name +
 			              "\" already exists') ELSE NULL END");
@@ -3530,7 +3533,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " (view_name varchar primary key, hook_sql varchar not null,"
 		              " mode varchar not null default 'after')");
 
-		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
+		ddl.push_back("create table if not exists " + string(openivm::DELTA_TABLES_TABLE) +
 		              " (view_name varchar, table_name varchar, last_update timestamp,"
 		              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default null,"
 		              " last_refresh_ts timestamp default null,"
@@ -3540,56 +3543,56 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " source_schema varchar default null,"
 		              " primary key(view_name, table_name))");
 		// Backfill for existing databases without the columns (added post-release).
-		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		ddl.push_back("alter table " + string(openivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists last_refresh_ts timestamp default null");
-		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		ddl.push_back("alter table " + string(openivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists pending_row_estimate bigint default null");
-		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		ddl.push_back("alter table " + string(openivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists pending_estimate_ts timestamp default null");
-		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		ddl.push_back("alter table " + string(openivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists source_catalog varchar default null");
-		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		ddl.push_back("alter table " + string(openivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists source_schema varchar default null");
 
 		// Refresh history: stores execution stats for learned cost model calibration.
 		// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
-		ddl.push_back("create table if not exists " + string(ivm::HISTORY_TABLE) +
+		ddl.push_back("create table if not exists " + string(openivm::HISTORY_TABLE) +
 		              " (view_name varchar, refresh_timestamp timestamp default current_timestamp,"
-		              " method varchar, ivm_compute_est double, ivm_upsert_est double,"
+		              " method varchar, incremental_compute_est double, incremental_upsert_est double,"
 		              " recompute_compute_est double, recompute_replace_est double,"
 		              " actual_duration_ms bigint,"
 		              " strategy varchar default 'incremental',"
 		              " primary key(view_name, refresh_timestamp))");
-		ddl.push_back("alter table " + string(ivm::HISTORY_TABLE) +
+		ddl.push_back("alter table " + string(openivm::HISTORY_TABLE) +
 		              " add column if not exists strategy varchar default 'incremental'");
-		ddl.push_back("create table if not exists " + string(ivm::PROFILE_TABLE) +
+		ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
 		              " (refresh_id varchar, view_name varchar,"
 		              " profile_timestamp timestamp default current_timestamp,"
 		              " step_order integer, step_name varchar, duration_ms bigint, detail varchar,"
 		              " primary key(refresh_id, step_order))");
 
 		// --- OR REPLACE: drop old MV if it exists ---
-		if (ivm_parse_data.is_replace) {
+		if (parse_data_ref.is_replace) {
 			add_profile_marker("create_mv_replace_cleanup");
 			string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
-			string qdt_drop =
-			    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
+			string qdt_drop = internal_catalog_prefix +
+			                  KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
 			string qdv_drop =
-			    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+			    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 			// Drop the user-facing VIEW, data table, and delta view table
 			ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
 			ddl.push_back("DROP TABLE IF EXISTS " + qdt_drop);
 			ddl.push_back("DROP TABLE IF EXISTS " + qdv_drop);
 			// Clean metadata (the INSERT OR REPLACE below handles openivm_views)
-			ddl.push_back("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
-			ddl.push_back("DELETE FROM " + string(ivm::HISTORY_TABLE) + " WHERE view_name = '" +
-			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+			              SqlUtils::EscapeSingleQuotes(view_name) + "'");
+			ddl.push_back("DELETE FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
+			              SqlUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 
 		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
 		// LEFT JOIN key) and preserves user column names.
-		string refresh_val = ivm_parse_data.refresh_interval > 0 ? to_string(ivm_parse_data.refresh_interval) : "null";
+		string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 		// Store GROUP BY or PARTITION BY columns (mutually exclusive in our type system).
 		// For WINDOW_PARTITION, store the PARTITION BY columns so the upsert compiler
 		// can identify affected partitions from deltas.
@@ -3601,7 +3604,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				if (i > 0) {
 					group_cols_val += ",";
 				}
-				group_cols_val += OpenIVMUtils::EscapeSingleQuotes(cols_to_store[i]);
+				group_cols_val += SqlUtils::EscapeSingleQuotes(cols_to_store[i]);
 			}
 			group_cols_val += "'";
 		}
@@ -3618,25 +3621,25 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			agg_types_val += "'";
 		}
 		string having_val =
-		    having_predicate.empty() ? "null" : "'" + OpenIVMUtils::EscapeSingleQuotes(having_predicate) + "'";
+		    having_predicate.empty() ? "null" : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
 
 		// Extract FULL OUTER JOIN condition: "left_table:left_col,right_table:right_col"
 		string full_outer_join_cols_val = "null";
 		if (classification.found_full_outer) {
 			string foj_cols = ExtractFullOuterJoinMetadata(plan.get());
 			if (!foj_cols.empty()) {
-				full_outer_join_cols_val = "'" + OpenIVMUtils::EscapeSingleQuotes(foj_cols) + "'";
+				full_outer_join_cols_val = "'" + SqlUtils::EscapeSingleQuotes(foj_cols) + "'";
 			}
 		}
 
 		// 10 trailing NULLs: 8 matcher metadata columns + distinct/semi-anti aux metadata.
 		// Matcher metadata is populated by the Stage I block below when
 		// openivm_enable_view_matching=true. distinct_aux_meta_json is populated by a
-		// follow-up UPDATE if ivm_type == DISTINCT_INCREMENTAL and the extractor
+		// follow-up UPDATE if refresh_type == DISTINCT_INCREMENTAL and the extractor
 		// recognised the DISTINCT shape.
-		metadata_ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name +
-		                       "', '" + OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " +
-		                       to_string((int)ivm_type) + ", " + (classification.found_minmax ? "true" : "false") +
+		metadata_ddl.push_back("insert or replace into " + string(openivm::VIEWS_TABLE) + " values ('" + view_name +
+		                       "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
+		                       to_string((int)refresh_type) + ", " + (classification.found_minmax ? "true" : "false") +
 		                       ", " + (classification.found_left_join ? "true" : "false") + ", now(), " + refresh_val +
 		                       ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 		                       (classification.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
@@ -3653,8 +3656,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			vector<string> sorted_tables;
 			sorted_tables.reserve(table_names.size());
 			for (const auto &t : table_names) {
-				if (StringUtil::StartsWith(t, ivm::DATA_TABLE_PREFIX)) {
-					sorted_tables.push_back(t.substr(strlen(ivm::DATA_TABLE_PREFIX)));
+				if (StringUtil::StartsWith(t, openivm::DATA_TABLE_PREFIX)) {
+					sorted_tables.push_back(t.substr(strlen(openivm::DATA_TABLE_PREFIX)));
 				} else {
 					sorted_tables.push_back(t);
 				}
@@ -3670,20 +3673,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				src_json += "\"" + sorted_tables[i] + "\"";
 			}
 			src_json += "]";
-			metadata_ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET source_tables_json = '" +
-			                       OpenIVMUtils::EscapeSingleQuotes(src_json) + "' WHERE view_name = '" +
-			                       OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			metadata_ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) + " SET source_tables_json = '" +
+			                       SqlUtils::EscapeSingleQuotes(src_json) + "' WHERE view_name = '" +
+			                       SqlUtils::EscapeSingleQuotes(view_name) + "'");
 			// Replace any prior edges for this child, then re-emit. INSERTs are
 			// conditional on the source being a registered MV (the SELECT
 			// returns zero rows for non-MV sources).
-			metadata_ddl.push_back("DELETE FROM " + string(ivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
-			                       OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			metadata_ddl.push_back("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
+			                       SqlUtils::EscapeSingleQuotes(view_name) + "'");
 			for (const auto &t : sorted_tables) {
-				metadata_ddl.push_back("INSERT INTO " + string(ivm::MV_DEPS_TABLE) +
+				metadata_ddl.push_back("INSERT INTO " + string(openivm::MV_DEPS_TABLE) +
 				                       " (parent_view, child_view, edge_kind) SELECT view_name, '" +
-				                       OpenIVMUtils::EscapeSingleQuotes(view_name) + "', 'direct' FROM " +
-				                       string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-				                       OpenIVMUtils::EscapeSingleQuotes(t) + "'");
+				                       SqlUtils::EscapeSingleQuotes(view_name) + "', 'direct' FROM " +
+				                       string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+				                       SqlUtils::EscapeSingleQuotes(t) + "'");
 			}
 		}
 
@@ -3691,7 +3694,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// metadata so refresh-time can find the source SQL, the column list, and the aux
 		// table name. The aux table is populated from the (DISTINCT-stripped) input SQL
 		// at CREATE time; refresh-time MERGE keeps it in sync with delta multiplicities.
-		if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+		if (refresh_type == RefreshType::DISTINCT_INCREMENTAL) {
 			add_profile_marker("create_mv_distinct_aux");
 			string aux_table = "openivm_distinct_count_" + view_name;
 			string cols_csv;
@@ -3726,12 +3729,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			                   ",\"filter\":" + JsonQuote(distinct_extracted_filter) +
 			                   ",\"sum_arg\":" + JsonQuote(distinct_sum_arg) +
 			                   ",\"sum_out\":" + JsonQuote(distinct_sum_out) + "}";
-			aux_metadata_ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET distinct_aux_meta_json = '" +
-			                           OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
-			                           OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			aux_metadata_ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) + " SET distinct_aux_meta_json = '" +
+			                           SqlUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
+			                           SqlUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 
-		if (ivm_type == IVMType::SIMPLE_AGGREGATE && has_filtered_group_count_aux) {
+		if (refresh_type == RefreshType::SIMPLE_AGGREGATE && has_filtered_group_count_aux) {
 			add_profile_marker("create_mv_filtered_group_count_aux");
 			string aux_table = "openivm_filtered_group_count_" + view_name;
 			auto qualify_source_table = [&](const string &table_name) {
@@ -3758,12 +3761,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			                   ",\"output_col\":" + JsonQuote(filtered_group_count_extract.output_col) +
 			                   ",\"op\":" + JsonQuote(filtered_group_count_extract.comparison_op) +
 			                   ",\"threshold\":" + JsonQuote(filtered_group_count_extract.threshold_sql) + "}";
-			aux_metadata_ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET aggregate_decomposition_json = '" +
-			                           OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
-			                           OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			aux_metadata_ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) +
+			                           " SET aggregate_decomposition_json = '" +
+			                           SqlUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
+			                           SqlUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 
-		if (ivm_type == IVMType::SEMI_ANTI_RECOMPUTE) {
+		if (refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
 			add_profile_marker("create_mv_semi_anti_aux");
 			string aux_table = "openivm_semi_anti_state_" + view_name;
 			auto qualify_source_table = [&](const string &table_name) {
@@ -3858,9 +3862,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			    ",\"predicate\":" + JsonQuote(semi_anti_extract.predicate) +
 			    ",\"post_filter\":" + JsonQuote(semi_anti_extract.post_filter) + ",\"left_cols\":" + left_cols_json +
 			    ",\"left_exprs\":" + left_exprs_json + ",\"output_cols\":" + output_cols_json + "}";
-			aux_metadata_ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET semi_anti_aux_meta_json = '" +
-			                           OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
-			                           OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			aux_metadata_ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) + " SET semi_anti_aux_meta_json = '" +
+			                           SqlUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
+			                           SqlUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 
 		// Classify each base table by catalog type (duckdb vs ducklake).
@@ -3869,7 +3873,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Catalog::GetEntry inside BeginTransaction() cannot see DuckLake entries:
 		// DuckLake requires its own transaction protocol. Walk the logical plan's
 		// DUCKLAKE_SCAN nodes instead — same approach used in ducklake_join.cpp.
-		unordered_map<string, OpenIVMDuckLakeTableInfo> dl_table_info; // keyed by lowercased name
+		unordered_map<string, DuckLakeSourceTableInfo> dl_table_info; // keyed by lowercased name
 		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info);
 
 		unordered_set<string> ducklake_tables;
@@ -3889,7 +3893,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		for (const auto &table_name : table_names) {
 			string catalog_type = "duckdb";
 			string snapshot_val = "null";
-			string meta_table_name = OpenIVMUtils::DeltaName(table_name);
+			string meta_table_name = SqlUtils::DeltaName(table_name);
 			string source_catalog_val = current_catalog.empty() ? "memory" : current_catalog;
 			string source_schema_val = current_schema.empty() ? "main" : current_schema;
 
@@ -3923,14 +3927,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				continue;
 			}
 
-			source_metadata_ddl.push_back("insert or replace into " + string(ivm::DELTA_TABLES_TABLE) +
+			source_metadata_ddl.push_back("insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
 			                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
 			                              "last_refresh_ts, source_catalog, source_schema) "
 			                              "values ('" +
-			                              view_name + "', '" + OpenIVMUtils::EscapeSingleQuotes(meta_table_name) +
+			                              view_name + "', '" + SqlUtils::EscapeSingleQuotes(meta_table_name) +
 			                              "', now(), '" + catalog_type + "', " + snapshot_val + ", now(), '" +
-			                              OpenIVMUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
-			                              OpenIVMUtils::EscapeSingleQuotes(source_schema_val) + "')");
+			                              SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
+			                              SqlUtils::EscapeSingleQuotes(source_schema_val) + "')");
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -3953,7 +3957,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			string diagnostic;
 			diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
 			diagnostic += "view_name: " + view_name + "\n";
-			diagnostic += "ivm_type: " + string(ParserIVMTypeName(ivm_type)) + "\n";
+			diagnostic += "refresh_type: " + string(ParserRefreshTypeName(refresh_type)) + "\n";
 			diagnostic += "lpts_fallback: " + string(lpts_fallback ? "true" : "false") + "\n";
 			diagnostic += "uses_staging_table: false\n";
 			diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
@@ -3966,13 +3970,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 			Value files_path_val;
 			if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
-				OpenIVMUtils::WriteFile(files_path_val.ToString() + "/openivm_initial_load_explain_" + view_name +
-				                            ".txt",
-				                        false, diagnostic);
+				SqlUtils::WriteFile(files_path_val.ToString() + "/openivm_initial_load_explain_" + view_name + ".txt",
+				                    false, diagnostic);
 			}
 			if (BoolSetting(context, "openivm_explain_initial_load_only")) {
-				result.function = TableFunction("openivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction,
-				                                IVMFunction::IVMInit);
+				result.function = TableFunction("openivm_ddl_executor", {}, DDLExecutorExecuteFunction,
+				                                DDLExecutorBindFunction, DDLExecutorFunction::DDLExecutorInit);
 				result.requires_valid_transaction = true;
 				result.return_type = StatementReturnType::QUERY_RESULT;
 				return result;
@@ -4015,7 +4018,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			vector<string> internal_cols;
 			if (!lpts_fallback) {
 				for (auto &name : output_names) {
-					if (IVMTableNames::IsInternalColumn(name)) {
+					if (IncrementalTableNames::IsInternalColumn(name)) {
 						internal_cols.push_back(name);
 					}
 				}
@@ -4082,28 +4085,28 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			auto catalog_schema = QualifiedTablePrefix(catalog_value.ToString(), schema_value.ToString());
 
 			ddl.push_back("create table if not exists " + catalog_schema +
-			              KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(table_name)) +
-			              " as select *, 1::INTEGER as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
-			              string(ivm::TIMESTAMP_COL) + " from " + catalog_schema +
+			              KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(table_name)) +
+			              " as select *, 1::INTEGER as " + string(openivm::MULTIPLICITY_COL) +
+			              ", now()::timestamp as " + string(openivm::TIMESTAMP_COL) + " from " + catalog_schema +
 			              KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
 		}
 
 		// Delta table for the MV — based on the DATA table (has all columns)
 		add_profile_marker("create_mv_mv_delta_table");
-		string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+		string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 		ddl.push_back("create table if not exists " + qdv + " as select *, 1::INTEGER as " +
-		              string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
-		              qdt + " limit 0");
-		ddl.push_back("alter table " + qdv + " alter " + string(ivm::TIMESTAMP_COL) + " set default now()");
+		              string(openivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(openivm::TIMESTAMP_COL) +
+		              " from " + qdt + " limit 0");
+		ddl.push_back("alter table " + qdv + " alter " + string(openivm::TIMESTAMP_COL) + " set default now()");
 		add_cleanup("DROP TABLE IF EXISTS " + qdv);
 
 		// --- Index DDL (for aggregate group queries) ---
 		// DuckLake source scans and DuckLake-backed MV state do not support this optional
 		// native index.
-		if ((ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) &&
+		if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
 		    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
 			add_profile_marker("create_mv_index", "columns=" + to_string(aggregate_columns.size()));
-			string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + ivm::INDEX_SUFFIX);
+			string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + openivm::INDEX_SUFFIX);
 			string index_query_view = "create unique index " + index_name + " on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
 				index_query_view += KeywordHelper::WriteOptionallyQuoted(aggregate_columns[i]);
@@ -4128,8 +4131,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// DuckLake publish fails, the DDL executor removes these rows before the retry.
 		add_profile_marker("create_mv_source_metadata", "rows=" + to_string(source_metadata_ddl.size()));
 		ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
-		add_cleanup("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-		            OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+		add_cleanup("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+		            SqlUtils::EscapeSingleQuotes(view_name) + "'");
 
 		// After all tables are created and populated, update DuckLake snapshot IDs
 		// to the current snapshot. This ensures the first refresh only sees changes
@@ -4156,10 +4159,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 				string meta_table_name = info_it->second.table_name;
 				string dl_cat_name = info_it->second.catalog_name;
-				ddl.push_back("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = (SELECT id FROM " +
-				              dl_cat_name + ".current_snapshot()) WHERE view_name = '" +
-				              OpenIVMUtils::EscapeSingleQuotes(view_name) + "' AND table_name = '" +
-				              OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "'");
+				ddl.push_back("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
+				              " SET last_snapshot_id = (SELECT id FROM " + dl_cat_name +
+				              ".current_snapshot()) WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) +
+				              "' AND table_name = '" + SqlUtils::EscapeSingleQuotes(meta_table_name) + "'");
 			}
 		}
 
@@ -4171,10 +4174,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		                   "rows=" + to_string(metadata_ddl.size() + aux_metadata_ddl.size()));
 		ddl.insert(ddl.end(), metadata_ddl.begin(), metadata_ddl.end());
 		ddl.insert(ddl.end(), aux_metadata_ddl.begin(), aux_metadata_ddl.end());
-		add_cleanup("DELETE FROM " + string(ivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
-		            OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
-		add_cleanup("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		            OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+		add_cleanup("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
+		            SqlUtils::EscapeSingleQuotes(view_name) + "'");
+		add_cleanup("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+		            SqlUtils::EscapeSingleQuotes(view_name) + "'");
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());
 
@@ -4199,8 +4202,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 				visible_ddl_idx++;
 			}
-			OpenIVMUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
-			OpenIVMUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
+			SqlUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
+			SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
 		}
 
 		// Pass DDL via result.parameters — the bind function receives them as input.inputs.
@@ -4214,14 +4217,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 	}
 
 	// Return DDL executor table function
-	result.function =
-	    TableFunction("openivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction, IVMFunction::IVMInit);
+	result.function = TableFunction("openivm_ddl_executor", {}, DDLExecutorExecuteFunction, DDLExecutorBindFunction,
+	                                DDLExecutorFunction::DDLExecutorInit);
 	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::QUERY_RESULT;
 	return result;
 }
 
-BoundStatement IVMBind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info, SQLStatement &statement) {
+BoundStatement DDLExecutorBind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
+                               SQLStatement &statement) {
 	return BoundStatement();
 }
 } // namespace duckdb

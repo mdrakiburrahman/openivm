@@ -7,7 +7,7 @@
 #include <chrono>
 #include <cmath>
 
-namespace ivm_benchmark {
+namespace openivm_benchmark {
 
 // Timestamp helper (PAC style)
 static std::string Timestamp() {
@@ -342,7 +342,7 @@ public:
 	}
 };
 
-} // namespace ivm_benchmark
+} // namespace openivm_benchmark
 
 int main(int argc, char **argv) {
 	int scale_factor = 3;  // Default SF3
@@ -367,30 +367,30 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	ivm_benchmark::Log("╔════════════════════════════════════════════════════════╗");
-	ivm_benchmark::Log("║       TPC-C Data Generation for OpenIVM Testing        ║");
-	ivm_benchmark::Log("╚════════════════════════════════════════════════════════╝");
-	ivm_benchmark::Log("Configuration:");
-	ivm_benchmark::Log("  Scale factor: " + std::to_string(scale_factor));
-	ivm_benchmark::Log("  Customers per district: " + std::to_string(customers_per_district));
-	ivm_benchmark::Log("  Transactions: " + std::to_string(num_transactions));
-	ivm_benchmark::Log("  Database: " + db_path);
-	ivm_benchmark::Log("  Output file: " + output_file);
-	ivm_benchmark::Log("");
+	openivm_benchmark::Log("╔════════════════════════════════════════════════════════╗");
+	openivm_benchmark::Log("║       TPC-C Data Generation for OpenIVM Testing        ║");
+	openivm_benchmark::Log("╚════════════════════════════════════════════════════════╝");
+	openivm_benchmark::Log("Configuration:");
+	openivm_benchmark::Log("  Scale factor: " + std::to_string(scale_factor));
+	openivm_benchmark::Log("  Customers per district: " + std::to_string(customers_per_district));
+	openivm_benchmark::Log("  Transactions: " + std::to_string(num_transactions));
+	openivm_benchmark::Log("  Database: " + db_path);
+	openivm_benchmark::Log("  Output file: " + output_file);
+	openivm_benchmark::Log("");
 
 	try {
-		ivm_benchmark::TPCCSetup setup(db_path, scale_factor, customers_per_district);
+		openivm_benchmark::TPCCSetup setup(db_path, scale_factor, customers_per_district);
 		setup.CreateSchema();
 		setup.GenerateData();
 		setup.SimulateTransactions(num_transactions);
 		setup.VerifyData();
 		setup.ExportDeltas(output_file);
 
-		ivm_benchmark::Log("");
-		ivm_benchmark::Log("✓ Setup complete! Database ready for IVM testing.");
+		openivm_benchmark::Log("");
+		openivm_benchmark::Log("✓ Setup complete! Database ready for IVM testing.");
 
 	} catch (const std::exception &e) {
-		ivm_benchmark::Log("✗ Error: " + std::string(e.what()));
+		openivm_benchmark::Log("✗ Error: " + std::string(e.what()));
 		return 1;
 	}
 

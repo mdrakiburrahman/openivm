@@ -2,11 +2,11 @@
 
 namespace duckdb {
 
-std::mutex IVMRefreshLocks::map_mutex_;
-std::unordered_map<string, unique_ptr<std::mutex>> IVMRefreshLocks::view_mutexes_;
-std::unordered_map<string, unique_ptr<std::mutex>> IVMRefreshLocks::delta_mutexes_;
+std::mutex RefreshLocks::map_mutex_;
+std::unordered_map<string, unique_ptr<std::mutex>> RefreshLocks::view_mutexes_;
+std::unordered_map<string, unique_ptr<std::mutex>> RefreshLocks::delta_mutexes_;
 
-std::mutex &IVMRefreshLocks::GetViewMutex(const string &view_name) {
+std::mutex &RefreshLocks::GetViewMutex(const string &view_name) {
 	std::lock_guard<std::mutex> guard(map_mutex_);
 	auto &entry = view_mutexes_[view_name];
 	if (!entry) {
@@ -15,7 +15,7 @@ std::mutex &IVMRefreshLocks::GetViewMutex(const string &view_name) {
 	return *entry;
 }
 
-std::mutex &IVMRefreshLocks::GetDeltaMutex(const string &delta_table_name) {
+std::mutex &RefreshLocks::GetDeltaMutex(const string &delta_table_name) {
 	std::lock_guard<std::mutex> guard(map_mutex_);
 	auto &entry = delta_mutexes_[delta_table_name];
 	if (!entry) {
@@ -24,23 +24,23 @@ std::mutex &IVMRefreshLocks::GetDeltaMutex(const string &delta_table_name) {
 	return *entry;
 }
 
-void IVMRefreshLocks::LockView(const string &view_name) {
+void RefreshLocks::LockView(const string &view_name) {
 	GetViewMutex(view_name).lock();
 }
 
-bool IVMRefreshLocks::TryLockView(const string &view_name) {
+bool RefreshLocks::TryLockView(const string &view_name) {
 	return GetViewMutex(view_name).try_lock();
 }
 
-void IVMRefreshLocks::UnlockView(const string &view_name) {
+void RefreshLocks::UnlockView(const string &view_name) {
 	GetViewMutex(view_name).unlock();
 }
 
-void IVMRefreshLocks::LockDelta(const string &delta_table_name) {
+void RefreshLocks::LockDelta(const string &delta_table_name) {
 	GetDeltaMutex(delta_table_name).lock();
 }
 
-void IVMRefreshLocks::UnlockDelta(const string &delta_table_name) {
+void RefreshLocks::UnlockDelta(const string &delta_table_name) {
 	GetDeltaMutex(delta_table_name).unlock();
 }
 

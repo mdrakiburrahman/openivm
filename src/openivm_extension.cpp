@@ -5,7 +5,7 @@
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"
 #include "core/refresh_locks.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
@@ -39,22 +39,22 @@ namespace duckdb {
 
 // Global daemon instance — started unconditionally at extension load.
 // The daemon sleeps and periodically checks for scheduled views; no work if none exist.
-static shared_ptr<IVMRefreshDaemon> global_daemon;
+static shared_ptr<RefreshDaemon> global_daemon;
 
-struct DoIVMData : public GlobalTableFunctionState {
-	DoIVMData() : offset(0) {
+struct ComputeDeltaData : public GlobalTableFunctionState {
+	ComputeDeltaData() : offset(0) {
 	}
 	idx_t offset;
 	string view_name;
 };
 
-unique_ptr<GlobalTableFunctionState> DoIVMInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto result = make_uniq<DoIVMData>();
+unique_ptr<GlobalTableFunctionState> ComputeDeltaInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<ComputeDeltaData>();
 	return std::move(result);
 }
 
-static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context, TableFunctionBindInput &input,
+                                                         vector<LogicalType> &return_types, vector<string> &names) {
 	string view_catalog_name = StringValue::Get(input.inputs[0]);
 	string view_schema_name = StringValue::Get(input.inputs[1]);
 	string view_name = StringValue::Get(input.inputs[2]);
@@ -65,36 +65,36 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
-	string view_query = IVMMetadata(con).GetViewQuery(view_name);
+	string view_query = RefreshMetadata(con).GetViewQuery(view_name);
 	if (view_query.empty()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: materialized view '" + view_name + "' not found or its definition is missing");
 	}
-	OPENIVM_DEBUG_PRINT("[DoIVM Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
+	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
 
 	Parser parser;
 	parser.ParseQuery(view_query);
 	auto statement = parser.statements[0].get();
 	Planner planner(context);
 	planner.CreatePlan(statement->Copy());
-	OPENIVM_DEBUG_PRINT("[DoIVM Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
+	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
 	auto result = make_uniq<TableFunctionData>();
 	for (size_t i = 0; i < planner.names.size(); i++) {
 		return_types.emplace_back(planner.types[i]);
 		names.emplace_back(planner.names[i]);
-		OPENIVM_DEBUG_PRINT("[DoIVM Bind] Column %zu: %s (%s)\n", i, planner.names[i].c_str(),
+		OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Column %zu: %s (%s)\n", i, planner.names[i].c_str(),
 		                    planner.types[i].ToString().c_str());
 	}
 
 	return_types.emplace_back(LogicalTypeId::INTEGER);
-	names.emplace_back(ivm::MULTIPLICITY_COL);
+	names.emplace_back(openivm::MULTIPLICITY_COL);
 
 	return std::move(result);
 }
 
-static void DoIVMFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = dynamic_cast<DoIVMData &>(*data_p.global_state);
+static void ComputeDeltaFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = dynamic_cast<ComputeDeltaData &>(*data_p.global_state);
 	if (data.offset >= 1) {
 		return;
 	}
@@ -203,9 +203,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Connection con(instance);
 
 	// Migration: add new columns to existing openivm_views tables
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
 
 	// Migration: create refresh history table for learned cost model.
@@ -214,13 +214,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// default at first MV creation, so INSERTs (which omit refresh_timestamp)
 	// work. This stanza only matters for legacy DBs where the table already
 	// exists without the default.
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::HISTORY_TABLE) +
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::HISTORY_TABLE) +
 	          " (view_name VARCHAR, refresh_timestamp TIMESTAMP DEFAULT current_timestamp,"
-	          " method VARCHAR, ivm_compute_est DOUBLE, ivm_upsert_est DOUBLE,"
+	          " method VARCHAR, incremental_compute_est DOUBLE, incremental_upsert_est DOUBLE,"
 	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
 	          " PRIMARY KEY(view_name, refresh_timestamp))");
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::PROFILE_TABLE) +
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::PROFILE_TABLE) +
 	          " (refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,"
 	          " step_order INTEGER, step_name VARCHAR, duration_ms BIGINT, detail VARCHAR,"
 	          " PRIMARY KEY(refresh_id, step_order))");
@@ -229,7 +229,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// hit not-yet-existing tables on a fresh DB fail silently — the parser's
 	// CREATE TABLE includes these columns directly, so fresh DBs are fine.
 	// ALTERs are backward-compat for legacy DBs.
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::MATCH_LOG_TABLE) +
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::MATCH_LOG_TABLE) +
 	          " (query_hash UBIGINT,"
 	          " log_timestamp TIMESTAMP,"
 	          " matched_view VARCHAR,"
@@ -238,66 +238,67 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " chosen_cost_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
 	          " PRIMARY KEY (query_hash, log_timestamp))");
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::MV_DEPS_TABLE) +
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::MV_DEPS_TABLE) +
 	          " (parent_view VARCHAR, child_view VARCHAR,"
 	          " edge_kind VARCHAR DEFAULT 'direct',"
 	          " PRIMARY KEY (parent_view, child_view))");
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::CONSTRAINTS_CACHE_TABLE) +
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
 	          " (table_name VARCHAR, constraint_kind VARCHAR,"
 	          " columns_json VARCHAR, referenced_table VARCHAR,"
 	          " referenced_columns_json VARCHAR,"
 	          " is_trusted BOOLEAN DEFAULT true,"
 	          " PRIMARY KEY (table_name, constraint_kind, columns_json))");
 
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS signature_hash UBIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS canonical_plan_blob BLOB DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS output_columns_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS predicate_summary_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS fd_summary_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS source_tables_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS aggregate_decomposition_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS nullified_columns_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS distinct_aux_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
 
-	con.Query("ALTER TABLE " + string(ivm::DELTA_TABLES_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS pending_row_estimate BIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(ivm::DELTA_TABLES_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS pending_estimate_ts TIMESTAMP DEFAULT NULL");
 
-	con.Query("ALTER TABLE " + string(ivm::HISTORY_TABLE) +
+	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
 
-	auto ivm_parser = duckdb::IVMParserExtension();
+	auto materialized_view_parser = duckdb::MaterializedViewParserExtension();
 
-	auto ivm_rewrite_rule = duckdb::IVMRewriteRule();
-	auto ivm_insert_rule = duckdb::IVMInsertRule();
+	auto incremental_rewrite_rule = duckdb::IncrementalRewriteRule();
+	auto refresh_insert_rule = duckdb::RefreshInsertRule();
 
-	ParserExtension::Register(db_config, std::move(ivm_parser));
-	OptimizerExtension::Register(db_config, std::move(ivm_rewrite_rule));
-	OptimizerExtension::Register(db_config, std::move(ivm_insert_rule));
+	ParserExtension::Register(db_config, std::move(materialized_view_parser));
+	OptimizerExtension::Register(db_config, std::move(incremental_rewrite_rule));
+	OptimizerExtension::Register(db_config, std::move(refresh_insert_rule));
 
-	TableFunction ivm_func("DoIVM", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, DoIVMFunction,
-	                       DoIVMBind, DoIVMInit);
+	TableFunction compute_delta_function("ComputeDelta",
+	                                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                     ComputeDeltaFunction, ComputeDeltaBind, ComputeDeltaInit);
 
 	con.BeginTransaction();
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
-	ivm_func.name = "DoIVM";
-	ivm_func.named_parameters["view_catalog_name"];
-	ivm_func.named_parameters["view_schema_name"];
-	ivm_func.named_parameters["view_name"];
-	CreateTableFunctionInfo ivm_func_info(ivm_func);
-	catalog.CreateTableFunction(*con.context, &ivm_func_info);
+	compute_delta_function.name = "ComputeDelta";
+	compute_delta_function.named_parameters["view_catalog_name"];
+	compute_delta_function.named_parameters["view_schema_name"];
+	compute_delta_function.named_parameters["view_name"];
+	CreateTableFunctionInfo compute_delta_function_info(compute_delta_function);
+	catalog.CreateTableFunction(*con.context, &compute_delta_function_info);
 	con.Commit();
 
 	// Use the locked pragma_function_t variant: generates SQL and executes it under a
@@ -323,14 +324,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string view_name = StringValue::Get(parameters.values[0]);
 		    Connection con(*context.db.get());
-		    IVMMetadata metadata(con);
+		    RefreshMetadata metadata(con);
 
 		    auto interval = metadata.GetRefreshInterval(view_name);
 		    string interval_str = interval > 0 ? to_string(interval) : "NULL";
 
 		    // Get the earliest last_update across all delta tables for this view
-		    auto last_update_result = con.Query("SELECT MIN(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                                        " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "'");
+		    auto last_update_result = con.Query("SELECT MIN(last_update) FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 		    string last_refresh = "NULL";
 		    string next_refresh = "NULL";
 		    if (!last_update_result->HasError() && last_update_result->RowCount() > 0 &&
@@ -355,16 +356,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
-		    // Query IVMType directly, same pattern as GetRefreshInterval — returns
-		    // 'unknown' on failure rather than throwing. Order MUST mirror IVMType enum
+		    // Query RefreshType directly, same pattern as GetRefreshInterval — returns
+		    // 'unknown' on failure rather than throwing. Order MUST mirror RefreshType enum
 		    // in src/include/core/openivm_constants.hpp.
 		    static const char *kTypeNames[] = {
 		        "aggregate_group",      "simple_aggregate",   "simple_projection", "full_refresh",
 		        "aggregate_having",     "window_partition",   "group_recompute",   "top_k",
 		        "distinct_incremental", "semi_anti_recompute"};
 		    string strategy_str = "'unknown'";
-		    auto type_result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		                                 OpenIVMUtils::EscapeValue(view_name) + "'");
+		    auto type_result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+		                                 SqlUtils::EscapeValue(view_name) + "'");
 		    if (!type_result->HasError() && type_result->RowCount() > 0 && !type_result->GetValue(0, 0).IsNull()) {
 			    auto idx = static_cast<size_t>(type_result->GetValue(0, 0).GetValue<int8_t>());
 			    if (idx < sizeof(kTypeNames) / sizeof(kTypeNames[0])) {
@@ -372,7 +373,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
-		    return "SELECT '" + OpenIVMUtils::EscapeValue(view_name) + "' AS view_name, " + interval_str +
+		    return "SELECT '" + SqlUtils::EscapeValue(view_name) + "' AS view_name, " + interval_str +
 		           " AS refresh_interval, " + last_refresh + " AS last_refresh, " + next_refresh +
 		           " AS next_refresh, " + status + " AS status, " + effective_interval + " AS effective_interval, " +
 		           strategy_str + " AS refresh_strategy;";
@@ -387,7 +388,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		                               if (global_daemon) {
 			                               global_daemon->Stop();
 		                               }
-		                               global_daemon = make_shared_ptr<IVMRefreshDaemon>();
+		                               global_daemon = make_shared_ptr<RefreshDaemon>();
 		                               global_daemon->Start(*context.db);
 		                               return "SELECT true AS started;";
 	                               },
@@ -403,7 +404,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		}
 	}
 	if (!daemon_disabled) {
-		global_daemon = make_shared_ptr<IVMRefreshDaemon>();
+		global_daemon = make_shared_ptr<RefreshDaemon>();
 		global_daemon->Start(instance);
 	}
 }

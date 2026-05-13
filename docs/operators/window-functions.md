@@ -94,7 +94,7 @@ refresh is a full recompute of the downstream query, not incremental.
 - **No insert-only optimization.** Unlike grouped aggregates, window functions always
   require full partition recompute regardless of delta type. A single insertion can
   change the numbering of all rows in the partition.
-- **Delta view not populated.** The DoIVM/LPTS pipeline is bypassed for window views
+- **Delta view not populated.** The ComputeDelta/LPTS pipeline is bypassed for window views
   because LPTS does not support the WINDOW operator. Downstream chained MVs do a full
   recompute when refreshed (reading from the window MV's data table directly).
 - **LPTS fallback.** The view query is stored as the original user SQL, not the

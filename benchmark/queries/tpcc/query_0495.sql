@@ -1,2 +1,2 @@
--- {"operators": "OUTER_JOIN,AGGREGATE,LIMIT", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,STOCK", "ivm_type": "RECOMPUTE"}
+-- {"operators": "OUTER_JOIN,AGGREGATE,LIMIT", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,STOCK", "refresh_type": "RECOMPUTE"}
 SELECT WAREHOUSE.W_ID, COUNT(*) FROM WAREHOUSE LEFT JOIN STOCK ON WAREHOUSE.W_ID = STOCK.S_W_ID GROUP BY WAREHOUSE.W_ID LIMIT 10;

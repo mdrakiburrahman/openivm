@@ -1,4 +1,4 @@
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
@@ -124,7 +124,7 @@ static bool ReadCreateTargetName(const string &sql, const string &object_keyword
 	return true;
 }
 
-void OpenIVMUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
+void SqlUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
 	std::ofstream file;
 	if (append) {
 		file.open(filename, std::ios_base::app);
@@ -135,7 +135,7 @@ void OpenIVMUtils::WriteFile(const string &filename, bool append, const string &
 	file.close();
 }
 
-string OpenIVMUtils::ExtractTableName(const string &sql) {
+string SqlUtils::ExtractTableName(const string &sql) {
 	string name;
 	if (ReadCreateTargetName(sql, "table", name)) {
 		return name;
@@ -154,7 +154,7 @@ string OpenIVMUtils::ExtractTableName(const string &sql) {
 	return "";
 }
 
-string OpenIVMUtils::ExtractViewName(const string &sql) {
+string SqlUtils::ExtractViewName(const string &sql) {
 	string name;
 	if (ReadCreateTargetName(sql, "view", name)) {
 		return name;
@@ -172,7 +172,7 @@ string OpenIVMUtils::ExtractViewName(const string &sql) {
 	return "";
 }
 
-string OpenIVMUtils::EscapeSingleQuotes(const string &input) {
+string SqlUtils::EscapeSingleQuotes(const string &input) {
 	std::stringstream escaped_stream;
 	for (char c : input) {
 		if (c == '\'') {
@@ -184,12 +184,12 @@ string OpenIVMUtils::EscapeSingleQuotes(const string &input) {
 	return escaped_stream.str();
 }
 
-void OpenIVMUtils::ReplaceMaterializedView(string &query) {
+void SqlUtils::ReplaceMaterializedView(string &query) {
 	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b"), "table if not exists");
 	query = regex_replace(query, std::regex("\\s*;$"), "");
 }
 
-string OpenIVMUtils::ExtractViewQuery(string &query) {
+string SqlUtils::ExtractViewQuery(string &query) {
 	string lower = StringUtil::Lower(query);
 	size_t pos = lower.find("create");
 	if (pos != string::npos) {
@@ -273,7 +273,7 @@ string OpenIVMUtils::ExtractViewQuery(string &query) {
 	return "";
 }
 
-string OpenIVMUtils::SQLToLowercase(const string &sql) {
+string SqlUtils::SQLToLowercase(const string &sql) {
 	std::stringstream lowercase_stream;
 	bool in_string = false;
 	for (char c : sql) {
@@ -289,7 +289,7 @@ string OpenIVMUtils::SQLToLowercase(const string &sql) {
 	return lowercase_stream.str();
 }
 
-string OpenIVMUtils::GenerateDeltaTable(string &input) {
+string SqlUtils::GenerateDeltaTable(string &input) {
 	input = SQLToLowercase(input);
 	input = std::regex_replace(input, std::regex(R"(\")"), "");
 
@@ -298,7 +298,7 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 	std::regex primary_key_re(R"((primary\s+key\s*\([^\)]+\)))", std::regex::icase);
 	std::regex inline_primary_key_re(R"(([^\s,]+[^\),]*\s+primary\s+key))", std::regex::icase);
 
-	std::string multiplicity_col = string(ivm::MULTIPLICITY_COL) + " integer default 1";
+	std::string multiplicity_col = string(openivm::MULTIPLICITY_COL) + " integer default 1";
 	std::string timestamp_col = "timestamp timestamp default now()";
 
 	std::smatch match;
@@ -319,7 +319,7 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 			table_name = full_table_name;
 		}
 
-		std::string new_table_name = prefix + string(ivm::DELTA_PREFIX) + table_name;
+		std::string new_table_name = prefix + string(openivm::DELTA_PREFIX) + table_name;
 
 		if (std::regex_search(columns, match, primary_key_re)) {
 			primary_key = match[0].str();
@@ -336,9 +336,9 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 		}
 
 		if (!pk_columns.empty()) {
-			pk_columns += ", " + string(ivm::MULTIPLICITY_COL);
+			pk_columns += ", " + string(openivm::MULTIPLICITY_COL);
 		} else {
-			pk_columns = string(ivm::MULTIPLICITY_COL);
+			pk_columns = string(openivm::MULTIPLICITY_COL);
 		}
 
 		columns += ", " + multiplicity_col + ", " + timestamp_col;
@@ -350,11 +350,11 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 	return output;
 }
 
-void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {
+void SqlUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
 }
 
-void OpenIVMUtils::StripLineComments(string &query) {
+void SqlUtils::StripLineComments(string &query) {
 	string out;
 	out.reserve(query.size());
 	bool in_string = false;
@@ -381,23 +381,23 @@ void OpenIVMUtils::StripLineComments(string &query) {
 	query = std::move(out);
 }
 
-string OpenIVMUtils::DeltaName(const string &name) {
+string SqlUtils::DeltaName(const string &name) {
 	// Delta tables use the user-facing view name, not the internal data table name.
 	// Strip openivm_data_ prefix if present (handles LPTS-generated SQL that references
 	// the data table directly via VIEW expansion).
-	static const string data_prefix(ivm::DATA_TABLE_PREFIX);
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
 	if (name.size() > data_prefix.size() && name.rfind(data_prefix, 0) == 0) {
-		return string(ivm::DELTA_PREFIX) + name.substr(data_prefix.size());
+		return string(openivm::DELTA_PREFIX) + name.substr(data_prefix.size());
 	}
-	return string(ivm::DELTA_PREFIX) + name;
+	return string(openivm::DELTA_PREFIX) + name;
 }
 
-string OpenIVMUtils::FullName(const string &catalog, const string &schema, const string &table) {
+string SqlUtils::FullName(const string &catalog, const string &schema, const string &table) {
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
 }
 
-string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
-	static const string data_prefix(ivm::DATA_TABLE_PREFIX);
+string SqlUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
 	string base = table;
 	if (base.size() > data_prefix.size() && base.rfind(data_prefix, 0) == 0) {
 		base = base.substr(data_prefix.size());
@@ -405,12 +405,12 @@ string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, 
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(DeltaName(base));
 }
 
-bool OpenIVMUtils::IsDelta(const string &name) {
-	static const string prefix(ivm::DELTA_PREFIX);
+bool SqlUtils::IsDelta(const string &name) {
+	static const string prefix(openivm::DELTA_PREFIX);
 	return name.size() >= prefix.size() && name.rfind(prefix, 0) == 0;
 }
 
-int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {
+int64_t SqlUtils::ParseRefreshInterval(const string &interval_str) {
 	std::regex interval_re(R"((\d+)\s*(minute|minutes|min|hour|hours|day|days))", std::regex::icase);
 	std::smatch match;
 	if (!std::regex_match(interval_str, match, interval_re)) {
@@ -435,7 +435,7 @@ int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {
 	return seconds;
 }
 
-int64_t OpenIVMUtils::ExtractRefreshInterval(string &query) {
+int64_t SqlUtils::ExtractRefreshInterval(string &query) {
 	std::regex refresh_re(R"(refresh\s+every\s+'([^']+)')", std::regex::icase);
 	std::smatch match;
 	if (!std::regex_search(query, match, refresh_re)) {
@@ -444,7 +444,7 @@ int64_t OpenIVMUtils::ExtractRefreshInterval(string &query) {
 	string interval_str = match[1].str();
 	// Strip the REFRESH EVERY clause from the query
 	query = std::regex_replace(query, refresh_re, "");
-	OpenIVMUtils::RemoveRedundantWhitespaces(query);
+	SqlUtils::RemoveRedundantWhitespaces(query);
 	return ParseRefreshInterval(interval_str);
 }
 

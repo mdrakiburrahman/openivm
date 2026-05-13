@@ -18,7 +18,7 @@ The check plans the stored `sql_string` from `openivm_views`, walks the logical 
 
 ## How it works
 
-The `IVMInsertRule` optimizer extension intercepts `LOGICAL_ALTER` nodes. For each `AlterTableInfo`:
+The `RefreshInsertRule` optimizer extension intercepts `LOGICAL_ALTER` nodes. For each `AlterTableInfo`:
 
 1. Checks if the altered table has a delta table (i.e., it's tracked by IVM)
 2. Determines the alter type (ADD, DROP, RENAME)

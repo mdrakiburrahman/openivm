@@ -1,5 +1,5 @@
-#ifndef OPENIVM_UTILS_HPP
-#define OPENIVM_UTILS_HPP
+#ifndef SQL_UTILS_HPP
+#define SQL_UTILS_HPP
 
 #include "duckdb.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -11,7 +11,7 @@ namespace duckdb {
 // Utility functions for SQL string manipulation.
 // Originally from the compiler extension; inlined here to remove the external dependency.
 
-class OpenIVMUtils {
+class SqlUtils {
 public:
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string ExtractTableName(const string &sql);
@@ -23,6 +23,8 @@ public:
 	static void RemoveRedundantWhitespaces(string &query);
 	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
 	static void StripLineComments(string &query);
+	static vector<string> SplitSQLStatements(const string &sql);
+	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
@@ -51,4 +53,4 @@ public:
 
 } // namespace duckdb
 
-#endif // OPENIVM_UTILS_HPP
+#endif // SQL_UTILS_HPP

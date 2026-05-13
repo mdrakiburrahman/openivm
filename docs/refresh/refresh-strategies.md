@@ -28,7 +28,7 @@ PRAGMA refresh('monthly_totals');
 
 ## Upsert compilation by view type
 
-The incremental refresh compiles different SQL depending on the view's `IVMType` (see [Parser: IVM compatibility classification](../internals/parser.md#ivm-compatibility-classification)).
+The incremental refresh compiles different SQL depending on the view's `RefreshType` (see [Parser: IVM compatibility classification](../internals/parser.md#ivm-compatibility-classification)).
 
 | View type | Strategy | Why |
 |---|---|---|
@@ -68,12 +68,12 @@ PRAGMA refresh_cost('monthly_totals');
 
 Returns a single row:
 
-| decision | ivm_cost | recompute_cost |
+| decision | incremental_cost | recompute_cost |
 |---|---|---|
 | incremental | 1200.0 | 50000.0 |
 
 - `decision`: `incremental` or `full`, based on which cost is lower.
-- `ivm_cost`: estimated cost of applying deltas.
+- `incremental_cost`: estimated cost of applying deltas.
 - `recompute_cost`: estimated cost of a full DELETE + INSERT.
 
 ## Automatic full-refresh detection

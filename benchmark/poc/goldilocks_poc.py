@@ -186,11 +186,11 @@ def summarize(rows: list[dict]) -> None:
 	for f in sorted(by_frac):
 		pair = by_frac[f]
 		winner = min(pair, key=pair.get)
-		ivm_ms = pair.get("refresh", float("nan"))
+		refresh_ms = pair.get("refresh", float("nan"))
 		bypass_ms = pair.get("bypass", float("nan"))
-		ratio = bypass_ms / ivm_ms if ivm_ms else float("nan")
+		ratio = bypass_ms / refresh_ms if refresh_ms else float("nan")
 		print(
-			f"{f:>10.4f}  {ivm_ms:>10.1f}  {bypass_ms:>12.1f}  "
+			f"{f:>10.4f}  {refresh_ms:>10.1f}  {bypass_ms:>12.1f}  "
 			f"{winner:<8} {ratio:>10.2f}x"
 		)
 

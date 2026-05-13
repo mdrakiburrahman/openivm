@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmProjectionRule : public IvmRule {
+class IncrementalProjectionRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 	Linearity GetLinearity() const override {

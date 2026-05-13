@@ -1,7 +1,7 @@
 #include "match/mv_catalog_index.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 vector<MVCandidate> MVCatalogIndex::CandidatesForQuery(const vector<string> &query_source_tables,
                                                        const vector<string> &query_group_columns,
@@ -31,5 +31,5 @@ void MVCatalogIndex::OnViewRefreshed(const string &view_name) {
 	// pending_row_estimate changes; tree structure unchanged.
 }
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb

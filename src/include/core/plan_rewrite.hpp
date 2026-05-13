@@ -18,8 +18,8 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 /// - LEFT/RIGHT JOIN → add projection with openivm_left_key column
 /// planner_names: column names from Planner.names (user aliases). These are set on
 /// aggregate expressions so LPTS can pick them up. Unaliased aggregates get auto-generated names.
-void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                    vector<string> &planner_names);
+void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                 vector<string> &planner_names);
 
 /// Strip the HAVING filter (FILTER above AGGREGATE) from the plan.
 /// Returns the HAVING predicate as SQL using output column aliases, or empty if no HAVING.

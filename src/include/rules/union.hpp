@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmUnionRule : public IvmRule {
+class IncrementalUnionRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 	// UNION ALL is bag-union, which is Z-set addition — linear.

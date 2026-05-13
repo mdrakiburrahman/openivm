@@ -4,7 +4,7 @@
 #include "duckdb.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 // System table names
 constexpr const char *VIEWS_TABLE = "openivm_views";
@@ -60,9 +60,9 @@ static constexpr idx_t MAX_JOIN_TABLES = 16;
 constexpr const char *DISABLED_OPTIMIZERS =
     "compressed_materialization, column_lifetime, statistics_propagation, expression_rewriter";
 
-} // namespace ivm
+} // namespace openivm
 
-enum class IVMType : uint8_t {
+enum class RefreshType : uint8_t {
 	AGGREGATE_GROUP,
 	SIMPLE_AGGREGATE,
 	SIMPLE_PROJECTION,

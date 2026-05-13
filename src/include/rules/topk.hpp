@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmTopKRule : public IvmRule {
+class IncrementalTopKRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 

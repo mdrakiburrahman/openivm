@@ -25,7 +25,7 @@ Locations:
 - `src/core/parser.cpp:443`
 - `src/upsert/refresh.cpp:486`
 
-`IVMPlanFunction` handles catalog routing, PAC forwarding, parsing, planning, multiple plan rewrites, compatibility
+`PlanFunction` handles catalog routing, PAC forwarding, parsing, planning, multiple plan rewrites, compatibility
 classification, LPTS fallback, table DDL, metadata DML, top-k handling, DuckLake special cases, and output SQL file
 generation in one function. `GenerateRefreshSQL` similarly owns crash recovery, adaptive cost decisions, strategy
 dispatch, downstream refresh semantics, companion delta rows, timestamp advancement, DuckLake snapshot updates, cleanup,
@@ -34,7 +34,7 @@ and SQL file output.
 Why it matters:
 - Invariants are spread across comments and branch ordering instead of types or narrow interfaces.
 - Small algorithm changes risk altering catalog routing, metadata updates, or fallback behavior.
-- It is hard to verify that every `IVMType` follows the same lifecycle: decide strategy, build data SQL, update metadata,
+- It is hard to verify that every `RefreshType` follows the same lifecycle: decide strategy, build data SQL, update metadata,
 clean deltas, update downstream delta views.
 
 Fix direction:
@@ -48,7 +48,7 @@ downstream-delta handling, cursor/snapshot advance, cleanup.
 
 Location: `src/core/plan_rewrite.cpp:1134`
 
-`IVMPlanRewrite` runs many recursive passes in sequence: CTE inlining, aggregate FILTER rewrite, DISTINCT rewrite,
+`PlanRewrite` runs many recursive passes in sequence: CTE inlining, aggregate FILTER rewrite, DISTINCT rewrite,
 derived aggregate rewrite, hidden count injection, hidden-column propagation, left-join key rewrite, match-count rewrite.
 Some of these passes independently traverse the full tree and depend on prior pass ordering.
 
@@ -216,7 +216,7 @@ use `DeltaLockGuard`; view locks should get the same RAII treatment everywhere c
    - Convert historical comments into concise invariants or regression-test names.
 
 3. Behavior-preserving refactor:
-   - Split `IVMPlanFunction` and `GenerateRefreshSQL` into smaller helpers with typed context structs.
+   - Split `PlanFunction` and `GenerateRefreshSQL` into smaller helpers with typed context structs.
    - Centralize name quoting, metadata list encoding, and SQL fragment assembly.
    - Consolidate plan traversal utilities before changing incrementalization algorithms.
 

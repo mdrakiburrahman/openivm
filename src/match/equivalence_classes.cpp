@@ -1,7 +1,7 @@
 #include "match/equivalence_classes.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 EquivalenceClassMap EquivalenceClassMap::FromEqualities(const vector<reference<Expression>> &equalities) {
 	(void)equalities;
@@ -32,5 +32,5 @@ optional_ptr<const Value> EquivalenceClassMap::GetConstantForClass(idx_t class_i
 	return constants_[class_id].get();
 }
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb

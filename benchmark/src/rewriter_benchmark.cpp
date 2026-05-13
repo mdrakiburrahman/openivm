@@ -646,8 +646,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						auto check_result = con.Query("SELECT type FROM " + native_catalog +
 						                              ".openivm_views WHERE view_name = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
-							int64_t ivm_type = check_result->GetValue(0, 0).GetValue<int64_t>();
-							is_incremental = (ivm_type != 3) ? 1 : 0;
+							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
+							is_incremental = (refresh_type != 3) ? 1 : 0;
 						}
 
 						// Phase 3: Apply deltas
@@ -1325,7 +1325,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		}
 
 		// Metadata-vs-OpenIVM confusion matrix: only count queries where MV creation succeeded
-		// (so we have a real ivm_type to compare against).
+		// (so we have a real refresh_type to compare against).
 		if (phase == 3 || phase == 4 || phase == 5 || phase == 6) {
 			bool actual_incr = (worker.result_incremental != 0);
 			if (meta_incremental < 0) {

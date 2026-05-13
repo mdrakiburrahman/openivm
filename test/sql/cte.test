@@ -596,7 +596,7 @@ SELECT w_tax, w_tax_1, count_star FROM mv_dup_agg ORDER BY w_tax;
 # ============================================================
 # CTE self-join (regression — pre-fix the optimizer's CTE
 # materialization left a single physical scan referenced from
-# both join sides, so IvmJoinRule's inclusion-exclusion saw one
+# both join sides, so IncrementalJoinRule's inclusion-exclusion saw one
 # leaf instead of two and missed the cross-term Δt × t_now /
 # t_now × Δt that produces new pairs from a single delta.
 # Fix: InlineCteRefs in src/core/plan_rewrite.cpp deep-copies

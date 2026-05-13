@@ -240,7 +240,8 @@ static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const Log
 		ErrorData err;
 		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
 		if (!product) {
-			throw InternalException("IvmDelimJoinRule: failed to bind multiplicity product: %s", err.RawMessage());
+			throw InternalException("IncrementalDelimJoinRule: failed to bind multiplicity product: %s",
+			                        err.RawMessage());
 		}
 	}
 	if (mul_bindings.size() % 2 == 0) {
@@ -250,7 +251,7 @@ static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const Log
 		ErrorData err;
 		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
 		if (!product) {
-			throw InternalException("IvmDelimJoinRule: failed to bind multiplicity sign: %s", err.RawMessage());
+			throw InternalException("IncrementalDelimJoinRule: failed to bind multiplicity sign: %s", err.RawMessage());
 		}
 	}
 	return product;
@@ -291,7 +292,7 @@ static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original
 
 } // namespace
 
-ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
+ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
 	ClientContext &context = pw.input.context;
 	Binder &binder = pw.input.optimizer.binder;
 	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
@@ -300,9 +301,9 @@ ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
 	vector<BaseLeafInfo> leaves;
 	CollectBaseLeaves(pw.plan.get(), {}, leaves);
 	if (leaves.empty()) {
-		throw InternalException("IvmDelimJoinRule: no mutable base leaves found");
+		throw InternalException("IncrementalDelimJoinRule: no mutable base leaves found");
 	}
-	if (leaves.size() > ivm::MAX_JOIN_TABLES) {
+	if (leaves.size() > openivm::MAX_JOIN_TABLES) {
 		throw NotImplementedException("DELIM_JOIN IVM not supported for joins with more than 16 base tables");
 	}
 
@@ -313,8 +314,8 @@ ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
 
 	vector<unique_ptr<LogicalOperator>> terms;
 	const uint64_t term_count = (1ULL << leaves.size()) - 1;
-	OPENIVM_DEBUG_PRINT("[IvmDelimJoinRule] Rewriting DELIM_JOIN with %zu base leaves (%llu terms)\n", leaves.size(),
-	                    (unsigned long long)term_count);
+	OPENIVM_DEBUG_PRINT("[IncrementalDelimJoinRule] Rewriting DELIM_JOIN with %zu base leaves (%llu terms)\n",
+	                    leaves.size(), (unsigned long long)term_count);
 	for (uint64_t mask = 1; mask <= term_count; mask++) {
 		auto term = pw.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
@@ -345,7 +346,7 @@ ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
 			if (!mul_set.count(key)) {
 				if (output_idx >= output_types.size()) {
 					throw InternalException(
-					    "IvmDelimJoinRule: term output binding count exceeds original output types");
+					    "IncrementalDelimJoinRule: term output binding count exceeds original output types");
 				}
 				exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx++], term_bindings[i]));
 			}

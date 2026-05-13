@@ -58,7 +58,7 @@ SELECT * FROM projection_2;
 ```sql
 -- Consolidate delta rows: fold insertions (+1) and deletions (-1) into a single net delta per group.
 -- With integer-weighted multiplicity, this is just SUM(_w * col) — no CASE round-trip needed.
-WITH ivm_cte AS (
+WITH refresh_cte AS (
     SELECT region,
         SUM(openivm_multiplicity * total) AS total,
         SUM(openivm_multiplicity * cnt) AS cnt
@@ -67,7 +67,7 @@ WITH ivm_cte AS (
 )
 -- Single-pass MERGE: update existing groups and insert new ones atomically
 -- IS NOT DISTINCT FROM handles NULL group keys correctly (NULL = NULL)
-MERGE INTO sales_summary v USING ivm_cte d
+MERGE INTO sales_summary v USING refresh_cte d
 ON v.region IS NOT DISTINCT FROM d.region
 -- Existing group: add the net delta to the current aggregate values
 WHEN MATCHED THEN UPDATE SET total = v.total + d.total, cnt = v.cnt + d.cnt

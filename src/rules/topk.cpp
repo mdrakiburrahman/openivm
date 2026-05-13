@@ -4,8 +4,8 @@
 
 namespace duckdb {
 
-ModifiedPlan IvmTopKRule::Rewrite(PlanWrapper pw) {
-	OPENIVM_DEBUG_PRINT("[IvmTopKRule] Stripping %s — top-k is non-linear; delta is computed unbounded\n",
+ModifiedPlan IncrementalTopKRule::Rewrite(PlanWrapper pw) {
+	OPENIVM_DEBUG_PRINT("[IncrementalTopKRule] Stripping %s — top-k is non-linear; delta is computed unbounded\n",
 	                    LogicalOperatorToString(pw.plan->type).c_str());
 
 	// LIMIT, TOP_N, and standalone ORDER BY are stripped from the delta plan:
@@ -15,7 +15,7 @@ ModifiedPlan IvmTopKRule::Rewrite(PlanWrapper pw) {
 	//     The runtime ordering is meaningless for IVM purposes.
 	// We recurse into the only child, take its rewritten plan + multiplicity binding,
 	// and return them directly — the LIMIT/TOP_N/ORDER_BY node is discarded.
-	auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
+	auto child_mul = IncrementalRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
 	return {std::move(child_mul.op), child_mul.mul_binding};
 }
 

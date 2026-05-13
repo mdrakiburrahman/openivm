@@ -1731,7 +1731,7 @@ class QueryGenerator:
         non_incremental_ops = {
             # Note: ORDER (top-level or inside WINDOW frames) is incrementally
             # maintainable — top-level ORDER BY doesn't affect MV state, and
-            # window functions are handled by IvmWindowRule via partition
+            # window functions are handled by IncrementalWindowRule via partition
             # recompute. Don't classify as non-incremental on ORDER alone.
             "LIMIT", "LATERAL", "UNNEST", "PIVOT", "EXCEPT", "INTERSECT",
             "SUBQUERY_FILTER",  # IN/scalar-compare/scalar-in-SELECT — not flattened by OpenIVM

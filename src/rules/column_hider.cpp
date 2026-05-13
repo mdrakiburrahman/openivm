@@ -4,12 +4,12 @@
 // (openivm_left_key, openivm_distinct_count, etc.). A user-facing VIEW (<name>) exposes
 // only the user's columns via SELECT * EXCLUDE (...).
 //
-// This file is intentionally minimal — the naming logic lives in ivm_column_hider.hpp.
+// This file is intentionally minimal — the naming logic lives in column_hider.hpp.
 // The parser (parser.cpp) creates the view during CREATE MATERIALIZED VIEW,
 // and the insert rule (refresh_insert_rule.cpp) drops it during DROP TABLE.
 
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
-// All logic is in the header (IVMTableNames is header-only).
+// All logic is in the header (IncrementalTableNames is header-only).
 } // namespace duckdb

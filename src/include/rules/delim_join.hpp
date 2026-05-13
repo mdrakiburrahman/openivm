@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmDelimJoinRule : public IvmRule {
+class IncrementalDelimJoinRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 

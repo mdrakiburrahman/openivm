@@ -4,7 +4,7 @@
 #include "core/refresh_metadata.hpp"
 #include "core/parser.hpp"
 #include "core/refresh_locks.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 
 #include "lpts_pipeline.hpp"
@@ -54,7 +54,7 @@ static void DisablePACIfLoaded(ClientContext &context, Connection &con) {
 static string BuildDeltaDataColumns(TableCatalogEntry &delta_entry) {
 	string cols;
 	for (auto &col : delta_entry.GetColumns().Logical()) {
-		if (col.GetName() == ivm::MULTIPLICITY_COL || col.GetName() == ivm::TIMESTAMP_COL) {
+		if (col.GetName() == openivm::MULTIPLICITY_COL || col.GetName() == openivm::TIMESTAMP_COL) {
 			continue;
 		}
 		if (!cols.empty()) {
@@ -68,8 +68,8 @@ static string BuildDeltaDataColumns(TableCatalogEntry &delta_entry) {
 // Build "INSERT INTO delta_t (col1, col2, ..., mul, ts)" prefix for delta writes.
 static string BuildDeltaInsertPrefix(const string &full_delta_table_name, TableCatalogEntry &delta_entry) {
 	string col_list = BuildDeltaDataColumns(delta_entry);
-	return "INSERT INTO " + full_delta_table_name + " (" + col_list + ", " + string(ivm::MULTIPLICITY_COL) + ", " +
-	       string(ivm::TIMESTAMP_COL) + ")";
+	return "INSERT INTO " + full_delta_table_name + " (" + col_list + ", " + string(openivm::MULTIPLICITY_COL) + ", " +
+	       string(openivm::TIMESTAMP_COL) + ")";
 }
 
 // Build "SELECT col1, col2, ..., <mul_val>, now()::timestamp FROM <source>" for delta writes.
@@ -127,9 +127,9 @@ static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, 
 
 static string FindMVReferencingColumn(Connection &con, const string &delta_name, const string &table_name,
                                       const string &col_name) {
-	IVMMetadata metadata(con);
-	auto mvs = con.Query("SELECT DISTINCT d.view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
-	                     " d WHERE d.table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+	RefreshMetadata metadata(con);
+	auto mvs = con.Query("SELECT DISTINCT d.view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	                     " d WHERE d.table_name = '" + SqlUtils::EscapeValue(delta_name) + "'");
 	if (mvs->HasError()) {
 		return "";
 	}
@@ -178,12 +178,13 @@ static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
 	return false;
 }
 
-IVMInsertRule::IVMInsertRule() {
-	optimize_function = IVMInsertRuleFunction;
-	optimizer_info = make_shared_ptr<IVMInsertOptimizerInfo>();
+RefreshInsertRule::RefreshInsertRule() {
+	optimize_function = RefreshInsertRuleFunction;
+	optimizer_info = make_shared_ptr<RefreshInsertOptimizerInfo>();
 }
 
-void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan) {
+void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input,
+                                                  duckdb::unique_ptr<LogicalOperator> &plan) {
 	auto root = plan.get();
 
 	// Handle DROP TABLE/VIEW: clean up IVM metadata if the dropped object is an IVM view
@@ -200,31 +201,30 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto table_name = drop_info->name;
 		Connection con(*input.context.db);
 
-		auto view_check = con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		                            OpenIVMUtils::EscapeValue(table_name) + "'");
+		auto view_check = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+		                            SqlUtils::EscapeValue(table_name) + "'");
 		if (!view_check->HasError() && view_check->RowCount() > 0) {
 			// Acquire view lock to prevent cleanup during an in-flight refresh
 			ViewLockGuard view_guard(table_name);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
-			IVMMetadata metadata(con);
+			RefreshMetadata metadata(con);
 			auto delta_tables = metadata.GetDeltaTables(table_name);
 
-			con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-			          OpenIVMUtils::EscapeValue(table_name) + "'");
-			con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-			          OpenIVMUtils::EscapeValue(table_name) + "'");
+			con.Query("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+			          SqlUtils::EscapeValue(table_name) + "'");
+			con.Query("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+			          SqlUtils::EscapeValue(table_name) + "'");
+			con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(table_name)));
 			con.Query("DROP TABLE IF EXISTS " +
-			          KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(table_name)));
-			con.Query("DROP TABLE IF EXISTS " +
-			          KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(table_name)));
+			          KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(table_name)));
 
 			for (auto &dt : delta_tables) {
 				// DuckLake entries store the base table name — never drop it
 				if (metadata.IsDuckLakeTable(table_name, dt)) {
 					continue;
 				}
-				auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-				                           " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "'");
+				auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
+				                           " WHERE table_name = '" + SqlUtils::EscapeValue(dt) + "'");
 				if (!remaining->HasError() && remaining->RowCount() > 0 &&
 				    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
 					con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dt));
@@ -234,29 +234,29 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 
 		// Handle CASCADE: drop dependent MVs
 		auto dep_check =
-		    con.Query("SELECT DISTINCT view_name FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
-		              OpenIVMUtils::EscapeValue(OpenIVMUtils::DeltaName(table_name)) + "'");
+		    con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		              " WHERE table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(table_name)) + "'");
 		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
 			for (size_t i = 0; i < dep_check->RowCount(); i++) {
 				auto dep_view = dep_check->GetValue(0, i).ToString();
 				// Lock each dependent view before dropping
 				ViewLockGuard view_guard(dep_view);
-				IVMMetadata dep_metadata(con);
+				RefreshMetadata dep_metadata(con);
 				auto dep_delta_tables = dep_metadata.GetDeltaTables(dep_view);
 
-				con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-				          OpenIVMUtils::EscapeValue(dep_view) + "'");
-				con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-				          OpenIVMUtils::EscapeValue(dep_view) + "'");
+				con.Query("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+				          SqlUtils::EscapeValue(dep_view) + "'");
+				con.Query("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+				          SqlUtils::EscapeValue(dep_view) + "'");
 				con.Query("DROP TABLE IF EXISTS " +
-				          KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(dep_view)));
+				          KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(dep_view)));
 				con.Query("DROP TABLE IF EXISTS " +
-				          KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(dep_view)));
+				          KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(dep_view)));
 				con.Query("DROP VIEW IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dep_view));
 
 				for (auto &dt : dep_delta_tables) {
-					auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-					                           " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "'");
+					auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
+					                           " WHERE table_name = '" + SqlUtils::EscapeValue(dt) + "'");
 					if (!remaining->HasError() && remaining->RowCount() > 0 &&
 					    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
 						con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dt));
@@ -280,13 +280,13 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		}
 
 		string table_name = alter_info->name;
-		string delta_name = OpenIVMUtils::DeltaName(table_name);
+		string delta_name = SqlUtils::DeltaName(table_name);
 		string qdelta = KeywordHelper::WriteOptionallyQuoted(delta_name);
 
 		Connection con(*input.context.db);
 		// Check if a delta table exists for this base table (i.e., it's tracked by IVM)
 		auto delta_check = con.Query("SELECT 1 FROM information_schema.tables WHERE table_name = '" +
-		                             OpenIVMUtils::EscapeValue(delta_name) + "'");
+		                             SqlUtils::EscapeValue(delta_name) + "'");
 		if (delta_check->HasError() || delta_check->RowCount() == 0) {
 			return; // not an IVM-tracked table
 		}
@@ -361,8 +361,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto insert_table_name = insert_node->table.name;
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] INSERT into '%s'\n", insert_table_name.c_str());
 
-		if (OpenIVMUtils::IsDelta(insert_table_name) || insert_table_name.empty() ||
-		    IVMTableNames::IsDataTable(insert_table_name)) {
+		if (SqlUtils::IsDelta(insert_table_name) || insert_table_name.empty() ||
+		    IncrementalTableNames::IsDataTable(insert_table_name)) {
 			return;
 		}
 		// DuckLake tables have native change tracking — no delta writes needed
@@ -372,14 +372,14 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    input.context, insert_node->table.catalog.GetName(), insert_node->table.schema.name,
-		    OpenIVMUtils::DeltaName(insert_table_name), OnEntryNotFound::RETURN_NULL);
+		    SqlUtils::DeltaName(insert_table_name), OnEntryNotFound::RETURN_NULL);
 
 		if (delta_table_catalog_entry) {
 			Connection con(*input.context.db);
 			DisablePACIfLoaded(input.context, con);
-			IVMMetadata metadata(con);
+			RefreshMetadata metadata(con);
 			if (metadata.IsBaseTable(insert_table_name)) {
-				string full_delta_table_name = OpenIVMUtils::FullDeltaName(
+				string full_delta_table_name = SqlUtils::FullDeltaName(
 				    insert_node->table.catalog.GetName(), insert_node->table.schema.name, insert_node->table.name);
 				if (insert_node->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 					auto &delta_entry_ins = delta_table_catalog_entry->Cast<TableCatalogEntry>();
@@ -425,7 +425,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					}
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] insert_query: %s\n", insert_query.c_str());
 					{
-						DeltaLockGuard guard(OpenIVMUtils::DeltaName(insert_table_name));
+						DeltaLockGuard guard(SqlUtils::DeltaName(insert_table_name));
 						auto r = con.Query(insert_query);
 						if (r->HasError()) {
 							throw Exception(ExceptionType::EXECUTOR,
@@ -446,7 +446,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					auto files = bind_data->file_list->GetAllFiles();
 					for (auto &file : files) {
 						auto query = prefix_csv + " SELECT *, 1, now()::timestamp FROM read_csv('" + file.path + "');";
-						DeltaLockGuard guard(OpenIVMUtils::DeltaName(insert_table_name));
+						DeltaLockGuard guard(SqlUtils::DeltaName(insert_table_name));
 						auto r = con.Query(query);
 						if (r->HasError()) {
 							throw Exception(ExceptionType::EXECUTOR, "Cannot insert in delta table! " + r->GetError());
@@ -461,7 +461,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto delete_node = dynamic_cast<LogicalDelete *>(root);
 		auto delete_table_name = delete_node->table.name;
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] DELETE from '%s'\n", delete_table_name.c_str());
-		if (OpenIVMUtils::IsDelta(delete_table_name) || IVMTableNames::IsDataTable(delete_table_name)) {
+		if (SqlUtils::IsDelta(delete_table_name) || IncrementalTableNames::IsDataTable(delete_table_name)) {
 			return;
 		}
 		if (delete_node->table.catalog.GetCatalogType() == "ducklake") {
@@ -470,16 +470,16 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    input.context, delete_node->table.catalog.GetName(), delete_node->table.schema.name,
-		    OpenIVMUtils::DeltaName(delete_table_name), OnEntryNotFound::RETURN_NULL);
+		    SqlUtils::DeltaName(delete_table_name), OnEntryNotFound::RETURN_NULL);
 
 		if (delta_table_catalog_entry) {
-			auto full_table_name = OpenIVMUtils::FullName(delete_node->table.catalog.GetName(),
-			                                              delete_node->table.schema.name, delete_node->table.name);
-			auto full_delta_table_name = OpenIVMUtils::FullDeltaName(
+			auto full_table_name = SqlUtils::FullName(delete_node->table.catalog.GetName(),
+			                                          delete_node->table.schema.name, delete_node->table.name);
+			auto full_delta_table_name = SqlUtils::FullDeltaName(
 			    delete_node->table.catalog.GetName(), delete_node->table.schema.name, delete_node->table.name);
 			Connection con(*input.context.db);
 			DisablePACIfLoaded(input.context, con);
-			IVMMetadata metadata(con);
+			RefreshMetadata metadata(con);
 			if (metadata.IsBaseTable(delete_table_name)) {
 				auto &delta_entry_del = delta_table_catalog_entry->Cast<TableCatalogEntry>();
 				string insert_string = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del) + " " +
@@ -576,7 +576,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				}
 
 				{
-					DeltaLockGuard guard(OpenIVMUtils::DeltaName(delete_table_name));
+					DeltaLockGuard guard(SqlUtils::DeltaName(delete_table_name));
 					auto r = con.Query(insert_string);
 					if (r->HasError()) {
 						throw Exception(ExceptionType::EXECUTOR,
@@ -590,7 +590,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 	case LogicalOperatorType::LOGICAL_UPDATE: {
 		auto update_node = dynamic_cast<LogicalUpdate *>(root);
 		auto update_table_name = update_node->table.name;
-		if (OpenIVMUtils::IsDelta(update_table_name) || IVMTableNames::IsDataTable(update_table_name)) {
+		if (SqlUtils::IsDelta(update_table_name) || IncrementalTableNames::IsDataTable(update_table_name)) {
 			return;
 		}
 		if (update_node->table.catalog.GetCatalogType() == "ducklake") {
@@ -599,19 +599,19 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    input.context, update_node->table.catalog.GetName(), update_node->table.schema.name,
-		    OpenIVMUtils::DeltaName(update_table_name), OnEntryNotFound::RETURN_NULL);
+		    SqlUtils::DeltaName(update_table_name), OnEntryNotFound::RETURN_NULL);
 
 		if (delta_table_catalog_entry) {
 			Connection con(*input.context.db);
 			DisablePACIfLoaded(input.context, con);
-			IVMMetadata metadata(con);
+			RefreshMetadata metadata(con);
 			if (!metadata.IsBaseTable(update_table_name)) {
 				break;
 			}
 			{
-				auto full_table_name = OpenIVMUtils::FullName(update_node->table.catalog.GetName(),
-				                                              update_node->table.schema.name, update_node->table.name);
-				auto full_delta_table_name = OpenIVMUtils::FullDeltaName(
+				auto full_table_name = SqlUtils::FullName(update_node->table.catalog.GetName(),
+				                                          update_node->table.schema.name, update_node->table.name);
+				auto full_delta_table_name = SqlUtils::FullDeltaName(
 				    update_node->table.catalog.GetName(), update_node->table.schema.name, update_node->table.name);
 				auto *projection = dynamic_cast<LogicalProjection *>(update_node->children[0].get());
 				if (!projection) {
@@ -662,7 +662,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				// For select_new: use the update_values map to replace modified columns
 				string select_new = "SELECT ";
 				for (auto &col : delta_entry_upd.GetColumns().Logical()) {
-					if (col.GetName() == ivm::MULTIPLICITY_COL || col.GetName() == ivm::TIMESTAMP_COL) {
+					if (col.GetName() == openivm::MULTIPLICITY_COL || col.GetName() == openivm::TIMESTAMP_COL) {
 						continue;
 					}
 					// Find the column's positional index in the base table
@@ -681,7 +681,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				select_new += "1, now()::timestamp FROM " + full_table_name + where_string;
 
 				{
-					DeltaLockGuard guard(OpenIVMUtils::DeltaName(update_table_name));
+					DeltaLockGuard guard(SqlUtils::DeltaName(update_table_name));
 					// ATOMIC UPDATE DELTA WRITES:
 					// The old-delete and new-insert rows MUST commit together. If they land
 					// in separate auto-commit transactions, a concurrent refresh can take a

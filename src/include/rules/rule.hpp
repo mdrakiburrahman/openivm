@@ -26,7 +26,7 @@ struct PlanWrapper {
 	//   +k = inserted with multiplicity k (typically +1 for a single insert),
 	//   -k = deleted with multiplicity k (typically -1 for a single delete).
 	// Joins multiply weights (Z-set bilinear product); Möbius inclusion-exclusion
-	// signs are applied in IvmJoinRule because base scans read R_now=R_old+ΔR.
+	// signs are applied in IncrementalJoinRule because base scans read R_now=R_old+ΔR.
 	const LogicalType mul_type = LogicalType::INTEGER;
 	/// SQL text of the view query — used as fallback for Copy when serialization fails (e.g. DuckLake)
 	string view_query;
@@ -46,7 +46,7 @@ struct DeltaGetResult {
 };
 
 //==============================================================================
-// IvmRule — base class for all operator-specific IVM rewrite rules
+// IncrementalRule — base class for all operator-specific IVM rewrite rules
 //==============================================================================
 
 /// DBSP linearity classification of an operator's incremental form.
@@ -63,9 +63,9 @@ struct DeltaGetResult {
 ///                  group-recompute or full-refresh. Cost ∝ affected groups.
 enum class Linearity { LINEAR, BILINEAR, NON_LINEAR };
 
-class IvmRule {
+class IncrementalRule {
 public:
-	virtual ~IvmRule() = default;
+	virtual ~IncrementalRule() = default;
 	virtual ModifiedPlan Rewrite(PlanWrapper pw) = 0;
 
 	/// Linearity of this operator's delta rule. Used for documentation and

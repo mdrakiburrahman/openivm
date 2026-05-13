@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmWindowRule : public IvmRule {
+class IncrementalWindowRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 	// Window functions (ROW_NUMBER, RANK, LAG, etc.) depend on partition order

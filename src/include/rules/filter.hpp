@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-class IvmFilterRule : public IvmRule {
+class IncrementalFilterRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 	Linearity GetLinearity() const override {

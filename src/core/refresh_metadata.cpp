@@ -1,75 +1,75 @@
 #include "core/refresh_metadata.hpp"
 
 #include "core/openivm_debug.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include <sstream>
 
 namespace duckdb {
 
-bool IVMMetadata::IsBaseTable(const string &table_name) {
-	auto result = con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(table_name) + "'");
+bool RefreshMetadata::IsBaseTable(const string &table_name) {
+	auto result = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(table_name) + "'");
 	return !result->HasError() && result->RowCount() == 0;
 }
 
-string IVMMetadata::GetViewQuery(const string &view_name) {
-	auto result = con.Query("SELECT sql_string FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+string RefreshMetadata::GetViewQuery(const string &view_name) {
+	auto result = con.Query("SELECT sql_string FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
 		return "";
 	}
 	return result->GetValue(0, 0).ToString();
 }
 
-IVMType IVMMetadata::GetViewType(const string &view_name) {
-	auto result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+RefreshType RefreshMetadata::GetViewType(const string &view_name) {
+	auto result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
 		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
 	}
-	return static_cast<IVMType>(result->GetValue(0, 0).GetValue<int8_t>());
+	return static_cast<RefreshType>(result->GetValue(0, 0).GetValue<int8_t>());
 }
 
-bool IVMMetadata::HasMinMax(const string &view_name) {
-	auto result = con.Query("SELECT has_minmax FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+bool RefreshMetadata::HasMinMax(const string &view_name) {
+	auto result = con.Query("SELECT has_minmax FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
-bool IVMMetadata::HasLeftJoin(const string &view_name) {
-	auto result = con.Query("SELECT has_left_join FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+bool RefreshMetadata::HasLeftJoin(const string &view_name) {
+	auto result = con.Query("SELECT has_left_join FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
-bool IVMMetadata::HasFullOuter(const string &view_name) {
-	auto result = con.Query("SELECT has_full_outer FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+bool RefreshMetadata::HasFullOuter(const string &view_name) {
+	auto result = con.Query("SELECT has_full_outer FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
-string IVMMetadata::GetFullOuterJoinCols(const string &view_name) {
-	auto result = con.Query("SELECT full_outer_join_cols FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+string RefreshMetadata::GetFullOuterJoinCols(const string &view_name) {
+	auto result = con.Query("SELECT full_outer_join_cols FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "";
 	}
 	return result->GetValue(0, 0).ToString();
 }
 
-vector<string> IVMMetadata::GetDeltaTables(const string &view_name) {
-	auto result = con.Query("SELECT table_name FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
+	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> tables;
 	if (!result->HasError()) {
 		for (size_t i = 0; i < result->RowCount(); i++) {
@@ -79,26 +79,25 @@ vector<string> IVMMetadata::GetDeltaTables(const string &view_name) {
 	return tables;
 }
 
-string IVMMetadata::GetLastUpdate(const string &view_name, const string &table_name) {
-	auto result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	                        OpenIVMUtils::EscapeValue(table_name) + "'");
+string RefreshMetadata::GetLastUpdate(const string &view_name, const string &table_name) {
+	auto result =
+	    con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
 		return "";
 	}
 	return result->GetValue(0, 0).ToString();
 }
 
-void IVMMetadata::UpdateTimestamp(const string &view_name) {
-	auto result =
-	    con.Query("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
-	              OpenIVMUtils::EscapeValue(view_name) + "'");
+void RefreshMetadata::UpdateTimestamp(const string &view_name) {
+	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
+	                        " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "Cannot update IVM metadata timestamp: " + result->GetError());
 	}
 }
 
-vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
+vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 	// Walk upstream: for view V, find its delta tables. If a delta table is "delta_X"
 	// and X is a registered MV, then X is an upstream dependency. Recurse.
 	vector<string> result;
@@ -110,8 +109,8 @@ vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
 			// Extract source MV name from delta table name.
 			// Standard: "delta_<source>", DuckLake: "openivm_data_<source>"
 			string source;
-			static const string delta_prefix(ivm::DELTA_PREFIX);
-			static const string data_prefix(ivm::DATA_TABLE_PREFIX);
+			static const string delta_prefix(openivm::DELTA_PREFIX);
+			static const string data_prefix(openivm::DATA_TABLE_PREFIX);
 			if (dt.size() > delta_prefix.size() && dt.substr(0, delta_prefix.size()) == delta_prefix) {
 				source = dt.substr(delta_prefix.size());
 			} else if (dt.size() > data_prefix.size() && dt.substr(0, data_prefix.size()) == data_prefix) {
@@ -128,18 +127,18 @@ vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
 	return result; // topological order: ancestors first
 }
 
-vector<string> IVMMetadata::GetDownstreamViews(const string &view_name) {
+vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 	// Find all views that depend on delta_<view_name> or openivm_data_<view_name> as a source.
 	// DuckLake chained MVs use openivm_data_* (data table) instead of delta_* (delta table).
 	vector<string> result;
 	unordered_set<string> visited;
 
 	std::function<void(const string &)> collect = [&](const string &vn) {
-		string delta_name = OpenIVMUtils::DeltaName(vn);
-		string data_name = IVMTableNames::DataTableName(vn);
-		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                            " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_name) +
-		                            "' OR table_name = '" + OpenIVMUtils::EscapeValue(data_name) + "'");
+		string delta_name = SqlUtils::DeltaName(vn);
+		string data_name = IncrementalTableNames::DataTableName(vn);
+		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                            " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) +
+		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "'");
 		if (!dependents->HasError()) {
 			for (size_t i = 0; i < dependents->RowCount(); i++) {
 				string dep = dependents->GetValue(0, i).ToString();
@@ -155,9 +154,9 @@ vector<string> IVMMetadata::GetDownstreamViews(const string &view_name) {
 	return result; // topological order: closest descendants first
 }
 
-vector<string> IVMMetadata::GetGroupColumns(const string &view_name) {
-	auto result = con.Query("SELECT group_columns FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
+	auto result = con.Query("SELECT group_columns FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> cols;
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return cols;
@@ -174,9 +173,9 @@ vector<string> IVMMetadata::GetGroupColumns(const string &view_name) {
 	return cols;
 }
 
-vector<string> IVMMetadata::GetAggregateTypes(const string &view_name) {
-	auto result = con.Query("SELECT aggregate_types FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {
+	auto result = con.Query("SELECT aggregate_types FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> types;
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return types;
@@ -192,22 +191,22 @@ vector<string> IVMMetadata::GetAggregateTypes(const string &view_name) {
 	return types;
 }
 
-int64_t IVMMetadata::GetRefreshInterval(const string &view_name) {
-	auto result = con.Query("SELECT refresh_interval FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
+	auto result = con.Query("SELECT refresh_interval FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->GetValue(0, 0).GetValue<int64_t>();
 }
 
-vector<IVMMetadata::ScheduledView> IVMMetadata::GetScheduledViews() {
+vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 	auto result = con.Query("SELECT v.view_name, v.refresh_interval, "
 	                        "(SELECT MIN(d.last_update) FROM " +
-	                        string(ivm::DELTA_TABLES_TABLE) +
+	                        string(openivm::DELTA_TABLES_TABLE) +
 	                        " d WHERE d.view_name = v.view_name) AS last_update "
 	                        "FROM " +
-	                        string(ivm::VIEWS_TABLE) + " v WHERE v.refresh_interval IS NOT NULL");
+	                        string(openivm::VIEWS_TABLE) + " v WHERE v.refresh_interval IS NOT NULL");
 	vector<ScheduledView> views;
 	if (result->HasError()) {
 		OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] GetScheduledViews query error: %s\n", result->GetError().c_str());
@@ -224,49 +223,48 @@ vector<IVMMetadata::ScheduledView> IVMMetadata::GetScheduledViews() {
 	return views;
 }
 
-void IVMMetadata::SetRefreshInProgress(const string &view_name, bool in_progress) {
-	con.Query("UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_in_progress = " + (in_progress ? "true" : "false") +
-	          " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "'");
+void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_progress) {
+	con.Query("UPDATE " + string(openivm::VIEWS_TABLE) + " SET refresh_in_progress = " +
+	          (in_progress ? "true" : "false") + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 }
 
-string IVMMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key) {
+string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
-	return "DELETE FROM " + qtarget + " WHERE " + string(ivm::TIMESTAMP_COL) + " < (SELECT MIN(last_update) FROM " +
-	       string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" + OpenIVMUtils::EscapeValue(metadata_key) +
+	return "DELETE FROM " + qtarget + " WHERE " + string(openivm::TIMESTAMP_COL) + " < (SELECT MIN(last_update) FROM " +
+	       string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" + SqlUtils::EscapeValue(metadata_key) +
 	       "');\n";
 }
 
 // --- DuckLake support ---
 
-string IVMMetadata::GetCatalogType(const string &view_name, const string &table_name) {
-	auto result = con.Query("SELECT catalog_type FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	                        OpenIVMUtils::EscapeValue(table_name) + "'");
+string RefreshMetadata::GetCatalogType(const string &view_name, const string &table_name) {
+	auto result =
+	    con.Query("SELECT catalog_type FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "duckdb";
 	}
 	return result->GetValue(0, 0).ToString();
 }
 
-bool IVMMetadata::IsDuckLakeTable(const string &view_name, const string &table_name) {
+bool RefreshMetadata::IsDuckLakeTable(const string &view_name, const string &table_name) {
 	return GetCatalogType(view_name, table_name) == "ducklake";
 }
 
-int64_t IVMMetadata::GetLastSnapshotId(const string &view_name, const string &table_name) {
-	auto result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	                        OpenIVMUtils::EscapeValue(table_name) + "'");
+int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string &table_name) {
+	auto result =
+	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->GetValue(0, 0).GetValue<int64_t>();
 }
 
-void IVMMetadata::UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id) {
-	auto result =
-	    con.Query("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " + to_string(snapshot_id) +
-	              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	              OpenIVMUtils::EscapeValue(table_name) + "'");
+void RefreshMetadata::UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id) {
+	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " +
+	                        to_string(snapshot_id) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+	                        "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
 	if (result->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake snapshot ID: " + result->GetError());
 	}
@@ -274,15 +272,16 @@ void IVMMetadata::UpdateSnapshotId(const string &view_name, const string &table_
 
 // --- Refresh history (learned cost model) ---
 
-void IVMMetadata::RecordRefreshHistory(const string &view_name, const string &method, double ivm_compute_est,
-                                       double ivm_upsert_est, double recompute_compute_est,
-                                       double recompute_replace_est, int64_t actual_duration_ms, idx_t max_history) {
-	auto result = con.Query("INSERT INTO " + string(ivm::HISTORY_TABLE) +
-	                        " (view_name, method, ivm_compute_est, ivm_upsert_est,"
+void RefreshMetadata::RecordRefreshHistory(const string &view_name, const string &method,
+                                           double incremental_compute_est, double incremental_upsert_est,
+                                           double recompute_compute_est, double recompute_replace_est,
+                                           int64_t actual_duration_ms, idx_t max_history) {
+	auto result = con.Query("INSERT INTO " + string(openivm::HISTORY_TABLE) +
+	                        " (view_name, method, incremental_compute_est, incremental_upsert_est,"
 	                        " recompute_compute_est, recompute_replace_est, actual_duration_ms)"
 	                        " VALUES ('" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "', '" + OpenIVMUtils::EscapeValue(method) + "', " +
-	                        to_string(ivm_compute_est) + ", " + to_string(ivm_upsert_est) + ", " +
+	                        SqlUtils::EscapeValue(view_name) + "', '" + SqlUtils::EscapeValue(method) + "', " +
+	                        to_string(incremental_compute_est) + ", " + to_string(incremental_upsert_est) + ", " +
 	                        to_string(recompute_compute_est) + ", " + to_string(recompute_replace_est) + ", " +
 	                        to_string(actual_duration_ms) + ")");
 	if (result->HasError()) {
@@ -291,28 +290,28 @@ void IVMMetadata::RecordRefreshHistory(const string &view_name, const string &me
 	}
 
 	// Prune old entries beyond the window
-	con.Query("DELETE FROM " + string(ivm::HISTORY_TABLE) + " WHERE view_name = '" +
-	          OpenIVMUtils::EscapeValue(view_name) + "' AND refresh_timestamp NOT IN (SELECT refresh_timestamp FROM " +
-	          string(ivm::HISTORY_TABLE) + " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+	con.Query("DELETE FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
+	          SqlUtils::EscapeValue(view_name) + "' AND refresh_timestamp NOT IN (SELECT refresh_timestamp FROM " +
+	          string(openivm::HISTORY_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
 	          "' ORDER BY refresh_timestamp DESC LIMIT " + to_string(max_history) + ")");
 }
 
-vector<IVMMetadata::RefreshHistoryEntry> IVMMetadata::GetRefreshHistory(const string &view_name, const string &method,
-                                                                        idx_t limit) {
+vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(const string &view_name,
+                                                                                const string &method, idx_t limit) {
 	// Select the cost components for the given method:
 	// - 'full': use recompute_compute_est, recompute_replace_est
 	// - 'incremental' / 'group_recompute' / 'window_partition' (anything else):
-	//   use ivm_compute_est, ivm_upsert_est. The cost model writes the chosen
+	//   use incremental_compute_est, incremental_upsert_est. The cost model writes the chosen
 	//   strategy's compute/upsert cost into those columns at refresh time, so the
 	//   regression learns weights specific to whichever non-full path the view uses.
 	bool is_full = (method == "full");
-	string col1 = is_full ? "recompute_compute_est" : "ivm_compute_est";
-	string col2 = is_full ? "recompute_replace_est" : "ivm_upsert_est";
+	string col1 = is_full ? "recompute_compute_est" : "incremental_compute_est";
+	string col2 = is_full ? "recompute_replace_est" : "incremental_upsert_est";
 
 	auto result =
-	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms FROM " + string(ivm::HISTORY_TABLE) +
-	              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND method = '" +
-	              OpenIVMUtils::EscapeValue(method) + "' ORDER BY refresh_timestamp ASC LIMIT " + to_string(limit));
+	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms FROM " + string(openivm::HISTORY_TABLE) +
+	              " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND method = '" +
+	              SqlUtils::EscapeValue(method) + "' ORDER BY refresh_timestamp ASC LIMIT " + to_string(limit));
 
 	vector<RefreshHistoryEntry> entries;
 	if (result->HasError() || result->RowCount() == 0) {
@@ -398,9 +397,9 @@ static bool ExtractJsonStringArray(const string &json, const string &key, vector
 
 } // namespace
 
-bool IVMMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
-	auto result = con.Query("SELECT distinct_aux_meta_json FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
+	auto result = con.Query("SELECT distinct_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
@@ -420,9 +419,9 @@ bool IVMMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &o
 	return ok;
 }
 
-bool IVMMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
-	auto result = con.Query("SELECT semi_anti_aux_meta_json FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
+	auto result = con.Query("SELECT semi_anti_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
@@ -445,9 +444,9 @@ bool IVMMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &o
 	return ok;
 }
 
-bool IVMMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
-	auto result = con.Query("SELECT aggregate_decomposition_json FROM " + string(ivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "'");
+bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
+	auto result = con.Query("SELECT aggregate_decomposition_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}

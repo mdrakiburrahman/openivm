@@ -25,7 +25,7 @@ void DemoteLeftJoins(LogicalOperator *node);
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf);
 
-class IvmJoinRule : public IvmRule {
+class IncrementalJoinRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
 	// Join is bilinear: linear in each input separately. The delta rule expands

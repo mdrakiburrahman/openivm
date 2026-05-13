@@ -3,7 +3,7 @@
 #include <unordered_set>
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "core/openivm_debug.hpp"
 #include "rules/column_hider.hpp"
 #include "storage/ducklake_scan.hpp"
@@ -24,7 +24,7 @@ namespace duckdb {
 
 /// Get the row count of a table by name, returns 0 if table doesn't exist.
 static double GetTableRowCount(Connection &con, const string &table_name) {
-	auto result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(table_name) + ";");
+	auto result = con.Query("SELECT COUNT(*) FROM " + SqlUtils::QuoteIdentifier(table_name) + ";");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
@@ -33,12 +33,12 @@ static double GetTableRowCount(Connection &con, const string &table_name) {
 
 /// Get the number of pending delta rows for a given base delta table and view.
 static double GetDeltaRowCount(Connection &con, const string &delta_table_name, const string &view_name) {
-	auto ts_string = IVMMetadata(con).GetLastUpdate(view_name, delta_table_name);
+	auto ts_string = RefreshMetadata(con).GetLastUpdate(view_name, delta_table_name);
 	if (ts_string.empty()) {
 		return 0;
 	}
-	auto count_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(delta_table_name) +
-	                              " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
+	auto count_result = con.Query("SELECT COUNT(*) FROM " + SqlUtils::QuoteIdentifier(delta_table_name) + " WHERE " +
+	                              string(openivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
 	if (count_result->HasError() || count_result->RowCount() == 0 || count_result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
@@ -68,7 +68,7 @@ struct PlanStats {
 /// Get delta cardinality for a DuckLake table by counting changes between snapshots.
 static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_name, const string &schema_name,
                                        const string &table_name, const string &view_name) {
-	IVMMetadata metadata(con);
+	RefreshMetadata metadata(con);
 	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
 	auto cur_snap_result = con.Query("SELECT id FROM " + catalog_name + ".current_snapshot()");
 	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 || cur_snap_result->GetValue(0, 0).IsNull()) {
@@ -81,15 +81,15 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 
 	double count = 0;
 	auto ins_result =
-	    con.Query("SELECT COUNT(*) FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog_name) +
-	              "', '" + OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) +
-	              "', " + to_string(last_snap) + ", " + to_string(cur_snap) + ")");
+	    con.Query("SELECT COUNT(*) FROM ducklake_table_insertions('" + SqlUtils::EscapeValue(catalog_name) + "', '" +
+	              SqlUtils::EscapeValue(schema_name) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
+	              to_string(last_snap) + ", " + to_string(cur_snap) + ")");
 	if (!ins_result->HasError() && ins_result->RowCount() > 0) {
 		count += ins_result->GetValue(0, 0).GetValue<double>();
 	}
 	auto del_result =
-	    con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog_name) + "', '" +
-	              OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	    con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" + SqlUtils::EscapeValue(catalog_name) + "', '" +
+	              SqlUtils::EscapeValue(schema_name) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
 	              to_string(last_snap) + ", " + to_string(cur_snap) + ")");
 	if (!del_result->HasError() && del_result->RowCount() > 0) {
 		count += del_result->GetValue(0, 0).GetValue<double>();
@@ -127,7 +127,7 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 				ts.delta_card = GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name);
 			} else {
 				stats.all_ducklake = false;
-				ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
+				ts.delta_table_name = SqlUtils::DeltaName(ts.table_name);
 				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name);
 			}
 
@@ -240,7 +240,7 @@ static bool Solve3x3(const double A[3][3], const double b[3], double x[3]) {
 
 /// Fit weighted NNLS ridge regression from execution history.
 /// Returns calibrated weights or uncalibrated fallback.
-static RegressionWeights FitRegression(const vector<IVMMetadata::RefreshHistoryEntry> &history, double decay,
+static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHistoryEntry> &history, double decay,
                                        double ridge_lambda, idx_t min_samples) {
 	RegressionWeights result = {1.0, 1.0, 0.0, false};
 	idx_t n = history.size();
@@ -353,7 +353,7 @@ static RegressionWeights FitRegression(const vector<IVMMetadata::RefreshHistoryE
 
 // ============================================================================
 
-IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
+RefreshCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
 
@@ -371,9 +371,9 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	// Read view type so the IVM-cost branch can reflect the strategy that will
 	// actually run at refresh time. Defaults to AGGREGATE_GROUP if the view isn't
 	// in metadata yet (e.g. test harnesses that call EstimateIVMCost on a raw plan).
-	IVMType view_type = IVMType::AGGREGATE_GROUP;
+	RefreshType view_type = RefreshType::AGGREGATE_GROUP;
 	{
-		IVMMetadata vt_meta(con);
+		RefreshMetadata vt_meta(con);
 		try {
 			view_type = vt_meta.GetViewType(view_name);
 		} catch (...) {
@@ -400,7 +400,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		delta_fraction_sum += ts.delta_card / ts.base_card;
 	}
 
-	double mv_card = GetTableRowCount(con, IVMTableNames::DataTableName(view_name));
+	double mv_card = GetTableRowCount(con, IncrementalTableNames::DataTableName(view_name));
 	if (mv_card == 0) {
 		mv_card = 1;
 	}
@@ -420,7 +420,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 			if (i > 0) {
 				in_list += ", ";
 			}
-			in_list += "'" + OpenIVMUtils::EscapeValue(table_stats[i].table_name) + "'";
+			in_list += "'" + SqlUtils::EscapeValue(table_stats[i].table_name) + "'";
 		}
 		// Batch query: get all FK constraints for join tables in one call.
 		unordered_set<size_t> pruned_pk_leaves;
@@ -463,7 +463,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	//   - For aggregates: merge cost depends on affected groups
 	//   - For projections/filters: targeted insert/delete
 
-	double ivm_compute;
+	double incremental_compute;
 	double estimated_delta_result;
 
 	if (has_join) {
@@ -484,7 +484,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 			scan_multiplier = static_cast<double>(1ULL << (join_leaves - 1));
 		}
 
-		ivm_compute = scan_multiplier * total_base_scan;
+		incremental_compute = scan_multiplier * total_base_scan;
 
 		// Estimate delta result: each delta row fans out by MV/actual_card.
 		// Use actual_card (unfiltered) instead of base_card to avoid inflated fanout
@@ -506,32 +506,32 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 			double selectivity = std::min(1.0, ts.base_card / ts.actual_card);
 			filtered_delta += ts.delta_card * selectivity;
 		}
-		ivm_compute = total_delta;
+		incremental_compute = total_delta;
 		// Apply both pushed-down selectivity and non-pushed-down filter selectivity
 		estimated_delta_result = filtered_delta * plan_stats.filter_selectivity;
 	}
 
-	double ivm_upsert;
+	double incremental_upsert;
 	if (has_aggregate) {
 		// Aggregate merge: affected groups ≈ min(delta_result, MV groups)
 		// Merge cost is proportional to affected groups, not full MV
 		double affected_groups = std::min(estimated_delta_result, mv_card);
-		ivm_upsert = affected_groups * 2.0; // read + write per group
+		incremental_upsert = affected_groups * 2.0; // read + write per group
 		if (plan_stats.has_full_outer) {
 			// FULL OUTER: MERGE + targeted unmatched recompute + NULL group recompute
-			ivm_upsert *= 3.0;
+			incremental_upsert *= 3.0;
 		}
 	} else {
 		// Projection/filter: targeted insert/delete
 		// EXISTS subquery cost ≈ delta_result × log(MV) for each delete
-		ivm_upsert = estimated_delta_result * (1.0 + std::log2(std::max(mv_card, 1.0)));
+		incremental_upsert = estimated_delta_result * (1.0 + std::log2(std::max(mv_card, 1.0)));
 		if (plan_stats.has_full_outer) {
 			// Bidirectional key CTE queries both delta tables
-			ivm_upsert *= 1.5;
+			incremental_upsert *= 1.5;
 		}
 	}
 
-	double ivm_total = ivm_compute + ivm_upsert;
+	double incremental_total = incremental_compute + incremental_upsert;
 
 	// 4. Estimate recompute cost
 	//
@@ -544,7 +544,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 
 	// 5. Learned cost model: calibrate predictions using execution history
 	//    Gated by openivm_adaptive_refresh (same gate as the cost model decision).
-	double ivm_predicted_ms = ivm_total;
+	double incremental_predicted_ms = incremental_total;
 	double recompute_predicted_ms = recompute_total;
 	bool calibrated = false;
 
@@ -565,18 +565,19 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 			}
 		}
 
-		IVMMetadata metadata(con);
+		RefreshMetadata metadata(con);
 		constexpr double RIDGE_LAMBDA = 1e-4;
 		constexpr idx_t MIN_SAMPLES = 3;
 
 		auto incremental_history = metadata.GetRefreshHistory(view_name, "incremental");
-		auto ivm_reg = FitRegression(incremental_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (ivm_reg.calibrated) {
-			ivm_predicted_ms =
-			    std::max(0.0, ivm_reg.w_compute * ivm_compute + ivm_reg.w_upsert * ivm_upsert + ivm_reg.w_intercept);
+		auto incremental_reg = FitRegression(incremental_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
+		if (incremental_reg.calibrated) {
+			incremental_predicted_ms =
+			    std::max(0.0, incremental_reg.w_compute * incremental_compute +
+			                      incremental_reg.w_upsert * incremental_upsert + incremental_reg.w_intercept);
 			calibrated = true;
 			OPENIVM_DEBUG_PRINT("[COST MODEL] IVM regression: w_compute=%.4f, w_upsert=%.4f, intercept=%.1f\n",
-			                    ivm_reg.w_compute, ivm_reg.w_upsert, ivm_reg.w_intercept);
+			                    incremental_reg.w_compute, incremental_reg.w_upsert, incremental_reg.w_intercept);
 		}
 
 		auto rc_history = metadata.GetRefreshHistory(view_name, "full");
@@ -598,18 +599,18 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	                    total_base_scan, delta_fraction_sum, plan_stats.filter_selectivity);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] MV cardinality: %.0f, Est. delta result: %.0f\n", mv_card,
 	                    estimated_delta_result);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] IVM cost: %.0f (compute: %.0f, upsert: %.0f)\n", ivm_total, ivm_compute,
-	                    ivm_upsert);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] IVM cost: %.0f (compute: %.0f, upsert: %.0f)\n", incremental_total,
+	                    incremental_compute, incremental_upsert);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute cost: %.0f (compute: %.0f, replace: %.0f)\n", recompute_total,
 	                    recompute_compute, recompute_replace);
 	if (calibrated) {
-		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: IVM=%.0fms, Recompute=%.0fms\n", ivm_predicted_ms,
+		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: IVM=%.0fms, Recompute=%.0fms\n", incremental_predicted_ms,
 		                    recompute_predicted_ms);
 	}
 	// "FULL_RECOMPUTE" is the cost-model strategy label (delete+insert the whole MV from the
-	// view query); the IVMType enum no longer has a RECOMPUTE variant — see openivm_constants.hpp.
+	// view query); the RefreshType enum no longer has a RECOMPUTE variant — see openivm_constants.hpp.
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
-	                    ivm_predicted_ms < recompute_predicted_ms ? "IVM" : "FULL_RECOMPUTE");
+	                    incremental_predicted_ms < recompute_predicted_ms ? "IVM" : "FULL_RECOMPUTE");
 
 	// Strategy-aware override: for views whose refresh path is fixed-by-classification
 	// (no IVM-vs-recompute decision is actually consulted), replace the `ivm_*` fields
@@ -624,9 +625,9 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	//   WINDOW_PARTITION — partition-level recompute. Touched partitions ≈ delta rows
 	//     fanned through partition-key selectivity to MV rows.
 	string strategy_label;
-	double strategy_compute = ivm_compute;
-	double strategy_upsert = ivm_upsert;
-	if (view_type == IVMType::GROUP_RECOMPUTE) {
+	double strategy_compute = incremental_compute;
+	double strategy_upsert = incremental_upsert;
+	if (view_type == RefreshType::GROUP_RECOMPUTE) {
 		strategy_label = "group_recompute";
 		// Estimated affected MV keys = Σᵢ delta_Tᵢ × (mv_card / actual_card_Tᵢ).
 		// Each source contributes a per-table view-query variant (substitute T_i
@@ -652,7 +653,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		// DELETE+INSERT for affected_keys rows (bounded by mv_card).
 		double affected_keys_clamped = std::min(affected_keys, mv_card);
 		strategy_upsert = affected_keys_clamped * 2.0; // delete + insert
-	} else if (view_type == IVMType::WINDOW_PARTITION) {
+	} else if (view_type == RefreshType::WINDOW_PARTITION) {
 		strategy_label = "window_partition";
 		// Partition recompute: scan delta to identify affected partitions, then
 		// re-evaluate the view query for those partitions. Cost ≈ delta scan +
@@ -668,20 +669,21 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		strategy_label = "incremental";
 	}
 	double strategy_total = strategy_compute + strategy_upsert;
-	double strategy_predicted_ms = ivm_predicted_ms; // calibrated regression already absorbed ivm_compute/upsert
+	double strategy_predicted_ms =
+	    incremental_predicted_ms; // calibrated regression already absorbed incremental_compute/upsert
 	if (strategy_label != "incremental") {
 		// Static fallback for non-IVM strategies until per-strategy regression history accrues.
 		strategy_predicted_ms = strategy_total;
 	}
 
-	IVMCostEstimate estimate;
-	estimate.ivm_compute = strategy_compute;
-	estimate.ivm_upsert = strategy_upsert;
+	RefreshCostEstimate estimate;
+	estimate.incremental_compute = strategy_compute;
+	estimate.incremental_upsert = strategy_upsert;
 	estimate.recompute_compute = recompute_compute;
 	estimate.recompute_replace = recompute_replace;
-	estimate.ivm_cost = strategy_total;
+	estimate.incremental_cost = strategy_total;
 	estimate.recompute_cost = recompute_total;
-	estimate.ivm_predicted_ms = strategy_predicted_ms;
+	estimate.incremental_predicted_ms = strategy_predicted_ms;
 	estimate.recompute_predicted_ms = recompute_predicted_ms;
 	estimate.calibrated = calibrated;
 	estimate.strategy_label = std::move(strategy_label);
@@ -707,7 +709,7 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 
 	con.BeginTransaction();
 
-	IVMMetadata metadata(con);
+	RefreshMetadata metadata(con);
 	auto view_query = metadata.GetViewQuery(view_name);
 	if (view_query.empty()) {
 		con.Rollback();
@@ -739,18 +741,18 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 	if (decision == "incremental" && estimate.ShouldRecompute()) {
 		decision = "full";
 	}
-	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.ivm_cost) + " AS ivm_cost, " +
-	       to_string(estimate.recompute_cost) + " AS recompute_cost, " + to_string(estimate.ivm_predicted_ms) +
-	       " AS ivm_predicted_ms, " + to_string(estimate.recompute_predicted_ms) + " AS recompute_predicted_ms, " +
-	       (estimate.calibrated ? "true" : "false") + " AS calibrated";
+	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.incremental_cost) + " AS incremental_cost, " +
+	       to_string(estimate.recompute_cost) + " AS recompute_cost, " + to_string(estimate.incremental_predicted_ms) +
+	       " AS incremental_predicted_ms, " + to_string(estimate.recompute_predicted_ms) +
+	       " AS recompute_predicted_ms, " + (estimate.calibrated ? "true" : "false") + " AS calibrated";
 }
 
 string IVMCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto view_name = StringValue::Get(parameters.values[0]);
-	return "SELECT view_name, refresh_timestamp, method, ivm_compute_est, ivm_upsert_est,"
+	return "SELECT view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
 	       " FROM " +
-	       string(ivm::HISTORY_TABLE) + " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+	       string(openivm::HISTORY_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
 	       "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }
 

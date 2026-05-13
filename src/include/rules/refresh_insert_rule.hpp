@@ -6,16 +6,16 @@
 
 namespace duckdb {
 
-class IVMInsertRule : public OptimizerExtension {
+class RefreshInsertRule : public OptimizerExtension {
 public:
-	IVMInsertRule();
+	RefreshInsertRule();
 
-	struct IVMInsertOptimizerInfo : OptimizerExtensionInfo {
-		explicit IVMInsertOptimizerInfo() {
+	struct RefreshInsertOptimizerInfo : OptimizerExtensionInfo {
+		explicit RefreshInsertOptimizerInfo() {
 		}
 	};
 
-	static void IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan);
+	static void RefreshInsertRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan);
 };
 
 } // namespace duckdb

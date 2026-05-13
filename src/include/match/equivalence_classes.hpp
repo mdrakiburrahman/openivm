@@ -15,7 +15,7 @@
 #include "duckdb/planner/expression.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 class EquivalenceClassMap {
 public:
@@ -49,7 +49,7 @@ private:
 	vector<unique_ptr<Value>> constants_;
 };
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb
 
 #endif

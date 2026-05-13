@@ -3,7 +3,7 @@
 #include "duckdb/main/config.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 PredicateOracle::PredicateOracle(ClientContext &context) : context_(context), oracle_mode_("interval") {
 	Value v;
@@ -30,5 +30,5 @@ ImplicationCheck PredicateOracle::Check(const vector<reference<Expression>> &que
 	return ImplicationCheck {ImplicationResult::UNDECIDED, nullptr};
 }
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb

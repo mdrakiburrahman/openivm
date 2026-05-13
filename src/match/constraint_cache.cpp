@@ -1,7 +1,7 @@
 #include "match/constraint_cache.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 vector<CachedConstraint> ConstraintCache::GetConstraints(const string &table_name) {
 	std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -47,5 +47,5 @@ void ConstraintCache::InvalidateTable(const string &table_name) {
 	cache_.erase(table_name);
 }
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb

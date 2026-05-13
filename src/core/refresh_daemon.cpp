@@ -3,7 +3,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_locks.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -13,17 +13,17 @@
 
 namespace duckdb {
 
-void IVMRefreshDaemon::Start(DatabaseInstance &db) {
+void RefreshDaemon::Start(DatabaseInstance &db) {
 	bool expected = false;
 	if (!started_.compare_exchange_strong(expected, true)) {
 		return; // already started
 	}
 	db_ = &db;
 	shutdown_ = false;
-	thread_ = std::thread(&IVMRefreshDaemon::Run, this);
+	thread_ = std::thread(&RefreshDaemon::Run, this);
 }
 
-void IVMRefreshDaemon::Stop() {
+void RefreshDaemon::Stop() {
 	if (!started_.load()) {
 		return;
 	}
@@ -35,11 +35,11 @@ void IVMRefreshDaemon::Stop() {
 	started_ = false;
 }
 
-IVMRefreshDaemon::~IVMRefreshDaemon() {
+RefreshDaemon::~RefreshDaemon() {
 	Stop();
 }
 
-int64_t IVMRefreshDaemon::GetEffectiveInterval(const string &view_name) const {
+int64_t RefreshDaemon::GetEffectiveInterval(const string &view_name) const {
 	std::lock_guard<std::mutex> guard(backoff_mutex_);
 	auto it = effective_intervals_.find(view_name);
 	if (it != effective_intervals_.end()) {
@@ -48,12 +48,12 @@ int64_t IVMRefreshDaemon::GetEffectiveInterval(const string &view_name) const {
 	return -1; // not backed off, use configured interval
 }
 
-bool IVMRefreshDaemon::IsRefreshing(const string &view_name) const {
+bool RefreshDaemon::IsRefreshing(const string &view_name) const {
 	std::lock_guard<std::mutex> guard(refreshing_mutex_);
 	return currently_refreshing_ == view_name;
 }
 
-void IVMRefreshDaemon::Run() {
+void RefreshDaemon::Run() {
 	OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Started\n");
 
 	while (!shutdown_.load()) {
@@ -122,7 +122,7 @@ void IVMRefreshDaemon::Run() {
 				adaptive_backoff_ = backoff_val.GetValue<bool>();
 			}
 
-			IVMMetadata metadata(con);
+			RefreshMetadata metadata(con);
 			auto scheduled = metadata.GetScheduledViews();
 			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Scheduled views: %lu\n", (unsigned long)scheduled.size());
 
@@ -186,7 +186,7 @@ void IVMRefreshDaemon::Run() {
 					// Check for refresh hooks
 					auto hook_r =
 					    refresh_con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks WHERE view_name = '" +
-					                      OpenIVMUtils::EscapeValue(sv.view_name) + "'");
+					                      SqlUtils::EscapeValue(sv.view_name) + "'");
 					string hook_sql;
 					string hook_mode;
 					if (!hook_r->HasError() && hook_r->RowCount() > 0) {
@@ -203,7 +203,7 @@ void IVMRefreshDaemon::Run() {
 
 					if (hook_mode != "replace") {
 						auto result =
-						    refresh_con.Query("PRAGMA refresh('" + OpenIVMUtils::EscapeValue(sv.view_name) + "')");
+						    refresh_con.Query("PRAGMA refresh('" + SqlUtils::EscapeValue(sv.view_name) + "')");
 						if (result->HasError()) {
 							Printer::Print("Warning: auto-refresh of '" + sv.view_name +
 							               "' failed: " + result->GetError());

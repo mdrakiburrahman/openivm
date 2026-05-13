@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Validate is_incremental metadata by attempting to CREATE MATERIALIZED VIEW
-with OpenIVM for each query and checking the resulting ivm_type.
+with OpenIVM for each query and checking the resulting refresh_type.
 
 For each query file in benchmark/queries/:
-  - SUCCESS + ivm_type != 'FULL_REFRESH'  → is_incremental = True
-  - SUCCESS + ivm_type == 'FULL_REFRESH'  → is_incremental = False
+  - SUCCESS + refresh_type != 'FULL_REFRESH'  → is_incremental = True
+  - SUCCESS + refresh_type == 'FULL_REFRESH'  → is_incremental = False
   - MV CREATE fails                       → is_incremental = False (record error)
 """
 
@@ -98,7 +98,7 @@ def write_query_file(path: Path, metadata: dict, query: str):
 
 def classify_query(con, query: str, mv_name: str) -> tuple[str, str]:
     """
-    Try CREATE MATERIALIZED VIEW, check ivm_type, then DROP.
+    Try CREATE MATERIALIZED VIEW, check refresh_type, then DROP.
     Returns ("incremental"|"full_refresh"|"create_failed", detail_string).
     """
     # Ensure a clean slate for this view name
@@ -113,25 +113,25 @@ def classify_query(con, query: str, mv_name: str) -> tuple[str, str]:
         return ("create_failed", msg)
     try:
         row = con.execute(
-            f"SELECT ivm_type FROM openivm_views WHERE view_name = '{mv_name}'"
+            f"SELECT refresh_type FROM openivm_views WHERE view_name = '{mv_name}'"
         ).fetchone()
         if row is None:
-            ivm_type = "UNKNOWN"
+            refresh_type = "UNKNOWN"
         else:
-            ivm_type = str(row[0])
+            refresh_type = str(row[0])
     except Exception as e:
-        ivm_type = f"ERR: {e}"
+        refresh_type = f"ERR: {e}"
     finally:
         try:
             con.execute(f"DROP VIEW IF EXISTS {mv_name}")
         except Exception:
             pass
 
-    if ivm_type == "FULL_REFRESH":
-        return ("full_refresh", ivm_type)
-    if ivm_type.startswith("ERR:") or ivm_type == "UNKNOWN":
-        return ("create_failed", f"missing metadata: {ivm_type}")
-    return ("incremental", ivm_type)
+    if refresh_type == "FULL_REFRESH":
+        return ("full_refresh", refresh_type)
+    if refresh_type.startswith("ERR:") or refresh_type == "UNKNOWN":
+        return ("create_failed", f"missing metadata: {refresh_type}")
+    return ("incremental", refresh_type)
 
 
 def main():
@@ -196,10 +196,10 @@ def main():
                 metadata["mv_create_error"] = detail[:150]
             elif result == "full_refresh":
                 metadata.pop("mv_create_error", None)
-                metadata["ivm_type"] = "FULL_REFRESH"
+                metadata["refresh_type"] = "FULL_REFRESH"
             else:
                 metadata.pop("mv_create_error", None)
-                metadata["ivm_type"] = detail
+                metadata["refresh_type"] = detail
             write_query_file(f, metadata, query)
             stats["updated"] += 1
 

@@ -61,7 +61,7 @@ SELECT sensor, all_readings, openivm_multiplicity FROM aggregate_1;
 -- reduce via element-wise addition.
 -- list_transform multiplies each element by the integer multiplicity (+1 / -1).
 -- list_reduce folds multiple lists into one by adding corresponding elements.
-WITH ivm_cte AS (
+WITH refresh_cte AS (
     SELECT sensor,
         list_reduce(list(
             list_transform(all_readings, lambda x: openivm_multiplicity * x)
@@ -72,7 +72,7 @@ WITH ivm_cte AS (
     GROUP BY sensor
 )
 -- MERGE: add corresponding elements of existing and delta lists
-MERGE INTO sensor_totals v USING ivm_cte d
+MERGE INTO sensor_totals v USING refresh_cte d
 ON v.sensor IS NOT DISTINCT FROM d.sensor
 -- Existing group: element-wise addition of old and delta lists
 WHEN MATCHED THEN UPDATE SET

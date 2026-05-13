@@ -10,11 +10,11 @@ namespace duckdb {
 // Centralized access to IVM metadata stored in system tables.
 // Wraps all raw SQL queries to openivm_views and openivm_delta_tables
 // behind typed methods. Takes a Connection reference — does NOT create its own.
-class IVMMetadata {
+class RefreshMetadata {
 	Connection &con;
 
 public:
-	explicit IVMMetadata(Connection &con) : con(con) {
+	explicit RefreshMetadata(Connection &con) : con(con) {
 	}
 
 	// Returns true if the given table name is NOT a tracked materialized view.
@@ -26,7 +26,7 @@ public:
 	string GetViewQuery(const string &view_name);
 
 	// Get the IVM type for a materialized view.
-	IVMType GetViewType(const string &view_name);
+	RefreshType GetViewType(const string &view_name);
 
 	// Check if the view uses MIN/MAX aggregates (requires group-recompute).
 	bool HasMinMax(const string &view_name);
@@ -100,21 +100,21 @@ public:
 	// --- Refresh history (learned cost model) ---
 
 	// Record a refresh execution in the history table. Prunes entries beyond the window.
-	void RecordRefreshHistory(const string &view_name, const string &method, double ivm_compute_est,
-	                          double ivm_upsert_est, double recompute_compute_est, double recompute_replace_est,
+	void RecordRefreshHistory(const string &view_name, const string &method, double incremental_compute_est,
+	                          double incremental_upsert_est, double recompute_compute_est, double recompute_replace_est,
 	                          int64_t actual_duration_ms, idx_t max_history = 20);
 
 	// Refresh history entry for regression fitting.
 	struct RefreshHistoryEntry {
-		double compute_est; // ivm_compute_est or recompute_compute_est (depending on method)
-		double upsert_est;  // ivm_upsert_est or recompute_replace_est
+		double compute_est; // incremental_compute_est or recompute_compute_est (depending on method)
+		double upsert_est;  // incremental_upsert_est or recompute_replace_est
 		double actual_ms;
 	};
 
 	// Get the last N history entries for a given method ('incremental' or 'full').
 	vector<RefreshHistoryEntry> GetRefreshHistory(const string &view_name, const string &method, idx_t limit = 20);
 
-	// --- Aux-state DISTINCT (IVMType::DISTINCT_INCREMENTAL) ---
+	// --- Aux-state DISTINCT (RefreshType::DISTINCT_INCREMENTAL) ---
 
 	// Metadata captured at CREATE-MV time for the aux-state DISTINCT pipeline.
 	// `aux_table` is the per-tuple count table (e.g. `openivm_distinct_count_<view>`);

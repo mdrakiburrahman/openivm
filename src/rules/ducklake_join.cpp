@@ -4,7 +4,7 @@
 #include "rules/incremental_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "core/openivm_utils.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -86,8 +86,8 @@ static void CollectDuckLakeKeyProbes(LogicalOperator *node,
 
 static string DuckLakeQualifiedTable(const string &catalog, const string &schema, const string &table_name,
                                      int64_t snapshot_id) {
-	string result = OpenIVMUtils::QuoteIdentifier(catalog) + "." + OpenIVMUtils::QuoteIdentifier(schema) + "." +
-	                OpenIVMUtils::QuoteIdentifier(table_name);
+	string result = SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(schema) + "." +
+	                SqlUtils::QuoteIdentifier(table_name);
 	if (snapshot_id >= 0) {
 		result += " AT (VERSION => " + to_string(snapshot_id) + ")";
 	}
@@ -98,21 +98,21 @@ static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, con
                                      const string &table_name, const string &delta_column, int64_t old_snapshot,
                                      int64_t current_snapshot, const string &other_catalog, const string &other_schema,
                                      const string &other_table, const string &other_column, int64_t other_snapshot) {
-	string delta_col = OpenIVMUtils::QuoteIdentifier(delta_column);
-	string other_col = OpenIVMUtils::QuoteIdentifier(other_column);
+	string delta_col = SqlUtils::QuoteIdentifier(delta_column);
+	string other_col = SqlUtils::QuoteIdentifier(other_column);
 	string other_relation = DuckLakeQualifiedTable(other_catalog, other_schema, other_table, other_snapshot);
 	string old_snap = to_string(old_snapshot);
 	string cur_snap = to_string(current_snapshot);
 	string sql = "SELECT EXISTS(SELECT 1 FROM ("
 	             "SELECT " +
-	             delta_col + " AS openivm_key FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog) +
-	             "', '" + OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	             delta_col + " AS openivm_key FROM ducklake_table_insertions('" + SqlUtils::EscapeValue(catalog) +
+	             "', '" + SqlUtils::EscapeValue(schema) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
 	             old_snap + ", " + cur_snap +
 	             ") "
 	             "UNION ALL "
 	             "SELECT " +
-	             delta_col + " AS openivm_key FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog) +
-	             "', '" + OpenIVMUtils::EscapeValue(schema) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	             delta_col + " AS openivm_key FROM ducklake_table_deletions('" + SqlUtils::EscapeValue(catalog) +
+	             "', '" + SqlUtils::EscapeValue(schema) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
 	             old_snap + ", " + cur_snap +
 	             ")) openivm_delta_keys "
 	             "JOIN (SELECT * FROM " +
@@ -171,9 +171,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		table_catalogs[i] = table_ref->ParentCatalog().GetName();
 		table_schemas[i] = table_ref->schema.name;
 		table_names[i] = table_name;
-		auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(pw.view) +
-		                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
+		auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                             " WHERE view_name = '" + SqlUtils::EscapeValue(pw.view) + "' AND table_name = '" +
+		                             SqlUtils::EscapeValue(table_name) + "'");
 		if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 			throw Exception(ExceptionType::CATALOG, "IVM: no snapshot ID recorded for DuckLake table '" + table_name +
 			                                            "' in view '" + pw.view + "'");
@@ -213,14 +213,14 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			string has_changes_sql =
 			    "SELECT EXISTS(SELECT 1 FROM ("
 			    "(SELECT 1 FROM ducklake_table_insertions('" +
-			    OpenIVMUtils::EscapeValue(table_catalogs[i]) + "', '" + OpenIVMUtils::EscapeValue(table_schemas[i]) +
-			    "', '" + OpenIVMUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
+			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
+			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
 			    to_string(current_snapshot) +
 			    ") LIMIT 1) "
 			    "UNION ALL "
 			    "(SELECT 1 FROM ducklake_table_deletions('" +
-			    OpenIVMUtils::EscapeValue(table_catalogs[i]) + "', '" + OpenIVMUtils::EscapeValue(table_schemas[i]) +
-			    "', '" + OpenIVMUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
+			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
+			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
 			    to_string(current_snapshot) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
 			auto has_changes = con.Query(has_changes_sql);
 			if (has_changes->HasError()) {
@@ -329,7 +329,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		} else {
 			// GET wrapped in projections/filters — rewrite the entire subtree.
 			auto &subtree_ref = GetNodeAtPath(term, term_leaves[i].path);
-			auto rewritten = IVMRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
+			auto rewritten = IncrementalRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
 			mul_binding = rewritten.mul_binding;
 			subtree_ref = std::move(rewritten.op);
 		}

@@ -16,7 +16,7 @@ namespace duckdb {
 // Per-delta-table mutex: serializes the refresh's "read deltas + set last_update"
 // critical section with the insert rule's delta row writes. This closes the window
 // where concurrent DML deltas could be permanently skipped.
-class IVMRefreshLocks {
+class RefreshLocks {
 public:
 	// --- View-level locks (prevent concurrent refresh of same MV) ---
 
@@ -52,10 +52,10 @@ class DeltaLockGuard {
 
 public:
 	explicit DeltaLockGuard(const string &delta_table_name) : name_(delta_table_name) {
-		IVMRefreshLocks::LockDelta(name_);
+		RefreshLocks::LockDelta(name_);
 	}
 	~DeltaLockGuard() {
-		IVMRefreshLocks::UnlockDelta(name_);
+		RefreshLocks::UnlockDelta(name_);
 	}
 	DeltaLockGuard(const DeltaLockGuard &) = delete;
 	DeltaLockGuard &operator=(const DeltaLockGuard &) = delete;
@@ -69,10 +69,10 @@ class ViewLockGuard {
 
 public:
 	explicit ViewLockGuard(const string &view_name) : name_(view_name) {
-		IVMRefreshLocks::LockView(name_);
+		RefreshLocks::LockView(name_);
 	}
 	~ViewLockGuard() {
-		IVMRefreshLocks::UnlockView(name_);
+		RefreshLocks::UnlockView(name_);
 	}
 	ViewLockGuard(const ViewLockGuard &) = delete;
 	ViewLockGuard &operator=(const ViewLockGuard &) = delete;
@@ -87,11 +87,11 @@ class TryViewLockGuard {
 
 public:
 	explicit TryViewLockGuard(const string &view_name)
-	    : name_(view_name), owns_lock_(IVMRefreshLocks::TryLockView(name_)) {
+	    : name_(view_name), owns_lock_(RefreshLocks::TryLockView(name_)) {
 	}
 	~TryViewLockGuard() {
 		if (owns_lock_) {
-			IVMRefreshLocks::UnlockView(name_);
+			RefreshLocks::UnlockView(name_);
 		}
 	}
 	bool OwnsLock() const {

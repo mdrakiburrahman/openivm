@@ -17,7 +17,7 @@
 #include "match/equivalence_classes.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 enum class ImplicationResult : uint8_t {
 	IMPLIED,          // p_q → p_v with no extra rows
@@ -45,7 +45,7 @@ private:
 	string oracle_mode_;
 };
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb
 
 #endif

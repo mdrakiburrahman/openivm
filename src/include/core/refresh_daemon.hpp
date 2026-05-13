@@ -15,7 +15,7 @@ namespace duckdb {
 // Holds a raw pointer to DatabaseInstance (valid for the lifetime of the extension).
 // The daemon wakes every 30 seconds, checks which views are due, and refreshes them.
 // Views already being refreshed (manual PRAGMA or cascade) are skipped via TryLockView.
-class IVMRefreshDaemon {
+class RefreshDaemon {
 public:
 	// Start the daemon thread. Safe to call multiple times (only starts once).
 	void Start(DatabaseInstance &db);
@@ -23,7 +23,7 @@ public:
 	// Stop the daemon and join the thread. Called on destruction or explicit shutdown.
 	void Stop();
 
-	~IVMRefreshDaemon();
+	~RefreshDaemon();
 
 	// Get the effective interval for a view (may be larger than configured due to backoff).
 	int64_t GetEffectiveInterval(const string &view_name) const;
