@@ -129,6 +129,9 @@ SELECT group_columns FROM openivm_views WHERE view_name = 'mv_window_join';
 acct_id=acct_id
 
 statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
 INSERT INTO dl.window_join_codes VALUES (1, 'open');
 
 statement ok
@@ -139,6 +142,18 @@ INSERT INTO dl.window_join_events VALUES
 
 statement ok
 PRAGMA refresh('mv_window_join');
+
+query I
+SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected_mv_window_join')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_join.sql');
+----
+true
+
+query I
+SELECT contains(content, 'DROP TABLE IF EXISTS openivm_old_affected_mv_window_join')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_join.sql');
+----
+true
 
 query I
 SELECT count(*) FROM (
@@ -156,6 +171,187 @@ SELECT count(*) FROM (
     FROM dl.window_join_events e
     LEFT JOIN dl.window_join_codes c
         ON e.code = c.code
+);
+----
+0
+
+statement ok
+CREATE TABLE dl.trade_like (
+    t_id INT,
+    t_dts TIMESTAMP,
+    t_status INT,
+    t_type INT,
+    t_qty INT
+);
+
+statement ok
+CREATE TABLE dl.trade_history_like (
+    th_t_id INT,
+    th_dts TIMESTAMP,
+    th_status INT
+);
+
+statement ok
+CREATE TABLE dl.trade_status_like (
+    status_id INT,
+    status_name VARCHAR
+);
+
+statement ok
+CREATE TABLE dl.trade_type_like (
+    type_id INT,
+    type_name VARCHAR
+);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_trades_history_like AS
+SELECT
+    t_id AS trade_id,
+    t_dts AS trade_timestamp,
+    ts.status_name AS trade_status,
+    tt.type_name AS trade_type,
+    us.status_name AS update_status,
+    th_dts AS effective_timestamp,
+    COALESCE(
+        LAG(th_dts) OVER (
+            PARTITION BY t_id
+            ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+        ) - INTERVAL 1 MILLISECOND,
+        TIMESTAMP '9999-12-31 23:59:59.999'
+    ) AS end_timestamp,
+    CASE
+        WHEN ROW_NUMBER() OVER (
+            PARTITION BY t_id
+            ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+        ) = 1 THEN TRUE
+        ELSE FALSE
+    END AS is_current
+FROM dl.trade_like
+JOIN dl.trade_history_like
+    ON t_id = th_t_id
+JOIN dl.trade_type_like tt
+    ON t_type = tt.type_id
+JOIN dl.trade_status_like ts
+    ON t_status = ts.status_id
+JOIN dl.trade_status_like us
+    ON th_status = us.status_id;
+
+statement ok
+INSERT INTO dl.trade_status_like VALUES (1, 'new'), (2, 'settled'), (3, 'closed');
+
+statement ok
+INSERT INTO dl.trade_type_like VALUES (10, 'cash');
+
+statement ok
+INSERT INTO dl.trade_like VALUES
+    (100, '2026-01-01 09:00:00', 1, 10, 50),
+    (200, '2026-01-01 10:00:00', 1, 10, 60);
+
+statement ok
+INSERT INTO dl.trade_history_like VALUES
+    (100, '2026-01-01 09:05:00', 1),
+    (200, '2026-01-01 10:05:00', 1);
+
+statement ok
+PRAGMA refresh('mv_trades_history_like');
+
+statement ok
+INSERT INTO dl.trade_like VALUES
+    (100, '2026-01-02 09:00:00', 2, 10, 50),
+    (300, '2026-01-02 11:00:00', 1, 10, 70);
+
+statement ok
+INSERT INTO dl.trade_history_like VALUES
+    (100, '2026-01-02 09:05:00', 2),
+    (300, '2026-01-02 11:05:00', 1);
+
+statement ok
+PRAGMA refresh('mv_trades_history_like');
+
+query I
+SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected_mv_trades_history_like')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+----
+true
+
+query I
+SELECT contains(content, 'SELECT * FROM dl.main.openivm_data_mv_trades_history_like openivm_old_rows')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+----
+true
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_trades_history_like
+    EXCEPT ALL
+    SELECT
+        t_id AS trade_id,
+        t_dts AS trade_timestamp,
+        ts.status_name AS trade_status,
+        tt.type_name AS trade_type,
+        us.status_name AS update_status,
+        th_dts AS effective_timestamp,
+        COALESCE(
+            LAG(th_dts) OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        CASE
+            WHEN ROW_NUMBER() OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) = 1 THEN TRUE
+            ELSE FALSE
+        END AS is_current
+    FROM dl.trade_like
+    JOIN dl.trade_history_like
+        ON t_id = th_t_id
+    JOIN dl.trade_type_like tt
+        ON t_type = tt.type_id
+    JOIN dl.trade_status_like ts
+        ON t_status = ts.status_id
+    JOIN dl.trade_status_like us
+        ON th_status = us.status_id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        t_id AS trade_id,
+        t_dts AS trade_timestamp,
+        ts.status_name AS trade_status,
+        tt.type_name AS trade_type,
+        us.status_name AS update_status,
+        th_dts AS effective_timestamp,
+        COALESCE(
+            LAG(th_dts) OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        CASE
+            WHEN ROW_NUMBER() OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) = 1 THEN TRUE
+            ELSE FALSE
+        END AS is_current
+    FROM dl.trade_like
+    JOIN dl.trade_history_like
+        ON t_id = th_t_id
+    JOIN dl.trade_type_like tt
+        ON t_type = tt.type_id
+    JOIN dl.trade_status_like ts
+        ON t_status = ts.status_id
+    JOIN dl.trade_status_like us
+        ON th_status = us.status_id
+    EXCEPT ALL
+    SELECT * FROM dl.mv_trades_history_like
 );
 ----
 0

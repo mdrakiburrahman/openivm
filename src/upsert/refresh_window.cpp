@@ -123,16 +123,9 @@ static string BuildSingleSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, 
 	return upsert_query;
 }
 
-static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                                    const string &view_query_sql,
+static string BuildMultiSourceDuckLakeWindowRefresh(const string &view_name, const string &view_query_sql,
                                                     const vector<string> &delta_table_names,
-                                                    const vector<string> &partition_cols, const string &data_table,
-                                                    const string &view_catalog_name, const string &view_schema_name,
-                                                    const string &attached_db_catalog_name,
-                                                    const string &attached_db_schema_name) {
-	string old_view_query =
-	    BuildDuckLakeSnapshotQuery(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
-	                               view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+                                                    const vector<string> &partition_cols, const string &data_table) {
 	string key_cols;
 	string key_tuple;
 	for (size_t i = 0; i < partition_cols.size(); i++) {
@@ -146,21 +139,30 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
 		key_tuple += output_col;
 	}
 	string current_rows = "SELECT * FROM (" + view_query_sql + ") openivm_current_rows";
-	string old_rows = "SELECT * FROM (" + old_view_query + ") openivm_old_rows";
+	// At refresh start the MV data table is the last committed result. Diffing against it
+	// avoids replaying every DuckLake source at its previous snapshot just to find changed partitions.
+	string old_rows = "SELECT * FROM " + data_table + " openivm_old_rows";
 	string changed_rows = "((" + current_rows + ") EXCEPT ALL (" + old_rows + ")) UNION ALL ((" + old_rows +
 	                      ") EXCEPT ALL (" + current_rows + "))";
+	string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
+	string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
 	string affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") openivm_changed_rows";
 	string affected_filter;
 	if (partition_cols.size() == 1) {
-		affected_filter = key_tuple + " IN (" + affected_keys + ")";
+		affected_filter = key_tuple + " IN (SELECT " + key_cols + " FROM " + qtemp_affected + ")";
 	} else {
-		affected_filter = "(" + key_tuple + ") IN (" + affected_keys + ")";
+		affected_filter = "(" + key_tuple + ") IN (SELECT " + key_cols + " FROM " + qtemp_affected + ")";
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 	                    "partition cols, %zu sources)\n",
 	                    partition_cols.size(), delta_table_names.size());
-	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
-	                                   affected_filter);
+	// Materialize the affected partition keys once; otherwise DuckDB/DuckLake repeats the
+	// full view diff independently for DELETE and INSERT.
+	string upsert_query = "CREATE OR REPLACE TEMP TABLE " + qtemp_affected + " AS " + affected_keys + ";\n";
+	upsert_query +=
+	    BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter, affected_filter);
+	upsert_query += "DROP TABLE IF EXISTS " + qtemp_affected + ";\n";
+	return upsert_query;
 }
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
@@ -182,9 +184,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		    attached_db_catalog_name, attached_db_schema_name, delta_table_names[0]);
 	}
 	if (safe_for_snapdiff && any_ducklake) {
-		return BuildMultiSourceDuckLakeWindowRefresh(metadata, con, view_name, view_query_sql, delta_table_names,
-		                                             partition_cols, data_table, view_catalog_name, view_schema_name,
-		                                             attached_db_catalog_name, attached_db_schema_name);
+		return BuildMultiSourceDuckLakeWindowRefresh(view_name, view_query_sql, delta_table_names, partition_cols,
+		                                             data_table);
 	}
 	if (any_ducklake) {
 		OPENIVM_DEBUG_PRINT(
