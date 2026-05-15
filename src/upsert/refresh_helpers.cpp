@@ -183,6 +183,15 @@ string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_
 	       insert_where + ";\n";
 }
 
+static string BuildDeleteUsingInsertRefreshSQL(const string &data_table, const string &view_query_sql,
+                                               const string &recompute_alias, const string &using_source,
+                                               const string &using_alias, const string &delete_match,
+                                               const string &insert_where, const string &statement_prefix) {
+	return statement_prefix + "DELETE FROM " + data_table + " AS openivm_delete_target\nUSING " + using_source + " " +
+	       using_alias + "\nWHERE " + delete_match + ";\n" + statement_prefix + "INSERT INTO " + data_table +
+	       "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " + insert_where + ";\n";
+}
+
 string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
@@ -446,6 +455,7 @@ static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const st
 	}
 
 	string affected = "EXISTS (SELECT 1 FROM openivm_affected _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
+	string delete_match = "_d." + lk + " IS NOT DISTINCT FROM openivm_delete_target." + lk;
 	// TODO(PROPER Lineage): replace this TPC-DI source-specific shortcut with lineage from
 	// openivm_left_key to the source binding that produced it, then push the affected-key
 	// predicate to that binding generically. The final EXISTS guard stays because it makes
@@ -454,8 +464,8 @@ static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const st
 	// false negatives unless lineage proves the affected key comes from this source binding.
 	// We also benchmarked dropping the final guard at SF25/SF50; it was only marginally
 	// faster, so the guarded shape is the safer default until lineage proves exactness.
-	return BuildDeleteInsertRefreshSQL(data_table, pushed_query, "openivm_lj", affected + data_table + "." + lk + ")",
-	                                   affected + "openivm_lj." + lk + ")", affected_cte);
+	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
+	                                        delete_match, affected + "openivm_lj." + lk + ")", affected_cte);
 }
 
 static string BuildLeftJoinProjectionRefresh(const string &view_name, const string &data_table,
