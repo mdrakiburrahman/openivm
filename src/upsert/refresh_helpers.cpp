@@ -303,7 +303,7 @@ string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_vie
 
 	string col_list = SqlUtils::JoinQuotedColumns(column_names);
 	string data_select = SqlUtils::JoinQuotedColumns(data_columns);
-	string group_by = data_select;
+	const string &group_by = data_select;
 
 	string where_clause = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	string delete_filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
