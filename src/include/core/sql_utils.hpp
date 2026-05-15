@@ -48,6 +48,8 @@ public:
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
 	static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement);
+	static string ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
+	                                              const string &replacement, bool &replaced);
 	static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
 	                                                const string &replacement);
 	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);

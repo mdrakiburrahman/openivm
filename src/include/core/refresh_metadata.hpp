@@ -188,6 +188,30 @@ public:
 
 	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
 
+	struct ProjectionKeyLineageStep {
+		string table;
+		idx_t occurrence = 0;
+		string lookup_col;
+		string lookup_out;
+	};
+
+	struct ProjectionKeyLineageArm {
+		string source;
+		idx_t occurrence = 0;
+		string source_col;
+		vector<ProjectionKeyLineageStep> steps;
+	};
+
+	struct ProjectionKeyLineage {
+		string output_col;
+		string key_source;
+		idx_t key_occurrence = 0;
+		string key_col;
+		vector<ProjectionKeyLineageArm> arms;
+	};
+
+	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);
+
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
 		string source;

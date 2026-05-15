@@ -217,6 +217,175 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 	return result;
 }
 
+struct ProjectionKeySourceSpec {
+	string metadata_key;
+	DuckLakeSourceLocation loc;
+	int64_t old_snap = -1;
+	int64_t current_snap = -1;
+};
+
+static string StripOpenIVMDataPrefix(const string &name) {
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+	string last = SqlUtils::LastIdentifierPart(name);
+	if (last.size() > data_prefix.size() && last.rfind(data_prefix, 0) == 0) {
+		return last.substr(data_prefix.size());
+	}
+	return last;
+}
+
+static bool ProjectionSourceNameMatches(const ProjectionKeySourceSpec &spec, const string &table_name) {
+	return StringUtil::CIEquals(StripOpenIVMDataPrefix(spec.metadata_key), StripOpenIVMDataPrefix(table_name)) ||
+	       StringUtil::CIEquals(StripOpenIVMDataPrefix(spec.loc.table_name), StripOpenIVMDataPrefix(table_name));
+}
+
+static const ProjectionKeySourceSpec *FindProjectionSourceSpec(const vector<ProjectionKeySourceSpec> &specs,
+                                                               const string &table_name) {
+	for (auto &spec : specs) {
+		if (ProjectionSourceNameMatches(spec, table_name)) {
+			return &spec;
+		}
+	}
+	return nullptr;
+}
+
+static bool BuildProjectionKeySourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                          const vector<string> &delta_table_names, const string &view_catalog_name,
+                                          const string &view_schema_name, const string &attached_db_catalog_name,
+                                          const string &attached_db_schema_name,
+                                          vector<ProjectionKeySourceSpec> &specs) {
+	for (auto &dt : delta_table_names) {
+		if (!metadata.IsDuckLakeTable(view_name, dt)) {
+			return false;
+		}
+		ProjectionKeySourceSpec spec;
+		spec.metadata_key = dt;
+		spec.loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
+		                                         attached_db_catalog_name, attached_db_schema_name);
+		spec.old_snap = metadata.GetLastSnapshotId(view_name, dt);
+		spec.current_snap = metadata.GetCurrentDuckLakeSnapshot(spec.loc.catalog_name);
+		if (spec.loc.catalog_name.empty() || spec.loc.schema_name.empty() || spec.loc.table_name.empty() ||
+		    spec.old_snap < 0 || spec.current_snap < 0) {
+			return false;
+		}
+		specs.push_back(std::move(spec));
+	}
+	return !specs.empty();
+}
+
+static string BuildProjectionChangedValuesSQL(const ProjectionKeySourceSpec &spec, const string &source_col,
+                                              const string &output_col) {
+	string qsource_col = SqlUtils::QuoteIdentifier(source_col);
+	string qoutput_col = SqlUtils::QuoteIdentifier(output_col);
+	string insertions =
+	    "SELECT " + qsource_col + " AS " + qoutput_col + " FROM " +
+	    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.loc.catalog_name, spec.loc.schema_name,
+	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
+	string deletions =
+	    "SELECT " + qsource_col + " AS " + qoutput_col + " FROM " +
+	    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.loc.catalog_name, spec.loc.schema_name,
+	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
+	return "(" + insertions + " UNION ALL " + deletions + ")";
+}
+
+static string BuildProjectionLineageArmSQL(const RefreshMetadata::ProjectionKeyLineageArm &arm,
+                                           const vector<ProjectionKeySourceSpec> &specs, const string &output_col,
+                                           bool current_snapshot) {
+	auto *source_spec = FindProjectionSourceSpec(specs, arm.source);
+	if (!source_spec) {
+		return "";
+	}
+	string sql = BuildProjectionChangedValuesSQL(*source_spec, arm.source_col, "openivm_lineage_key");
+	for (auto &step : arm.steps) {
+		auto *lookup_spec = FindProjectionSourceSpec(specs, step.table);
+		if (!lookup_spec) {
+			return "";
+		}
+		string lookup_table = SqlUtils::FullName(lookup_spec->loc.catalog_name, lookup_spec->loc.schema_name,
+		                                         lookup_spec->loc.table_name);
+		int64_t snapshot = current_snapshot ? lookup_spec->current_snap : lookup_spec->old_snap;
+		sql = "SELECT l." + SqlUtils::QuoteIdentifier(step.lookup_out) + " AS openivm_lineage_key FROM (" + sql +
+		      ") c JOIN (SELECT * FROM " + lookup_table + " AT (VERSION => " + to_string(snapshot) + ")) l ON l." +
+		      SqlUtils::QuoteIdentifier(step.lookup_col) + " IS NOT DISTINCT FROM c.openivm_lineage_key";
+	}
+	return "SELECT openivm_lineage_key AS " + SqlUtils::QuoteIdentifier(output_col) + " FROM (" + sql + ") openivm_k";
+}
+
+bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                          const vector<string> &delta_table_names, const string &data_table,
+                                          const string &view_query_sql, const string &view_catalog_name,
+                                          const string &view_schema_name, const string &attached_db_catalog_name,
+                                          const string &attached_db_schema_name, string &upsert_query) {
+	RefreshMetadata::ProjectionKeyLineage lineage;
+	if (!metadata.GetProjectionKeyLineage(view_name, lineage)) {
+		return false;
+	}
+
+	vector<ProjectionKeySourceSpec> specs;
+	if (!BuildProjectionKeySourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name, view_schema_name,
+	                                   attached_db_catalog_name, attached_db_schema_name, specs)) {
+		return false;
+	}
+	auto *key_spec = FindProjectionSourceSpec(specs, lineage.key_source);
+	if (!key_spec) {
+		return false;
+	}
+
+	vector<string> arms;
+	for (auto &arm : lineage.arms) {
+		if (arm.steps.empty()) {
+			string direct = BuildProjectionLineageArmSQL(arm, specs, lineage.output_col, true);
+			if (direct.empty()) {
+				return false;
+			}
+			arms.push_back(std::move(direct));
+			continue;
+		}
+		string current = BuildProjectionLineageArmSQL(arm, specs, lineage.output_col, true);
+		string old = BuildProjectionLineageArmSQL(arm, specs, lineage.output_col, false);
+		if (current.empty() || old.empty()) {
+			return false;
+		}
+		arms.push_back(std::move(current));
+		arms.push_back(std::move(old));
+	}
+	if (arms.empty()) {
+		return false;
+	}
+
+	string union_sql = StringUtil::Join(arms, arms.size(), " UNION ALL ", [](const string &arm) { return arm; });
+	string qkey = SqlUtils::QuoteIdentifier(lineage.output_col);
+	string affected_sql = "SELECT DISTINCT " + qkey + " FROM (" + union_sql + ") openivm_projection_keys";
+	string temp_affected = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name);
+	string key_table =
+	    SqlUtils::FullName(key_spec->loc.catalog_name, key_spec->loc.schema_name, key_spec->loc.table_name);
+	string replacement = "(SELECT * FROM " + key_table + " openivm_key_source WHERE EXISTS (SELECT 1 FROM " +
+	                     temp_affected + " openivm_aff WHERE openivm_aff." + qkey +
+	                     " IS NOT DISTINCT FROM openivm_key_source." + SqlUtils::QuoteIdentifier(lineage.key_col) +
+	                     "))";
+	bool replaced = false;
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, lineage.key_source,
+	                                                                lineage.key_occurrence, replacement, replaced);
+	if (!replaced) {
+		pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_spec->loc.table_name,
+		                                                         lineage.key_occurrence, replacement, replaced);
+	}
+	if (!replaced || pushed_query == view_query_sql) {
+		return false;
+	}
+
+	string target_alias = "openivm_delete_target";
+	string target_match = "openivm_aff." + qkey + " IS NOT DISTINCT FROM " + target_alias + "." + qkey;
+	upsert_query = "CREATE OR REPLACE TEMP TABLE " + temp_affected + " AS\n" + affected_sql + ";\n\n";
+	upsert_query += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE EXISTS (SELECT 1 FROM " +
+	                temp_affected + " openivm_aff WHERE " + target_match + ");\n\n";
+	upsert_query += "INSERT INTO " + data_table + "\n" + pushed_query + ";\n\n";
+	upsert_query += "DROP TABLE IF EXISTS " + temp_affected + ";\n";
+	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling SIMPLE_PROJECTION DuckLake affected-key refresh (%s via %s[%llu])\n",
+	                    lineage.output_col.c_str(), lineage.key_source.c_str(),
+	                    static_cast<unsigned long long>(lineage.key_occurrence));
+	return true;
+}
+
 bool IsEmptyDeltaPlan(LogicalOperator *op) {
 	if (!op) {
 		return false;

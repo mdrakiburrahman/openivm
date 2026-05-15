@@ -271,6 +271,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	OPENIVM_DEBUG_PRINT("[UPSERT] List mode: %s\n", list_mode ? "true" : "false");
 
 	string upsert_query;
+	bool skip_compute_delta_for_refresh = false;
 	string delta_ts_filter = BuildDeltaTimestampFilter(con, view_name, has_ts_col);
 	bool has_left_join =
 	    std::find(column_names.begin(), column_names.end(), openivm::LEFT_KEY_COL) != column_names.end();
@@ -333,9 +334,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		break;
 	}
 	case RefreshType::SIMPLE_PROJECTION: {
-		upsert_query = CompileProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
-		                                        view_query_sql, delta_ts_filter, internal_catalog_prefix,
-		                                        has_full_outer, has_left_join, skip_proj_delete);
+		if (!has_full_outer && !has_left_join &&
+		    TryBuildDuckLakeProjectionKeyRefresh(metadata, con, view_name, delta_table_names, data_table,
+		                                         view_query_sql, view_catalog_name, view_schema_name,
+		                                         attached_db_catalog_name, attached_db_schema_name, upsert_query)) {
+			skip_compute_delta_for_refresh = true;
+		} else {
+			upsert_query = CompileProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
+			                                        view_query_sql, delta_ts_filter, internal_catalog_prefix,
+			                                        has_full_outer, has_left_join, skip_proj_delete);
+		}
 		break;
 	}
 
@@ -510,13 +518,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
 	};
 
-	if (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE ||
-	    view_query_type == RefreshType::DISTINCT_INCREMENTAL || view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
+	if (skip_compute_delta_for_refresh || view_query_type == RefreshType::WINDOW_PARTITION ||
+	    view_query_type == RefreshType::GROUP_RECOMPUTE || view_query_type == RefreshType::DISTINCT_INCREMENTAL ||
+	    view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping ComputeDelta for %s\n",
-		                    view_query_type == RefreshType::DISTINCT_INCREMENTAL  ? "DISTINCT_INCREMENTAL"
-		                    : view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE ? "SEMI_ANTI_RECOMPUTE"
-		                    : view_query_type == RefreshType::GROUP_RECOMPUTE     ? "GROUP_RECOMPUTE"
-		                                                                          : "WINDOW_PARTITION");
+		                    skip_compute_delta_for_refresh                         ? "SIMPLE_PROJECTION_KEY"
+		                    : view_query_type == RefreshType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
+		                    : view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
+		                    : view_query_type == RefreshType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
+		                                                                           : "WINDOW_PARTITION");
 		delta_query = "";
 		if (has_downstream) {
 			build_snapshot_companion();

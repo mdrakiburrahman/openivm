@@ -715,6 +715,45 @@ struct BaseColumnRef {
 	string column;
 };
 
+struct OccurrenceColumnRef {
+	string table;
+	idx_t occurrence = 0;
+	string column;
+};
+
+struct ProjectionSourceOccurrence {
+	string table;
+	idx_t occurrence = 0;
+	idx_t table_index = 0;
+};
+
+struct ProjectionLineageEdge {
+	OccurrenceColumnRef from;
+	OccurrenceColumnRef to;
+};
+
+struct ProjectionLineageStep {
+	string table;
+	idx_t occurrence = 0;
+	string lookup_col;
+	string lookup_out;
+};
+
+struct ProjectionLineageArm {
+	string source_table;
+	idx_t source_occurrence = 0;
+	string source_col;
+	vector<ProjectionLineageStep> steps;
+};
+
+static string OccurrenceKey(const string &table, idx_t occurrence) {
+	return StringUtil::Lower(table) + "#" + to_string(occurrence);
+}
+
+static string OccurrenceKey(const OccurrenceColumnRef &ref) {
+	return OccurrenceKey(ref.table, ref.occurrence);
+}
+
 static bool ResolveBindingToBaseRef(ColumnBinding binding,
                                     const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
                                     const unordered_map<idx_t, LogicalGet *> &get_by_index, BaseColumnRef &out) {
@@ -758,6 +797,279 @@ static bool ResolveBindingToBaseRef(ColumnBinding binding,
 		column_index = next->binding.column_index;
 	}
 	return false;
+}
+
+static void CollectProjectionSourceOccurrences(LogicalOperator *op,
+                                               unordered_map<idx_t, ProjectionSourceOccurrence> &occurrence_by_index,
+                                               vector<ProjectionSourceOccurrence> &occurrences,
+                                               unordered_map<string, idx_t> &next_occurrence) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		if (get.GetTable().get()) {
+			string table = get.GetTable().get()->name;
+			idx_t occurrence = next_occurrence[StringUtil::Lower(table)]++;
+			ProjectionSourceOccurrence source;
+			source.table = table;
+			source.occurrence = occurrence;
+			source.table_index = get.table_index;
+			occurrence_by_index[get.table_index] = source;
+			occurrences.push_back(std::move(source));
+		}
+	}
+	for (auto &child : op->children) {
+		CollectProjectionSourceOccurrences(child.get(), occurrence_by_index, occurrences, next_occurrence);
+	}
+}
+
+static bool ResolveBindingToOccurrenceRef(ColumnBinding binding,
+                                          const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                          const unordered_map<idx_t, LogicalGet *> &get_by_index,
+                                          const unordered_map<idx_t, ProjectionSourceOccurrence> &occurrence_by_index,
+                                          OccurrenceColumnRef &out) {
+	idx_t table_index = binding.table_index;
+	idx_t column_index = binding.column_index;
+	for (int depth = 0; depth < 16; depth++) {
+		auto get_it = get_by_index.find(table_index);
+		if (get_it != get_by_index.end()) {
+			auto *get = get_it->second;
+			auto occ_it = occurrence_by_index.find(table_index);
+			if (occ_it == occurrence_by_index.end()) {
+				return false;
+			}
+			out.table = occ_it->second.table;
+			out.occurrence = occ_it->second.occurrence;
+			if (get->GetTable().get()) {
+				auto &ids = get->GetColumnIds();
+				if (column_index < ids.size()) {
+					auto base_idx = ids[column_index].GetPrimaryIndex();
+					auto &cols = get->GetTable().get()->GetColumns();
+					if (base_idx < cols.LogicalColumnCount()) {
+						out.column = cols.GetColumn(LogicalIndex(base_idx)).Name();
+						return true;
+					}
+				}
+			}
+			if (column_index < get->names.size()) {
+				out.column = get->names[column_index];
+				return true;
+			}
+			return false;
+		}
+		auto proj_it = proj_by_index.find(table_index);
+		if (proj_it == proj_by_index.end()) {
+			return false;
+		}
+		auto *proj = proj_it->second;
+		if (column_index >= proj->expressions.size()) {
+			return false;
+		}
+		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get());
+		if (!next) {
+			return false;
+		}
+		table_index = next->binding.table_index;
+		column_index = next->binding.column_index;
+	}
+	return false;
+}
+
+static void CollectProjectionJoinEdges(LogicalOperator *op,
+                                       const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                       const unordered_map<idx_t, LogicalGet *> &get_by_index,
+                                       const unordered_map<idx_t, ProjectionSourceOccurrence> &occurrence_by_index,
+                                       vector<ProjectionLineageEdge> &edges) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		if (join.join_type == JoinType::INNER) {
+			for (auto &cond : join.conditions) {
+				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+					continue;
+				}
+				auto *left = GetColumnRefThroughCasts(cond.left.get());
+				auto *right = GetColumnRefThroughCasts(cond.right.get());
+				if (!left || !right) {
+					continue;
+				}
+				OccurrenceColumnRef lref, rref;
+				if (ResolveBindingToOccurrenceRef(left->binding, proj_by_index, get_by_index, occurrence_by_index,
+				                                  lref) &&
+				    ResolveBindingToOccurrenceRef(right->binding, proj_by_index, get_by_index, occurrence_by_index,
+				                                  rref)) {
+					edges.push_back({lref, rref});
+					edges.push_back({rref, lref});
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectProjectionJoinEdges(child.get(), proj_by_index, get_by_index, occurrence_by_index, edges);
+	}
+}
+
+static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,
+                               const vector<ProjectionLineageEdge> &edges, vector<ProjectionLineageEdge> &path) {
+	string source_key = OccurrenceKey(source.table, source.occurrence);
+	string target_key = OccurrenceKey(key_ref);
+	if (source_key == target_key) {
+		path.clear();
+		return true;
+	}
+
+	vector<string> queue;
+	unordered_map<string, bool> seen;
+	unordered_map<string, ProjectionLineageEdge> prev_edge;
+	unordered_map<string, string> prev_node;
+	queue.push_back(source_key);
+	seen[source_key] = true;
+	for (idx_t pos = 0; pos < queue.size(); pos++) {
+		string node = queue[pos];
+		for (auto &edge : edges) {
+			if (OccurrenceKey(edge.from) != node) {
+				continue;
+			}
+			string next = OccurrenceKey(edge.to);
+			if (seen[next]) {
+				continue;
+			}
+			seen[next] = true;
+			prev_edge[next] = edge;
+			prev_node[next] = node;
+			if (next == target_key) {
+				vector<ProjectionLineageEdge> reversed;
+				string walk = target_key;
+				while (walk != source_key) {
+					reversed.push_back(prev_edge[walk]);
+					walk = prev_node[walk];
+				}
+				path.assign(reversed.rbegin(), reversed.rend());
+				return true;
+			}
+			queue.push_back(next);
+		}
+	}
+	return false;
+}
+
+static bool BuildProjectionLineageArm(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,
+                                      const vector<ProjectionLineageEdge> &path, ProjectionLineageArm &arm) {
+	arm.source_table = source.table;
+	arm.source_occurrence = source.occurrence;
+	arm.steps.clear();
+	if (path.empty()) {
+		arm.source_col = key_ref.column;
+		return StringUtil::CIEquals(source.table, key_ref.table) && source.occurrence == key_ref.occurrence;
+	}
+	arm.source_col = path[0].from.column;
+	for (idx_t i = 0; i < path.size(); i++) {
+		ProjectionLineageStep step;
+		step.table = path[i].to.table;
+		step.occurrence = path[i].to.occurrence;
+		step.lookup_col = path[i].to.column;
+		step.lookup_out = i + 1 < path.size() ? path[i + 1].from.column : key_ref.column;
+		arm.steps.push_back(std::move(step));
+	}
+	return true;
+}
+
+static string ProjectionLineageStepString(const ProjectionLineageStep &step) {
+	return step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" + step.lookup_out;
+}
+
+static string ProjectionLineageArmJson(const ProjectionLineageArm &arm) {
+	string json = "{\"source\":" + SqlUtils::JsonQuote(arm.source_table) +
+	              ",\"occ\":" + SqlUtils::JsonQuote(to_string(arm.source_occurrence)) +
+	              ",\"source_col\":" + SqlUtils::JsonQuote(arm.source_col) + ",\"steps\":[";
+	for (idx_t i = 0; i < arm.steps.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		json += SqlUtils::JsonQuote(ProjectionLineageStepString(arm.steps[i]));
+	}
+	json += "]}";
+	return json;
+}
+
+string BuildProjectionKeyLineageJson(LogicalOperator *plan, const vector<string> &output_names) {
+	if (!plan) {
+		return "";
+	}
+	auto *top_projection = FindFirstProjection(plan);
+	if (!top_projection) {
+		return "";
+	}
+
+	unordered_map<idx_t, LogicalProjection *> proj_by_index;
+	unordered_map<idx_t, LogicalGet *> get_by_index;
+	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
+
+	unordered_map<idx_t, ProjectionSourceOccurrence> occurrence_by_index;
+	vector<ProjectionSourceOccurrence> occurrences;
+	unordered_map<string, idx_t> next_occurrence;
+	CollectProjectionSourceOccurrences(plan, occurrence_by_index, occurrences, next_occurrence);
+	if (occurrences.size() < 3) {
+		return "";
+	}
+
+	vector<ProjectionLineageEdge> edges;
+	CollectProjectionJoinEdges(plan, proj_by_index, get_by_index, occurrence_by_index, edges);
+	if (edges.empty()) {
+		return "";
+	}
+
+	for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
+		auto &expr = top_projection->expressions[expr_i];
+		auto *bcr = GetColumnRefThroughCasts(expr.get());
+		if (!bcr) {
+			continue;
+		}
+		OccurrenceColumnRef key_ref;
+		if (!ResolveBindingToOccurrenceRef(bcr->binding, proj_by_index, get_by_index, occurrence_by_index, key_ref)) {
+			continue;
+		}
+		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+		if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
+			continue;
+		}
+
+		vector<ProjectionLineageArm> arms;
+		bool covered = true;
+		for (auto &occurrence : occurrences) {
+			vector<ProjectionLineageEdge> path;
+			if (!FindProjectionPath(occurrence, key_ref, edges, path)) {
+				covered = false;
+				break;
+			}
+			ProjectionLineageArm arm;
+			if (!BuildProjectionLineageArm(occurrence, key_ref, path, arm)) {
+				covered = false;
+				break;
+			}
+			arms.push_back(std::move(arm));
+		}
+		if (!covered || arms.empty()) {
+			continue;
+		}
+
+		string json = "{\"kind\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(output_col) +
+		              ",\"key_source\":" + SqlUtils::JsonQuote(key_ref.table) +
+		              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(key_ref.occurrence)) +
+		              ",\"key_col\":" + SqlUtils::JsonQuote(key_ref.column) + ",\"arms\":[";
+		for (idx_t i = 0; i < arms.size(); i++) {
+			if (i > 0) {
+				json += ",";
+			}
+			json += ProjectionLineageArmJson(arms[i]);
+		}
+		json += "]}";
+		return json;
+	}
+	return "";
 }
 
 struct WindowLineageOp {

@@ -522,6 +522,34 @@ static vector<string> ExtractJsonObjectsFromArray(const string &json, const stri
 	return objects;
 }
 
+static vector<string> SplitPipeFields(const string &value) {
+	vector<string> fields;
+	string current;
+	for (char c : value) {
+		if (c == '|') {
+			fields.push_back(std::move(current));
+			current.clear();
+			continue;
+		}
+		current += c;
+	}
+	fields.push_back(std::move(current));
+	return fields;
+}
+
+static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
+	string text;
+	if (!ExtractJsonString(json, key, text)) {
+		return false;
+	}
+	try {
+		out = static_cast<idx_t>(std::stoull(text));
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
 } // namespace
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
@@ -601,6 +629,52 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 		out.push_back(std::move(op));
 	}
 	return !out.empty();
+}
+
+bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
+	auto result = con.Query("SELECT window_partition_lineage_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	string kind;
+	if (!ExtractJsonString(json, "kind", kind) || kind != "projection_key") {
+		return false;
+	}
+	if (!ExtractJsonString(json, "out", out.output_col) || !ExtractJsonString(json, "key_source", out.key_source) ||
+	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) || !ExtractJsonString(json, "key_col", out.key_col)) {
+		return false;
+	}
+	out.arms.clear();
+	auto objects = ExtractJsonObjectsFromArray(json, "arms");
+	for (auto &object : objects) {
+		ProjectionKeyLineageArm arm;
+		if (!ExtractJsonString(object, "source", arm.source) || !ParseJsonIndex(object, "occ", arm.occurrence) ||
+		    !ExtractJsonString(object, "source_col", arm.source_col)) {
+			continue;
+		}
+		vector<string> steps;
+		ExtractJsonStringArray(object, "steps", steps);
+		for (auto &step_text : steps) {
+			auto fields = SplitPipeFields(step_text);
+			if (fields.size() != 4) {
+				continue;
+			}
+			ProjectionKeyLineageStep step;
+			step.table = fields[0];
+			try {
+				step.occurrence = static_cast<idx_t>(std::stoull(fields[1]));
+			} catch (...) {
+				continue;
+			}
+			step.lookup_col = fields[2];
+			step.lookup_out = fields[3];
+			arm.steps.push_back(std::move(step));
+		}
+		out.arms.push_back(std::move(arm));
+	}
+	return !out.arms.empty();
 }
 
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {

@@ -979,6 +979,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				aux_metadata_ddl.push_back(
 				    BuildUpdateViewJsonSQL("window_partition_lineage_json", lineage_json, view_name));
 			}
+		} else if (refresh_type == RefreshType::SIMPLE_PROJECTION && !classification.found_left_join &&
+		           !classification.found_full_outer) {
+			string lineage_json = BuildProjectionKeyLineageJson(plan.get(), output_names);
+			if (!lineage_json.empty()) {
+				aux_metadata_ddl.push_back(
+				    BuildUpdateViewJsonSQL("window_partition_lineage_json", lineage_json, view_name));
+			}
 		}
 
 		Value match_flag_val;

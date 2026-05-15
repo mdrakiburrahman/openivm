@@ -87,6 +87,7 @@ vector<string> DeriveAggregateGroupColumnNames(LogicalOperator *plan, const vect
 void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<string> &partition_columns,
                                        const vector<string> &output_names);
 string BuildWindowPartitionLineageJson(LogicalOperator *plan, const vector<string> &partition_columns);
+string BuildProjectionKeyLineageJson(LogicalOperator *plan, const vector<string> &output_names);
 void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(LogicalOperator *plan);

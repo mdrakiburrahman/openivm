@@ -897,6 +897,102 @@ string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_n
 	return result;
 }
 
+string SqlUtils::ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
+                                                 const string &replacement, bool &replaced) {
+	replaced = false;
+	if (table_name.empty()) {
+		return sql;
+	}
+	string result;
+	result.reserve(sql.size());
+	bool in_single_quote = false;
+	bool expect_table = false;
+	idx_t seen = 0;
+	for (idx_t i = 0; i < sql.size();) {
+		char c = sql[i];
+		if (c == '\'') {
+			result += c;
+			i++;
+			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
+				result += sql[i++];
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+			idx_t start = i;
+			if (expect_table) {
+				idx_t end = i;
+				string qualified_identifier;
+				if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
+				    IdentifierMatchesTable(qualified_identifier, table_name)) {
+					idx_t at_pos = end;
+					while (at_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[at_pos]))) {
+						at_pos++;
+					}
+					if (StringUtil::CIStartsWith(sql.substr(at_pos), "AT (")) {
+						idx_t depth = 0;
+						while (at_pos < sql.size()) {
+							if (sql[at_pos] == '(') {
+								depth++;
+							} else if (sql[at_pos] == ')') {
+								depth--;
+								if (depth == 0) {
+									at_pos++;
+									break;
+								}
+							}
+							at_pos++;
+						}
+						end = at_pos;
+					}
+					if (!replaced && seen == occurrence) {
+						result += replacement;
+						i = end;
+						expect_table = false;
+						replaced = true;
+						seen++;
+						continue;
+					}
+					seen++;
+				}
+			}
+			bool in_identifier_quote = c == '"';
+			i++;
+			while (i < sql.size()) {
+				char nc = sql[i];
+				if (in_identifier_quote) {
+					i++;
+					if (nc == '"') {
+						break;
+					}
+					continue;
+				}
+				if (!IsQualifiedIdentifierChar(nc)) {
+					break;
+				}
+				i++;
+			}
+			string token = sql.substr(start, i - start);
+			result += token;
+			string unquoted = token;
+			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
+				unquoted = unquoted.substr(1, unquoted.size() - 2);
+			}
+			string lower = StringUtil::Lower(unquoted);
+			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
+			continue;
+		}
+		result += c;
+		if (!std::isspace(static_cast<unsigned char>(c))) {
+			expect_table = false;
+		}
+		i++;
+	}
+	return result;
+}
+
 vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const string &table_name,
                                                    const string &replacement) {
 	vector<string> variants;

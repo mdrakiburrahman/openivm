@@ -62,6 +62,11 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete);
+bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                          const vector<string> &delta_table_names, const string &data_table,
+                                          const string &view_query_sql, const string &view_catalog_name,
+                                          const string &view_schema_name, const string &attached_db_catalog_name,
+                                          const string &attached_db_schema_name, string &upsert_query);
 void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &upsert_query, const string &view_name,
                                              const vector<string> &column_names, const string &data_table,
                                              const string &view_catalog_name, const string &view_schema_name,

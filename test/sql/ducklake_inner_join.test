@@ -147,6 +147,161 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# ==========================================
+# Test 7: Projection-key refresh over a self-join
+# ==========================================
+
+statement ok
+CREATE TABLE dl.pk_holdings(trade_id INT, previous_trade_id INT, account_id INT, symbol VARCHAR, qty INT);
+
+statement ok
+CREATE TABLE dl.pk_trades(sk_trade_id INT, trade_id INT);
+
+statement ok
+CREATE TABLE dl.pk_accounts(account_id INT, sk_customer_id INT);
+
+statement ok
+CREATE TABLE dl.pk_securities(symbol VARCHAR, sk_security_id INT);
+
+statement ok
+INSERT INTO dl.pk_trades VALUES (100, 10), (200, 20), (300, 30);
+
+statement ok
+INSERT INTO dl.pk_accounts VALUES (1, 1000), (2, 2000);
+
+statement ok
+INSERT INTO dl.pk_securities VALUES ('A', 500), ('B', 600);
+
+statement ok
+INSERT INTO dl.pk_holdings VALUES (10, 20, 1, 'A', 5), (30, 20, 2, 'B', 9);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.projection_key_holdings AS
+    SELECT
+        ct.sk_trade_id AS sk_current_trade_id,
+        pt.sk_trade_id AS prev_sk_trade_id,
+        a.sk_customer_id,
+        s.sk_security_id,
+        h.qty
+    FROM dl.pk_holdings h
+    JOIN dl.pk_trades ct ON h.trade_id = ct.trade_id
+    JOIN dl.pk_trades pt ON h.previous_trade_id = pt.trade_id
+    JOIN dl.pk_accounts a ON h.account_id = a.account_id
+    JOIN dl.pk_securities s ON h.symbol = s.symbol;
+
+query I
+SELECT window_partition_lineage_json LIKE '{"kind":"projection_key"%' FROM openivm_views WHERE view_name = 'projection_key_holdings';
+----
+true
+
+statement ok
+SET openivm_profile_refresh = true;
+
+# Exercise the direct source, the repeated pk_trades source through the previous-trade alias,
+# and a dimension lookup. The affected-key path may over-include keys, but it must not miss any.
+statement ok
+UPDATE dl.pk_trades SET sk_trade_id = 201 WHERE trade_id = 20;
+
+statement ok
+UPDATE dl.pk_accounts SET sk_customer_id = 1001 WHERE account_id = 1;
+
+statement ok
+INSERT INTO dl.pk_holdings VALUES (10, 20, 1, 'A', 6);
+
+statement ok
+PRAGMA refresh('projection_key_holdings');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT
+        ct.sk_trade_id AS sk_current_trade_id,
+        pt.sk_trade_id AS prev_sk_trade_id,
+        a.sk_customer_id,
+        s.sk_security_id,
+        h.qty
+    FROM dl.pk_holdings h
+    JOIN dl.pk_trades ct ON h.trade_id = ct.trade_id
+    JOIN dl.pk_trades pt ON h.previous_trade_id = pt.trade_id
+    JOIN dl.pk_accounts a ON h.account_id = a.account_id
+    JOIN dl.pk_securities s ON h.symbol = s.symbol
+    EXCEPT ALL
+    SELECT sk_current_trade_id, prev_sk_trade_id, sk_customer_id, sk_security_id, qty FROM dl.projection_key_holdings
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT sk_current_trade_id, prev_sk_trade_id, sk_customer_id, sk_security_id, qty FROM dl.projection_key_holdings
+    EXCEPT ALL
+    SELECT
+        ct.sk_trade_id AS sk_current_trade_id,
+        pt.sk_trade_id AS prev_sk_trade_id,
+        a.sk_customer_id,
+        s.sk_security_id,
+        h.qty
+    FROM dl.pk_holdings h
+    JOIN dl.pk_trades ct ON h.trade_id = ct.trade_id
+    JOIN dl.pk_trades pt ON h.previous_trade_id = pt.trade_id
+    JOIN dl.pk_accounts a ON h.account_id = a.account_id
+    JOIN dl.pk_securities s ON h.symbol = s.symbol
+);
+----
+0
+
+# Changing the output key itself must delete the old key partition and insert the new one.
+statement ok
+UPDATE dl.pk_trades SET sk_trade_id = 101 WHERE trade_id = 10;
+
+statement ok
+PRAGMA refresh('projection_key_holdings');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT
+        ct.sk_trade_id AS sk_current_trade_id,
+        pt.sk_trade_id AS prev_sk_trade_id,
+        a.sk_customer_id,
+        s.sk_security_id,
+        h.qty
+    FROM dl.pk_holdings h
+    JOIN dl.pk_trades ct ON h.trade_id = ct.trade_id
+    JOIN dl.pk_trades pt ON h.previous_trade_id = pt.trade_id
+    JOIN dl.pk_accounts a ON h.account_id = a.account_id
+    JOIN dl.pk_securities s ON h.symbol = s.symbol
+    EXCEPT ALL
+    SELECT sk_current_trade_id, prev_sk_trade_id, sk_customer_id, sk_security_id, qty FROM dl.projection_key_holdings
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT sk_current_trade_id, prev_sk_trade_id, sk_customer_id, sk_security_id, qty FROM dl.projection_key_holdings
+    EXCEPT ALL
+    SELECT
+        ct.sk_trade_id AS sk_current_trade_id,
+        pt.sk_trade_id AS prev_sk_trade_id,
+        a.sk_customer_id,
+        s.sk_security_id,
+        h.qty
+    FROM dl.pk_holdings h
+    JOIN dl.pk_trades ct ON h.trade_id = ct.trade_id
+    JOIN dl.pk_trades pt ON h.previous_trade_id = pt.trade_id
+    JOIN dl.pk_accounts a ON h.account_id = a.account_id
+    JOIN dl.pk_securities s ON h.symbol = s.symbol
+);
+----
+0
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'projection_key_holdings'
+  AND step_name = 'execute_refresh_sql_stmt'
+  AND detail LIKE '%ComputeDelta%';
+----
+0
+
 query I
 SELECT COUNT(*) FROM (
     SELECT pname, total_rev, sale_count FROM dl.product_summary
