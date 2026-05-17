@@ -190,7 +190,7 @@ CREATE MATERIALIZED VIEW dl.projection_key_holdings AS
     JOIN dl.pk_securities s ON h.symbol = s.symbol;
 
 query I
-SELECT window_partition_lineage_json LIKE '{"kind":"projection_key"%' FROM openivm_views WHERE view_name = 'projection_key_holdings';
+SELECT lineage_json LIKE '{"v":1,"items":[{"k":"projection_key"%' FROM openivm_views WHERE view_name = 'projection_key_holdings';
 ----
 true
 

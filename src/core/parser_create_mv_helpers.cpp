@@ -61,12 +61,12 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " nullified_columns_json varchar default null,"
 	              " distinct_aux_meta_json varchar default null,"
 	              " semi_anti_aux_meta_json varchar default null,"
-	              " window_partition_lineage_json varchar default null)");
+	              " lineage_json varchar default null)");
 	// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 	// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "distinct_aux_meta_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "semi_anti_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "window_partition_lineage_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "lineage_json varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));

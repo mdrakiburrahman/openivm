@@ -550,6 +550,27 @@ static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
 	}
 }
 
+static bool ReadRefreshLineageEntry(Connection &con, const string &view_name, const string &kind, string &entry) {
+	auto result = con.Query("SELECT lineage_json FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	auto objects = ExtractJsonObjectsFromArray(json, "items");
+	for (auto &object : objects) {
+		string object_kind;
+		if (ExtractJsonString(object, "k", object_kind) && object_kind == kind) {
+			entry = std::move(object);
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
@@ -600,19 +621,15 @@ bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMet
 }
 
 bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
-	auto result = con.Query("SELECT window_partition_lineage_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
-	if (json.empty()) {
+	out.clear();
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "window_partition", json)) {
 		return false;
 	}
 	vector<string> objects = ExtractJsonObjectsFromArray(json, "ops");
 	for (auto &object : objects) {
 		WindowPartitionLineageOp op;
-		if (!ExtractJsonString(object, "kind", op.kind) || !ExtractJsonString(object, "out", op.output_col) ||
+		if (!ExtractJsonString(object, "k", op.kind) || !ExtractJsonString(object, "out", op.output_col) ||
 		    !ExtractJsonString(object, "source", op.source) ||
 		    !ExtractJsonString(object, "source_col", op.source_col)) {
 			continue;
@@ -632,14 +649,8 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 }
 
 bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
-	auto result = con.Query("SELECT window_partition_lineage_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
-	string kind;
-	if (!ExtractJsonString(json, "kind", kind) || kind != "projection_key") {
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "projection_key", json)) {
 		return false;
 	}
 	if (!ExtractJsonString(json, "out", out.output_col) || !ExtractJsonString(json, "key_source", out.key_source) ||

@@ -961,31 +961,33 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		// 11 trailing NULLs: 8 matcher metadata columns plus aux/lineage metadata.
-		// Matcher metadata is populated by the Stage I block below when
-		// openivm_enable_view_matching=true. The aux/lineage columns are populated by
-		// follow-up UPDATEs when the corresponding refresh strategy recognizes a shape.
-		metadata_ddl.push_back("insert or replace into " + string(openivm::VIEWS_TABLE) + " values ('" + view_name +
-		                       "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
+		metadata_ddl.push_back("insert or replace into " + string(openivm::VIEWS_TABLE) +
+		                       " (view_name, sql_string, type, has_minmax, has_left_join, last_update, "
+		                       "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
+		                       "having_predicate, has_full_outer, full_outer_join_cols) values ('" +
+		                       view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 		                       to_string((int)refresh_type) + ", " + (classification.found_minmax ? "true" : "false") +
 		                       ", " + (classification.found_left_join ? "true" : "false") + ", now(), " + refresh_val +
 		                       ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 		                       (classification.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
-		                       ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+		                       ")");
 
+		vector<string> refresh_lineage_entries;
 		if (refresh_type == RefreshType::WINDOW_PARTITION) {
-			string lineage_json = BuildWindowPartitionLineageJson(plan.get(), window_partition_columns);
-			if (!lineage_json.empty()) {
-				aux_metadata_ddl.push_back(
-				    BuildUpdateViewJsonSQL("window_partition_lineage_json", lineage_json, view_name));
+			string lineage_entry = BuildWindowPartitionLineageEntryJson(plan.get(), window_partition_columns);
+			if (!lineage_entry.empty()) {
+				refresh_lineage_entries.push_back(std::move(lineage_entry));
 			}
 		} else if (refresh_type == RefreshType::SIMPLE_PROJECTION && !classification.found_left_join &&
 		           !classification.found_full_outer) {
-			string lineage_json = BuildProjectionKeyLineageJson(plan.get(), output_names);
-			if (!lineage_json.empty()) {
-				aux_metadata_ddl.push_back(
-				    BuildUpdateViewJsonSQL("window_partition_lineage_json", lineage_json, view_name));
+			string lineage_entry = BuildProjectionKeyLineageEntryJson(plan.get(), output_names);
+			if (!lineage_entry.empty()) {
+				refresh_lineage_entries.push_back(std::move(lineage_entry));
 			}
+		}
+		string lineage_json = BuildRefreshLineageJson(refresh_lineage_entries);
+		if (!lineage_json.empty()) {
+			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
 		}
 
 		Value match_flag_val;

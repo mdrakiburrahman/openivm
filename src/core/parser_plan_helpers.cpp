@@ -995,7 +995,15 @@ static string ProjectionLineageArmJson(const ProjectionLineageArm &arm) {
 	return json;
 }
 
-string BuildProjectionKeyLineageJson(LogicalOperator *plan, const vector<string> &output_names) {
+string BuildRefreshLineageJson(const vector<string> &entries) {
+	if (entries.empty()) {
+		return "";
+	}
+	return "{\"v\":1,\"items\":[" +
+	       StringUtil::Join(entries, entries.size(), ",", [](const string &entry) { return entry; }) + "]}";
+}
+
+string BuildProjectionKeyLineageEntryJson(LogicalOperator *plan, const vector<string> &output_names) {
 	if (!plan) {
 		return "";
 	}
@@ -1056,7 +1064,7 @@ string BuildProjectionKeyLineageJson(LogicalOperator *plan, const vector<string>
 			continue;
 		}
 
-		string json = "{\"kind\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(output_col) +
+		string json = "{\"k\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(output_col) +
 		              ",\"key_source\":" + SqlUtils::JsonQuote(key_ref.table) +
 		              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(key_ref.occurrence)) +
 		              ",\"key_col\":" + SqlUtils::JsonQuote(key_ref.column) + ",\"arms\":[";
@@ -1180,7 +1188,7 @@ static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const 
 	return false;
 }
 
-string BuildWindowPartitionLineageJson(LogicalOperator *plan, const vector<string> &partition_columns) {
+string BuildWindowPartitionLineageEntryJson(LogicalOperator *plan, const vector<string> &partition_columns) {
 	if (!plan || partition_columns.empty()) {
 		return "";
 	}
@@ -1269,13 +1277,13 @@ string BuildWindowPartitionLineageJson(LogicalOperator *plan, const vector<strin
 		}
 	}
 
-	string json = "{\"ops\":[";
+	string json = "{\"k\":\"window_partition\",\"ops\":[";
 	for (idx_t i = 0; i < ops.size(); i++) {
 		if (i > 0) {
 			json += ",";
 		}
 		auto &op = ops[i];
-		json += "{\"kind\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
+		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
 		        ",\"source\":" + SqlUtils::JsonQuote(op.source_table) +
 		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
 		if (op.kind == "lookup") {
