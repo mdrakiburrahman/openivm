@@ -55,6 +55,13 @@ public:
 		steps.push_back({next_step++, step_name, duration_ms, detail});
 	}
 
+	void AddMeasuredStep(const string &step_name, int64_t duration_ms, const string &detail = string()) {
+		if (!enabled) {
+			return;
+		}
+		steps.push_back({next_step++, step_name, duration_ms, detail});
+	}
+
 	void AddTotal() {
 		AddStep("create_mv_total", total_start);
 	}
@@ -107,6 +114,27 @@ void ParseCreateMVProfileMarker(const string &payload, string &view_name, string
 	detail = payload.substr(second + 1);
 }
 
+void ParseCreateMVProfileRecord(const string &payload, string &view_name, string &step_name, int64_t &duration_ms,
+                                string &detail) {
+	auto first = payload.find('\t');
+	auto second = first == string::npos ? string::npos : payload.find('\t', first + 1);
+	auto third = second == string::npos ? string::npos : payload.find('\t', second + 1);
+	if (first == string::npos || second == string::npos || third == string::npos) {
+		step_name = "create_mv_unclassified";
+		duration_ms = 0;
+		detail = payload;
+		return;
+	}
+	view_name = payload.substr(0, first);
+	step_name = payload.substr(first + 1, second - first - 1);
+	try {
+		duration_ms = std::stoll(payload.substr(second + 1, third - second - 1));
+	} catch (...) {
+		duration_ms = 0;
+	}
+	detail = payload.substr(third + 1);
+}
+
 void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	if (ddl.empty()) {
 		return;
@@ -142,6 +170,19 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		}
 	};
 	for (auto &q : ddl) {
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+			string marker_view_name;
+			string measured_step_name;
+			string measured_detail;
+			int64_t measured_duration_ms = 0;
+			ParseCreateMVProfileRecord(q.substr(strlen(OPENIVM_DDL_PROFILE_RECORD_PREFIX)), marker_view_name,
+			                           measured_step_name, measured_duration_ms, measured_detail);
+			if (!marker_view_name.empty()) {
+				profiler.SetViewName(marker_view_name);
+			}
+			profiler.AddMeasuredStep(measured_step_name, measured_duration_ms, measured_detail);
+			continue;
+		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_PREFIX)) {
 			string marker_view_name;
 			ParseCreateMVProfileMarker(q.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), marker_view_name,

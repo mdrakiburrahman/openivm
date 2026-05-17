@@ -8,6 +8,8 @@
 #include "duckdb/planner/logical_operator.hpp"
 #include "upsert/refresh_compiler.hpp"
 
+#include <chrono>
+
 namespace duckdb {
 
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
@@ -29,6 +31,23 @@ struct DeltaFastPathFlags {
 	bool skip_agg_delete = false;
 	bool skip_proj_delete = false;
 	bool minmax_incremental = false;
+};
+
+struct RefreshCompileProfileStep {
+	string step_name;
+	int64_t duration_ms;
+	string detail;
+};
+
+struct RefreshCompileProfile {
+	vector<RefreshCompileProfileStep> steps;
+
+	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
+	             const string &detail = string()) {
+		auto duration_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		steps.push_back({step_name, duration_ms, detail});
+	}
 };
 
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
@@ -109,7 +128,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,
-                          string *out_post_meta = nullptr);
+                          string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr);
 
 } // namespace duckdb
 

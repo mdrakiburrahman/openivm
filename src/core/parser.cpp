@@ -25,6 +25,8 @@
 
 #include "core/openivm_debug.hpp"
 
+#include <chrono>
+
 namespace duckdb {
 
 ParserExtensionPlanResult
@@ -42,12 +44,28 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	if (parse_data_ref.plan) {
 		Connection con(*context.db.get());
+		struct CreateMVPreProfileStep {
+			string step_name;
+			int64_t duration_ms;
+			string detail;
+		};
+		vector<CreateMVPreProfileStep> create_profile_steps;
+		auto create_profile_now = []() {
+			return std::chrono::steady_clock::now();
+		};
+		auto add_create_profile_step = [&](const string &step_name, std::chrono::steady_clock::time_point start,
+		                                   const string &detail = string()) {
+			auto duration_ms =
+			    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+			create_profile_steps.push_back({step_name, duration_ms, detail});
+		};
 
 		// Capture the current catalog/schema from the originating context. DDLExecutorBindFunction
 		// creates a fresh Connection that reflects the DatabaseInstance's physical default
 		// catalog (not the session's USE setting). We only inject "USE catalog.schema" when
 		// the session's active catalog differs from that physical default — e.g. when DuckLake
 		// ("dl") is active but the file DB ("rewriter_benchmark_sf1") is the physical default.
+		auto context_start = create_profile_now();
 		string current_catalog;
 		string current_schema;
 		{
@@ -56,8 +74,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			current_catalog = def.catalog;
 			current_schema = def.schema.empty() ? "main" : def.schema;
 		}
+		add_create_profile_step("create_compile_session_context", context_start);
 		// Query the physical default by running SELECT current_database() on the fresh `con`
 		// (created above without any USE, so it reflects the DB's true default, not the session).
+		auto default_context_start = create_profile_now();
 		string default_db;
 		string default_schema = "main";
 		{
@@ -70,6 +90,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				default_schema = schema_res->GetValue(0, 0).ToString();
 			}
 		}
+		add_create_profile_step("create_compile_default_context", default_context_start);
 		string default_catalog_schema = KeywordHelper::WriteOptionallyQuoted(default_db) + "." +
 		                                KeywordHelper::WriteOptionallyQuoted(default_schema);
 		string current_catalog_schema = KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
@@ -91,6 +112,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		bool pac_loaded = IsPacLoaded(context);
 		ForwardPacSettingsIfLoaded(context, con);
 
+		auto name_resolution_start = create_profile_now();
 		auto full_view_name = SqlUtils::ExtractTableName(statement->query);
 		bool statement_needs_original_sql_for_lpts = QueryNeedsOriginalSqlForLpts(statement->query);
 		// Keep the user's raw AS-query as the source of truth for original-SQL fallback.
@@ -142,6 +164,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
 		string top_k_suffix;                     // ORDER BY … LIMIT k, appended to the CREATE VIEW
+		add_create_profile_step("create_compile_name_resolution", name_resolution_start,
+		                        "target_ducklake=" + string(target_is_ducklake ? "true" : "false"));
 
 		// Apply the session's active catalog to `con` so unqualified table references in the
 		// MV query resolve in the user's catalog (e.g. `dl.main`) rather than the physical
@@ -149,7 +173,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// issued under `USE dl.main` fails during planning with "Table WAREHOUSE does not
 		// exist" because the fresh connection resolves against the physical-default catalog.
 		if (!current_catalog.empty() && current_catalog != default_db) {
+			auto use_start = create_profile_now();
 			con.Query("USE " + current_catalog + "." + current_schema);
+			add_create_profile_step("create_compile_use_context", use_start, current_catalog_schema);
 		}
 
 		if (!parse_data_ref.is_replace) {
@@ -169,21 +195,27 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// throws. Catch and use an empty table_names — the later ExtractViewQuery path
 		// re-derives what it needs from the plan.
 		unordered_set<string> table_names;
+		auto table_names_start = create_profile_now();
 		try {
 			table_names = con.GetTableNames(statement->query);
 		} catch (const std::exception &e) {
 			OPENIVM_DEBUG_PRINT("[CREATE MV] GetTableNames failed: %s — continuing\n", e.what());
 		}
+		add_create_profile_step("create_compile_get_table_names", table_names_start,
+		                        "tables=" + to_string(table_names.size()));
 
 		// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
+		auto full_plan_start = create_profile_now();
 		Planner planner(*con.context);
 		planner.CreatePlan(statement->Copy());
 		auto plan = std::move(planner.plan);
+		add_create_profile_step("create_compile_full_plan", full_plan_start);
 
 		// Inline CTEs in this plan too so AnalyzePlan / find_group_cols / HasLeftJoin
 		// walks see the folded structure. DuckDB's binder defaults to
 		// CTE_MATERIALIZE_ALWAYS, which makes CTEInlining bail — relax to DEFAULT first.
 		// (The SELECT-only `select_plan` below does the same for LPTS serialization.)
+		auto source_discovery_start = create_profile_now();
 		InlineCtesIfPresent(context, *planner.binder, plan);
 
 		unordered_map<string, SourceTableInfo> source_table_info;
@@ -196,6 +228,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		unordered_map<string, DuckLakeSourceTableInfo> dl_table_info_for_classification;
 		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info_for_classification);
+		add_create_profile_step("create_compile_source_discovery", source_discovery_start,
+		                        "sources=" + to_string(table_names.size()) +
+		                            "; ducklake_sources=" + to_string(dl_table_info_for_classification.size()));
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
@@ -203,12 +238,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 		bool original_has_repeated_cte_ref_under_join = false;
 		{
+			auto select_parse_plan_start = create_profile_now();
 			Parser select_parser;
 			select_parser.ParseQuery(original_view_query);
 			Planner select_planner(*con.context);
 			select_planner.CreatePlan(std::move(select_parser.statements[0]));
 			auto select_plan = std::move(select_planner.plan);
 			original_has_repeated_cte_ref_under_join = HasRepeatedCteRefUnderJoin(select_plan.get());
+			add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
 			// Inline CTEs so the refresh rewriter sees one maintainable operator tree.
 			// Query-bound CTEs become LOGICAL_MATERIALIZED_CTE + LOGICAL_CTE_REF nodes
@@ -226,6 +263,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			// CTE_MATERIALIZE_DEFAULT before inlining. Single-ref CTEs always inline;
 			// multi-ref CTEs inline when they're cheap and don't end in an aggregate
 			// that would be wastefully re-materialized.
+			auto select_rewrite_start = create_profile_now();
 			InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
@@ -300,7 +338,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				select_plan = std::move(select_plan->children[0]);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 			}
+			add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
+			                        "output_cols=" + to_string(output_names.size()));
 
+			auto lpts_start = create_profile_now();
 			if (statement_needs_original_sql_for_lpts || QueryNeedsOriginalSqlForLpts(original_view_query)) {
 				view_query = original_view_query;
 				lpts_fallback = true;
@@ -343,6 +384,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 					                    view_query.c_str());
 				}
 			}
+			add_create_profile_step("create_compile_lpts", lpts_start,
+			                        "fallback=" + string(lpts_fallback ? "true" : "false") +
+			                            "; query_bytes=" + to_string(view_query.size()));
 		}
 		con.Rollback();
 
@@ -353,11 +397,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Normalize FILTER aggregates in the full plan before analysis so the checker
 		// sees CASE expressions instead of raw FILTER and doesn't set incremental_compatible=false.
 		// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
+		auto analysis_start = create_profile_now();
 		RewriteAggregateFilters(context, plan);
 
 		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
 		auto analysis = AnalyzePlan(plan.get());
 		MVClassificationState classification(analysis);
+		add_create_profile_step("create_compile_analyze_plan", analysis_start);
 		if (analysis.found_delim_join && !classification.found_aggregation && !analysis.found_single_join) {
 			// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
 			// round-trip lateral table functions, but its CTE-normalized SQL lowers them
@@ -377,6 +423,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
 		// are unreliable for CASE/COALESCE expressions.
 		// For DISTINCT views, the checker already extracts aggregate_columns from distinct_targets.
+		auto classification_start = create_profile_now();
 		size_t group_count = analysis.group_count;
 		idx_t group_index = analysis.group_index;
 		vector<string> aggregate_columns;
@@ -892,6 +939,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake window MV uses original SQL for initial data table: %s\n",
 			                    view_query.c_str());
 		}
+		add_create_profile_step("create_compile_classification", classification_start,
+		                        "refresh_type=" + string(RefreshTypeName(refresh_type)) +
+		                            "; group_cols=" + to_string(aggregate_columns.size()));
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
 		                    RefreshTypeName(refresh_type), (int)classification.found_aggregation,
@@ -913,6 +963,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto add_profile_marker = [&](const string &step_name, const string &detail = string()) {
 			ddl.push_back(string(OPENIVM_DDL_PROFILE_PREFIX) + view_name + "\t" + step_name + "\t" + detail);
 		};
+		auto add_profile_record = [&](const string &step_name, int64_t duration_ms, const string &detail = string()) {
+			ddl.push_back(string(OPENIVM_DDL_PROFILE_RECORD_PREFIX) + view_name + "\t" + step_name + "\t" +
+			              to_string(duration_ms) + "\t" + detail);
+		};
+		for (const auto &step : create_profile_steps) {
+			add_profile_record(step.step_name, step.duration_ms, step.detail);
+		}
 
 		// --- System tables DDL ---
 		add_profile_marker("create_mv_system_tables",
@@ -973,6 +1030,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		                       ")");
 
 		vector<string> refresh_lineage_entries;
+		auto lineage_start = create_profile_now();
 		if (refresh_type == RefreshType::WINDOW_PARTITION) {
 			string lineage_entry = BuildWindowPartitionLineageEntryJson(plan.get(), window_partition_columns);
 			if (!lineage_entry.empty()) {
@@ -989,6 +1047,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (!lineage_json.empty()) {
 			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
 		}
+		add_profile_record(
+		    "create_compile_lineage",
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lineage_start)
+		        .count(),
+		    "entries=" + to_string(refresh_lineage_entries.size()));
 
 		Value match_flag_val;
 		bool view_matching_enabled = context.TryGetCurrentSetting("openivm_enable_view_matching", match_flag_val) &&

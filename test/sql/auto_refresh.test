@@ -69,6 +69,11 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj'
 ----
 1
 
+query I
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('create_compile_full_plan', 'create_compile_lpts') AND duration_ms >= 0;
+----
+2
+
 statement ok
 INSERT INTO profile_proj_base VALUES (2, 'two');
 
@@ -87,6 +92,11 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj'
 
 query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('acquire_locks', 'generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
+----
+4
+
+query I
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('generate_refresh_sql.context', 'generate_refresh_sql.metadata_lookup', 'generate_refresh_sql.dispatch', 'generate_refresh_sql.assembly') AND duration_ms >= 0;
 ----
 4
 
@@ -886,9 +896,9 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 7
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
+SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
 ----
-13
+1
 
 statement ok
 INSERT INTO openivm_refresh_profile

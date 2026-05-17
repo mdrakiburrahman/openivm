@@ -74,6 +74,13 @@ public:
 		steps.push_back({next_step++, step_name, duration_ms, detail});
 	}
 
+	void AddMeasuredStep(const string &step_name, int64_t duration_ms, const string &detail = string()) {
+		if (!enabled) {
+			return;
+		}
+		steps.push_back({next_step++, step_name, duration_ms, detail});
+	}
+
 	void AddTotal() {
 		AddStep("total_refresh", total_start);
 	}
@@ -176,10 +183,15 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// For cross_system (DuckLake) MVs, split the refresh SQL into data ops (dl catalog)
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
+		RefreshCompileProfile compile_profile;
 		auto generate_start = std::chrono::steady_clock::now();
-		string sql = GenerateRefreshSQL(
-		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr);
+		string sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system,
+		                                attached_db_catalog_name, attached_db_schema_name,
+		                                cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr,
+		                                profiler.Enabled() ? &compile_profile : nullptr);
+		for (const auto &step : compile_profile.steps) {
+			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
+		}
 		profiler.AddStep("generate_refresh_sql", generate_start,
 		                 "sql_bytes=" + to_string(sql.size()) + ", meta_pre_bytes=" + to_string(meta_pre_sql.size()) +
 		                     ", meta_post_bytes=" + to_string(meta_post_sql.size()));
