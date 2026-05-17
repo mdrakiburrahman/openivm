@@ -1326,7 +1326,8 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 		// Metadata-vs-OpenIVM confusion matrix: only count queries where MV creation succeeded
 		// (so we have a real refresh_type to compare against).
-		if (phase == 3 || phase == 4 || phase == 5 || phase == 6) {
+		bool has_actual_classification = phase == 3 || phase == 4 || phase == 5 || phase == 6;
+		if (has_actual_classification) {
 			bool actual_incr = (worker.result_incremental != 0);
 			if (meta_incremental < 0) {
 				stats.meta_missing++;
@@ -1345,9 +1346,10 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 		// Build CSV line — meta_is_incremental column is blank when metadata is missing
 		string meta_str = (meta_incremental < 0) ? "" : std::to_string(meta_incremental);
+		string actual_str = has_actual_classification ? std::to_string(worker.result_incremental) : "";
 		std::ostringstream csv_line;
 		csv_line << query_name << "," << std::to_string(phase) << "," << meta_str << ","
-		         << std::to_string(worker.result_incremental) << "," << std::to_string(worker.result_correct) << ","
+		         << actual_str << "," << std::to_string(worker.result_correct) << ","
 		         << FormatNumber(worker.result_time_select_ms) << "," << FormatNumber(worker.result_time_mv_ms) << ","
 		         << FormatNumber(worker.result_time_refresh_ms) << "," << FormatNumber(worker.result_time_verify_ms)
 		         << ",\"" << error_msg << "\"";

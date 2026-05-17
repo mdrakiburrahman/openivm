@@ -1703,9 +1703,8 @@ class QueryGenerator:
         #     optimizer level (surprising, but confirmed by the run)
         #   - STDDEV / VARIANCE / STDDEV_POP / VAR_POP — OpenIVM handles these
         #     via SUM/COUNT decomposition
-        #   - TABLE_FUNCTION (range, generate_series) — handled when DuckDB plans
-        #     it as a constant leaf in a larger incremental plan. UNNEST currently
-        #     plans as LOGICAL_UNNEST and is rejected by the checker.
+        #   - TABLE_FUNCTION / VALUES_ONLY / UNNEST — constant relations and row-local
+        #     unnest leaves are stable inputs in the current incremental plan.
         #   - FILTER (...) clause on aggregates — handled (FILTER → CASE-WHEN)
         #   - LIST / ARRAY_AGG — handled
         #   - ROLLUP / CUBE / GROUPING SETS — handled
@@ -1733,9 +1732,8 @@ class QueryGenerator:
             # maintainable — top-level ORDER BY doesn't affect MV state, and
             # window functions are handled by IncrementalWindowRule via partition
             # recompute. Don't classify as non-incremental on ORDER alone.
-            "LIMIT", "LATERAL", "UNNEST", "PIVOT", "EXCEPT", "INTERSECT",
+            "LIMIT", "LATERAL", "PIVOT", "EXCEPT", "INTERSECT",
             "SUBQUERY_FILTER",  # IN/scalar-compare/scalar-in-SELECT — not flattened by OpenIVM
-            "VALUES_ONLY",      # FROM (VALUES …) — no base table to delta
         }
         non_incremental_fns = [
             "RANDOM(", "NOW(", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
