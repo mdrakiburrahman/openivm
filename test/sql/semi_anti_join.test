@@ -469,6 +469,100 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Multiple independent equality-correlated NOT EXISTS subqueries used to serialize
+# as MARK joins plus NOT(mark). Convert them to ANTI before LPTS and reduce each
+# RHS to distinct non-null source keys, not a delimiter-key cross product.
+statement ok
+CREATE TABLE exists_multi_l (id INT, grp INT, x INT, y INT);
+
+statement ok
+CREATE TABLE exists_multi_rx (a INT, active BOOLEAN);
+
+statement ok
+CREATE TABLE exists_multi_ry (b INT, active BOOLEAN);
+
+statement ok
+INSERT INTO exists_multi_l VALUES (1, 1, 10, 100), (2, 1, 20, 200), (3, 2, NULL, 300), (4, 2, 40, NULL);
+
+statement ok
+INSERT INTO exists_multi_rx VALUES (10, true), (NULL, true), (99, false);
+
+statement ok
+INSERT INTO exists_multi_ry VALUES (200, true), (NULL, true), (999, false);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_exists_multi_anti_group AS
+    SELECT grp, COUNT(*) AS cnt
+    FROM exists_multi_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM exists_multi_rx rx
+        WHERE rx.active AND rx.a = l.x
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM exists_multi_ry ry
+        WHERE ry.active AND ry.b = l.y
+    )
+    GROUP BY grp;
+
+query I
+SELECT COUNT(*) FROM openivm_views
+WHERE view_name = 'mv_exists_multi_anti_group'
+  AND (length(lower(sql_string)) - length(replace(lower(sql_string), 'anti join', ''))) / length('anti join') = 2
+  AND strpos(lower(sql_string), '__mark') = 0
+  AND strpos(lower(sql_string), ' on (true)') = 0
+  AND strpos(lower(sql_string), 'is not null') > 0;
+----
+1
+
+statement ok
+INSERT INTO exists_multi_rx VALUES (40, true);
+
+statement ok
+DELETE FROM exists_multi_ry WHERE b = 200;
+
+statement ok
+INSERT INTO exists_multi_l VALUES (5, 3, 99, 999), (6, 3, NULL, NULL);
+
+statement ok
+PRAGMA refresh('mv_exists_multi_anti_group');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*) AS cnt
+    FROM exists_multi_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM exists_multi_rx rx
+        WHERE rx.active AND rx.a = l.x
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM exists_multi_ry ry
+        WHERE ry.active AND ry.b = l.y
+    )
+    GROUP BY grp
+    EXCEPT ALL SELECT grp, cnt FROM mv_exists_multi_anti_group
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, cnt FROM mv_exists_multi_anti_group
+    EXCEPT ALL
+    SELECT grp, COUNT(*) AS cnt
+    FROM exists_multi_l l
+    WHERE NOT EXISTS (
+        SELECT 1 FROM exists_multi_rx rx
+        WHERE rx.active AND rx.a = l.x
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM exists_multi_ry ry
+        WHERE ry.active AND ry.b = l.y
+    )
+    GROUP BY grp
+);
+----
+0
+
 # ============================================================
 # EXISTS / NOT EXISTS combined with other operators. Aggregates and
 # UNION ALL are outside the simple aux-state shape, so they must stay

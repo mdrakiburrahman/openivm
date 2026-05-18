@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/plan_rewrite_internal.hpp"
+#include "rules/delim_join.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
@@ -13,6 +14,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/optimizer/deliminator.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -20,6 +22,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "upsert/refresh_index_regen.hpp"
@@ -29,6 +32,7 @@
 
 #include <functional>
 #include <set>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -80,6 +84,446 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
+}
+
+static bool IsSemiAntiJoinType(JoinType join_type) {
+	return join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::RIGHT_SEMI ||
+	       join_type == JoinType::RIGHT_ANTI;
+}
+
+static idx_t SemiAntiProbeChildIndex(JoinType join_type) {
+	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI) {
+		return 1;
+	}
+	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		return 0;
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+static unordered_set<idx_t> OutputTableIndexes(LogicalOperator &op) {
+	unordered_set<idx_t> result;
+	for (auto &binding : op.GetColumnBindings()) {
+		result.insert(binding.table_index);
+	}
+	return result;
+}
+
+static unordered_set<idx_t> ExpressionTableIndexes(const Expression &expr) {
+	unordered_set<idx_t> result;
+	LogicalJoin::GetExpressionBindings(expr, result);
+	return result;
+}
+
+static bool ExpressionUsesOnly(const Expression &expr, const unordered_set<idx_t> &table_indexes,
+                               bool allow_no_bindings = false) {
+	auto bindings = ExpressionTableIndexes(expr);
+	if (bindings.empty()) {
+		return allow_no_bindings;
+	}
+	for (auto &binding : bindings) {
+		if (!table_indexes.count(binding)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+struct SemiAntiKeyReplacement {
+	unique_ptr<Expression> delim_expr;
+	unique_ptr<Expression> source_expr;
+	bool null_reject_source = false;
+};
+
+static bool TryCollectSemiAntiKeyReplacement(ExpressionType comparison, const Expression &left, const Expression &right,
+                                             const unordered_set<idx_t> &source_bindings,
+                                             const unordered_set<idx_t> &delim_bindings,
+                                             vector<SemiAntiKeyReplacement> &replacements) {
+	if (comparison != ExpressionType::COMPARE_EQUAL && comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		return false;
+	}
+	bool left_source = ExpressionUsesOnly(left, source_bindings);
+	bool right_source = ExpressionUsesOnly(right, source_bindings);
+	bool left_delim = ExpressionUsesOnly(left, delim_bindings);
+	bool right_delim = ExpressionUsesOnly(right, delim_bindings);
+
+	SemiAntiKeyReplacement replacement;
+	if (left_source && right_delim) {
+		replacement.source_expr = left.Copy();
+		replacement.delim_expr = right.Copy();
+	} else if (right_source && left_delim) {
+		replacement.source_expr = right.Copy();
+		replacement.delim_expr = left.Copy();
+	} else {
+		return false;
+	}
+	replacement.null_reject_source = comparison == ExpressionType::COMPARE_EQUAL;
+	replacements.push_back(std::move(replacement));
+	return true;
+}
+
+static unique_ptr<Expression> BuildIsNotNull(unique_ptr<Expression> child) {
+	auto is_not_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
+	is_not_null->children.push_back(std::move(child));
+	return std::move(is_not_null);
+}
+
+static bool IsEmptyJoinPredicate(const unique_ptr<Expression> &predicate) {
+	if (!predicate) {
+		return true;
+	}
+	if (predicate->type != ExpressionType::VALUE_CONSTANT) {
+		return false;
+	}
+	auto &constant = predicate->Cast<BoundConstantExpression>();
+	return !constant.value.IsNull() && constant.value.type().id() == LogicalTypeId::BOOLEAN &&
+	       constant.value.GetValue<bool>();
+}
+
+// DuckDB decorrelates simple equality EXISTS/NOT EXISTS into a SEMI/ANTI join
+// whose existence-probe side is:
+//   project(delim_key) over filter(source_key = delim_key)
+//     over cross(source, distinct(preserved_keys)).
+// That is correct but unnecessarily expands the RHS by the left key domain. When
+// the correlated predicates are equality/null-safe equality predicates, the probe
+// side only needs to expose the distinct matching source keys. Plain '='
+// additionally rejects NULL source keys to preserve SQL's UNKNOWN semantics
+// before the outer SEMI/ANTI join uses DuckDB's null-safe join condition.
+static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &node) {
+	if (!node || node->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return false;
+	}
+	auto &semi_anti = node->Cast<LogicalComparisonJoin>();
+	if (!IsSemiAntiJoinType(semi_anti.join_type) || semi_anti.children.size() != 2) {
+		return false;
+	}
+	const idx_t probe_child_idx = SemiAntiProbeChildIndex(semi_anti.join_type);
+	if (probe_child_idx == DConstants::INVALID_INDEX || probe_child_idx >= semi_anti.children.size()) {
+		return false;
+	}
+	auto &probe_child = semi_anti.children[probe_child_idx];
+	if (!probe_child || probe_child->type != LogicalOperatorType::LOGICAL_PROJECTION ||
+	    probe_child->children.size() != 1) {
+		return false;
+	}
+	auto &old_projection = probe_child->Cast<LogicalProjection>();
+	if (!old_projection.children[0] || old_projection.children[0]->type != LogicalOperatorType::LOGICAL_FILTER ||
+	    old_projection.children[0]->children.size() != 1) {
+		return false;
+	}
+	auto &filter = old_projection.children[0]->Cast<LogicalFilter>();
+	if (!filter.children[0] || filter.children[0]->children.size() != 2) {
+		return false;
+	}
+	if (!filter.projection_map.empty()) {
+		return false;
+	}
+	auto &inner = *filter.children[0];
+	if (inner.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    inner.type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		return false;
+	}
+
+	idx_t delim_child_idx = DConstants::INVALID_INDEX;
+	if (inner.children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		delim_child_idx = 0;
+	} else if (inner.children[1]->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		delim_child_idx = 1;
+	} else {
+		return false;
+	}
+	const idx_t source_child_idx = 1 - delim_child_idx;
+	auto source_bindings = OutputTableIndexes(*inner.children[source_child_idx]);
+	auto delim_bindings = OutputTableIndexes(*inner.children[delim_child_idx]);
+
+	vector<SemiAntiKeyReplacement> replacements;
+	if (inner.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &inner_join = inner.Cast<LogicalComparisonJoin>();
+		if (inner_join.join_type != JoinType::INNER || !IsEmptyJoinPredicate(inner_join.predicate)) {
+			return false;
+		}
+		for (auto &condition : inner_join.conditions) {
+			if (!condition.left || !condition.right ||
+			    !TryCollectSemiAntiKeyReplacement(condition.comparison, *condition.left, *condition.right,
+			                                      source_bindings, delim_bindings, replacements)) {
+				return false;
+			}
+		}
+	}
+
+	vector<unique_ptr<Expression>> source_filters;
+	for (auto &expr : filter.expressions) {
+		if (!expr) {
+			return false;
+		}
+		if (expr->type == ExpressionType::COMPARE_EQUAL || expr->type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			auto &comparison = expr->Cast<BoundComparisonExpression>();
+			if (TryCollectSemiAntiKeyReplacement(comparison.type, *comparison.left, *comparison.right, source_bindings,
+			                                     delim_bindings, replacements)) {
+				continue;
+			}
+		}
+		if (!ExpressionUsesOnly(*expr, source_bindings, true)) {
+			return false;
+		}
+		source_filters.push_back(expr->Copy());
+	}
+	if (replacements.empty()) {
+		return false;
+	}
+
+	vector<bool> used_replacements(replacements.size(), false);
+	vector<unique_ptr<Expression>> new_projection_exprs;
+	new_projection_exprs.reserve(old_projection.expressions.size());
+	for (auto &expr : old_projection.expressions) {
+		if (!expr) {
+			return false;
+		}
+		bool replaced = false;
+		for (idx_t i = 0; i < replacements.size(); i++) {
+			if (Expression::Equals(*expr, *replacements[i].delim_expr)) {
+				used_replacements[i] = true;
+				new_projection_exprs.push_back(replacements[i].source_expr->Copy());
+				replaced = true;
+				break;
+			}
+		}
+		if (replaced) {
+			continue;
+		}
+		if (ExpressionUsesOnly(*expr, source_bindings, true)) {
+			new_projection_exprs.push_back(expr->Copy());
+			continue;
+		}
+		return false;
+	}
+	for (idx_t i = 0; i < replacements.size(); i++) {
+		if (!used_replacements[i]) {
+			return false;
+		}
+		if (replacements[i].null_reject_source) {
+			source_filters.push_back(BuildIsNotNull(replacements[i].source_expr->Copy()));
+		}
+	}
+
+	auto source = std::move(inner.children[source_child_idx]);
+	if (!source_filters.empty()) {
+		auto source_filter = make_uniq<LogicalFilter>();
+		source_filter->expressions = std::move(source_filters);
+		source_filter->children.push_back(std::move(source));
+		source_filter->ResolveOperatorTypes();
+		source = std::move(source_filter);
+	}
+
+	auto projection = make_uniq<LogicalProjection>(old_projection.table_index, std::move(new_projection_exprs));
+	projection->children.push_back(std::move(source));
+	projection->ResolveOperatorTypes();
+
+	vector<unique_ptr<Expression>> distinct_targets;
+	auto projection_bindings = projection->GetColumnBindings();
+	for (idx_t i = 0; i < projection_bindings.size(); i++) {
+		distinct_targets.push_back(make_uniq<BoundColumnRefExpression>(projection->types[i], projection_bindings[i]));
+	}
+	auto distinct = make_uniq<LogicalDistinct>(std::move(distinct_targets), DistinctType::DISTINCT);
+	distinct->children.push_back(std::move(projection));
+	distinct->ResolveOperatorTypes();
+
+	semi_anti.children[probe_child_idx] = std::move(distinct);
+	semi_anti.ResolveOperatorTypes();
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Rewrote SEMI/ANTI probe side to distinct source keys\n");
+	return true;
+}
+
+static bool RewriteSemiAntiProbeKeyProjections(unique_ptr<LogicalOperator> &node) {
+	if (!node) {
+		return false;
+	}
+	bool rewritten = false;
+	for (auto &child : node->children) {
+		rewritten = RewriteSemiAntiProbeKeyProjections(child) || rewritten;
+	}
+	return TryRewriteSemiAntiProbeKeyProjection(node) || rewritten;
+}
+
+static bool IsMarkColumnRef(const Expression &expr, idx_t mark_index) {
+	if (expr.type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &col_ref = expr.Cast<BoundColumnRefExpression>();
+	return col_ref.binding.table_index == mark_index && col_ref.binding.column_index == 0;
+}
+
+static bool IsNotMarkColumnRef(const Expression &expr, idx_t mark_index) {
+	if (expr.type != ExpressionType::OPERATOR_NOT) {
+		return false;
+	}
+	auto &op = expr.Cast<BoundOperatorExpression>();
+	return op.children.size() == 1 && op.children[0] && IsMarkColumnRef(*op.children[0], mark_index);
+}
+
+static bool MarkJoinCanBecomeSemiAnti(LogicalOperator &op) {
+	if (op.type != LogicalOperatorType::LOGICAL_DELIM_JOIN && op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return false;
+	}
+	auto &join = op.Cast<LogicalComparisonJoin>();
+	if (join.join_type != JoinType::MARK || join.conditions.empty() || join.predicate || !join.convert_mark_to_semi) {
+		return false;
+	}
+	for (auto &condition : join.conditions) {
+		// Correlated EXISTS/NOT EXISTS MARK joins use null-safe delimiter comparisons.
+		// That guarantees the mark is TRUE/FALSE, not NULL, so filtering on mark is
+		// equivalent to SEMI/ANTI. Other MARK joins are left untouched.
+		if (condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void CollectConvertibleMarkIndexes(LogicalOperator &op, unordered_set<idx_t> &mark_indexes) {
+	if (MarkJoinCanBecomeSemiAnti(op)) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		mark_indexes.insert(join.mark_index);
+	}
+	for (auto &child : op.children) {
+		if (child) {
+			CollectConvertibleMarkIndexes(*child, mark_indexes);
+		}
+	}
+}
+
+static bool IsConvertibleMarkPredicate(const Expression &expr, const unordered_set<idx_t> &mark_indexes) {
+	for (auto &mark_index : mark_indexes) {
+		if (IsMarkColumnRef(expr, mark_index) || IsNotMarkColumnRef(expr, mark_index)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool RewriteMarkJoinFilters(unique_ptr<LogicalOperator> &node);
+
+static bool TryPushMarkFilterThroughSemiAnti(unique_ptr<LogicalOperator> &node) {
+	if (!node || node->type != LogicalOperatorType::LOGICAL_FILTER || node->children.size() != 1) {
+		return false;
+	}
+	auto &filter = node->Cast<LogicalFilter>();
+	if (filter.projection_map.size() > 0) {
+		return false;
+	}
+	auto &child = node->children[0];
+	if (!child || (child->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	               child->type != LogicalOperatorType::LOGICAL_DELIM_JOIN)) {
+		return false;
+	}
+	auto &join = child->Cast<LogicalComparisonJoin>();
+	const idx_t probe_child_idx = SemiAntiProbeChildIndex(join.join_type);
+	if (probe_child_idx == DConstants::INVALID_INDEX || join.children.size() != 2) {
+		return false;
+	}
+	const idx_t preserved_child_idx = 1 - probe_child_idx;
+
+	unordered_set<idx_t> mark_indexes;
+	CollectConvertibleMarkIndexes(*join.children[preserved_child_idx], mark_indexes);
+	if (mark_indexes.empty()) {
+		return false;
+	}
+
+	vector<unique_ptr<Expression>> pushed_expressions;
+	vector<unique_ptr<Expression>> remaining_expressions;
+	for (auto &expr : filter.expressions) {
+		if (expr && IsConvertibleMarkPredicate(*expr, mark_indexes)) {
+			pushed_expressions.push_back(std::move(expr));
+		} else {
+			remaining_expressions.push_back(std::move(expr));
+		}
+	}
+	if (pushed_expressions.empty()) {
+		filter.expressions = std::move(remaining_expressions);
+		return false;
+	}
+
+	// SEMI/ANTI only returns the preserved side, so marker predicates on that side
+	// can commute below the join. This lets stacked correlated subqueries become a
+	// chain of SEMI/ANTI joins instead of leaving one marker column above another.
+	auto pushed_filter = make_uniq<LogicalFilter>();
+	pushed_filter->expressions = std::move(pushed_expressions);
+	pushed_filter->children.push_back(std::move(join.children[preserved_child_idx]));
+	pushed_filter->ResolveOperatorTypes();
+	join.children[preserved_child_idx] = std::move(pushed_filter);
+	RewriteMarkJoinFilters(join.children[preserved_child_idx]);
+	join.ResolveOperatorTypes();
+
+	if (remaining_expressions.empty()) {
+		node = std::move(child);
+	} else {
+		filter.expressions = std::move(remaining_expressions);
+		filter.ResolveOperatorTypes();
+	}
+	return true;
+}
+
+static bool TryRewriteMarkFilter(unique_ptr<LogicalOperator> &node) {
+	if (!node || node->type != LogicalOperatorType::LOGICAL_FILTER || node->children.size() != 1) {
+		return false;
+	}
+	auto &filter = node->Cast<LogicalFilter>();
+	if (filter.projection_map.size() > 0) {
+		return false;
+	}
+	auto &child = node->children[0];
+	if (!child || !MarkJoinCanBecomeSemiAnti(*child)) {
+		return TryPushMarkFilterThroughSemiAnti(node);
+	}
+	auto &join = child->Cast<LogicalComparisonJoin>();
+
+	JoinType replacement_join_type = JoinType::INVALID;
+	idx_t mark_filter_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < filter.expressions.size(); i++) {
+		auto &expr = filter.expressions[i];
+		if (!expr) {
+			continue;
+		}
+		if (IsMarkColumnRef(*expr, join.mark_index)) {
+			replacement_join_type = JoinType::SEMI;
+			mark_filter_idx = i;
+			break;
+		}
+		if (IsNotMarkColumnRef(*expr, join.mark_index)) {
+			replacement_join_type = JoinType::ANTI;
+			mark_filter_idx = i;
+			break;
+		}
+	}
+	if (mark_filter_idx == DConstants::INVALID_INDEX) {
+		return false;
+	}
+
+	filter.expressions.erase_at(mark_filter_idx);
+	join.join_type = replacement_join_type;
+	join.mark_types.clear();
+	child->ResolveOperatorTypes();
+
+	if (filter.expressions.empty()) {
+		node = std::move(child);
+	} else {
+		node->ResolveOperatorTypes();
+		TryPushMarkFilterThroughSemiAnti(node);
+	}
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Rewrote MARK join filter to %s join\n",
+	                    replacement_join_type == JoinType::SEMI ? "SEMI" : "ANTI");
+	return true;
+}
+
+static bool RewriteMarkJoinFilters(unique_ptr<LogicalOperator> &node) {
+	if (!node) {
+		return false;
+	}
+	bool rewritten = false;
+	for (auto &child : node->children) {
+		rewritten = RewriteMarkJoinFilters(child) || rewritten;
+	}
+	return TryRewriteMarkFilter(node) || rewritten;
 }
 
 /// Inline every `LOGICAL_CTE_REF` in the plan with a fresh deep copy of its CTE
@@ -657,6 +1101,15 @@ static void RewritePassOuterJoinSupport(PlanRewriteContext &rewrite_context) {
 	RewriteOuterJoinSupport(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
 }
 
+static void RewritePassSemiAntiSubqueries(PlanRewriteContext &rewrite_context) {
+	if (RewriteMarkJoinFilters(rewrite_context.plan)) {
+		Deliminator deliminator;
+		rewrite_context.plan = deliminator.Optimize(std::move(rewrite_context.plan));
+	}
+	RewriteSafeSemiAntiDelimGets(rewrite_context.context, rewrite_context.plan);
+	RewriteSemiAntiProbeKeyProjections(rewrite_context.plan);
+}
+
 static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	const PlanRewritePassEntry passes[] = {
 	    {"inline_cte_refs", RewritePassInlineCteRefs},
@@ -666,6 +1119,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	    {"group_count_star", RewritePassGroupCountStar},
 	    {"hidden_aggregate_propagation", RewritePassHiddenAggregatePropagation},
 	    {"outer_join_support", RewritePassOuterJoinSupport},
+	    {"semi_anti_subqueries", RewritePassSemiAntiSubqueries},
 	};
 
 	for (const auto &pass : passes) {
