@@ -38,9 +38,7 @@ struct FojJoinInfo {
 			}
 		}
 		for (auto &dt_name : delta_table_names) {
-			string base = StringUtil::StartsWith(dt_name, openivm::DELTA_PREFIX)
-			                  ? dt_name.substr(strlen(openivm::DELTA_PREFIX))
-			                  : dt_name;
+			string base = BaseTableNameFromDeltaKey(dt_name);
 			if (StringUtil::CIEquals(base, info.left_table)) {
 				info.dt_left_name = dt_name;
 			}
@@ -52,7 +50,7 @@ struct FojJoinInfo {
 	}
 };
 
-static string NormalizeColumnNameForMatch(const string &name) {
+string NormalizeColumnNameForMatch(const string &name) {
 	string normalized;
 	for (auto c : name) {
 		if (std::isalnum(static_cast<unsigned char>(c))) {
@@ -60,6 +58,52 @@ static string NormalizeColumnNameForMatch(const string &name) {
 		}
 	}
 	return normalized;
+}
+
+bool IsSummableLogicalType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		return true;
+	default:
+		return false;
+	}
+}
+
+string BaseTableNameFromDeltaKey(const string &delta_key) {
+	static const string prefix(openivm::DELTA_PREFIX);
+	if (delta_key.size() > prefix.size() && delta_key.rfind(prefix, 0) == 0) {
+		return delta_key.substr(prefix.size());
+	}
+	return delta_key;
+}
+
+string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                 const string &extra_predicate) {
+	string predicate;
+	if (!last_update.empty()) {
+		predicate = string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP";
+	}
+	if (!extra_predicate.empty()) {
+		if (!predicate.empty()) {
+			predicate += " AND ";
+		}
+		predicate += extra_predicate;
+	}
+	string where_clause = predicate.empty() ? "" : " WHERE " + predicate;
+	return "(SELECT * EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " + string(openivm::TIMESTAMP_COL) +
+	       ") FROM " + delta_table_sql + where_clause + ")";
 }
 
 static bool GroupColumnMatchesJoinColumn(const string &group_col, const string &join_col) {
@@ -532,10 +576,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			continue;
 		}
-		string resolved = dt;
-		if (cross_system) {
-			resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
-		}
+		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
 		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt);
 	}
 
@@ -676,8 +717,7 @@ void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &
                                              const string &attached_db_schema_name) {
 	auto source_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : source_tables) {
-		static const string prefix(openivm::DELTA_PREFIX);
-		string base_name = dt.size() > prefix.size() && dt.rfind(prefix, 0) == 0 ? dt.substr(prefix.size()) : dt;
+		string base_name = BaseTableNameFromDeltaKey(dt);
 		string catalog_name = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
 		string schema_name = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
 		auto source_location = metadata.GetSourceLocation(view_name, dt, catalog_name, schema_name);
@@ -769,11 +809,7 @@ vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(RefreshMetadata &m
 	vector<GroupRecomputeDeltaSpec> delta_specs;
 	for (auto &dt : delta_table_names) {
 		GroupRecomputeDeltaSpec spec;
-		spec.base_table = dt;
-		static const string prefix(openivm::DELTA_PREFIX);
-		if (spec.base_table.size() > prefix.size() && spec.base_table.rfind(prefix, 0) == 0) {
-			spec.base_table = spec.base_table.substr(prefix.size());
-		}
+		spec.base_table = BaseTableNameFromDeltaKey(dt);
 		spec.last_update = metadata.GetLastUpdate(view_name, dt);
 		spec.is_ducklake = metadata.IsDuckLakeTable(view_name, dt);
 		if (spec.is_ducklake) {
@@ -786,14 +822,6 @@ vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(RefreshMetadata &m
 		delta_specs.push_back(std::move(spec));
 	}
 	return delta_specs;
-}
-
-static string BaseTableNameFromDeltaKey(const string &delta_key) {
-	static const string prefix(openivm::DELTA_PREFIX);
-	if (delta_key.size() > prefix.size() && delta_key.rfind(prefix, 0) == 0) {
-		return delta_key.substr(prefix.size());
-	}
-	return delta_key;
 }
 
 string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, const string &view_name,

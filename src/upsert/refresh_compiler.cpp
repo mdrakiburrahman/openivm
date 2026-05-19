@@ -10,6 +10,47 @@ namespace duckdb {
 
 // Zero-initialized 64-element float list, used as COALESCE default for NULL list aggregates.
 static constexpr const char *ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
+static constexpr idx_t GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD = 32;
+static constexpr idx_t GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD = 16ULL * 1024ULL * 1024ULL;
+
+static idx_t EstimateGroupRecomputeAffectedVariants(const string &view_query_sql,
+                                                    const vector<GroupRecomputeDeltaSpec> &delta_table_specs) {
+	idx_t variants = 0;
+	for (auto &spec : delta_table_specs) {
+		variants += SqlUtils::CountTableReferences(view_query_sql, spec.base_table);
+	}
+	return variants;
+}
+
+static bool ShouldUseCurrentDiffGroupRecompute(const string &view_query_sql,
+                                               const vector<GroupRecomputeDeltaSpec> &delta_table_specs) {
+	idx_t variants = EstimateGroupRecomputeAffectedVariants(view_query_sql, delta_table_specs);
+	return variants >= GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD ||
+	       variants * view_query_sql.size() >= GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD;
+}
+
+static string BuildCurrentDiffGroupRecomputeSQL(const string &view_name, const string &data_table,
+                                                const string &view_query_sql, const vector<string> &group_columns) {
+	string current_temp = SqlUtils::QuoteIdentifier("openivm_current_" + view_name);
+	string affected_temp = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
+	string target_match = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
+	string recompute_match = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_recompute");
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + current_temp + " AS\n" + view_query_sql + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp + " AS\nSELECT DISTINCT " + group_csv +
+	       "\nFROM (\n  (SELECT * FROM " + current_temp + " EXCEPT ALL SELECT * FROM " + data_table +
+	       ")\n  UNION ALL\n  (SELECT * FROM " + data_table + " EXCEPT ALL SELECT * FROM " + current_temp +
+	       ")\n) openivm_changed;\n\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp +
+	       " AS openivm_aff WHERE " + target_match + "\n);\n\n";
+	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + current_temp +
+	       " AS openivm_recompute\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp + " AS openivm_aff WHERE " +
+	       recompute_match + "\n);\n\n";
+	sql += "DROP TABLE IF EXISTS " + affected_temp + ";\nDROP TABLE IF EXISTS " + current_temp + ";\n";
+	return sql;
+}
 
 static string BuildUpdatedAggregateColumn(const string &col) {
 	return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
@@ -118,29 +159,6 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	return result;
 }
 
-// Types that can be added/subtracted in `sum(case mult=false then -<col> else <col> end)`.
-// Anything else (VARCHAR, BOOLEAN, LIST, STRUCT, MAP, ...) breaks the delta path.
-static bool IsSummableType(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::UHUGEINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-	case LogicalTypeId::DECIMAL:
-		return true;
-	default:
-		return false;
-	}
-}
-
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
@@ -174,7 +192,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		if (keys_set.find(SqlUtils::QuoteIdentifier(column)) == keys_set.end() &&
 		    column != string(openivm::MULTIPLICITY_COL)) {
 			aggregates.push_back(SqlUtils::QuoteIdentifier(column));
-			if (i < column_types.size() && !IsSummableType(column_types[i])) {
+			if (i < column_types.size() && !IsSummableLogicalType(column_types[i])) {
 				has_non_summable_col = true;
 			}
 		}
@@ -674,7 +692,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		if (column_names[i] == string(openivm::MULTIPLICITY_COL) || column_names[i] == string(openivm::TIMESTAMP_COL)) {
 			continue;
 		}
-		if (!IsSummableType(column_types[i])) {
+		if (!IsSummableLogicalType(column_types[i])) {
 			has_non_summable_col = true;
 			break;
 		}
@@ -858,6 +876,11 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
+	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large plan\n");
+		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
+	}
+
 	// For each source table T_i, build a "view query restricted to T_i's delta" variant by
 	// substituting the qualified `cat.schema.<base>` reference with a delta-filtered subquery,
 	// then project DISTINCT group_columns. Union across sources gives the affected-keys set.
@@ -879,14 +902,8 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			    ")";
 		} else {
 			string delta_basename = string(openivm::DELTA_PREFIX) + base;
-			string delta_filter;
-			if (!spec.last_update.empty()) {
-				delta_filter = " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-				               SqlUtils::EscapeValue(spec.last_update) + "'::TIMESTAMP";
-			}
-			delta_subselect = "(SELECT * EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
-			                  string(openivm::TIMESTAMP_COL) + ") FROM " + catalog_prefix +
-			                  SqlUtils::QuoteIdentifier(delta_basename) + delta_filter + ")";
+			delta_subselect =
+			    BuildStandardDeltaRowsSQL(catalog_prefix + SqlUtils::QuoteIdentifier(delta_basename), spec.last_update);
 		}
 
 		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when

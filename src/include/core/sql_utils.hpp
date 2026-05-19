@@ -54,6 +54,7 @@ public:
 	                                                const string &replacement);
 	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
 	static string FindTableReference(const string &sql, const string &table_name);
+	static idx_t CountTableReferences(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.

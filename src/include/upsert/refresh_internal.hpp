@@ -31,6 +31,7 @@ struct DeltaFastPathFlags {
 	bool skip_agg_delete = false;
 	bool skip_proj_delete = false;
 	bool minmax_incremental = false;
+	vector<string> active_delta_table_names;
 };
 
 struct RefreshCompileProfileStep {
@@ -64,6 +65,11 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table = "");
+bool IsSummableLogicalType(const LogicalType &type);
+string NormalizeColumnNameForMatch(const string &name);
+string BaseTableNameFromDeltaKey(const string &delta_key);
+string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                 const string &extra_predicate = "");
 
 string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
                                   const string &attached_db_catalog_name);
@@ -116,6 +122,10 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name, bool cross_system);
+vector<string> BuildActiveDeltaTableNames(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                          const vector<string> &delta_table_names, const string &view_catalog_name,
+                                          const string &view_schema_name, const string &attached_db_catalog_name,
+                                          const string &attached_db_schema_name);
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                    const string &view_query_sql, const vector<string> &delta_table_names,
@@ -124,6 +134,11 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                    bool cross_system);
+bool TryBuildGroupMeasureUpdateRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                       const string &view_query_sql, const vector<string> &active_delta_table_names,
+                                       const vector<string> &column_names, const vector<LogicalType> &column_types,
+                                       const string &data_table, const string &view_catalog_name,
+                                       const string &view_schema_name, string &upsert_query);
 
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,

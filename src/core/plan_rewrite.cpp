@@ -408,7 +408,7 @@ static bool TryPushMarkFilterThroughSemiAnti(unique_ptr<LogicalOperator> &node) 
 		return false;
 	}
 	auto &filter = node->Cast<LogicalFilter>();
-	if (filter.projection_map.size() > 0) {
+	if (!filter.projection_map.empty()) {
 		return false;
 	}
 	auto &child = node->children[0];
@@ -468,7 +468,7 @@ static bool TryRewriteMarkFilter(unique_ptr<LogicalOperator> &node) {
 		return false;
 	}
 	auto &filter = node->Cast<LogicalFilter>();
-	if (filter.projection_map.size() > 0) {
+	if (!filter.projection_map.empty()) {
 		return false;
 	}
 	auto &child = node->children[0];

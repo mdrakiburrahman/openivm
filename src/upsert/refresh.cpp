@@ -484,62 +484,10 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		auto view_type = metadata.GetViewType(view_name);
 		if (view_type != RefreshType::FULL_REFRESH) {
 			auto delta_tables = metadata.GetDeltaTables(view_name);
-			bool all_empty = true;
-
-			for (auto &dt : delta_tables) {
-				if (metadata.IsDuckLakeTable(view_name, dt)) {
-					Connection snap_con(*context.db.get());
-					auto loc =
-					    ResolveDuckLakeSourceLocation(snap_con, view_name, dt, view_catalog_name, view_schema_name,
-					                                  attached_db_catalog_name, attached_db_schema_name);
-					RefreshMetadata snap_metadata(snap_con);
-					auto ducklake_current_snap = snap_metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
-					if (ducklake_current_snap < 0) {
-						all_empty = false;
-						break;
-					}
-					auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
-					if (last_snap == ducklake_current_snap) {
-						continue;
-					}
-					string insertions =
-					    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-					                                    loc.table_name, last_snap, ducklake_current_snap);
-					string deletions =
-					    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-					                                    loc.table_name, last_snap, ducklake_current_snap);
-					auto has_changes = snap_con.Query("SELECT EXISTS(SELECT 1 FROM ("
-					                                  "(SELECT 1 FROM " +
-					                                  insertions +
-					                                  " LIMIT 1) "
-					                                  "UNION ALL "
-					                                  "(SELECT 1 FROM " +
-					                                  deletions + " LIMIT 1)) openivm_delta_probe LIMIT 1)");
-					if (has_changes->HasError() || has_changes->RowCount() == 0 ||
-					    has_changes->GetValue(0, 0).IsNull() || has_changes->GetValue(0, 0).GetValue<bool>()) {
-						all_empty = false;
-						break;
-					}
-					continue;
-				}
-				string delta_probe = SqlUtils::QuoteIdentifier(dt);
-				if (cross_system) {
-					delta_probe = metadata.ResolveDeltaQualifiedName(view_name, dt);
-				} else if (!view_catalog_name.empty() && !view_schema_name.empty()) {
-					delta_probe = SqlUtils::FullName(view_catalog_name, view_schema_name, dt);
-				}
-				auto last_update = metadata.GetLastUpdate(view_name, dt);
-				if (last_update.empty()) {
-					all_empty = false;
-					break;
-				}
-				auto stats = metadata.GetStandardDeltaChangeStats(delta_probe, last_update);
-				if (!stats.ok || stats.total > 0) {
-					all_empty = false;
-					break;
-				}
-			}
-			if (all_empty) {
+			auto active_delta_tables =
+			    BuildActiveDeltaTableNames(metadata, con, view_name, delta_tables, view_catalog_name, view_schema_name,
+			                               attached_db_catalog_name, attached_db_schema_name);
+			if (active_delta_tables.empty()) {
 				OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
 				return;
 			}

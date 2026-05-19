@@ -17,6 +17,7 @@ struct DeltaChangeSummary {
 	idx_t tables_with_changes = 0;
 	bool any_has_deletes = false;
 	bool all_ducklake = true;
+	vector<string> active_delta_table_names;
 };
 
 static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshMetadata &metadata, Connection &con,
@@ -28,9 +29,10 @@ static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshM
 	                                         attached_db_catalog_name, attached_db_schema_name);
 	auto last_snap = metadata.GetLastSnapshotId(view_name, delta_table);
 	auto cur_snap = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
-	if (cur_snap < 0) {
+	if (cur_snap < 0 || last_snap < 0) {
 		summary.any_has_deletes = true; // conservative
 		summary.tables_with_changes++;
+		summary.active_delta_table_names.push_back(delta_table);
 		return;
 	}
 	if (last_snap == cur_snap) {
@@ -45,6 +47,7 @@ static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshM
 	if (count_result->HasError()) {
 		summary.any_has_deletes = true;
 		summary.tables_with_changes++;
+		summary.active_delta_table_names.push_back(delta_table);
 		return;
 	}
 	auto insert_count = count_result->GetValue(0, 0).GetValue<int64_t>();
@@ -53,25 +56,37 @@ static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshM
 		return;
 	}
 	summary.tables_with_changes++;
+	summary.active_delta_table_names.push_back(delta_table);
 	if (delete_count > 0) {
 		summary.any_has_deletes = true;
 	}
 }
 
 static void AccumulateStandardDeltaSummary(DeltaChangeSummary &summary, RefreshMetadata &metadata,
-                                           const string &view_name, const string &delta_table, bool cross_system) {
+                                           const string &view_name, const string &delta_table,
+                                           const string &view_catalog_name, const string &view_schema_name) {
 	summary.all_ducklake = false;
 	auto ts_string = metadata.GetLastUpdate(view_name, delta_table);
 	if (ts_string.empty()) {
+		summary.any_has_deletes = true; // conservative
+		summary.tables_with_changes++;
+		summary.active_delta_table_names.push_back(delta_table);
 		return;
 	}
-	string delta_table_sql = cross_system ? metadata.ResolveDeltaQualifiedName(view_name, delta_table)
-	                                      : SqlUtils::QuoteIdentifier(delta_table);
+	string delta_table_sql =
+	    metadata.ResolveDeltaQualifiedName(view_name, delta_table, view_catalog_name, view_schema_name);
 	auto stats = metadata.GetStandardDeltaChangeStats(delta_table_sql, ts_string);
-	if (!stats.ok || stats.total == 0) {
+	if (!stats.ok) {
+		summary.any_has_deletes = true; // conservative
+		summary.tables_with_changes++;
+		summary.active_delta_table_names.push_back(delta_table);
+		return;
+	}
+	if (stats.total == 0) {
 		return;
 	}
 	summary.tables_with_changes++;
+	summary.active_delta_table_names.push_back(delta_table);
 	if (stats.deletes > 0) {
 		summary.any_has_deletes = true;
 	}
@@ -105,10 +120,19 @@ static DeltaChangeSummary AnalyzeDeltaChanges(RefreshMetadata &metadata, Connect
 			AccumulateDuckLakeDeltaSummary(summary, metadata, con, view_name, dt, view_catalog_name, view_schema_name,
 			                               attached_db_catalog_name, attached_db_schema_name);
 		} else {
-			AccumulateStandardDeltaSummary(summary, metadata, view_name, dt, cross_system);
+			AccumulateStandardDeltaSummary(summary, metadata, view_name, dt, view_catalog_name, view_schema_name);
 		}
 	}
 	return summary;
+}
+
+vector<string> BuildActiveDeltaTableNames(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                          const vector<string> &delta_table_names, const string &view_catalog_name,
+                                          const string &view_schema_name, const string &attached_db_catalog_name,
+                                          const string &attached_db_schema_name) {
+	auto summary = AnalyzeDeltaChanges(metadata, con, view_name, "", delta_table_names, view_catalog_name,
+	                                   view_schema_name, attached_db_catalog_name, attached_db_schema_name, false);
+	return summary.active_delta_table_names;
 }
 
 DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMetadata &metadata, Connection &con,
@@ -124,6 +148,7 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	flags.skip_agg_delete = flags.insert_only;
 	flags.skip_proj_delete = flags.insert_only;
 	flags.minmax_incremental = flags.insert_only;
+	flags.active_delta_table_names = summary.active_delta_table_names;
 
 	Value skip_agg_del_val, skip_proj_del_val, minmax_incr_val;
 	if (context.TryGetCurrentSetting("openivm_skip_aggregate_delete", skip_agg_del_val) && !skip_agg_del_val.IsNull() &&

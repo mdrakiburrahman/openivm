@@ -1113,3 +1113,72 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Source table in a non-default schema with MV in the default schema must refresh
+# using the source schema's delta table, not main.openivm_delta_*.
+statement ok
+CREATE SCHEMA mvq_src_schema;
+
+statement ok
+CREATE TABLE mvq_src_schema.t3(k INT, v INT);
+
+statement ok
+INSERT INTO mvq_src_schema.t3 VALUES (1, 10), (1, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mvq_cross_schema_source AS
+SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k;
+
+statement ok
+INSERT INTO mvq_src_schema.t3 VALUES (1, 30), (2, 40);
+
+statement ok
+PRAGMA refresh('mvq_cross_schema_source');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mvq_cross_schema_source
+  EXCEPT ALL
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+  EXCEPT ALL
+  SELECT * FROM mvq_cross_schema_source
+);
+----
+0
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+INSERT INTO mvq_src_schema.t3 VALUES (2, 50);
+
+statement ok
+PRAGMA refresh('mvq_cross_schema_source');
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mvq_cross_schema_source
+  EXCEPT ALL
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+  EXCEPT ALL
+  SELECT * FROM mvq_cross_schema_source
+);
+----
+0

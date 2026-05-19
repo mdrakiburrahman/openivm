@@ -473,8 +473,19 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	case RefreshType::GROUP_RECOMPUTE: {
 		auto group_columns = metadata.GetGroupColumns(view_name);
+		auto active_delta_table_names = fast_paths.active_delta_table_names;
+		if (active_delta_table_names.empty()) {
+			upsert_query = "";
+			OPENIVM_DEBUG_PRINT("[UPSERT] GROUP_RECOMPUTE has no active deltas after filtering\n");
+			break;
+		}
+		if (TryBuildGroupMeasureUpdateRefresh(metadata, con, view_name, view_query_sql, active_delta_table_names,
+		                                      column_names, column_types, data_table, view_catalog_name,
+		                                      view_schema_name, upsert_query)) {
+			break;
+		}
 		bool group_recompute_has_ducklake_source = false;
-		for (auto &dt : delta_table_names) {
+		for (auto &dt : active_delta_table_names) {
 			if (metadata.IsDuckLakeTable(view_name, dt)) {
 				group_recompute_has_ducklake_source = true;
 				break;
@@ -485,7 +496,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			recompute_ducklake_catalog = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
 		}
 		string recompute_ducklake_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
-		auto delta_specs = BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, delta_table_names,
+		auto delta_specs = BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, active_delta_table_names,
 		                                                 recompute_ducklake_catalog, recompute_ducklake_schema);
 		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
@@ -693,10 +704,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                          SqlUtils::EscapeValue(dt) + "';\n";
 			continue;
 		}
-		string resolved = dt;
-		if (cross_system) {
-			resolved = metadata.ResolveDeltaQualifiedName(view_name, dt);
-		}
+		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, view_catalog_name, view_schema_name);
 		update_timestamp_query += "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 		                          " SET last_update = COALESCE("
 		                          "(SELECT MAX(" +
@@ -732,7 +740,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (cross_system) {
 			continue;
 		}
-		delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(dt, dt);
+		auto resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, view_catalog_name, view_schema_name);
+		delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt);
 	}
 	string set_in_progress = "UPDATE " + string(openivm::VIEWS_TABLE) +
 	                         " SET refresh_in_progress = true WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
