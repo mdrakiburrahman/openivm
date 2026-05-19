@@ -746,3 +746,153 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# UNION ALL over aggregate branches — GROUP_RECOMPUTE keys must not be positional
+# ==========================================
+
+statement ok
+CREATE TABLE ugk_f(id INTEGER, k1 INTEGER, k2 INTEGER, k3 VARCHAR, k4 VARCHAR, x INTEGER);
+
+statement ok
+INSERT INTO ugk_f VALUES
+    (1, 10, 100, 'os-a', 'lic-a', 5),
+    (2, 10, 100, 'os-a', 'lic-a', 7),
+    (3, 10, 100, 'os-b', 'lic-a', 11),
+    (4, 20, 200, 'os-a', 'lic-b', 3);
+
+statement ok
+CREATE MATERIALIZED VIEW union_group_key_reordered AS
+WITH branch AS (
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x <= 7
+    GROUP BY k1, k2, k3, k4
+    UNION ALL
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x > 7
+    GROUP BY k1, k2, k3, k4
+)
+SELECT
+    CAST(k1 AS VARCHAR) || '-' || CAST(k2 AS VARCHAR) || '-' || k3 || '-' || k4 AS primary_key,
+    k1,
+    k2,
+    CAST(c AS INTEGER) AS c,
+    CAST(sx AS INTEGER) AS sx,
+    k3,
+    k4
+FROM branch;
+
+statement ok
+CREATE VIEW union_group_key_reordered_base AS
+WITH branch AS (
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x <= 7
+    GROUP BY k1, k2, k3, k4
+    UNION ALL
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x > 7
+    GROUP BY k1, k2, k3, k4
+)
+SELECT
+    CAST(k1 AS VARCHAR) || '-' || CAST(k2 AS VARCHAR) || '-' || k3 || '-' || k4 AS primary_key,
+    k1,
+    k2,
+    CAST(c AS INTEGER) AS c,
+    CAST(sx AS INTEGER) AS sx,
+    k3,
+    k4
+FROM branch;
+
+query T
+SELECT group_columns FROM openivm_views WHERE view_name = 'union_group_key_reordered';
+----
+k1,k2,k3,k4
+
+statement ok
+INSERT INTO ugk_f VALUES (5, 10, 100, 'os-a', 'lic-a', 6);
+
+statement ok
+PRAGMA refresh('union_group_key_reordered');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_reordered
+    EXCEPT ALL SELECT * FROM union_group_key_reordered_base
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_reordered_base
+    EXCEPT ALL SELECT * FROM union_group_key_reordered
+);
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW union_group_key_alias AS
+WITH cust_stats AS (
+    SELECT k1 AS C_W_ID, COUNT(*) AS n, AVG(x) AS avg_bal
+    FROM ugk_f
+    GROUP BY k1
+),
+w_stats AS (
+    SELECT k1 AS W_ID, SUM(x) AS W_YTD
+    FROM ugk_f
+    GROUP BY k1
+)
+SELECT cs.C_W_ID AS w, cs.n AS metric_val, 'count' AS kind FROM cust_stats cs
+UNION ALL
+SELECT cs.C_W_ID, cs.avg_bal, 'avg_bal' FROM cust_stats cs
+UNION ALL
+SELECT ws.W_ID, ws.W_YTD, 'ytd' FROM w_stats ws;
+
+statement ok
+CREATE VIEW union_group_key_alias_base AS
+WITH cust_stats AS (
+    SELECT k1 AS C_W_ID, COUNT(*) AS n, AVG(x) AS avg_bal
+    FROM ugk_f
+    GROUP BY k1
+),
+w_stats AS (
+    SELECT k1 AS W_ID, SUM(x) AS W_YTD
+    FROM ugk_f
+    GROUP BY k1
+)
+SELECT cs.C_W_ID AS w, cs.n AS metric_val, 'count' AS kind FROM cust_stats cs
+UNION ALL
+SELECT cs.C_W_ID, cs.avg_bal, 'avg_bal' FROM cust_stats cs
+UNION ALL
+SELECT ws.W_ID, ws.W_YTD, 'ytd' FROM w_stats ws;
+
+query T
+SELECT group_columns FROM openivm_views WHERE view_name = 'union_group_key_alias';
+----
+w
+
+statement ok
+INSERT INTO ugk_f VALUES (6, 30, 300, 'os-c', 'lic-c', 9);
+
+statement ok
+PRAGMA refresh('union_group_key_alias');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_alias
+    EXCEPT ALL SELECT * FROM union_group_key_alias_base
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_alias_base
+    EXCEPT ALL SELECT * FROM union_group_key_alias
+);
+----
+0

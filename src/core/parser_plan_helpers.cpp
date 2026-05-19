@@ -15,6 +15,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "storage/ducklake_scan.hpp"
@@ -401,41 +402,94 @@ bool RelationExists(Connection &con, const string &qualified_name) {
 	return !result->HasError();
 }
 
-static void CollectProjectionIndex(LogicalOperator *op,
-                                   unordered_map<idx_t, LogicalProjection *> &projections_by_index) {
+struct BindingResolverIndex {
+	unordered_map<idx_t, LogicalProjection *> projections_by_index;
+	unordered_map<idx_t, LogicalSetOperation *> setops_by_index;
+	unordered_map<idx_t, LogicalCTERef *> cte_refs_by_table_index;
+	unordered_map<idx_t, LogicalOperator *> cte_defs_by_index;
+};
+
+static void CollectBindingResolverIndex(LogicalOperator *op, BindingResolverIndex &index) {
+	if (!op) {
+		return;
+	}
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &proj = op->Cast<LogicalProjection>();
-		projections_by_index[proj.table_index] = &proj;
+		index.projections_by_index[proj.table_index] = &proj;
+	} else if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+		auto &setop = op->Cast<LogicalSetOperation>();
+		index.setops_by_index[setop.table_index] = &setop;
+	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &cte_ref = op->Cast<LogicalCTERef>();
+		index.cte_refs_by_table_index[cte_ref.table_index] = &cte_ref;
+	} else if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && op->children.size() >= 2) {
+		auto &cte = op->Cast<LogicalMaterializedCTE>();
+		index.cte_defs_by_index[cte.table_index] = op->children[0].get();
 	}
 	for (auto &child : op->children) {
-		CollectProjectionIndex(child.get(), projections_by_index);
+		CollectBindingResolverIndex(child.get(), index);
 	}
 }
 
 static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
-                                   const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
-                                   int depth = 0) {
+                                   const BindingResolverIndex &index, int depth = 0) {
 	if (depth > 16) {
 		return false;
 	}
 	if (table_index == group_index) {
 		return column_index < static_cast<idx_t>(group_count);
 	}
-	auto it = projections_by_index.find(table_index);
-	if (it == projections_by_index.end()) {
+	auto projection_it = index.projections_by_index.find(table_index);
+	if (projection_it != index.projections_by_index.end()) {
+		auto &proj = *projection_it->second;
+		if (column_index >= proj.expressions.size()) {
+			return false;
+		}
+		auto &expr = proj.expressions[column_index];
+		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+		return ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+		                              index, depth + 1);
+	}
+	auto setop_it = index.setops_by_index.find(table_index);
+	if (setop_it != index.setops_by_index.end()) {
+		// UNION outputs keep branch columns by position; follow that binding instead of
+		// guessing that the first N final outputs are the group keys.
+		auto &setop = *setop_it->second;
+		if (column_index >= setop.column_count) {
+			return false;
+		}
+		for (auto &child : setop.children) {
+			auto bindings = child->GetColumnBindings();
+			if (column_index >= bindings.size()) {
+				continue;
+			}
+			auto &binding = bindings[column_index];
+			if (ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, index,
+			                           depth + 1)) {
+				return true;
+			}
+		}
 		return false;
 	}
-	auto &proj = *it->second;
-	if (column_index >= proj.expressions.size()) {
-		return false;
+	auto cte_ref_it = index.cte_refs_by_table_index.find(table_index);
+	if (cte_ref_it != index.cte_refs_by_table_index.end()) {
+		auto &cte_ref = *cte_ref_it->second;
+		auto cte_def_it = index.cte_defs_by_index.find(cte_ref.cte_index);
+		if (cte_def_it == index.cte_defs_by_index.end()) {
+			return false;
+		}
+		auto bindings = cte_def_it->second->GetColumnBindings();
+		if (column_index >= bindings.size()) {
+			return false;
+		}
+		auto &binding = bindings[column_index];
+		return ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, index,
+		                              depth + 1);
 	}
-	auto &expr = proj.expressions[column_index];
-	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &bcr = expr->Cast<BoundColumnRefExpression>();
-	return ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
-	                              projections_by_index, depth + 1);
+	return false;
 }
 
 static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
@@ -461,9 +515,8 @@ static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
 	return &expr->Cast<BoundColumnRefExpression>();
 }
 
-static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
-                                          const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
-                                          idx_t group_index, size_t group_count, const vector<string> &output_names,
+static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const BindingResolverIndex &index, idx_t group_index,
+                                          size_t group_count, const vector<string> &output_names,
                                           vector<string> &group_names) {
 	bool matched = false;
 	for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
@@ -473,7 +526,7 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
 		if (!ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
-		                            projections_by_index)) {
+		                            index)) {
 			continue;
 		}
 		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
@@ -485,30 +538,47 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
 	return matched;
 }
 
-static bool FindGroupColumns(LogicalOperator *op, const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
-                             idx_t group_index, size_t group_count, const vector<string> &output_names,
-                             vector<string> &group_names) {
+static bool AddGroupColumnsFromBindings(LogicalOperator &op, const BindingResolverIndex &index, idx_t group_index,
+                                        size_t group_count, const vector<string> &output_names,
+                                        vector<string> &group_names) {
+	bool matched = false;
+	auto bindings = op.GetColumnBindings();
+	for (idx_t col_idx = 0; col_idx < bindings.size() && col_idx < output_names.size(); col_idx++) {
+		auto &binding = bindings[col_idx];
+		if (!ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, index)) {
+			continue;
+		}
+		if (!output_names[col_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[col_idx])) {
+			group_names.push_back(output_names[col_idx]);
+			matched = true;
+		}
+	}
+	return matched;
+}
+
+static bool FindGroupColumns(LogicalOperator *op, const BindingResolverIndex &index, idx_t group_index,
+                             size_t group_count, const vector<string> &output_names, vector<string> &group_names) {
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &proj = op->Cast<LogicalProjection>();
-		return AddGroupColumnsFromProjection(proj, projections_by_index, group_index, group_count, output_names,
-		                                     group_names);
+		return AddGroupColumnsFromProjection(proj, index, group_index, group_count, output_names, group_names);
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+		if (AddGroupColumnsFromBindings(*op, index, group_index, group_count, output_names, group_names)) {
+			return true;
+		}
 		return false;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 		if (op->children.size() >= 2) {
-			if (FindGroupColumns(op->children[1].get(), projections_by_index, group_index, group_count, output_names,
-			                     group_names)) {
+			if (FindGroupColumns(op->children[1].get(), index, group_index, group_count, output_names, group_names)) {
 				return true;
 			}
-			return FindGroupColumns(op->children[0].get(), projections_by_index, group_index, group_count, output_names,
-			                        group_names);
+			return FindGroupColumns(op->children[0].get(), index, group_index, group_count, output_names, group_names);
 		}
 		return false;
 	}
 	for (auto &child : op->children) {
-		if (FindGroupColumns(child.get(), projections_by_index, group_index, group_count, output_names, group_names)) {
+		if (FindGroupColumns(child.get(), index, group_index, group_count, output_names, group_names)) {
 			return true;
 		}
 	}
@@ -516,19 +586,14 @@ static bool FindGroupColumns(LogicalOperator *op, const unordered_map<idx_t, Log
 }
 
 vector<string> DeriveGroupColumnNames(LogicalOperator *plan, idx_t group_index, size_t group_count,
-                                      const vector<string> &output_names, bool has_union_over_agg) {
+                                      const vector<string> &output_names) {
 	vector<string> group_names;
-	if (has_union_over_agg) {
-		for (size_t i = 0; i < group_count && i < output_names.size(); i++) {
-			if (!IncrementalTableNames::IsInternalColumn(output_names[i])) {
-				group_names.push_back(output_names[i]);
-			}
-		}
+	BindingResolverIndex index;
+	CollectBindingResolverIndex(plan, index);
+	if (AddGroupColumnsFromBindings(*plan, index, group_index, group_count, output_names, group_names)) {
 		return group_names;
 	}
-	unordered_map<idx_t, LogicalProjection *> projections_by_index;
-	CollectProjectionIndex(plan, projections_by_index);
-	FindGroupColumns(plan, projections_by_index, group_index, group_count, output_names, group_names);
+	FindGroupColumns(plan, index, group_index, group_count, output_names, group_names);
 	return group_names;
 }
 
@@ -603,8 +668,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, const vect
 	return group_names;
 }
 
-static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator *op,
-                                         const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
+static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator *op, const BindingResolverIndex &index,
                                          const vector<string> &output_names, vector<string> &group_names,
                                          bool include_first_aggregate, bool &seen_aggregate) {
 	if (!op) {
@@ -616,26 +680,24 @@ static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator 
 		seen_aggregate = true;
 		if (include_this && !agg.groups.empty()) {
 			vector<string> nested_names;
-			if (FindGroupColumns(root, projections_by_index, agg.group_index, agg.groups.size(), output_names,
-			                     nested_names)) {
+			if (FindGroupColumns(root, index, agg.group_index, agg.groups.size(), output_names, nested_names)) {
 				AddUniqueGroupNames(group_names, nested_names);
 			}
 		}
 	}
 	for (auto &child : op->children) {
-		CollectAggregateGroupColumns(root, child.get(), projections_by_index, output_names, group_names,
-		                             include_first_aggregate, seen_aggregate);
+		CollectAggregateGroupColumns(root, child.get(), index, output_names, group_names, include_first_aggregate,
+		                             seen_aggregate);
 	}
 }
 
 vector<string> DeriveAggregateGroupColumnNames(LogicalOperator *plan, const vector<string> &output_names,
                                                bool include_first_aggregate) {
 	vector<string> group_names;
-	unordered_map<idx_t, LogicalProjection *> projections_by_index;
-	CollectProjectionIndex(plan, projections_by_index);
+	BindingResolverIndex index;
+	CollectBindingResolverIndex(plan, index);
 	bool seen_aggregate = false;
-	CollectAggregateGroupColumns(plan, plan, projections_by_index, output_names, group_names, include_first_aggregate,
-	                             seen_aggregate);
+	CollectAggregateGroupColumns(plan, plan, index, output_names, group_names, include_first_aggregate, seen_aggregate);
 	return group_names;
 }
 

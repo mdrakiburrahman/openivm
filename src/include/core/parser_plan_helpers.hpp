@@ -80,7 +80,7 @@ void CollectDuckLakeTables(LogicalOperator *op, const string &current_catalog,
 void CollectSourceTables(LogicalOperator *op, unordered_map<string, SourceTableInfo> &source_table_info);
 bool RelationExists(Connection &con, const string &qualified_name);
 vector<string> DeriveGroupColumnNames(LogicalOperator *plan, idx_t group_index, size_t group_count,
-                                      const vector<string> &output_names, bool has_union_over_agg);
+                                      const vector<string> &output_names);
 vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, const vector<string> &output_names);
 vector<string> DeriveAggregateGroupColumnNames(LogicalOperator *plan, const vector<string> &output_names,
                                                bool include_first_aggregate);

@@ -425,8 +425,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				}
 			}
 		}
-		// Detect UNION / UNION ALL over aggregates once, shared by the group_cols block below
-		// (to skip key extraction) and the classification chain (to route to RECOMPUTE).
+		// Detect UNION / UNION ALL over aggregates once for the classification chain (to route
+		// to RECOMPUTE).
 		// True only when the UNION node is an ancestor of the aggregate (union-of-aggs pattern).
 		// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
 		// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
@@ -434,16 +434,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		bool union_distinct_over_agg = classification.found_distinct && distinct_at_top && has_union_over_agg;
 
 		if (union_distinct_over_agg) {
-			aggregate_columns =
-			    DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names, has_union_over_agg);
+			aggregate_columns = DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names);
 		} else if (distinct_at_top) {
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (classification.found_distinct && analysis.aggregate_columns.empty()) {
 			// Plain DISTINCT (no explicit targets) — trust the checker.
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
-			auto group_names_list =
-			    DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names, has_union_over_agg);
+			auto group_names_list = DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names);
 			for (auto &name : group_names_list) {
 				aggregate_columns.push_back(name);
 			}
