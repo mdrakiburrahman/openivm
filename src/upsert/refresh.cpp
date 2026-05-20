@@ -17,6 +17,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -190,8 +191,8 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// openivm-spark to compile refresh plans without mutating the source
 		// DuckDB database.
 		Value compile_only_val;
-		if (context.TryGetCurrentSetting("openivm_compile_only", compile_only_val) &&
-		    !compile_only_val.IsNull() && compile_only_val.GetValue<bool>()) {
+		if (context.TryGetCurrentSetting("openivm_compile_only", compile_only_val) && !compile_only_val.IsNull() &&
+		    compile_only_val.GetValue<bool>()) {
 			OPENIVM_DEBUG_PRINT("[UPSERT] openivm_compile_only=true; skipping execution for '%s'\n", vn.c_str());
 			profiler.AddTotal();
 			profiler.Flush(*context.db.get());
@@ -662,16 +663,48 @@ string CompileRefreshQuery(ClientContext &context, const FunctionParameters &par
 	RefreshMetadata metadata(con);
 	RefreshType type = metadata.GetViewType(view_name);
 
-	// GenerateRefreshSQL is side-effect-free w.r.t. the source DuckDB database
-	// (it only writes the artifact file under `openivm_files_path`). It does NOT
-	// read `openivm_compile_only`, so we don't need to toggle that setting — the
-	// compile path is naturally read-only.
+	// Compile refresh should behave like PRAGMA refresh in compile-only mode even
+	// when the caller did not SET openivm_compile_only explicitly. In particular,
+	// the join delta compiler must preserve inclusion-exclusion terms for empty
+	// compile-time delta tables while still leaving the client setting unchanged
+	// after the pragma returns.
 	string sql;
 	string out_pre_meta;
 	string out_post_meta;
-	sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, cross_system,
-	                         /*attached_db_catalog_name=*/"", /*attached_db_schema_name=*/"",
-	                         cross_system ? &out_pre_meta : nullptr, cross_system ? &out_post_meta : nullptr);
+	auto &db_config = DBConfig::GetConfig(context);
+	ExtensionOption compile_only_option;
+	bool have_compile_only_option = db_config.TryGetExtensionOption("openivm_compile_only", compile_only_option) &&
+	                                compile_only_option.setting_index.IsValid();
+	Value previous_compile_only;
+	bool restore_compile_only = false;
+	if (have_compile_only_option) {
+		restore_compile_only =
+		    context.TryGetCurrentUserSetting(compile_only_option.setting_index.GetIndex(), previous_compile_only);
+		context.config.user_settings.SetUserSetting(compile_only_option.setting_index.GetIndex(), Value::BOOLEAN(true));
+	}
+	try {
+		sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, cross_system,
+		                         /*attached_db_catalog_name=*/"", /*attached_db_schema_name=*/"",
+		                         cross_system ? &out_pre_meta : nullptr, cross_system ? &out_post_meta : nullptr);
+	} catch (...) {
+		if (have_compile_only_option) {
+			if (restore_compile_only) {
+				context.config.user_settings.SetUserSetting(compile_only_option.setting_index.GetIndex(),
+				                                            previous_compile_only);
+			} else {
+				context.config.user_settings.ClearSetting(compile_only_option.setting_index.GetIndex());
+			}
+		}
+		throw;
+	}
+	if (have_compile_only_option) {
+		if (restore_compile_only) {
+			context.config.user_settings.SetUserSetting(compile_only_option.setting_index.GetIndex(),
+			                                            previous_compile_only);
+		} else {
+			context.config.user_settings.ClearSetting(compile_only_option.setting_index.GetIndex());
+		}
+	}
 
 	// Encode the resulting SQL strings into a SELECT that DuckDB will execute
 	// in place of this PRAGMA call, surfacing the result row to the caller.
@@ -703,8 +736,8 @@ string CompileRefreshQuery(ClientContext &context, const FunctionParameters &par
 	string escaped_sql = SqlUtils::EscapeValue(combined_sql);
 	int32_t type_int = static_cast<int32_t>(type);
 	string type_name = string(RefreshTypeName(type));
-	return "SELECT CAST(" + to_string(type_int) + " AS INTEGER) AS refresh_type, '" +
-	       SqlUtils::EscapeValue(type_name) + "' AS refresh_type_name, '" + escaped_sql + "' AS sql;";
+	return "SELECT CAST(" + to_string(type_int) + " AS INTEGER) AS refresh_type, '" + SqlUtils::EscapeValue(type_name) +
+	       "' AS refresh_type_name, '" + escaped_sql + "' AS sql;";
 }
 
 } // namespace duckdb

@@ -703,7 +703,15 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
-	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
+	Value compile_only_val;
+	bool compile_only = false;
+	if (context.TryGetCurrentSetting("openivm_compile_only", compile_only_val) && !compile_only_val.IsNull()) {
+		compile_only = compile_only_val.GetValue<bool>();
+	}
+	uint64_t empty_mask = 0;
+	if (skip_empty_enabled) {
+		empty_mask = compile_only ? (delta_status.empty_mask & delta_status.constant_mask) : delta_status.empty_mask;
+	}
 
 	Connection key_probe_con(*context.db);
 	vector<JoinColumnRef> leaf_refs(N);

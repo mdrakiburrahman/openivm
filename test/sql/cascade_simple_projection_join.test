@@ -1,0 +1,327 @@
+# name: test/sql/cascade_simple_projection_join.test
+# description: Compile-only SIMPLE_PROJECTION joins emit real cascade view deltas
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# 2-source equi join
+statement ok
+CREATE TABLE cspj_eq_watch (watch_id INT, security_id INT, action_ts INT);
+
+statement ok
+CREATE TABLE cspj_eq_security (security_id INT, symbol VARCHAR);
+
+statement ok
+INSERT INTO cspj_eq_watch VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+INSERT INTO cspj_eq_security VALUES (10, 'alpha'), (20, 'beta');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_eq_mv AS
+    SELECT w.watch_id, w.security_id, s.symbol, w.action_ts
+    FROM cspj_eq_watch w
+    JOIN cspj_eq_security s ON w.security_id = s.security_id;
+
+statement ok
+PRAGMA compile_refresh('cspj_eq_mv');
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_eq_mv') AND
+                contains(content, 'openivm_delta_cspj_eq_watch') AND
+                contains(content, 'openivm_delta_cspj_eq_security') AND
+                contains(content, 'UNION ALL') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_eq_mv.sql');
+----
+1
+
+statement ok
+INSERT INTO cspj_eq_watch VALUES (3, 30, 300), (4, 20, 250);
+
+statement ok
+INSERT INTO cspj_eq_security VALUES (30, 'gamma');
+
+statement ok
+DELETE FROM cspj_eq_watch WHERE watch_id = 1;
+
+statement ok
+UPDATE cspj_eq_security SET symbol = 'beta_x' WHERE security_id = 20;
+
+statement ok
+PRAGMA refresh('cspj_eq_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_eq_mv
+    EXCEPT ALL
+    SELECT w.watch_id, w.security_id, s.symbol, w.action_ts
+    FROM cspj_eq_watch w
+    JOIN cspj_eq_security s ON w.security_id = s.security_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.watch_id, w.security_id, s.symbol, w.action_ts
+    FROM cspj_eq_watch w
+    JOIN cspj_eq_security s ON w.security_id = s.security_id
+    EXCEPT ALL
+    SELECT * FROM cspj_eq_mv
+);
+----
+0
+
+# 2-source temporal range join
+statement ok
+CREATE TABLE cspj_rng_txn (txn_id INT, account_id INT, txn_ts INT, amount INT);
+
+statement ok
+CREATE TABLE cspj_rng_window (account_id INT, start_ts INT, end_ts INT, bucket VARCHAR);
+
+statement ok
+INSERT INTO cspj_rng_txn VALUES (10, 1, 50, 100), (20, 2, 50, 200);
+
+statement ok
+INSERT INTO cspj_rng_window VALUES (1, 0, 100, 'a'), (2, 0, 100, 'b');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_rng_mv AS
+    SELECT t.txn_id, t.account_id, w.bucket, t.txn_ts, t.amount
+    FROM cspj_rng_txn t
+    JOIN cspj_rng_window w
+      ON t.account_id = w.account_id
+     AND t.txn_ts BETWEEN w.start_ts AND w.end_ts;
+
+statement ok
+PRAGMA compile_refresh('cspj_rng_mv');
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_rng_mv') AND
+                contains(content, 'openivm_delta_cspj_rng_txn') AND
+                contains(content, 'openivm_delta_cspj_rng_window') AND
+                contains(content, 'UNION ALL') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_rng_mv.sql');
+----
+1
+
+statement ok
+INSERT INTO cspj_rng_txn VALUES (30, 2, 60, 250), (40, 3, 70, 300);
+
+statement ok
+INSERT INTO cspj_rng_window VALUES (3, 0, 100, 'c');
+
+statement ok
+DELETE FROM cspj_rng_txn WHERE txn_id = 20;
+
+statement ok
+UPDATE cspj_rng_window SET bucket = 'a2' WHERE account_id = 1 AND start_ts = 0 AND end_ts = 100;
+
+statement ok
+PRAGMA refresh('cspj_rng_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_rng_mv
+    EXCEPT ALL
+    SELECT t.txn_id, t.account_id, w.bucket, t.txn_ts, t.amount
+    FROM cspj_rng_txn t
+    JOIN cspj_rng_window w
+      ON t.account_id = w.account_id
+     AND t.txn_ts BETWEEN w.start_ts AND w.end_ts
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT t.txn_id, t.account_id, w.bucket, t.txn_ts, t.amount
+    FROM cspj_rng_txn t
+    JOIN cspj_rng_window w
+      ON t.account_id = w.account_id
+     AND t.txn_ts BETWEEN w.start_ts AND w.end_ts
+    EXCEPT ALL
+    SELECT * FROM cspj_rng_mv
+);
+----
+0
+
+# 3-source join
+statement ok
+CREATE TABLE cspj_tri_account (account_id INT, customer_id INT, broker_id INT, balance INT);
+
+statement ok
+CREATE TABLE cspj_tri_customer (customer_id INT, customer_name VARCHAR);
+
+statement ok
+CREATE TABLE cspj_tri_broker (broker_id INT, broker_name VARCHAR);
+
+statement ok
+INSERT INTO cspj_tri_account VALUES (1, 10, 100, 500);
+
+statement ok
+INSERT INTO cspj_tri_customer VALUES (10, 'Alice');
+
+statement ok
+INSERT INTO cspj_tri_broker VALUES (100, 'North');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_tri_mv AS
+    SELECT a.account_id, c.customer_name, b.broker_name, a.balance
+    FROM cspj_tri_account a
+    JOIN cspj_tri_customer c ON a.customer_id = c.customer_id
+    JOIN cspj_tri_broker b ON a.broker_id = b.broker_id;
+
+statement ok
+PRAGMA compile_refresh('cspj_tri_mv');
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_tri_mv') AND
+                contains(content, 'openivm_delta_cspj_tri_account') AND
+                contains(content, 'openivm_delta_cspj_tri_customer') AND
+                contains(content, 'openivm_delta_cspj_tri_broker') AND
+                ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL')) >= 2 AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
+----
+1
+
+statement ok
+UPDATE cspj_tri_broker SET broker_name = 'NorthX' WHERE broker_id = 100;
+
+statement ok
+INSERT INTO cspj_tri_account VALUES (2, 20, 200, 700);
+
+statement ok
+INSERT INTO cspj_tri_customer VALUES (20, 'Bob');
+
+statement ok
+INSERT INTO cspj_tri_broker VALUES (200, 'South');
+
+statement ok
+PRAGMA refresh('cspj_tri_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_tri_mv
+    EXCEPT ALL
+    SELECT a.account_id, c.customer_name, b.broker_name, a.balance
+    FROM cspj_tri_account a
+    JOIN cspj_tri_customer c ON a.customer_id = c.customer_id
+    JOIN cspj_tri_broker b ON a.broker_id = b.broker_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.account_id, c.customer_name, b.broker_name, a.balance
+    FROM cspj_tri_account a
+    JOIN cspj_tri_customer c ON a.customer_id = c.customer_id
+    JOIN cspj_tri_broker b ON a.broker_id = b.broker_id
+    EXCEPT ALL
+    SELECT * FROM cspj_tri_mv
+);
+----
+0
+
+# CTE-fed join
+statement ok
+CREATE TABLE cspj_cte_holdings (account_id INT, security_id INT, qty INT);
+
+statement ok
+CREATE TABLE cspj_cte_security (security_id INT, symbol VARCHAR);
+
+statement ok
+INSERT INTO cspj_cte_holdings VALUES (1, 10, 5), (2, 20, 8);
+
+statement ok
+INSERT INTO cspj_cte_security VALUES (10, 'AAA'), (20, 'BBB');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_cte_mv AS
+    WITH active_holdings AS (
+        SELECT account_id, security_id, qty
+        FROM cspj_cte_holdings
+        WHERE qty > 0
+    )
+    SELECT h.account_id, h.security_id, s.symbol, h.qty
+    FROM active_holdings h
+    JOIN cspj_cte_security s ON h.security_id = s.security_id;
+
+statement ok
+PRAGMA compile_refresh('cspj_cte_mv');
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_cte_mv') AND
+                contains(content, 'openivm_delta_cspj_cte_holdings') AND
+                contains(content, 'openivm_delta_cspj_cte_security') AND
+                contains(content, 'UNION ALL') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_cte_mv.sql');
+----
+1
+
+statement ok
+INSERT INTO cspj_cte_holdings VALUES (3, 30, 7);
+
+statement ok
+INSERT INTO cspj_cte_security VALUES (30, 'CCC');
+
+statement ok
+DELETE FROM cspj_cte_holdings WHERE account_id = 1;
+
+statement ok
+UPDATE cspj_cte_security SET symbol = 'BBBX' WHERE security_id = 20;
+
+statement ok
+PRAGMA refresh('cspj_cte_mv');
+
+query I
+WITH active_holdings AS (
+    SELECT account_id, security_id, qty
+    FROM cspj_cte_holdings
+    WHERE qty > 0
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_cte_mv
+    EXCEPT ALL
+    SELECT h.account_id, h.security_id, s.symbol, h.qty
+    FROM active_holdings h
+    JOIN cspj_cte_security s ON h.security_id = s.security_id
+);
+----
+0
+
+query I
+WITH active_holdings AS (
+    SELECT account_id, security_id, qty
+    FROM cspj_cte_holdings
+    WHERE qty > 0
+)
+SELECT COUNT(*) FROM (
+    SELECT h.account_id, h.security_id, s.symbol, h.qty
+    FROM active_holdings h
+    JOIN cspj_cte_security s ON h.security_id = s.security_id
+    EXCEPT ALL
+    SELECT * FROM cspj_cte_mv
+);
+----
+0

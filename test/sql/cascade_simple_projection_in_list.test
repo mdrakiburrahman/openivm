@@ -1,0 +1,218 @@
+# name: test/sql/cascade_simple_projection_in_list.test
+# description: Compile-only long IN-lists emit real SIMPLE_PROJECTION view deltas
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# 2-literal IN list (already works, regression guard)
+statement ok
+CREATE TABLE cspl_in2_item (id INT, rating VARCHAR, amount INT);
+
+statement ok
+INSERT INTO cspl_in2_item VALUES (1, 'A', 10), (2, 'Z', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW cspl_in2_mv AS
+    SELECT id, rating, amount, rating IN ('A', 'B') AS in_bucket
+    FROM cspl_in2_item;
+
+statement ok
+PRAGMA compile_refresh('cspl_in2_mv');
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspl_in2_mv') AND
+                contains(content, 'openivm_delta_cspl_in2_item') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspl_in2_mv.sql');
+----
+1
+
+statement ok
+UPDATE cspl_in2_item SET rating = 'C' WHERE id = 1;
+
+statement ok
+INSERT INTO cspl_in2_item VALUES (3, 'B', 30);
+
+statement ok
+DELETE FROM cspl_in2_item WHERE id = 2;
+
+statement ok
+PRAGMA refresh('cspl_in2_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspl_in2_mv
+    EXCEPT ALL
+    SELECT id, rating, amount, rating IN ('A', 'B') AS in_bucket
+    FROM cspl_in2_item
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, rating, amount, rating IN ('A', 'B') AS in_bucket
+    FROM cspl_in2_item
+    EXCEPT ALL
+    SELECT * FROM cspl_in2_mv
+);
+----
+0
+
+# 12-literal IN list (optimizer lowers to MARK join)
+statement ok
+CREATE TABLE cspl_in10_item (id INT, rating VARCHAR, amount INT);
+
+statement ok
+INSERT INTO cspl_in10_item VALUES (1, 'BB', 10), (2, 'AAA', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW cspl_in10_mv AS
+    SELECT id,
+           rating,
+           amount,
+           rating IN ('BB', 'B', 'CCC', 'CC', 'C', 'D', 'BB+', 'B+', 'CCC+', 'BB-', 'B-', 'CCC-') AS in_bucket
+    FROM cspl_in10_item;
+
+statement ok
+PRAGMA compile_refresh('cspl_in10_mv');
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspl_in10_mv') AND
+                contains(content, 'openivm_delta_cspl_in10_item') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspl_in10_mv.sql');
+----
+1
+
+statement ok
+UPDATE cspl_in10_item SET rating = 'AA' WHERE id = 1;
+
+statement ok
+INSERT INTO cspl_in10_item VALUES (3, 'B+', 30);
+
+statement ok
+DELETE FROM cspl_in10_item WHERE id = 2;
+
+statement ok
+PRAGMA refresh('cspl_in10_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspl_in10_mv
+    EXCEPT ALL
+    SELECT id,
+           rating,
+           amount,
+           rating IN ('BB', 'B', 'CCC', 'CC', 'C', 'D', 'BB+', 'B+', 'CCC+', 'BB-', 'B-', 'CCC-') AS in_bucket
+    FROM cspl_in10_item
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id,
+           rating,
+           amount,
+           rating IN ('BB', 'B', 'CCC', 'CC', 'C', 'D', 'BB+', 'B+', 'CCC+', 'BB-', 'B-', 'CCC-') AS in_bucket
+    FROM cspl_in10_item
+    EXCEPT ALL
+    SELECT * FROM cspl_in10_mv
+);
+----
+0
+
+# 50-literal IN list (stress)
+statement ok
+CREATE TABLE cspl_in50_item (id INT, rating VARCHAR, amount INT);
+
+statement ok
+INSERT INTO cspl_in50_item VALUES (1, 'K25', 10), (2, 'Z99', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW cspl_in50_mv AS
+    SELECT id,
+           rating,
+           amount,
+           rating IN (
+               'K01', 'K02', 'K03', 'K04', 'K05', 'K06', 'K07', 'K08', 'K09', 'K10',
+               'K11', 'K12', 'K13', 'K14', 'K15', 'K16', 'K17', 'K18', 'K19', 'K20',
+               'K21', 'K22', 'K23', 'K24', 'K25', 'K26', 'K27', 'K28', 'K29', 'K30',
+               'K31', 'K32', 'K33', 'K34', 'K35', 'K36', 'K37', 'K38', 'K39', 'K40',
+               'K41', 'K42', 'K43', 'K44', 'K45', 'K46', 'K47', 'K48', 'K49', 'K50'
+           ) AS in_bucket
+    FROM cspl_in50_item;
+
+statement ok
+PRAGMA compile_refresh('cspl_in50_mv');
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspl_in50_mv') AND
+                contains(content, 'openivm_delta_cspl_in50_item') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspl_in50_mv.sql');
+----
+1
+
+statement ok
+UPDATE cspl_in50_item SET rating = 'Z98' WHERE id = 1;
+
+statement ok
+INSERT INTO cspl_in50_item VALUES (3, 'K50', 30);
+
+statement ok
+DELETE FROM cspl_in50_item WHERE id = 2;
+
+statement ok
+PRAGMA refresh('cspl_in50_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspl_in50_mv
+    EXCEPT ALL
+    SELECT id,
+           rating,
+           amount,
+           rating IN (
+               'K01', 'K02', 'K03', 'K04', 'K05', 'K06', 'K07', 'K08', 'K09', 'K10',
+               'K11', 'K12', 'K13', 'K14', 'K15', 'K16', 'K17', 'K18', 'K19', 'K20',
+               'K21', 'K22', 'K23', 'K24', 'K25', 'K26', 'K27', 'K28', 'K29', 'K30',
+               'K31', 'K32', 'K33', 'K34', 'K35', 'K36', 'K37', 'K38', 'K39', 'K40',
+               'K41', 'K42', 'K43', 'K44', 'K45', 'K46', 'K47', 'K48', 'K49', 'K50'
+           ) AS in_bucket
+    FROM cspl_in50_item
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id,
+           rating,
+           amount,
+           rating IN (
+               'K01', 'K02', 'K03', 'K04', 'K05', 'K06', 'K07', 'K08', 'K09', 'K10',
+               'K11', 'K12', 'K13', 'K14', 'K15', 'K16', 'K17', 'K18', 'K19', 'K20',
+               'K21', 'K22', 'K23', 'K24', 'K25', 'K26', 'K27', 'K28', 'K29', 'K30',
+               'K31', 'K32', 'K33', 'K34', 'K35', 'K36', 'K37', 'K38', 'K39', 'K40',
+               'K41', 'K42', 'K43', 'K44', 'K45', 'K46', 'K47', 'K48', 'K49', 'K50'
+           ) AS in_bucket
+    FROM cspl_in50_item
+    EXCEPT ALL
+    SELECT * FROM cspl_in50_mv
+);
+----
+0

@@ -12,6 +12,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -91,6 +92,30 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 	return input;
 }
 
+static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
+	auto &db_config = DBConfig::GetConfig(to);
+	ExtensionOption option;
+	if (!db_config.TryGetExtensionOption(name, option) || !option.setting_index.IsValid()) {
+		return;
+	}
+	Value value;
+	if (from.TryGetCurrentSetting(name, value) && !value.IsNull()) {
+		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
+	} else {
+		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
+	}
+}
+
+static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
+	static const char *PLANNING_SETTINGS[] = {
+	    "openivm_compile_only", "openivm_target_dialect", "openivm_skip_empty_deltas",
+	    "openivm_fk_pruning",   "openivm_ducklake_nterm",
+	};
+	for (auto setting_name : PLANNING_SETTINGS) {
+		CopyOpenIvmSetting(from, to, setting_name);
+	}
+}
+
 } // namespace
 
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
@@ -99,6 +124,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto &catalog = Catalog::GetSystemCatalog(context);
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
+	PropagateRefreshPlanningSettings(context, *con.context);
 	Value skip_empty_val;
 	bool skip_empty_enabled = true;
 	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
