@@ -34,6 +34,27 @@ struct DeltaFastPathFlags {
 	vector<string> active_delta_table_names;
 };
 
+struct DuckLakeSnapshotAdvance {
+	DuckLakeSnapshotAdvance() {
+	}
+
+	DuckLakeSnapshotAdvance(string table_name_p, int64_t snapshot_id_p)
+	    : table_name(std::move(table_name_p)), snapshot_id(snapshot_id_p) {
+	}
+
+	string table_name;
+	int64_t snapshot_id = -1;
+};
+
+struct DeltaActivityResult {
+	bool has_join = false;
+	idx_t tables_with_changes = 0;
+	bool any_has_deletes = false;
+	bool all_ducklake = true;
+	vector<string> active_delta_table_names;
+	vector<DuckLakeSnapshotAdvance> ducklake_snapshot_advances;
+};
+
 struct RefreshCompileProfileStep {
 	string step_name;
 	int64_t duration_ms;
@@ -121,11 +142,13 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const string &view_name, const string &view_query_sql,
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name, bool cross_system);
-vector<string> BuildActiveDeltaTableNames(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                          const vector<string> &delta_table_names, const string &view_catalog_name,
-                                          const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name);
+                                             const string &attached_db_schema_name, bool cross_system,
+                                             const DeltaActivityResult *precomputed_delta_activity = nullptr);
+DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                             const string &view_query_sql, const vector<string> &delta_table_names,
+                                             const string &view_catalog_name, const string &view_schema_name,
+                                             const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name);
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                    const string &view_query_sql, const vector<string> &delta_table_names,
@@ -143,7 +166,8 @@ bool TryBuildGroupMeasureUpdateRefresh(RefreshMetadata &metadata, Connection &co
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,
-                          string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr);
+                          string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
+                          const DeltaActivityResult *precomputed_delta_activity = nullptr);
 
 } // namespace duckdb
 

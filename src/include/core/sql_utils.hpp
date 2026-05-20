@@ -35,6 +35,13 @@ public:
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
+	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
+		Value setting_value;
+		if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {
+			return setting_value.GetValue<bool>();
+		}
+		return default_value;
+	}
 	static bool IsDelta(const string &name);
 	static string GenerateDeltaTable(string &query);
 	static string JoinQuotedColumns(const vector<string> &columns);

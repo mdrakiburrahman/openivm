@@ -382,7 +382,7 @@ statement ok
 PRAGMA refresh('mv_skip_base');
 
 query I
-SELECT last_snapshot_id = (SELECT snap FROM skip_base_snapshot)
+SELECT last_snapshot_id > (SELECT snap FROM skip_base_snapshot)
 FROM openivm_delta_tables
 WHERE view_name = 'mv_skip_base';
 ----
@@ -390,6 +390,30 @@ true
 
 statement ok
 DROP TABLE skip_base_snapshot;
+
+statement ok
+INSERT INTO dl.skip_base VALUES (2, 20);
+
+statement ok
+PRAGMA refresh('mv_skip_base');
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.mv_skip_base
+  EXCEPT ALL
+  SELECT id, v FROM dl.skip_base
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.skip_base
+  EXCEPT ALL
+  SELECT id, v FROM dl.mv_skip_base
+);
+----
+0
 
 statement ok
 CREATE TABLE dl.skip_left (id INTEGER, v INTEGER);

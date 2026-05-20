@@ -96,7 +96,8 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
-                          RefreshCompileProfile *compile_profile) {
+                          RefreshCompileProfile *compile_profile,
+                          const DeltaActivityResult *precomputed_delta_activity) {
 	auto profile_now = []() {
 		return std::chrono::steady_clock::now();
 	};
@@ -109,11 +110,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto context_start = profile_now();
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
-	Value skip_empty_val;
-	bool skip_empty_enabled = true;
-	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
-		skip_empty_enabled = skip_empty_val.GetValue<bool>();
-	}
+	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	string default_db;
 	string default_schema = "main";
 	{
@@ -197,18 +194,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool source_has_left_join = metadata.HasLeftJoin(view_name);
 	bool source_has_full_outer = source_has_left_join && metadata.HasFullOuter(view_name);
 	bool left_join_merge = false;
-	Value lj_merge_val;
 	if (source_has_left_join && !source_has_full_outer) {
-		if (context.TryGetCurrentSetting("openivm_left_join_merge", lj_merge_val) && !lj_merge_val.IsNull()) {
-			left_join_merge = lj_merge_val.GetValue<bool>();
-		}
+		left_join_merge = SqlUtils::GetBoolSetting(context, "openivm_left_join_merge", false);
 	}
 	bool full_outer_merge = false;
 	if (source_has_full_outer) {
-		Value foj_merge_val;
-		if (context.TryGetCurrentSetting("openivm_full_outer_merge", foj_merge_val) && !foj_merge_val.IsNull()) {
-			full_outer_merge = foj_merge_val.GetValue<bool>();
-		}
+		full_outer_merge = SqlUtils::GetBoolSetting(context, "openivm_full_outer_merge", false);
 	}
 	bool has_minmax = metadata.HasMinMax(view_name) || view_query_type == RefreshType::AGGREGATE_HAVING ||
 	                  (source_has_left_join && !source_has_full_outer && !left_join_merge) ||
@@ -231,12 +222,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                 "full_recompute=true; sql_bytes=" + to_string(recompute_query.size()));
 		return recompute_query;
 	}
-	Value adaptive_refresh_val;
-	bool adaptive_refresh = false;
-	if (context.TryGetCurrentSetting("openivm_adaptive_refresh", adaptive_refresh_val) &&
-	    !adaptive_refresh_val.IsNull()) {
-		adaptive_refresh = adaptive_refresh_val.GetValue<bool>();
-	}
+	bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 	if (adaptive_refresh) {
 		auto adaptive_start = profile_now();
 		con.BeginTransaction();
@@ -316,7 +302,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto fast_path_start = profile_now();
 	auto fast_paths = ResolveDeltaFastPathFlags(context, metadata, con, view_name, view_query_sql, delta_table_names,
 	                                            view_catalog_name, view_schema_name, attached_db_catalog_name,
-	                                            attached_db_schema_name, cross_system);
+	                                            attached_db_schema_name, cross_system, precomputed_delta_activity);
 	add_profile_step("generate_refresh_sql.delta_fast_paths", fast_path_start,
 	                 "insert_only=" + string(fast_paths.insert_only ? "true" : "false") +
 	                     "; skip_agg_delete=" + string(fast_paths.skip_agg_delete ? "true" : "false") +
@@ -334,11 +320,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto dispatch_start = profile_now();
 	switch (view_query_type) {
 	case RefreshType::AGGREGATE_HAVING: {
-		Value having_merge_val;
-		bool having_merge = true;
-		if (context.TryGetCurrentSetting("openivm_having_merge", having_merge_val) && !having_merge_val.IsNull()) {
-			having_merge = having_merge_val.GetValue<bool>();
-		}
+		bool having_merge = SqlUtils::GetBoolSetting(context, "openivm_having_merge", true);
 		if (having_merge) {
 			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(
@@ -698,10 +680,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string update_timestamp_query;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
-			update_timestamp_query += "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-			                          " SET last_update = now(), last_refresh_ts = now() WHERE view_name = '" +
-			                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-			                          SqlUtils::EscapeValue(dt) + "';\n";
 			continue;
 		}
 		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, view_catalog_name, view_schema_name);
@@ -726,10 +704,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			string dl_snapshot_expr = cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
 			                                       : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) +
 			                                             ".current_snapshot())";
-			snapshot_update_query += "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-			                         " SET last_snapshot_id = " + dl_snapshot_expr + " WHERE view_name = '" +
-			                         SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-			                         SqlUtils::EscapeValue(dt) + "';\n";
+			snapshot_update_query += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, dl_snapshot_expr);
 		}
 	}
 

@@ -95,9 +95,136 @@ SELECT count(*) FROM (
 
 query I
 SELECT count(*) FROM (
-  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
   EXCEPT ALL
   SELECT region, total, cnt FROM dl.mv_top
+);
+----
+0
+
+# ==========================================
+# Empty upstream cascade should skip unchanged ancestors and advance DuckLake
+# snapshots for sources proven unchanged. A later real source update must still
+# be detected.
+# ==========================================
+
+statement ok
+SET openivm_cascade_refresh = 'upstream';
+
+statement ok
+SET openivm_skip_empty_deltas = true;
+
+statement ok
+CREATE TABLE dl.chain_skip_base (id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.chain_skip_unrelated (id INTEGER);
+
+statement ok
+INSERT INTO dl.chain_skip_base VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.chain_skip_l1 AS
+SELECT id, v FROM dl.chain_skip_base;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.chain_skip_l2 AS
+SELECT id, v * 2 AS doubled FROM dl.chain_skip_l1;
+
+statement ok
+CREATE TEMP TABLE chain_skip_snapshots AS
+SELECT view_name, table_name, last_snapshot_id AS snap
+FROM openivm_delta_tables
+WHERE view_name IN ('chain_skip_l1', 'chain_skip_l2');
+
+statement ok
+INSERT INTO dl.chain_skip_unrelated VALUES (1);
+
+statement ok
+PRAGMA refresh('chain_skip_l2');
+
+query I
+SELECT count(*) FROM openivm_delta_tables d
+JOIN chain_skip_snapshots s
+  ON d.view_name = s.view_name AND d.table_name = s.table_name
+WHERE d.last_snapshot_id <= s.snap;
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.chain_skip_l1
+  EXCEPT ALL
+  SELECT id, v FROM dl.chain_skip_base
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.chain_skip_base
+  EXCEPT ALL
+  SELECT id, v FROM dl.chain_skip_l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, doubled FROM dl.chain_skip_l2
+  EXCEPT ALL
+  SELECT id, v * 2 AS doubled FROM dl.chain_skip_base
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v * 2 AS doubled FROM dl.chain_skip_base
+  EXCEPT ALL
+  SELECT id, doubled FROM dl.chain_skip_l2
+);
+----
+0
+
+statement ok
+INSERT INTO dl.chain_skip_base VALUES (2, 20);
+
+statement ok
+PRAGMA refresh('chain_skip_l2');
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.chain_skip_l1
+  EXCEPT ALL
+  SELECT id, v FROM dl.chain_skip_base
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.chain_skip_base
+  EXCEPT ALL
+  SELECT id, v FROM dl.chain_skip_l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, doubled FROM dl.chain_skip_l2
+  EXCEPT ALL
+  SELECT id, v * 2 AS doubled FROM dl.chain_skip_base
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v * 2 AS doubled FROM dl.chain_skip_base
+  EXCEPT ALL
+  SELECT id, doubled FROM dl.chain_skip_l2
 );
 ----
 0

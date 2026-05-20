@@ -355,15 +355,8 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	Connection con(*context.db);
 
 	// Read operational flags — cost model reflects what actually happens at refresh time.
-	Value nterm_val, fk_val;
-	bool nterm_enabled = true;
-	bool fk_enabled = true;
-	if (context.TryGetCurrentSetting("openivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull()) {
-		nterm_enabled = nterm_val.GetValue<bool>();
-	}
-	if (context.TryGetCurrentSetting("openivm_fk_pruning", fk_val) && !fk_val.IsNull()) {
-		fk_enabled = fk_val.GetValue<bool>();
-	}
+	bool nterm_enabled = SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true);
+	bool fk_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
 
 	// Read view type so the IVM-cost branch can reflect the strategy that will
 	// actually run at refresh time. Defaults to AGGREGATE_GROUP if the view isn't
@@ -545,11 +538,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	double recompute_predicted_ms = recompute_total;
 	bool calibrated = false;
 
-	Value adaptive_val;
-	bool adaptive_on = false;
-	if (context.TryGetCurrentSetting("openivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull()) {
-		adaptive_on = adaptive_val.GetValue<bool>();
-	}
+	bool adaptive_on = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 
 	if (adaptive_on) {
 		// Read decay setting

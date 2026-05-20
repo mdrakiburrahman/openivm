@@ -678,11 +678,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	idx_t non_empty_leaf_count = CountBits(non_empty_mask);
 
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
-	Value fk_pruning_val;
-	bool fk_pruning_enabled = true;
-	if (context.TryGetCurrentSetting("openivm_fk_pruning", fk_pruning_val) && !fk_pruning_val.IsNull()) {
-		fk_pruning_enabled = fk_pruning_val.GetValue<bool>();
-	}
+	bool fk_pruning_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
 	uint64_t skip_bits = 0;
 	// FK pruning pays for catalog constraint inspection. When every leaf changed
 	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and
@@ -698,11 +694,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 
 	// Empty-delta skipping: skip terms where any table in the mask has zero delta rows.
 	// A join with an empty input always produces zero rows.
-	Value skip_empty_val;
-	bool skip_empty_enabled = true;
-	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
-		skip_empty_enabled = skip_empty_val.GetValue<bool>();
-	}
+	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
 
 	Connection key_probe_con(*context.db);
@@ -966,9 +958,7 @@ ModifiedPlan IncrementalJoinRule::Rewrite(PlanWrapper pw) {
 	// 3. Build terms — use DuckLake N-term path when all leaves are DuckLake scans
 	// Check if all leaves are DuckLake scans AND N-term telescoping is enabled.
 	bool all_ducklake = true;
-	Value nterm_val;
-	if (context.TryGetCurrentSetting("openivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull() &&
-	    !nterm_val.GetValue<bool>()) {
+	if (!SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true)) {
 		all_ducklake = false; // forced to inclusion-exclusion
 	} else {
 		for (size_t i = 0; i < N; i++) {

@@ -117,8 +117,9 @@ public:
 	// Get the DuckLake snapshot ID at last refresh. Returns -1 if not set.
 	int64_t GetLastSnapshotId(const string &view_name, const string &table_name);
 
-	// Update the DuckLake snapshot ID after refresh.
-	void UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id);
+	static string BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
+	                                              const string &snapshot_expr);
+	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id);
 
 	// --- Refresh history (learned cost model) ---
 

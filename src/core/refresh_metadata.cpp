@@ -336,12 +336,18 @@ int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string
 	return result->GetValue(0, 0).GetValue<int64_t>();
 }
 
-void RefreshMetadata::UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id) {
-	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " +
-	                        to_string(snapshot_id) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-	                        "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
+                                                        const string &snapshot_expr) {
+	return "UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " + snapshot_expr +
+	       ", last_update = now(), last_refresh_ts = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+	       "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "';\n";
+}
+
+void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name,
+                                                    int64_t snapshot_id) {
+	auto result = con.Query(BuildDuckLakeRefreshMetadataSQL(view_name, table_name, to_string(snapshot_id)));
 	if (result->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake snapshot ID: " + result->GetError());
+		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake refresh metadata: " + result->GetError());
 	}
 }
 

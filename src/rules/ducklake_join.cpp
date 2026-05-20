@@ -182,11 +182,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 	}
 
 	// Check if empty-delta term skipping is enabled.
-	bool skip_empty_enabled = true;
-	Value skip_empty_val;
-	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
-		skip_empty_enabled = skip_empty_val.GetValue<bool>();
-	}
+	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 
 	// Get current snapshot ID from the first leaf's DuckLakeFunctionInfo.
 	// The plan was just bound for this refresh, so this reflects the current state.

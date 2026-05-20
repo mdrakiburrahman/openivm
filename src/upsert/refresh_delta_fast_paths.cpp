@@ -12,15 +12,7 @@ static bool QueryLooksLikeJoin(const string &view_query_sql, const vector<string
 	       view_query_sql.find("join") != string::npos;
 }
 
-struct DeltaChangeSummary {
-	bool has_join = false;
-	idx_t tables_with_changes = 0;
-	bool any_has_deletes = false;
-	bool all_ducklake = true;
-	vector<string> active_delta_table_names;
-};
-
-static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshMetadata &metadata, Connection &con,
+static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, RefreshMetadata &metadata, Connection &con,
                                            const string &view_name, const string &delta_table,
                                            const string &view_catalog_name, const string &view_schema_name,
                                            const string &attached_db_catalog_name,
@@ -53,6 +45,7 @@ static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshM
 	auto insert_count = count_result->GetValue(0, 0).GetValue<int64_t>();
 	auto delete_count = count_result->GetValue(1, 0).GetValue<int64_t>();
 	if (insert_count == 0 && delete_count == 0) {
+		summary.ducklake_snapshot_advances.push_back({delta_table, cur_snap});
 		return;
 	}
 	summary.tables_with_changes++;
@@ -62,7 +55,7 @@ static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshM
 	}
 }
 
-static void AccumulateStandardDeltaSummary(DeltaChangeSummary &summary, RefreshMetadata &metadata,
+static void AccumulateStandardDeltaSummary(DeltaActivityResult &summary, RefreshMetadata &metadata,
                                            const string &view_name, const string &delta_table,
                                            const string &view_catalog_name, const string &view_schema_name) {
 	summary.all_ducklake = false;
@@ -92,7 +85,7 @@ static void AccumulateStandardDeltaSummary(DeltaChangeSummary &summary, RefreshM
 	}
 }
 
-static bool IsInsertOnlyDeltaSummary(const DeltaChangeSummary &summary, const vector<string> &delta_table_names) {
+static bool IsInsertOnlyDeltaSummary(const DeltaActivityResult &summary, const vector<string> &delta_table_names) {
 	if (summary.any_has_deletes) {
 		return false;
 	}
@@ -108,12 +101,12 @@ static bool IsInsertOnlyDeltaSummary(const DeltaChangeSummary &summary, const ve
 	return false;
 }
 
-static DeltaChangeSummary AnalyzeDeltaChanges(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                              const string &view_query_sql, const vector<string> &delta_table_names,
-                                              const string &view_catalog_name, const string &view_schema_name,
-                                              const string &attached_db_catalog_name,
-                                              const string &attached_db_schema_name, bool cross_system) {
-	DeltaChangeSummary summary;
+static DeltaActivityResult AnalyzeDeltaChanges(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                               const string &view_query_sql, const vector<string> &delta_table_names,
+                                               const string &view_catalog_name, const string &view_schema_name,
+                                               const string &attached_db_catalog_name,
+                                               const string &attached_db_schema_name, bool cross_system) {
+	DeltaActivityResult summary;
 	summary.has_join = QueryLooksLikeJoin(view_query_sql, delta_table_names);
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
@@ -126,23 +119,29 @@ static DeltaChangeSummary AnalyzeDeltaChanges(RefreshMetadata &metadata, Connect
 	return summary;
 }
 
-vector<string> BuildActiveDeltaTableNames(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                          const vector<string> &delta_table_names, const string &view_catalog_name,
-                                          const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name) {
-	auto summary = AnalyzeDeltaChanges(metadata, con, view_name, "", delta_table_names, view_catalog_name,
-	                                   view_schema_name, attached_db_catalog_name, attached_db_schema_name, false);
-	return summary.active_delta_table_names;
+DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                             const string &view_query_sql, const vector<string> &delta_table_names,
+                                             const string &view_catalog_name, const string &view_schema_name,
+                                             const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name) {
+	return AnalyzeDeltaChanges(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
+	                           view_schema_name, attached_db_catalog_name, attached_db_schema_name, false);
 }
 
 DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMetadata &metadata, Connection &con,
                                              const string &view_name, const string &view_query_sql,
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name, bool cross_system) {
-	auto summary =
-	    AnalyzeDeltaChanges(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
-	                        view_schema_name, attached_db_catalog_name, attached_db_schema_name, cross_system);
+                                             const string &attached_db_schema_name, bool cross_system,
+                                             const DeltaActivityResult *precomputed_delta_activity) {
+	DeltaActivityResult summary;
+	if (precomputed_delta_activity) {
+		summary = *precomputed_delta_activity;
+	} else {
+		summary =
+		    AnalyzeDeltaChanges(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
+		                        view_schema_name, attached_db_catalog_name, attached_db_schema_name, cross_system);
+	}
 	DeltaFastPathFlags flags;
 	flags.insert_only = IsInsertOnlyDeltaSummary(summary, delta_table_names);
 	flags.skip_agg_delete = flags.insert_only;
@@ -150,17 +149,13 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	flags.minmax_incremental = flags.insert_only;
 	flags.active_delta_table_names = summary.active_delta_table_names;
 
-	Value skip_agg_del_val, skip_proj_del_val, minmax_incr_val;
-	if (context.TryGetCurrentSetting("openivm_skip_aggregate_delete", skip_agg_del_val) && !skip_agg_del_val.IsNull() &&
-	    !skip_agg_del_val.GetValue<bool>()) {
+	if (!SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true)) {
 		flags.skip_agg_delete = false;
 	}
-	if (context.TryGetCurrentSetting("openivm_skip_projection_delete", skip_proj_del_val) &&
-	    !skip_proj_del_val.IsNull() && !skip_proj_del_val.GetValue<bool>()) {
+	if (!SqlUtils::GetBoolSetting(context, "openivm_skip_projection_delete", true)) {
 		flags.skip_proj_delete = false;
 	}
-	if (context.TryGetCurrentSetting("openivm_minmax_incremental", minmax_incr_val) && !minmax_incr_val.IsNull() &&
-	    !minmax_incr_val.GetValue<bool>()) {
+	if (!SqlUtils::GetBoolSetting(context, "openivm_minmax_incremental", true)) {
 		flags.minmax_incremental = false;
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d, skip_agg_delete=%d, skip_proj_delete=%d, minmax_incremental=%d\n",

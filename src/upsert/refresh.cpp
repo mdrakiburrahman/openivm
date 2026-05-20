@@ -118,12 +118,17 @@ private:
 	vector<RefreshProfileStep> steps;
 };
 
+static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadata, Connection &con,
+                                const string &view_catalog_name, const string &view_schema_name,
+                                const string &view_name, const string &attached_db_catalog_name,
+                                const string &attached_db_schema_name, DeltaActivityResult *active_activity);
+
 // Generate and execute refresh SQL for a single view under its per-view lock.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
-static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
+static bool RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
-                              const string &attached_db_schema_name) {
+                              const string &attached_db_schema_name, bool skip_empty_refresh) {
 	RefreshProfiler profiler(context, vn);
 	auto lock_start = std::chrono::steady_clock::now();
 	ViewLockGuard view_guard(vn);
@@ -143,6 +148,19 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
 	}
 	profiler.AddStep("acquire_locks", lock_start, to_string(delta_table_names.size()) + " delta locks");
+	DeltaActivityResult delta_activity;
+	DeltaActivityResult *precomputed_delta_activity = nullptr;
+	if (skip_empty_refresh) {
+		if (TrySkipEmptyRefresh(context, probe_meta, probe_con, view_catalog_name, view_schema_name, vn,
+		                        attached_db_catalog_name, attached_db_schema_name, &delta_activity)) {
+			profiler.AddTotal();
+			profiler.Flush(*context.db.get());
+			return true;
+		}
+		if (!delta_activity.active_delta_table_names.empty()) {
+			precomputed_delta_activity = &delta_activity;
+		}
+	}
 	// Track whether we're inside an open exec_con transaction so any exception path can
 	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
 	// Connection destructor, which can leak uncommitted writes into the WAL under some
@@ -154,9 +172,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// Check if adaptive cost model is active — if so, compute estimate for history recording.
 		bool record_history = false;
 		RefreshCostEstimate cost_estimate = {};
-		Value adaptive_val;
-		if (context.TryGetCurrentSetting("openivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull() &&
-		    adaptive_val.GetValue<bool>()) {
+		if (SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false)) {
 			auto adaptive_start = std::chrono::steady_clock::now();
 			// Compute cost estimate before refresh (for history recording).
 			// GenerateRefreshSQL also computes this when adaptive is on, but we need
@@ -188,7 +204,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		string sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system,
 		                                attached_db_catalog_name, attached_db_schema_name,
 		                                cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr,
-		                                profiler.Enabled() ? &compile_profile : nullptr);
+		                                profiler.Enabled() ? &compile_profile : nullptr, precomputed_delta_activity);
 		for (const auto &step : compile_profile.steps) {
 			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
 		}
@@ -350,6 +366,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		}
 		profiler.AddTotal();
 		profiler.Flush(*context.db.get());
+		return false;
 	} catch (...) {
 		// Ensure the transaction is rolled back before we propagate the exception.
 		// This covers the case where Query() itself threw (vs returning HasError) —
@@ -368,6 +385,41 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		profiler.Flush(*context.db.get());
 		throw;
 	}
+}
+
+static bool SkipEmptyDeltasEnabled(ClientContext &context) {
+	return SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
+}
+
+static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadata, Connection &con,
+                                const string &view_catalog_name, const string &view_schema_name,
+                                const string &view_name, const string &attached_db_catalog_name,
+                                const string &attached_db_schema_name, DeltaActivityResult *active_activity) {
+	if (!SkipEmptyDeltasEnabled(context)) {
+		return false;
+	}
+	if (metadata.GetViewType(view_name) == RefreshType::FULL_REFRESH) {
+		return false;
+	}
+
+	auto view_query_sql = metadata.GetViewQuery(view_name);
+	auto delta_tables = metadata.GetDeltaTables(view_name);
+	auto activity = BuildDeltaActivityResult(metadata, con, view_name, view_query_sql, delta_tables, view_catalog_name,
+	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+	if (!activity.active_delta_table_names.empty()) {
+		if (active_activity) {
+			*active_activity = std::move(activity);
+		}
+		return false;
+	}
+
+	for (auto &advance : activity.ducklake_snapshot_advances) {
+		if (advance.snapshot_id >= 0) {
+			metadata.UpdateDuckLakeRefreshMetadata(view_name, advance.table_name, advance.snapshot_id);
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
+	return true;
 }
 
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
@@ -468,31 +520,10 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		for (auto &dep : upstream) {
 			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
 			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep,
-			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name);
+			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name,
+			                  /*skip_empty_refresh=*/true);
 		}
 	}
-
-	// Early exit: skip refresh if all delta tables are empty.
-	// Placed AFTER upstream cascade so that upstream refreshes have a chance to populate
-	// our delta tables before we check.
-	Value skip_empty_val;
-	bool skip_empty_enabled = true;
-	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
-		skip_empty_enabled = skip_empty_val.GetValue<bool>();
-	}
-	if (skip_empty_enabled) {
-		auto view_type = metadata.GetViewType(view_name);
-		if (view_type != RefreshType::FULL_REFRESH) {
-			auto delta_tables = metadata.GetDeltaTables(view_name);
-			auto active_delta_tables =
-			    BuildActiveDeltaTableNames(metadata, con, view_name, delta_tables, view_catalog_name, view_schema_name,
-			                               attached_db_catalog_name, attached_db_schema_name);
-			if (active_delta_tables.empty()) {
-				OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
-				return;
-			}
-		}
-	} // skip_empty_enabled
 
 	// Check for refresh hooks (custom SQL to run before/after/instead of IVM)
 	string hook_sql;
@@ -505,6 +536,14 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			hook_mode = StringUtil::Lower(hook_r->GetValue(1, 0).ToString());
 		}
 	}
+	bool has_refresh_hook = !hook_sql.empty();
+
+	// Hook-bearing refreshes keep the old pre-hook empty skip semantics. Hook-free refreshes
+	// compute the same delta activity under the view lock and reuse it during SQL generation.
+	if (has_refresh_hook && TrySkipEmptyRefresh(context, metadata, con, view_catalog_name, view_schema_name, view_name,
+	                                            attached_db_catalog_name, attached_db_schema_name, nullptr)) {
+		return;
+	}
 
 	if (!hook_sql.empty() && hook_mode == "before") {
 		auto hr = con.Query(hook_sql);
@@ -514,8 +553,10 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	}
 
 	if (hook_mode != "replace") {
-		RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system,
-		                  attached_db_catalog_name, attached_db_schema_name);
+		if (RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system,
+		                      attached_db_catalog_name, attached_db_schema_name, !has_refresh_hook)) {
+			return;
+		}
 	}
 
 	if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
@@ -531,7 +572,8 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		for (auto &dep : downstream) {
 			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
 			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep,
-			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name);
+			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name,
+			                  /*skip_empty_refresh=*/true);
 		}
 	}
 }
