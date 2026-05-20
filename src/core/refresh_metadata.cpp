@@ -3,7 +3,10 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include <algorithm>
+#include <functional>
 #include <sstream>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -182,8 +185,11 @@ vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 }
 
 vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
-	// Find all views that depend on delta_<view_name> or openivm_data_<view_name> as a source.
+	// Find all reachable views that depend on delta_<view_name> or openivm_data_<view_name> as a source.
 	// DuckLake chained MVs use openivm_data_* (data table) instead of delta_* (delta table).
+	//
+	// The returned order must be topological over the reachable downstream DAG. Reverse postorder DFS keeps
+	// fanout branches before their fan-in children.
 	vector<string> result;
 	unordered_set<string> visited;
 
@@ -192,20 +198,23 @@ vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 		string data_name = IncrementalTableNames::DataTableName(vn);
 		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
 		                            " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) +
-		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "'");
+		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "' ORDER BY view_name");
 		if (!dependents->HasError()) {
 			for (size_t i = 0; i < dependents->RowCount(); i++) {
 				string dep = dependents->GetValue(0, i).ToString();
-				if (visited.find(dep) == visited.end()) {
-					visited.insert(dep);
-					result.push_back(dep); // closest first
-					collect(dep);          // then recurse deeper
+				if (dep == view_name) {
+					continue;
+				}
+				if (visited.insert(dep).second) {
+					collect(dep);
+					result.push_back(dep);
 				}
 			}
 		}
 	};
 	collect(view_name);
-	return result; // topological order: closest descendants first
+	std::reverse(result.begin(), result.end());
+	return result; // topological order: downstream parents before fan-in children
 }
 
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
