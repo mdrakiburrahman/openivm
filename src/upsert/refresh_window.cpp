@@ -68,6 +68,170 @@ static bool IsSafeForDuckLakeSnapshotDiff(const vector<string> &partition_cols, 
 	return true;
 }
 
+static string StripTrackedPrefix(const string &name) {
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+	static const string delta_prefix(openivm::DELTA_PREFIX);
+	string last = SqlUtils::LastIdentifierPart(name);
+	if (last.size() > data_prefix.size() && last.rfind(data_prefix, 0) == 0) {
+		return last.substr(data_prefix.size());
+	}
+	if (last.size() > delta_prefix.size() && last.rfind(delta_prefix, 0) == 0) {
+		return last.substr(delta_prefix.size());
+	}
+	return last;
+}
+
+static string FindTrackedDeltaKey(const vector<string> &delta_table_names, const string &table_name) {
+	for (auto &dt : delta_table_names) {
+		if (StringUtil::CIEquals(StripTrackedPrefix(dt), StripTrackedPrefix(table_name))) {
+			return dt;
+		}
+	}
+	return "";
+}
+
+static string ResolveStandardTrackedTableSQL(RefreshMetadata &metadata, const string &view_name,
+                                             const vector<string> &delta_table_names, const string &table_name,
+                                             bool delta_table, const string &view_catalog_name,
+                                             const string &view_schema_name, const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name) {
+	string metadata_key = FindTrackedDeltaKey(delta_table_names, table_name);
+	if (metadata_key.empty() && !StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX)) {
+		metadata_key = SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
+	}
+	string fallback_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
+	string fallback_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
+	auto loc = metadata.GetSourceLocation(view_name, metadata_key, fallback_catalog, fallback_schema);
+	string resolved_name = delta_table ? metadata_key : SqlUtils::LastIdentifierPart(table_name);
+	if (resolved_name.empty()) {
+		return "";
+	}
+	if (loc.catalog_name.empty()) {
+		return SqlUtils::QuoteIdentifier(resolved_name);
+	}
+	if (loc.schema_name.empty()) {
+		loc.schema_name = "main";
+	}
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, resolved_name);
+}
+
+static string BuildStandardChangedValuesSQL(RefreshMetadata &metadata, const string &view_name,
+                                            const vector<string> &delta_table_names, const string &table_name,
+                                            const string &source_col, const string &output_col,
+                                            const string &delta_ts_filter, const string &view_catalog_name,
+                                            const string &view_schema_name, const string &attached_db_catalog_name,
+                                            const string &attached_db_schema_name) {
+	string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, table_name,
+	                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
+	                                                    attached_db_catalog_name, attached_db_schema_name);
+	if (delta_table.empty()) {
+		return "";
+	}
+	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	return "SELECT DISTINCT " + SqlUtils::QuoteIdentifier(source_col) + " AS " + SqlUtils::QuoteIdentifier(output_col) +
+	       " FROM " + delta_table + filter;
+}
+
+static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const string &view_name,
+                                                const vector<string> &delta_table_names,
+                                                const RefreshMetadata::WindowPartitionLineageOp &op,
+                                                const string &delta_ts_filter, const string &view_catalog_name,
+                                                const string &view_schema_name, const string &attached_db_catalog_name,
+                                                const string &attached_db_schema_name) {
+	string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, op.source,
+	                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
+	                                                    attached_db_catalog_name, attached_db_schema_name);
+	string lookup_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, op.lookup,
+	                                                     /*delta_table=*/false, view_catalog_name, view_schema_name,
+	                                                     attached_db_catalog_name, attached_db_schema_name);
+	if (delta_table.empty() || lookup_table.empty()) {
+		return "";
+	}
+	string qsource_col = SqlUtils::QuoteIdentifier(op.source_col);
+	string qlookup_col = SqlUtils::QuoteIdentifier(op.lookup_col);
+	string qlookup_out = SqlUtils::QuoteIdentifier(op.lookup_out);
+	string qoutput_col = SqlUtils::QuoteIdentifier(op.output_col);
+	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	return "SELECT DISTINCT " + qlookup_out + " AS " + qoutput_col + " FROM " + lookup_table + " WHERE " + qlookup_col +
+	       " IN (SELECT DISTINCT " + qsource_col + " FROM " + delta_table + filter + ")";
+}
+
+static bool BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name,
+                                                const vector<string> &delta_table_names,
+                                                const vector<string> &partition_cols, const string &delta_ts_filter,
+                                                const string &view_catalog_name, const string &view_schema_name,
+                                                const string &attached_db_catalog_name,
+                                                const string &attached_db_schema_name, string &affected_keys_sql,
+                                                string &key_cols, string &key_tuple) {
+	if (partition_cols.size() != 1) {
+		return false;
+	}
+	auto parsed = SplitPartitionSpec(partition_cols[0]);
+	key_cols = SqlUtils::QuoteIdentifier(parsed.first);
+	key_tuple = key_cols;
+
+	vector<RefreshMetadata::WindowPartitionLineageOp> lineage_ops;
+	if (!metadata.GetWindowPartitionLineage(view_name, lineage_ops)) {
+		return false;
+	}
+
+	vector<string> arms;
+	unordered_set<string> covered_sources;
+	for (auto &op : lineage_ops) {
+		if (!StringUtil::CIEquals(op.output_col, parsed.first)) {
+			continue;
+		}
+		string arm_sql;
+		if (op.kind == "direct") {
+			arm_sql = BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
+			                                        op.output_col, delta_ts_filter, view_catalog_name, view_schema_name,
+			                                        attached_db_catalog_name, attached_db_schema_name);
+		} else if (op.kind == "lookup") {
+			arm_sql = BuildStandardLookupChangedKeysSQL(metadata, view_name, delta_table_names, op, delta_ts_filter,
+			                                            view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                            attached_db_schema_name);
+		}
+		if (arm_sql.empty()) {
+			continue;
+		}
+		arms.push_back("(" + arm_sql + ")");
+		covered_sources.insert(StripTrackedPrefix(op.source));
+	}
+
+	for (auto &dt : delta_table_names) {
+		if (!covered_sources.count(StripTrackedPrefix(dt))) {
+			return false;
+		}
+	}
+	if (arms.empty()) {
+		return false;
+	}
+
+	string union_sql;
+	for (idx_t i = 0; i < arms.size(); i++) {
+		if (i > 0) {
+			union_sql += " UNION ALL ";
+		}
+		union_sql += arms[i];
+	}
+	affected_keys_sql = "SELECT DISTINCT " + key_cols + " FROM (" + union_sql + ") openivm_changed_partitions";
+	return true;
+}
+
+static bool AllWindowPartitionSourcesCovered(const vector<string> &delta_table_names,
+                                             const vector<WindowPartitionDeltaSpec> &partition_delta_specs) {
+	unordered_set<string> covered_sources;
+	for (auto &spec : partition_delta_specs) {
+		covered_sources.insert(StringUtil::Lower(spec.delta_table));
+	}
+	for (auto &dt : delta_table_names) {
+		if (!covered_sources.count(StringUtil::Lower(dt))) {
+			return false;
+		}
+	}
+	return !delta_table_names.empty();
+}
+
 struct DuckLakeWindowSourceSpec {
 	string metadata_key;
 	DuckLakeSourceLocation loc;
@@ -362,6 +526,10 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);
 	bool any_ducklake = AnyDuckLakeSource(metadata, view_name, delta_table_names);
 	bool safe_for_snapdiff = IsSafeForDuckLakeSnapshotDiff(partition_cols, column_names, any_ducklake);
+	string affected_keys_sql;
+	string affected_key_cols;
+	string affected_key_tuple;
+	bool have_lineage_affected_keys = false;
 
 	if (safe_for_snapdiff && delta_table_names.size() == 1) {
 		return BuildSingleSourceDuckLakeWindowRefresh(
@@ -378,10 +546,24 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		    "[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake, full recompute fallback)\n");
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
-	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols)\n",
-	                    partition_cols.size());
+	if (delta_table_names.size() > 1) {
+		have_lineage_affected_keys = BuildLineageStandardAffectedKeysSQL(
+		    metadata, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
+		    view_schema_name, attached_db_catalog_name, attached_db_schema_name, affected_keys_sql, affected_key_cols,
+		    affected_key_tuple);
+	}
+	if (!have_lineage_affected_keys && delta_table_names.size() > 1 &&
+	    !AllWindowPartitionSourcesCovered(delta_table_names, partition_delta_specs)) {
+		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage incomplete for '%s' (%zu sources) — full recompute "
+		                    "fallback\n",
+		                    view_name.c_str(), delta_table_names.size());
+		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols, lineage keys: %s)\n",
+	                    partition_cols.size(), have_lineage_affected_keys ? "yes" : "no");
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
-	                              partition_delta_specs, emit_cascade_delta);
+	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql, affected_key_cols,
+	                              affected_key_tuple);
 }
 
 } // namespace duckdb

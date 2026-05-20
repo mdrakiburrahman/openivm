@@ -594,34 +594,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		// Window over join: non-DuckLake delta tables may not expose the partition key for
-		// every changed source, so native window recompute could miss partitions. DuckLake
-		// can compare the old/new view result at source snapshots, so it can safely keep
-		// partition keys even for multi-source window joins.
-		bool all_sources_are_ducklake = !table_names.empty();
-		if (all_sources_are_ducklake) {
-			for (const auto &table_name : table_names) {
-				string table_lc = StringUtil::Lower(table_name);
-				bool is_ducklake_scan =
-				    dl_table_info_for_classification.find(table_lc) != dl_table_info_for_classification.end();
-				// DuckLake views created by OpenIVM expose a DuckLake catalog view over an
-				// internal physical openivm_data_* table. When DuckDB expands such a view while
-				// planning a chained MV, the scan is physical even though the source's change
-				// tracking is still DuckLake-backed.
-				bool is_ducklake_mv_backing =
-				    !view_catalog_prefix.empty() && StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX);
-				if (!is_ducklake_scan && !is_ducklake_mv_backing) {
-					all_sources_are_ducklake = false;
-					break;
-				}
-			}
-		}
-		bool single_source_window_join =
-		    classification.found_window && classification.found_join && table_names.size() == 1;
-		if (classification.found_window && classification.found_join && !single_source_window_join &&
-		    !all_sources_are_ducklake) {
-			window_partition_columns.clear();
-		}
+		// Keep window partition metadata even for joined windows. Refresh-time lineage
+		// analysis decides whether a multi-source recompute can stay partition-scoped or
+		// must fall back to a wider refresh strategy.
 
 		// LEFT/RIGHT/OUTER JOIN aggregate with a non-trivial aggregate argument
 		// (e.g. `SUM(COALESCE(h.x, 0))`, `AVG(1)`, `SUM(CASE …)`) or a non-BCR

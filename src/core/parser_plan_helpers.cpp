@@ -1082,6 +1082,11 @@ struct WindowLineageOp {
 	string lookup_output_col;
 };
 
+struct WindowLookupEdge {
+	BaseColumnRef lookup_join;
+	BaseColumnRef changed_join;
+};
+
 static void CollectInnerJoinEdges(LogicalOperator *op, const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
                                   const unordered_map<idx_t, LogicalGet *> &get_by_index,
                                   vector<pair<BaseColumnRef, BaseColumnRef>> &edges) {
@@ -1089,6 +1094,9 @@ static void CollectInnerJoinEdges(LogicalOperator *op, const unordered_map<idx_t
 		auto &join = op->Cast<LogicalComparisonJoin>();
 		if (join.join_type == JoinType::INNER) {
 			for (auto &cond : join.conditions) {
+				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+					continue;
+				}
 				auto *left = GetColumnRefThroughCasts(cond.left.get());
 				auto *right = GetColumnRefThroughCasts(cond.right.get());
 				if (!left || !right) {
@@ -1104,6 +1112,50 @@ static void CollectInnerJoinEdges(LogicalOperator *op, const unordered_map<idx_t
 	}
 	for (auto &child : op->children) {
 		CollectInnerJoinEdges(child.get(), proj_by_index, get_by_index, edges);
+	}
+}
+
+static void CollectWindowLookupEdges(LogicalOperator *op,
+                                     const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                     const unordered_map<idx_t, LogicalGet *> &get_by_index,
+                                     vector<WindowLookupEdge> &edges) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		auto add_lookup_edge = [&](BaseColumnRef lookup_ref, BaseColumnRef changed_ref) {
+			edges.push_back({std::move(lookup_ref), std::move(changed_ref)});
+		};
+		for (auto &cond : join.conditions) {
+			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+				continue;
+			}
+			auto *left = GetColumnRefThroughCasts(cond.left.get());
+			auto *right = GetColumnRefThroughCasts(cond.right.get());
+			if (!left || !right) {
+				continue;
+			}
+			BaseColumnRef lref, rref;
+			if (!ResolveBindingToBaseRef(left->binding, proj_by_index, get_by_index, lref) ||
+			    !ResolveBindingToBaseRef(right->binding, proj_by_index, get_by_index, rref)) {
+				continue;
+			}
+			switch (join.join_type) {
+			case JoinType::INNER:
+				add_lookup_edge(lref, rref);
+				add_lookup_edge(rref, lref);
+				break;
+			case JoinType::LEFT:
+				add_lookup_edge(lref, rref);
+				break;
+			case JoinType::RIGHT:
+				add_lookup_edge(rref, lref);
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectWindowLookupEdges(child.get(), proj_by_index, get_by_index, edges);
 	}
 }
 
@@ -1196,6 +1248,8 @@ string BuildWindowPartitionLineageJson(LogicalOperator *plan, const vector<strin
 
 	vector<pair<BaseColumnRef, BaseColumnRef>> edges;
 	CollectInnerJoinEdges(plan, proj_by_index, get_by_index, edges);
+	vector<WindowLookupEdge> lookup_edges;
+	CollectWindowLookupEdges(plan, proj_by_index, get_by_index, lookup_edges);
 
 	vector<WindowLineageOp> partition_ops;
 	for (auto &op : direct_ops) {
@@ -1238,32 +1292,19 @@ string BuildWindowPartitionLineageJson(LogicalOperator *plan, const vector<strin
 		AddUniqueLineageOp(ops, op);
 	}
 
-	for (auto &edge : edges) {
+	for (auto &edge : lookup_edges) {
 		for (auto &direct : partition_ops) {
-			BaseColumnRef lookup_output {direct.source_table, direct.source_col};
-			BaseColumnRef lookup_join;
-			BaseColumnRef changed_join;
-			bool found = false;
-			if (StringUtil::CIEquals(edge.first.table, direct.source_table) && !SameRef(edge.first, lookup_output)) {
-				lookup_join = edge.first;
-				changed_join = edge.second;
-				found = true;
-			} else if (StringUtil::CIEquals(edge.second.table, direct.source_table) &&
-			           !SameRef(edge.second, lookup_output)) {
-				lookup_join = edge.second;
-				changed_join = edge.first;
-				found = true;
-			}
-			if (!found) {
+			if (!StringUtil::CIEquals(edge.lookup_join.table, direct.source_table) ||
+			    StringUtil::CIEquals(edge.lookup_join.column, direct.source_col)) {
 				continue;
 			}
 			WindowLineageOp lookup;
 			lookup.kind = "lookup";
 			lookup.output_col = direct.output_col;
-			lookup.source_table = changed_join.table;
-			lookup.source_col = changed_join.column;
+			lookup.source_table = edge.changed_join.table;
+			lookup.source_col = edge.changed_join.column;
 			lookup.lookup_table = direct.source_table;
-			lookup.lookup_col = lookup_join.column;
+			lookup.lookup_col = edge.lookup_join.column;
 			lookup.lookup_output_col = direct.source_col;
 			AddUniqueLineageOp(ops, std::move(lookup));
 		}

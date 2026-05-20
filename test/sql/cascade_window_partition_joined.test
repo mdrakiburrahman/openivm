@@ -1,0 +1,108 @@
+# name: test/sql/cascade_window_partition_joined.test
+# description: Joined WINDOW_PARTITION emits signed cascade deltas when pragma-enabled
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_emit_cascade_delta_for_recompute=false;
+
+statement ok
+CREATE TABLE cwj_customer (id INT, grp VARCHAR, tax_id INT, action_ts INT);
+
+statement ok
+CREATE TABLE cwj_tax (tx_id INT, rate INT);
+
+statement ok
+INSERT INTO cwj_customer VALUES
+    (1, 'a', 10, 100),
+    (2, 'a', 20, 90),
+    (3, 'b', 30, 80);
+
+statement ok
+INSERT INTO cwj_tax VALUES
+    (10, 1),
+    (20, 5),
+    (30, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW cwj_mv AS
+    SELECT c.id,
+           c.grp,
+           c.tax_id,
+           COALESCE(t.rate, 0) AS rate,
+           ROW_NUMBER() OVER (
+               PARTITION BY c.grp
+               ORDER BY COALESCE(t.rate, 0) DESC, c.action_ts DESC, c.id
+           ) AS rn
+    FROM cwj_customer c
+    LEFT JOIN cwj_tax t
+      ON c.tax_id = t.tx_id;
+
+query ITT
+PRAGMA compile_refresh('cwj_mv');
+----
+5	WINDOW_PARTITION	<REGEX>:.*CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS.*DELETE FROM .*openivm_data_cwj_mv.*INSERT INTO .*openivm_data_cwj_mv.*DELETE FROM openivm_delta_cwj_mv.*
+
+statement ok
+SET openivm_emit_cascade_delta_for_recompute=true;
+
+query ITT
+PRAGMA compile_refresh('cwj_mv');
+----
+5	WINDOW_PARTITION	<REGEX>:.*CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS.*CREATE OR REPLACE TEMP TABLE openivm_old_cwj_mv AS.*CREATE OR REPLACE TEMP TABLE openivm_new_cwj_mv AS.*INSERT INTO openivm_delta_cwj_mv.*CAST.*-1.*INTEGER.*CURRENT_TIMESTAMP.*UNION ALL.*CAST.*1.*INTEGER.*CURRENT_TIMESTAMP.*DROP TABLE IF EXISTS openivm_affected_cwj_mv.*DROP TABLE IF EXISTS openivm_old_cwj_mv.*DROP TABLE IF EXISTS openivm_new_cwj_mv.*
+
+statement ok
+UPDATE cwj_tax SET rate = 7 WHERE tx_id = 10;
+
+statement ok
+PRAGMA refresh('cwj_mv');
+
+query ITIIII rowsort
+SELECT id, grp, tax_id, rate, rn, openivm_multiplicity FROM openivm_delta_cwj_mv;
+----
+1	a	10	1	2	-1
+1	a	10	7	1	1
+2	a	20	5	1	-1
+2	a	20	5	2	1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, grp, tax_id, rate, rn FROM openivm_data_cwj_mv
+    EXCEPT ALL
+    SELECT c.id,
+           c.grp,
+           c.tax_id,
+           COALESCE(t.rate, 0) AS rate,
+           ROW_NUMBER() OVER (
+               PARTITION BY c.grp
+               ORDER BY COALESCE(t.rate, 0) DESC, c.action_ts DESC, c.id
+           ) AS rn
+    FROM cwj_customer c
+    LEFT JOIN cwj_tax t
+      ON c.tax_id = t.tx_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.id,
+           c.grp,
+           c.tax_id,
+           COALESCE(t.rate, 0) AS rate,
+           ROW_NUMBER() OVER (
+               PARTITION BY c.grp
+               ORDER BY COALESCE(t.rate, 0) DESC, c.action_ts DESC, c.id
+           ) AS rn
+    FROM cwj_customer c
+    LEFT JOIN cwj_tax t
+      ON c.tax_id = t.tx_id
+    EXCEPT ALL
+    SELECT id, grp, tax_id, rate, rn FROM openivm_data_cwj_mv
+);
+----
+0

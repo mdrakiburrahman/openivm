@@ -43,7 +43,8 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
-                              bool emit_cascade_delta = false);
+                              bool emit_cascade_delta = false, const string &affected_keys_sql = "",
+                              const string &affected_key_cols = "", const string &affected_key_tuple = "");
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE` (inner-DISTINCT under
