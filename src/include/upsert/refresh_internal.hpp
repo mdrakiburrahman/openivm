@@ -63,6 +63,8 @@ struct DuckLakeTableActivity {
 	bool requires_full_refresh = false;
 };
 
+struct RefreshCostEstimate;
+
 struct RefreshCompileProfileStep {
 	string step_name;
 	int64_t duration_ms;
@@ -179,7 +181,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,
                           string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
-                          const DeltaActivityResult *precomputed_delta_activity = nullptr);
+                          const DeltaActivityResult *precomputed_delta_activity = nullptr,
+                          RefreshCostEstimate *out_adaptive_estimate = nullptr);
 
 } // namespace duckdb
 

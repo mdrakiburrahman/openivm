@@ -121,7 +121,6 @@ void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result);
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
                        const vector<string> &output_col_names);
 void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
-bool BoolSetting(ClientContext &context, const string &name);
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);

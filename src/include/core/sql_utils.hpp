@@ -18,7 +18,6 @@ public:
 	static string EscapeSingleQuotes(const string &input);
 	static void ReplaceMaterializedView(string &query);
 	static string ExtractViewQuery(string &query);
-	static string ExtractViewName(const string &query);
 	static string SQLToLowercase(const string &sql);
 	static void RemoveRedundantWhitespaces(string &query);
 	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
@@ -43,7 +42,6 @@ public:
 		return default_value;
 	}
 	static bool IsDelta(const string &name);
-	static string GenerateDeltaTable(string &query);
 	static string JoinQuotedColumns(const vector<string> &columns);
 	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
 	static string BuildAllNullPredicate(const vector<string> &columns);

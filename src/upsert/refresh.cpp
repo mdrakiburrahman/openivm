@@ -4,32 +4,17 @@
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_locks.hpp"
-#include "rules/column_hider.hpp"
-#include "duckdb/main/client_data.hpp"
 #include "core/sql_utils.hpp"
-#include "upsert/refresh_compiler.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh_internal.hpp"
-#include "lpts_pipeline.hpp"
-#include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
-#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_error_context.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/planner/planner.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_join.hpp"
-#include "duckdb/planner/operator/logical_cte.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
-#include <cctype>
 #include <chrono>
 
 namespace duckdb {
@@ -169,42 +154,19 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 	Connection exec_con(*context.db.get());
 	bool tx_open = false;
 	try {
-		// Check if adaptive cost model is active — if so, compute estimate for history recording.
-		bool record_history = false;
+		bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 		RefreshCostEstimate cost_estimate = {};
-		if (SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false)) {
-			auto adaptive_start = std::chrono::steady_clock::now();
-			// Compute cost estimate before refresh (for history recording).
-			// GenerateRefreshSQL also computes this when adaptive is on, but we need
-			// the estimate here to record alongside the actual execution time.
-			Connection cost_con(*context.db.get());
-			cost_con.BeginTransaction();
-			RefreshMetadata cost_meta(cost_con);
-			auto vq = cost_meta.GetViewQuery(vn);
-			if (!vq.empty()) {
-				Parser cp;
-				cp.ParseQuery(vq);
-				Planner pl(*cost_con.context);
-				pl.CreatePlan(cp.statements[0]->Copy());
-				Optimizer opt(*pl.binder, *cost_con.context);
-				auto plan = opt.Optimize(std::move(pl.plan));
-				cost_estimate = EstimateRefreshCost(*cost_con.context, *plan, vn);
-				record_history = true;
-			}
-			cost_con.Rollback();
-			profiler.AddStep("adaptive_cost_estimate", adaptive_start,
-			                 record_history ? "record_history=true" : "record_history=false");
-		}
 
 		// For cross_system (DuckLake) MVs, split the refresh SQL into data ops (dl catalog)
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
 		RefreshCompileProfile compile_profile;
 		auto generate_start = std::chrono::steady_clock::now();
-		string sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system,
-		                                attached_db_catalog_name, attached_db_schema_name,
-		                                cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr,
-		                                profiler.Enabled() ? &compile_profile : nullptr, precomputed_delta_activity);
+		string sql =
+		    GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
+		                       attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
+		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
+		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr);
 		for (const auto &step : compile_profile.steps) {
 			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
 		}
@@ -337,7 +299,7 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		}
 
 		// Record execution history for the learned cost model.
-		if (record_history) {
+		if (!cost_estimate.strategy_label.empty()) {
 			auto history_start = std::chrono::steady_clock::now();
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 			// Determine which method was used. Priority:

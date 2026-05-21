@@ -20,7 +20,9 @@
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
@@ -74,6 +76,48 @@ static string BuildDeltaInsertPrefix(const string &full_delta_table_name, TableC
 static string BuildDeltaSelectFrom(TableCatalogEntry &delta_entry, const string &mul_val, const string &source) {
 	string cols = BuildDeltaDataColumns(delta_entry);
 	return "SELECT " + cols + ", " + mul_val + ", now()::timestamp FROM " + source;
+}
+
+using BoundColumnNameMap = std::map<std::pair<idx_t, idx_t>, string>;
+
+static void CollectBoundColumnNames(LogicalOperator &op, BoundColumnNameMap &column_names) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto bindings = get.GetColumnBindings();
+		auto column_ids = get.GetColumnIds();
+		for (auto &binding : bindings) {
+			if (binding.column_index >= column_ids.size()) {
+				continue;
+			}
+			auto column_name = get.GetColumnName(column_ids[binding.column_index]);
+			column_names[{binding.table_index, binding.column_index}] =
+			    KeywordHelper::WriteOptionallyQuoted(column_name);
+		}
+	}
+	for (auto &child : op.children) {
+		CollectBoundColumnNames(*child, column_names);
+	}
+}
+
+static void QuoteBoundColumnRefs(Expression &expr, const BoundColumnNameMap &column_names) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &bcr = expr.Cast<BoundColumnRefExpression>();
+		auto entry = column_names.find({bcr.binding.table_index, bcr.binding.column_index});
+		if (entry != column_names.end()) {
+			bcr.alias = entry->second;
+		}
+	}
+	ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) {
+		if (child) {
+			QuoteBoundColumnRefs(*child, column_names);
+		}
+	});
+}
+
+static string QuotedExpressionString(const unique_ptr<Expression> &expr, const BoundColumnNameMap &column_names) {
+	auto copy = expr->Copy();
+	QuoteBoundColumnRefs(*copy, column_names);
+	return copy->ToString();
 }
 
 static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
@@ -474,12 +518,14 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						insert_string = BuildDeleteDeltaInsertFromPlan(
 						    *con.context, delta_entry_del, full_delta_table_name, full_table_name, plan->children[0]);
 					} else {
+						BoundColumnNameMap column_names;
+						CollectBoundColumnNames(*filter->children[0], column_names);
 						insert_string += " where ";
 						for (idx_t i = 0; i < filter->expressions.size(); i++) {
 							if (i > 0) {
 								insert_string += " AND ";
 							}
-							insert_string += filter->expressions[i]->ToString();
+							insert_string += QuotedExpressionString(filter->expressions[i], column_names);
 						}
 					}
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
@@ -493,6 +539,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 							}
 							first_filter = false;
 							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
+							col_name = KeywordHelper::WriteOptionallyQuoted(col_name);
 							insert_string += entry.second->ToString(col_name);
 						}
 					}
@@ -569,9 +616,11 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 				std::map<string, string> update_values;
 				string where_string;
+				BoundColumnNameMap column_names;
+				CollectBoundColumnNames(*projection->children[0], column_names);
 				for (size_t i = 0; i < update_node->columns.size(); i++) {
 					auto column = update_node->columns[i].index;
-					update_values[to_string(column)] = projection->expressions[i]->ToString();
+					update_values[to_string(column)] = QuotedExpressionString(projection->expressions[i], column_names);
 				}
 
 				if (projection->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
@@ -581,7 +630,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						if (i > 0) {
 							where_string += " AND ";
 						}
-						where_string += filter->expressions[i]->ToString();
+						where_string += QuotedExpressionString(filter->expressions[i], column_names);
 					}
 				} else if (projection->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
 					auto get = dynamic_cast<LogicalGet *>(projection->children[0].get());
@@ -594,6 +643,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 							}
 							first_filter = false;
 							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
+							col_name = KeywordHelper::WriteOptionallyQuoted(col_name);
 							where_string += entry.second->ToString(col_name);
 						}
 					}

@@ -96,8 +96,8 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
-                          RefreshCompileProfile *compile_profile,
-                          const DeltaActivityResult *precomputed_delta_activity) {
+                          RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
+                          RefreshCostEstimate *out_adaptive_estimate) {
 	auto profile_now = []() {
 		return std::chrono::steady_clock::now();
 	};
@@ -215,18 +215,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool metadata_requires_full_refresh =
 	    precomputed_delta_activity && precomputed_delta_activity->requires_full_refresh;
 
-	if (force_full_refresh || metadata_requires_full_refresh || view_query_type == RefreshType::FULL_REFRESH) {
-		auto full_refresh_start = profile_now();
-		auto recompute_query =
-		    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-		                        attached_db_schema_name, internal_catalog_prefix, out_post_meta);
-		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
-		                 "full_recompute=true; metadata_requires_full_refresh=" +
-		                     string(metadata_requires_full_refresh ? "true" : "false") +
-		                     "; sql_bytes=" + to_string(recompute_query.size()));
-		return recompute_query;
-	}
 	bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
+	bool adaptive_recompute = false;
 	if (adaptive_refresh) {
 		auto adaptive_start = profile_now();
 		con.BeginTransaction();
@@ -239,13 +229,29 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 		auto cost_estimate = EstimateRefreshCost(*con.context, *cost_plan, view_name);
 		con.Rollback();
-		if (cost_estimate.ShouldRecompute()) {
-			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
-			add_profile_step("generate_refresh_sql.adaptive_cost", adaptive_start, "strategy=full");
-			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-			                           attached_db_schema_name, internal_catalog_prefix, out_post_meta);
+		if (out_adaptive_estimate) {
+			*out_adaptive_estimate = cost_estimate;
 		}
-		add_profile_step("generate_refresh_sql.adaptive_cost", adaptive_start, "strategy=incremental");
+		adaptive_recompute = cost_estimate.ShouldRecompute();
+		if (adaptive_recompute) {
+			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
+		}
+		add_profile_step("generate_refresh_sql.adaptive_cost", adaptive_start,
+		                 adaptive_recompute ? "strategy=full" : "strategy=incremental");
+	}
+
+	if (force_full_refresh || metadata_requires_full_refresh || view_query_type == RefreshType::FULL_REFRESH ||
+	    adaptive_recompute) {
+		auto full_refresh_start = profile_now();
+		auto recompute_query =
+		    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+		                        attached_db_schema_name, internal_catalog_prefix, out_post_meta);
+		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
+		                 "full_recompute=true; metadata_requires_full_refresh=" +
+		                     string(metadata_requires_full_refresh ? "true" : "false") +
+		                     "; adaptive_recompute=" + string(adaptive_recompute ? "true" : "false") +
+		                     "; sql_bytes=" + to_string(recompute_query.size()));
+		return recompute_query;
 	}
 	auto column_metadata_start = profile_now();
 	vector<string> column_names;

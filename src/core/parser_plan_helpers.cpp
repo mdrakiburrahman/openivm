@@ -103,11 +103,6 @@ void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<Logi
 	plan = cte_inlining.Optimize(std::move(plan));
 }
 
-bool BoolSetting(ClientContext &context, const string &name) {
-	Value value;
-	return context.TryGetCurrentSetting(name, value) && !value.IsNull() && BooleanValue::Get(value);
-}
-
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
                                 const string &default_db) {
 	if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||

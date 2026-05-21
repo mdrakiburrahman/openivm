@@ -221,24 +221,6 @@ string SqlUtils::ExtractTableName(const string &sql) {
 	return "";
 }
 
-string SqlUtils::ExtractViewName(const string &sql) {
-	string name;
-	if (ReadCreateTargetName(sql, "view", name)) {
-		return name;
-	}
-	std::regex view_name_regex(
-	    R"re(create\s+(?:materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
-	std::smatch match;
-	if (std::regex_search(sql, match, view_name_regex)) {
-		auto name = match[1].str();
-		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-			name = name.substr(1, name.size() - 2);
-		}
-		return name;
-	}
-	return "";
-}
-
 string SqlUtils::EscapeSingleQuotes(const string &input) {
 	std::stringstream escaped_stream;
 	for (char c : input) {
@@ -354,67 +336,6 @@ string SqlUtils::SQLToLowercase(const string &sql) {
 		}
 	}
 	return lowercase_stream.str();
-}
-
-string SqlUtils::GenerateDeltaTable(string &input) {
-	input = SQLToLowercase(input);
-	input = std::regex_replace(input, std::regex(R"(\")"), "");
-
-	std::regex create_table_re(R"(create\s+table\s+([^\s\(\)]+(?:\.[^\s\(\)]+){0,2})\s*\(([^;]+)\);)",
-	                           std::regex::icase);
-	std::regex primary_key_re(R"((primary\s+key\s*\([^\)]+\)))", std::regex::icase);
-	std::regex inline_primary_key_re(R"(([^\s,]+[^\),]*\s+primary\s+key))", std::regex::icase);
-
-	std::string multiplicity_col = string(openivm::MULTIPLICITY_COL) + " integer default 1";
-	std::string timestamp_col = "timestamp timestamp default now()";
-
-	std::smatch match;
-	std::string output = input;
-
-	if (std::regex_search(input, match, create_table_re)) {
-		std::string full_table_name = match[1].str();
-		std::string columns = match[2].str();
-		std::string primary_key;
-		std::string pk_columns;
-
-		size_t last_dot_pos = full_table_name.find_last_of('.');
-		std::string prefix, table_name;
-		if (last_dot_pos != std::string::npos) {
-			prefix = full_table_name.substr(0, last_dot_pos + 1);
-			table_name = full_table_name.substr(last_dot_pos + 1);
-		} else {
-			table_name = full_table_name;
-		}
-
-		std::string new_table_name = prefix + string(openivm::DELTA_PREFIX) + table_name;
-
-		if (std::regex_search(columns, match, primary_key_re)) {
-			primary_key = match[0].str();
-			pk_columns =
-			    primary_key.substr(primary_key.find('(') + 1, primary_key.find(')') - primary_key.find('(') - 1);
-			columns = std::regex_replace(columns, primary_key_re, "");
-		}
-
-		if (std::regex_search(columns, match, inline_primary_key_re)) {
-			primary_key = match[0].str();
-			std::string col_name = primary_key.substr(0, primary_key.find(' '));
-			pk_columns = col_name;
-			columns = std::regex_replace(columns, inline_primary_key_re, col_name);
-		}
-
-		if (!pk_columns.empty()) {
-			pk_columns += ", " + string(openivm::MULTIPLICITY_COL);
-		} else {
-			pk_columns = string(openivm::MULTIPLICITY_COL);
-		}
-
-		columns += ", " + multiplicity_col + ", " + timestamp_col;
-		columns += ", PRIMARY KEY(" + pk_columns + ")";
-
-		output = "create table if not exists " + new_table_name + " (" + columns + ");\n";
-	}
-
-	return output;
 }
 
 void SqlUtils::RemoveRedundantWhitespaces(string &query) {

@@ -1134,7 +1134,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// OpenIVM metadata in the physical default catalog. CREATE/REFRESH split metadata
 		// writes from DuckLake data writes because DuckDB cannot commit one transaction
 		// across both catalogs.
-		if (BoolSetting(context, "openivm_explain_initial_load")) {
+		if (SqlUtils::GetBoolSetting(context, "openivm_explain_initial_load", false)) {
 			// This diagnostic intentionally reports the exact first heavy statement that
 			// CREATE MV will run. DuckLake-targeted MVs should now write openivm_data_*
 			// directly; if staging reappears, this output makes the extra copy visible.
@@ -1161,7 +1161,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				SqlUtils::WriteFile(files_path_val.ToString() + "/openivm_initial_load_explain_" + view_name + ".txt",
 				                    false, diagnostic);
 			}
-			if (BoolSetting(context, "openivm_explain_initial_load_only")) {
+			if (SqlUtils::GetBoolSetting(context, "openivm_explain_initial_load_only", false)) {
 				ConfigureDDLExecutorResult(result);
 				return result;
 			}

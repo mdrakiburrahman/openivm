@@ -81,18 +81,6 @@ static string BuildGuardedVarianceFormula(const string &sum_expr, const string &
 	       BuildVarianceFormula(sum_expr, sum_sq_expr, count_expr, is_population, needs_sqrt, true) + " ELSE NULL END";
 }
 
-static string JoinPrefixedSQLFragments(const vector<string> &fragments, const string &prefix) {
-	return StringUtil::Join(fragments, fragments.size(), ", ",
-	                        [&](const string &fragment) { return prefix + fragment; });
-}
-
-static string BuildNullSafeSQLFragmentMatch(const vector<string> &columns, const string &left_prefix,
-                                            const string &right_prefix) {
-	return StringUtil::Join(columns, columns.size(), " AND ", [&](const string &column) {
-		return left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
-	});
-}
-
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
 /// AVG(x) is stored as openivm_sum_<alias>, openivm_count_<alias>, and <alias>.
 /// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the function type:
@@ -191,12 +179,12 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 		auto key_ids = index_catalog_entry->column_ids;
 		for (size_t i = 0; i < key_ids.size(); i++) {
-			keys.emplace_back(SqlUtils::QuoteIdentifier(column_names[key_ids[i]]));
+			keys.emplace_back(column_names[key_ids[i]]);
 		}
 	} else {
 		// No index (e.g. DuckLake) — use group column names from metadata
 		for (auto &col : group_column_names) {
-			keys.emplace_back(SqlUtils::QuoteIdentifier(col));
+			keys.emplace_back(col);
 		}
 	}
 
@@ -207,8 +195,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	bool has_non_summable_col = false;
 	for (size_t i = 0; i < column_names.size(); i++) {
 		const auto &column = column_names[i];
-		if (keys_set.find(SqlUtils::QuoteIdentifier(column)) == keys_set.end() &&
-		    column != string(openivm::MULTIPLICITY_COL)) {
+		if (keys_set.find(column) == keys_set.end() && column != string(openivm::MULTIPLICITY_COL)) {
 			aggregates.push_back(SqlUtils::QuoteIdentifier(column));
 			if (i < column_types.size() && !IsSummableLogicalType(column_types[i])) {
 				has_non_summable_col = true;
@@ -409,9 +396,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// for VARCHAR etc. regardless of whether the negative branch is reached.
 		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
 		// the MERGE path below.
-		string keys_tuple = StringUtil::Join(keys, ", ");
-		string match_delete = BuildNullSafeSQLFragmentMatch(keys, "openivm_aff.", "openivm_tgt.");
-		string match_insert = BuildNullSafeSQLFragmentMatch(keys, "openivm_aff.", "openivm_recompute.");
+		string keys_tuple = SqlUtils::JoinQuotedColumns(keys);
+		string match_delete = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_tgt.");
+		string match_insert = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_recompute.");
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, "  " + affected, "openivm_tgt",
@@ -420,7 +407,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	// CTE: consolidate deltas per group
 	string cte_select_string = "select ";
-	cte_select_string += StringUtil::Join(keys, ", ") + ", ";
+	cte_select_string += SqlUtils::JoinQuotedColumns(keys) + ", ";
 	for (auto &column : aggregates) {
 		string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
 		if (insert_only && agg_type == "min") {
@@ -448,13 +435,13 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		cte_from_string += " WHERE " + delta_ts_filter;
 	}
 	cte_from_string += "\n";
-	string cte_group_by_string = "group by " + StringUtil::Join(keys, ", ");
+	string cte_group_by_string = "group by " + SqlUtils::JoinQuotedColumns(keys);
 
 	string cte_body = cte_select_string + cte_from_string + cte_group_by_string;
 
 	// MERGE: single-pass upsert — UPDATE existing groups, INSERT new groups.
 	// Uses IS NOT DISTINCT FROM for NULL-safe key matching.
-	string on_clause = BuildNullSafeSQLFragmentMatch(keys, "v.", "d.");
+	string on_clause = SqlUtils::BuildNullSafeKeyPredicate(keys, "v.", "d.");
 
 	auto &derived_cols = decomp.derived_cols;
 	auto &d_sum_cols = decomp.sum_cols;
@@ -539,7 +526,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				insert_vals += "d." + column;
 			}
 		}
-		insert_cols = StringUtil::Join(keys, ", ") + ", " + StringUtil::Join(aggregates, ", ");
+		insert_cols = SqlUtils::JoinQuotedColumns(keys) + ", " + StringUtil::Join(aggregates, ", ");
 	}
 
 	string merge_query;
@@ -626,12 +613,12 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
 		              lj_update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
-		merge_query += JoinPrefixedSQLFragments(keys, "d.") + ", " + cond_insert_vals + ");\n";
+		merge_query += SqlUtils::JoinQualifiedQuotedColumns(keys, "d") + ", " + cond_insert_vals + ");\n";
 	} else {
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
 		              update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
-		merge_query += JoinPrefixedSQLFragments(keys, "d.") + ", " + insert_vals + ");\n";
+		merge_query += SqlUtils::JoinQualifiedQuotedColumns(keys, "d") + ", " + insert_vals + ");\n";
 	}
 
 	string upsert_query = merge_query + "\n";
