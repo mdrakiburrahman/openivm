@@ -1,2 +1,2 @@
--- {"operators": "UNNEST,TABLE_FUNCTION,AGGREGATE", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "non_incr_reason": "op:UNNEST"}
+-- {"operators": "UNNEST,TABLE_FUNCTION,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK"}
 SELECT s.S_W_ID, u.bucket, COUNT(*) AS stock_rows FROM STOCK s CROSS JOIN UNNEST(['low', 'mid', 'high']) AS u(bucket) WHERE (u.bucket = 'low' AND s.S_QUANTITY < 20) OR (u.bucket = 'mid' AND s.S_QUANTITY BETWEEN 20 AND 79) OR (u.bucket = 'high' AND s.S_QUANTITY >= 80) GROUP BY s.S_W_ID, u.bucket;

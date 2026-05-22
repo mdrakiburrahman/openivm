@@ -23,10 +23,6 @@ static bool IsIdentifierChar(char c) {
 	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
 }
 
-static bool IsQualifiedIdentifierChar(char c) {
-	return IsIdentifierChar(c) || c == '.';
-}
-
 static void SkipWhitespace(const string &sql, size_t &pos) {
 	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
 		pos++;
@@ -233,24 +229,6 @@ string SqlUtils::ExtractTableName(const string &sql) {
 	return "";
 }
 
-string SqlUtils::ExtractViewName(const string &sql) {
-	string name;
-	if (ReadCreateTargetName(sql, "view", name)) {
-		return name;
-	}
-	std::regex view_name_regex(
-	    R"re(create\s+(?:materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
-	std::smatch match;
-	if (std::regex_search(sql, match, view_name_regex)) {
-		auto name = match[1].str();
-		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-			name = name.substr(1, name.size() - 2);
-		}
-		return name;
-	}
-	return "";
-}
-
 string SqlUtils::EscapeSingleQuotes(const string &input) {
 	std::stringstream escaped_stream;
 	for (char c : input) {
@@ -366,67 +344,6 @@ string SqlUtils::SQLToLowercase(const string &sql) {
 		}
 	}
 	return lowercase_stream.str();
-}
-
-string SqlUtils::GenerateDeltaTable(string &input) {
-	input = SQLToLowercase(input);
-	input = std::regex_replace(input, std::regex(R"(\")"), "");
-
-	std::regex create_table_re(R"(create\s+table\s+([^\s\(\)]+(?:\.[^\s\(\)]+){0,2})\s*\(([^;]+)\);)",
-	                           std::regex::icase);
-	std::regex primary_key_re(R"((primary\s+key\s*\([^\)]+\)))", std::regex::icase);
-	std::regex inline_primary_key_re(R"(([^\s,]+[^\),]*\s+primary\s+key))", std::regex::icase);
-
-	std::string multiplicity_col = string(openivm::MULTIPLICITY_COL) + " integer default 1";
-	std::string timestamp_col = "timestamp timestamp default now()";
-
-	std::smatch match;
-	std::string output = input;
-
-	if (std::regex_search(input, match, create_table_re)) {
-		std::string full_table_name = match[1].str();
-		std::string columns = match[2].str();
-		std::string primary_key;
-		std::string pk_columns;
-
-		size_t last_dot_pos = full_table_name.find_last_of('.');
-		std::string prefix, table_name;
-		if (last_dot_pos != std::string::npos) {
-			prefix = full_table_name.substr(0, last_dot_pos + 1);
-			table_name = full_table_name.substr(last_dot_pos + 1);
-		} else {
-			table_name = full_table_name;
-		}
-
-		std::string new_table_name = prefix + string(openivm::DELTA_PREFIX) + table_name;
-
-		if (std::regex_search(columns, match, primary_key_re)) {
-			primary_key = match[0].str();
-			pk_columns =
-			    primary_key.substr(primary_key.find('(') + 1, primary_key.find(')') - primary_key.find('(') - 1);
-			columns = std::regex_replace(columns, primary_key_re, "");
-		}
-
-		if (std::regex_search(columns, match, inline_primary_key_re)) {
-			primary_key = match[0].str();
-			std::string col_name = primary_key.substr(0, primary_key.find(' '));
-			pk_columns = col_name;
-			columns = std::regex_replace(columns, inline_primary_key_re, col_name);
-		}
-
-		if (!pk_columns.empty()) {
-			pk_columns += ", " + string(openivm::MULTIPLICITY_COL);
-		} else {
-			pk_columns = string(openivm::MULTIPLICITY_COL);
-		}
-
-		columns += ", " + multiplicity_col + ", " + timestamp_col;
-		columns += ", PRIMARY KEY(" + pk_columns + ")";
-
-		output = "create table if not exists " + new_table_name + " (" + columns + ");\n";
-	}
-
-	return output;
 }
 
 void SqlUtils::RemoveRedundantWhitespaces(string &query) {
@@ -774,7 +691,49 @@ bool SqlUtils::IdentifierMatchesTable(const string &identifier, const string &ta
 	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
 }
 
-string SqlUtils::FindTableReference(const string &sql, const string &table_name) {
+struct TableReferenceMatch {
+	idx_t start;
+	idx_t end;
+};
+
+static bool IsIdentifierTokenStart(char c) {
+	return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"';
+}
+
+static bool IsTableReferenceKeyword(const string &identifier) {
+	return StringUtil::CIEquals(identifier, "from") || StringUtil::CIEquals(identifier, "join") ||
+	       StringUtil::CIEquals(identifier, "update") || StringUtil::CIEquals(identifier, "into");
+}
+
+static idx_t ExtendPastTimeTravelClause(const string &sql, idx_t end) {
+	idx_t at_pos = end;
+	while (at_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[at_pos]))) {
+		at_pos++;
+	}
+	if (!StringUtil::CIStartsWith(sql.substr(at_pos), "AT (")) {
+		return end;
+	}
+	idx_t depth = 0;
+	while (at_pos < sql.size()) {
+		if (sql[at_pos] == '(') {
+			depth++;
+		} else if (sql[at_pos] == ')') {
+			depth--;
+			if (depth == 0) {
+				return at_pos + 1;
+			}
+		}
+		at_pos++;
+	}
+	return end;
+}
+
+static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sql, const string &table_name,
+                                                                bool include_time_travel_clause) {
+	vector<TableReferenceMatch> matches;
+	if (table_name.empty()) {
+		return matches;
+	}
 	bool in_single_quote = false;
 	bool expect_table = false;
 	for (idx_t i = 0; i < sql.size();) {
@@ -788,19 +747,19 @@ string SqlUtils::FindTableReference(const string &sql, const string &table_name)
 			in_single_quote = !in_single_quote;
 			continue;
 		}
-		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+		if (!in_single_quote && IsIdentifierTokenStart(c)) {
 			idx_t start = i;
 			idx_t end = i;
 			string qualified_identifier;
 			if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier)) {
-				if (expect_table && IdentifierMatchesTable(qualified_identifier, table_name)) {
-					return sql.substr(start, end - start);
+				if (expect_table && SqlUtils::IdentifierMatchesTable(qualified_identifier, table_name)) {
+					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
+					i = matches.back().end;
+					expect_table = false;
+					continue;
 				}
 				i = end;
-				expect_table = StringUtil::CIEquals(qualified_identifier, "from") ||
-				               StringUtil::CIEquals(qualified_identifier, "join") ||
-				               StringUtil::CIEquals(qualified_identifier, "update") ||
-				               StringUtil::CIEquals(qualified_identifier, "into");
+				expect_table = IsTableReferenceKeyword(qualified_identifier);
 				continue;
 			}
 		}
@@ -809,256 +768,63 @@ string SqlUtils::FindTableReference(const string &sql, const string &table_name)
 		}
 		i++;
 	}
-	return "";
+	return matches;
+}
+
+string SqlUtils::FindTableReference(const string &sql, const string &table_name) {
+	auto matches = CollectTableReferenceMatches(sql, table_name, false);
+	if (matches.empty()) {
+		return "";
+	}
+	auto &match = matches[0];
+	return sql.substr(match.start, match.end - match.start);
+}
+
+idx_t SqlUtils::CountTableReferences(const string &sql, const string &table_name) {
+	return CollectTableReferenceMatches(sql, table_name, false).size();
 }
 
 string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
-	if (table_name.empty()) {
+	auto matches = CollectTableReferenceMatches(sql, table_name, true);
+	if (matches.empty()) {
 		return sql;
 	}
 	string result;
 	result.reserve(sql.size());
-	bool in_single_quote = false;
-	bool expect_table = false;
-	for (idx_t i = 0; i < sql.size();) {
-		char c = sql[i];
-		if (c == '\'') {
-			result += c;
-			i++;
-			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
-				result += sql[i++];
-				continue;
-			}
-			in_single_quote = !in_single_quote;
-			continue;
-		}
-		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
-			idx_t start = i;
-			if (expect_table) {
-				idx_t end = i;
-				string qualified_identifier;
-				if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
-				    IdentifierMatchesTable(qualified_identifier, table_name)) {
-					idx_t at_pos = end;
-					while (at_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[at_pos]))) {
-						at_pos++;
-					}
-					if (StringUtil::CIStartsWith(sql.substr(at_pos), "AT (")) {
-						idx_t depth = 0;
-						while (at_pos < sql.size()) {
-							if (sql[at_pos] == '(') {
-								depth++;
-							} else if (sql[at_pos] == ')') {
-								depth--;
-								if (depth == 0) {
-									at_pos++;
-									break;
-								}
-							}
-							at_pos++;
-						}
-						end = at_pos;
-					}
-					result += replacement;
-					i = end;
-					expect_table = false;
-					continue;
-				}
-			}
-			bool in_identifier_quote = c == '"';
-			i++;
-			while (i < sql.size()) {
-				char nc = sql[i];
-				if (in_identifier_quote) {
-					i++;
-					if (nc == '"') {
-						break;
-					}
-					continue;
-				}
-				if (!IsQualifiedIdentifierChar(nc)) {
-					break;
-				}
-				i++;
-			}
-			string token = sql.substr(start, i - start);
-			string unquoted = token;
-			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
-				unquoted = unquoted.substr(1, unquoted.size() - 2);
-			}
-			if (expect_table && IdentifierMatchesTable(unquoted, table_name)) {
-				result += replacement;
-				expect_table = false;
-				continue;
-			}
-			result += token;
-			string lower = StringUtil::Lower(unquoted);
-			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
-			continue;
-		}
-		result += c;
-		if (!std::isspace(static_cast<unsigned char>(c))) {
-			expect_table = false;
-		}
-		i++;
+	idx_t last = 0;
+	for (auto &match : matches) {
+		result += sql.substr(last, match.start - last);
+		result += replacement;
+		last = match.end;
 	}
+	result += sql.substr(last);
 	return result;
 }
 
 string SqlUtils::ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
                                                  const string &replacement, bool &replaced) {
 	replaced = false;
-	if (table_name.empty()) {
+	auto matches = CollectTableReferenceMatches(sql, table_name, true);
+	if (occurrence >= matches.size()) {
 		return sql;
 	}
+	auto &match = matches[occurrence];
 	string result;
 	result.reserve(sql.size());
-	bool in_single_quote = false;
-	bool expect_table = false;
-	idx_t seen = 0;
-	for (idx_t i = 0; i < sql.size();) {
-		char c = sql[i];
-		if (c == '\'') {
-			result += c;
-			i++;
-			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
-				result += sql[i++];
-				continue;
-			}
-			in_single_quote = !in_single_quote;
-			continue;
-		}
-		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
-			idx_t start = i;
-			if (expect_table) {
-				idx_t end = i;
-				string qualified_identifier;
-				if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
-				    IdentifierMatchesTable(qualified_identifier, table_name)) {
-					idx_t at_pos = end;
-					while (at_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[at_pos]))) {
-						at_pos++;
-					}
-					if (StringUtil::CIStartsWith(sql.substr(at_pos), "AT (")) {
-						idx_t depth = 0;
-						while (at_pos < sql.size()) {
-							if (sql[at_pos] == '(') {
-								depth++;
-							} else if (sql[at_pos] == ')') {
-								depth--;
-								if (depth == 0) {
-									at_pos++;
-									break;
-								}
-							}
-							at_pos++;
-						}
-						end = at_pos;
-					}
-					if (!replaced && seen == occurrence) {
-						result += replacement;
-						i = end;
-						expect_table = false;
-						replaced = true;
-						seen++;
-						continue;
-					}
-					seen++;
-				}
-			}
-			bool in_identifier_quote = c == '"';
-			i++;
-			while (i < sql.size()) {
-				char nc = sql[i];
-				if (in_identifier_quote) {
-					i++;
-					if (nc == '"') {
-						break;
-					}
-					continue;
-				}
-				if (!IsQualifiedIdentifierChar(nc)) {
-					break;
-				}
-				i++;
-			}
-			string token = sql.substr(start, i - start);
-			result += token;
-			string unquoted = token;
-			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
-				unquoted = unquoted.substr(1, unquoted.size() - 2);
-			}
-			string lower = StringUtil::Lower(unquoted);
-			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
-			continue;
-		}
-		result += c;
-		if (!std::isspace(static_cast<unsigned char>(c))) {
-			expect_table = false;
-		}
-		i++;
-	}
+	result += sql.substr(0, match.start);
+	result += replacement;
+	result += sql.substr(match.end);
+	replaced = true;
 	return result;
 }
 
 vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const string &table_name,
                                                    const string &replacement) {
 	vector<string> variants;
-	if (table_name.empty()) {
-		return variants;
-	}
-	bool in_single_quote = false;
-	bool expect_table = false;
-	for (idx_t i = 0; i < sql.size();) {
-		char c = sql[i];
-		if (c == '\'') {
-			i++;
-			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
-				i++;
-				continue;
-			}
-			in_single_quote = !in_single_quote;
-			continue;
-		}
-		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
-			idx_t start = i;
-			idx_t end = i;
-			string qualified_identifier;
-			if (expect_table && ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
-			    IdentifierMatchesTable(qualified_identifier, table_name)) {
-				string variant = sql;
-				variant.replace(start, end - start, replacement);
-				variants.push_back(std::move(variant));
-			}
-			bool in_identifier_quote = c == '"';
-			i++;
-			while (i < sql.size()) {
-				char nc = sql[i];
-				if (in_identifier_quote) {
-					i++;
-					if (nc == '"') {
-						break;
-					}
-					continue;
-				}
-				if (!IsQualifiedIdentifierChar(nc)) {
-					break;
-				}
-				i++;
-			}
-			string token = sql.substr(start, i - start);
-			string unquoted = token;
-			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
-				unquoted = unquoted.substr(1, unquoted.size() - 2);
-			}
-			string lower = StringUtil::Lower(unquoted);
-			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
-			continue;
-		}
-		if (!std::isspace(static_cast<unsigned char>(c))) {
-			expect_table = false;
-		}
-		i++;
+	for (auto &match : CollectTableReferenceMatches(sql, table_name, false)) {
+		string variant = sql;
+		variant.replace(match.start, match.end - match.start, replacement);
+		variants.push_back(std::move(variant));
 	}
 	return variants;
 }

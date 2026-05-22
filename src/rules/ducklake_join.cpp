@@ -4,6 +4,7 @@
 #include "rules/incremental_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "upsert/refresh_index_regen.hpp"
@@ -16,6 +17,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "storage/ducklake_scan.hpp"
+#include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
 
@@ -160,6 +162,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 	// Collect last_snapshot_id for each leaf upfront (one query per table).
 	Connection con(*context.db);
 	vector<int64_t> old_snapshots(N);
+	vector<int64_t> current_snapshots(N, -1);
 	vector<string> table_catalogs(N);
 	vector<string> table_schemas(N);
 	vector<string> table_names(N);
@@ -179,35 +182,36 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			                                            "' in view '" + pw.view + "'");
 		}
 		old_snapshots[i] = snap_result->GetValue(0, 0).GetValue<int64_t>();
-	}
-
-	// Check if empty-delta term skipping is enabled.
-	bool skip_empty_enabled = true;
-	Value skip_empty_val;
-	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
-		skip_empty_enabled = skip_empty_val.GetValue<bool>();
-	}
-
-	// Get current snapshot ID from the first leaf's DuckLakeFunctionInfo.
-	// The plan was just bound for this refresh, so this reflects the current state.
-	int64_t current_snapshot = -1;
-	{
-		auto *first_get = leaves[0].get ? leaves[0].get : FindGetInSubtree(leaves[0].node);
-		D_ASSERT(first_get);
-		if (first_get->function.name == "ducklake_scan" && first_get->function.function_info) {
-			auto &func_info = first_get->function.function_info->Cast<DuckLakeFunctionInfo>();
-			current_snapshot = static_cast<int64_t>(func_info.snapshot.snapshot_id);
+		if (get->function.name == "ducklake_scan" && get->function.function_info) {
+			auto &func_info = get->function.function_info->Cast<DuckLakeFunctionInfo>();
+			current_snapshots[i] = static_cast<int64_t>(func_info.snapshot.snapshot_id);
 		}
 	}
 
-	// DuckLake snapshot ids are catalog-wide. A table can have last_snapshot_id !=
-	// current_snapshot because another table changed. Probe table-level changes before
+	// Check if empty-delta term skipping is enabled.
+	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
+
+	// DuckLake snapshot ids are catalog-wide, not global across attached catalogs. A table can have
+	// last_snapshot_id != current_snapshot because another table changed. Probe table-level changes before
 	// building the term so unchanged tables do not force a full plan copy/rewrite.
 	vector<bool> empty_table_delta(N, false);
-	if (skip_empty_enabled && current_snapshot >= 0) {
+	if (skip_empty_enabled) {
+		RefreshMetadata metadata(con);
 		for (size_t i = 0; i < N; i++) {
-			if (old_snapshots[i] == current_snapshot) {
+			if (current_snapshots[i] < 0) {
+				continue;
+			}
+			if (old_snapshots[i] == current_snapshots[i]) {
 				empty_table_delta[i] = true;
+				continue;
+			}
+			auto metadata_activity =
+			    ProbeDuckLakeSnapshotActivity(metadata, con, pw.view, table_names[i], table_catalogs[i],
+			                                  table_schemas[i], old_snapshots[i], current_snapshots[i]);
+			if (metadata_activity.ok) {
+				if (!metadata_activity.has_changes) {
+					empty_table_delta[i] = true;
+				}
 				continue;
 			}
 			string has_changes_sql =
@@ -215,13 +219,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			    "(SELECT 1 FROM ducklake_table_insertions('" +
 			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
 			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
-			    to_string(current_snapshot) +
+			    to_string(current_snapshots[i]) +
 			    ") LIMIT 1) "
 			    "UNION ALL "
 			    "(SELECT 1 FROM ducklake_table_deletions('" +
 			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
 			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
-			    to_string(current_snapshot) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
+			    to_string(current_snapshots[i]) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
 			auto has_changes = con.Query(has_changes_sql);
 			if (has_changes->HasError()) {
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe changes for %s.%s.%s: %s\n",
@@ -237,7 +241,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 	}
 
 	vector<vector<DuckLakeKeyProbe>> key_probes(N);
-	if (skip_empty_enabled && !has_left_join && current_snapshot >= 0) {
+	if (skip_empty_enabled && !has_left_join) {
 		unordered_map<uint64_t, DuckLakeJoinColumnRef> column_refs;
 		for (size_t i = 0; i < N; i++) {
 			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
@@ -266,8 +270,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		CollectDuckLakeKeyProbes(pw.plan.get(), column_refs, key_probes);
 	}
 
-	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves, current_snapshot=%ld)\n",
-	                    N, (long)current_snapshot);
+	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves)\n", N);
 
 	for (size_t i = 0; i < N; i++) {
 		// Skip term if this table has no changes since last refresh.
@@ -278,12 +281,12 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			continue;
 		}
 		bool key_domain_empty = false;
-		if (skip_empty_enabled && !key_probes[i].empty()) {
+		if (skip_empty_enabled && current_snapshots[i] >= 0 && !key_probes[i].empty()) {
 			for (auto &probe : key_probes[i]) {
 				size_t other = probe.other_leaf;
 				int64_t other_snapshot = other > i ? old_snapshots[other] : -1;
 				if (!DuckLakeDeltaKeyHasMatch(con, table_catalogs[i], table_schemas[i], table_names[i],
-				                              probe.delta_column, old_snapshots[i], current_snapshot,
+				                              probe.delta_column, old_snapshots[i], current_snapshots[i],
 				                              table_catalogs[other], table_schemas[other], table_names[other],
 				                              probe.other_column, other_snapshot)) {
 					key_domain_empty = true;

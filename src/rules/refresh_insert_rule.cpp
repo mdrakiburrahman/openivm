@@ -18,10 +18,12 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
@@ -29,7 +31,6 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
@@ -78,6 +79,48 @@ static string BuildDeltaSelectFrom(TableCatalogEntry &delta_entry, const string 
 	return "SELECT " + cols + ", " + mul_val + ", now()::timestamp FROM " + source;
 }
 
+using BoundColumnNameMap = std::map<std::pair<idx_t, idx_t>, string>;
+
+static void CollectBoundColumnNames(LogicalOperator &op, BoundColumnNameMap &column_names) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto bindings = get.GetColumnBindings();
+		auto column_ids = get.GetColumnIds();
+		for (auto &binding : bindings) {
+			if (binding.column_index >= column_ids.size()) {
+				continue;
+			}
+			auto column_name = get.GetColumnName(column_ids[binding.column_index]);
+			column_names[{binding.table_index, binding.column_index}] =
+			    KeywordHelper::WriteOptionallyQuoted(column_name);
+		}
+	}
+	for (auto &child : op.children) {
+		CollectBoundColumnNames(*child, column_names);
+	}
+}
+
+static void QuoteBoundColumnRefs(Expression &expr, const BoundColumnNameMap &column_names) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &bcr = expr.Cast<BoundColumnRefExpression>();
+		auto entry = column_names.find({bcr.binding.table_index, bcr.binding.column_index});
+		if (entry != column_names.end()) {
+			bcr.alias = entry->second;
+		}
+	}
+	ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) {
+		if (child) {
+			QuoteBoundColumnRefs(*child, column_names);
+		}
+	});
+}
+
+static string QuotedExpressionString(const unique_ptr<Expression> &expr, const BoundColumnNameMap &column_names) {
+	auto copy = expr->Copy();
+	QuoteBoundColumnRefs(*copy, column_names);
+	return copy->ToString();
+}
+
 static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
                                        const string &full_delta_table_name, unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
@@ -92,7 +135,7 @@ static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry
 }
 
 static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
-                                             const string &full_delta_table_name,
+                                             const string &full_delta_table_name, const string &full_table_name,
                                              unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 	string data_cols = BuildDeltaDataColumns(delta_entry);
@@ -103,8 +146,30 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	if (!subquery_string.empty() && subquery_string.back() == ';') {
 		subquery_string.pop_back();
 	}
-	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM (" + subquery_string +
-	       ") openivm_deleted_rows";
+	// DuckDB DELETE children identify physical rows by rowid; read the base table
+	// columns back through that rowid set to materialize the negative delta tuple.
+	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM " + full_table_name +
+	       " WHERE rowid IN (SELECT rowid FROM (" + subquery_string + ") openivm_deleted_rows)";
+}
+
+static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
+	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &col_ref = expr->Cast<BoundColumnRefExpression>();
+	return StringUtil::CIEquals(col_ref.GetName(), "rowid") || StringUtil::CIEquals(col_ref.alias, "rowid");
+}
+
+static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
+	if (join.join_type != JoinType::SEMI) {
+		return false;
+	}
+	for (auto &condition : join.conditions) {
+		if (IsRowIdColumn(condition.left) || IsRowIdColumn(condition.right)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, const string &col_name) {
@@ -158,26 +223,6 @@ static string FindMVReferencingColumn(Connection &con, const string &delta_name,
 		}
 	}
 	return "";
-}
-
-static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &col_ref = expr->Cast<BoundColumnRefExpression>();
-	return StringUtil::CIEquals(col_ref.GetName(), "rowid") || StringUtil::CIEquals(col_ref.alias, "rowid");
-}
-
-static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
-	if (join.join_type != JoinType::SEMI) {
-		return false;
-	}
-	for (auto &condition : join.conditions) {
-		if (IsRowIdColumn(condition.left) || IsRowIdColumn(condition.right)) {
-			return true;
-		}
-	}
-	return false;
 }
 
 RefreshInsertRule::RefreshInsertRule() {
@@ -493,15 +538,17 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						has_subquery = has_subquery || expr->HasSubquery();
 					}
 					if (has_subquery) {
-						insert_string = BuildDeleteDeltaInsertFromPlan(*con.context, delta_entry_del,
-						                                               full_delta_table_name, plan->children[0]);
+						insert_string = BuildDeleteDeltaInsertFromPlan(
+						    *con.context, delta_entry_del, full_delta_table_name, full_table_name, plan->children[0]);
 					} else {
+						BoundColumnNameMap column_names;
+						CollectBoundColumnNames(*filter->children[0], column_names);
 						insert_string += " where ";
 						for (idx_t i = 0; i < filter->expressions.size(); i++) {
 							if (i > 0) {
 								insert_string += " AND ";
 							}
-							insert_string += filter->expressions[i]->ToString();
+							insert_string += QuotedExpressionString(filter->expressions[i], column_names);
 						}
 					}
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
@@ -515,6 +562,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 							}
 							first_filter = false;
 							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
+							col_name = KeywordHelper::WriteOptionallyQuoted(col_name);
 							insert_string += entry.second->ToString(col_name);
 						}
 					}
@@ -522,10 +570,10 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 					return;
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 					// DELETE FROM t WHERE rowid IN (subquery) compiles to a SEMI JOIN on rowid.
-					// LPTS can't serialize the full SEMI JOIN correctly because `rowid` is a
-					// virtual column that loses its binding after the join. Instead, serialize
-					// only the right child (the subquery that returns rowids) and wrap it as
-					// WHERE rowid IN (...) against the base table.
+					// LPTS (pinned at the spark-fork commit) can't serialize the full SEMI JOIN
+					// because `rowid` is a virtual column that loses its binding after the
+					// join. Serialize only the right child (the subquery returning rowids) and
+					// wrap it as WHERE rowid IN (...) against the base table.
 					auto *join = dynamic_cast<LogicalComparisonJoin *>(plan->children[0].get());
 					if (join && IsSemiJoinOnRowId(*join) && !join->children.empty()) {
 						try {
@@ -546,18 +594,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						}
 					} else {
 						try {
-							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-							string data_cols = BuildDeltaDataColumns(delta_entry_del);
-							SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
-							auto ast = LogicalPlanToAst(*con.context, plan->children[0], dialect);
-							auto cte_list = AstToCteList(*ast, dialect);
-							string subquery_string = cte_list->ToQuery(false);
-							if (!subquery_string.empty() && subquery_string.back() == ';') {
-								subquery_string.pop_back();
-							}
-							insert_string = prefix_del + " SELECT " + data_cols + ", -1, now()::timestamp FROM " +
-							                full_table_name + " WHERE rowid IN (SELECT rowid FROM (" + subquery_string +
-							                ") openivm_delete_rows)";
+							insert_string = BuildDeleteDeltaInsertFromPlan(
+							    *con.context, delta_entry_del, full_delta_table_name, full_table_name,
+							    plan->children[0]);
 						} catch (...) {
 							throw NotImplementedException(
 							    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
@@ -627,9 +666,11 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 				std::map<string, string> update_values;
 				string where_string;
+				BoundColumnNameMap column_names;
+				CollectBoundColumnNames(*projection->children[0], column_names);
 				for (size_t i = 0; i < update_node->columns.size(); i++) {
 					auto column = update_node->columns[i].index;
-					update_values[to_string(column)] = projection->expressions[i]->ToString();
+					update_values[to_string(column)] = QuotedExpressionString(projection->expressions[i], column_names);
 				}
 
 				if (projection->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
@@ -639,7 +680,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						if (i > 0) {
 							where_string += " AND ";
 						}
-						where_string += filter->expressions[i]->ToString();
+						where_string += QuotedExpressionString(filter->expressions[i], column_names);
 					}
 				} else if (projection->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
 					auto get = dynamic_cast<LogicalGet *>(projection->children[0].get());
@@ -652,6 +693,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 							}
 							first_filter = false;
 							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
+							col_name = KeywordHelper::WriteOptionallyQuoted(col_name);
 							where_string += entry.second->ToString(col_name);
 						}
 					}

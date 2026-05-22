@@ -746,3 +746,366 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# UNION ALL over aggregate branches — GROUP_RECOMPUTE keys must not be positional
+# ==========================================
+
+statement ok
+CREATE TABLE ugk_f(id INTEGER, k1 INTEGER, k2 INTEGER, k3 VARCHAR, k4 VARCHAR, x INTEGER);
+
+statement ok
+INSERT INTO ugk_f VALUES
+    (1, 10, 100, 'os-a', 'lic-a', 5),
+    (2, 10, 100, 'os-a', 'lic-a', 7),
+    (3, 10, 100, 'os-b', 'lic-a', 11),
+    (4, 20, 200, 'os-a', 'lic-b', 3);
+
+statement ok
+CREATE MATERIALIZED VIEW union_group_key_reordered AS
+WITH branch AS (
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x <= 7
+    GROUP BY k1, k2, k3, k4
+    UNION ALL
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x > 7
+    GROUP BY k1, k2, k3, k4
+)
+SELECT
+    CAST(k1 AS VARCHAR) || '-' || CAST(k2 AS VARCHAR) || '-' || k3 || '-' || k4 AS primary_key,
+    k1,
+    k2,
+    CAST(c AS INTEGER) AS c,
+    CAST(sx AS INTEGER) AS sx,
+    k3,
+    k4
+FROM branch;
+
+statement ok
+CREATE VIEW union_group_key_reordered_base AS
+WITH branch AS (
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x <= 7
+    GROUP BY k1, k2, k3, k4
+    UNION ALL
+    SELECT k1, k2, k3, k4, COUNT(DISTINCT id) AS c, SUM(x) AS sx
+    FROM ugk_f
+    WHERE x > 7
+    GROUP BY k1, k2, k3, k4
+)
+SELECT
+    CAST(k1 AS VARCHAR) || '-' || CAST(k2 AS VARCHAR) || '-' || k3 || '-' || k4 AS primary_key,
+    k1,
+    k2,
+    CAST(c AS INTEGER) AS c,
+    CAST(sx AS INTEGER) AS sx,
+    k3,
+    k4
+FROM branch;
+
+query T
+SELECT group_columns FROM openivm_views WHERE view_name = 'union_group_key_reordered';
+----
+k1,k2,k3,k4
+
+statement ok
+INSERT INTO ugk_f VALUES (5, 10, 100, 'os-a', 'lic-a', 6);
+
+statement ok
+PRAGMA refresh('union_group_key_reordered');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_reordered
+    EXCEPT ALL SELECT * FROM union_group_key_reordered_base
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_reordered_base
+    EXCEPT ALL SELECT * FROM union_group_key_reordered
+);
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW union_group_key_alias AS
+WITH cust_stats AS (
+    SELECT k1 AS C_W_ID, COUNT(*) AS n, AVG(x) AS avg_bal
+    FROM ugk_f
+    GROUP BY k1
+),
+w_stats AS (
+    SELECT k1 AS W_ID, SUM(x) AS W_YTD
+    FROM ugk_f
+    GROUP BY k1
+)
+SELECT cs.C_W_ID AS w, cs.n AS metric_val, 'count' AS kind FROM cust_stats cs
+UNION ALL
+SELECT cs.C_W_ID, cs.avg_bal, 'avg_bal' FROM cust_stats cs
+UNION ALL
+SELECT ws.W_ID, ws.W_YTD, 'ytd' FROM w_stats ws;
+
+statement ok
+CREATE VIEW union_group_key_alias_base AS
+WITH cust_stats AS (
+    SELECT k1 AS C_W_ID, COUNT(*) AS n, AVG(x) AS avg_bal
+    FROM ugk_f
+    GROUP BY k1
+),
+w_stats AS (
+    SELECT k1 AS W_ID, SUM(x) AS W_YTD
+    FROM ugk_f
+    GROUP BY k1
+)
+SELECT cs.C_W_ID AS w, cs.n AS metric_val, 'count' AS kind FROM cust_stats cs
+UNION ALL
+SELECT cs.C_W_ID, cs.avg_bal, 'avg_bal' FROM cust_stats cs
+UNION ALL
+SELECT ws.W_ID, ws.W_YTD, 'ytd' FROM w_stats ws;
+
+query T
+SELECT group_columns FROM openivm_views WHERE view_name = 'union_group_key_alias';
+----
+w
+
+statement ok
+INSERT INTO ugk_f VALUES (6, 30, 300, 'os-c', 'lic-c', 9);
+
+statement ok
+PRAGMA refresh('union_group_key_alias');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_alias
+    EXCEPT ALL SELECT * FROM union_group_key_alias_base
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM union_group_key_alias_base
+    EXCEPT ALL SELECT * FROM union_group_key_alias
+);
+----
+0
+
+# GROUP_RECOMPUTE with many source occurrences should avoid rendering one full
+# affected-key query per occurrence. The data has one row per key, so the 32-way
+# self-join remains tiny while still exercising the compile-time fallback.
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE gr_many_t(k INT, v INT);
+
+statement ok
+INSERT INTO gr_many_t VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW gr_many_mv AS
+SELECT t0.k, COUNT(DISTINCT t0.v) AS cd
+FROM gr_many_t t0
+JOIN gr_many_t t1 ON t0.k = t1.k
+JOIN gr_many_t t2 ON t0.k = t2.k
+JOIN gr_many_t t3 ON t0.k = t3.k
+JOIN gr_many_t t4 ON t0.k = t4.k
+JOIN gr_many_t t5 ON t0.k = t5.k
+JOIN gr_many_t t6 ON t0.k = t6.k
+JOIN gr_many_t t7 ON t0.k = t7.k
+JOIN gr_many_t t8 ON t0.k = t8.k
+JOIN gr_many_t t9 ON t0.k = t9.k
+JOIN gr_many_t t10 ON t0.k = t10.k
+JOIN gr_many_t t11 ON t0.k = t11.k
+JOIN gr_many_t t12 ON t0.k = t12.k
+JOIN gr_many_t t13 ON t0.k = t13.k
+JOIN gr_many_t t14 ON t0.k = t14.k
+JOIN gr_many_t t15 ON t0.k = t15.k
+JOIN gr_many_t t16 ON t0.k = t16.k
+JOIN gr_many_t t17 ON t0.k = t17.k
+JOIN gr_many_t t18 ON t0.k = t18.k
+JOIN gr_many_t t19 ON t0.k = t19.k
+JOIN gr_many_t t20 ON t0.k = t20.k
+JOIN gr_many_t t21 ON t0.k = t21.k
+JOIN gr_many_t t22 ON t0.k = t22.k
+JOIN gr_many_t t23 ON t0.k = t23.k
+JOIN gr_many_t t24 ON t0.k = t24.k
+JOIN gr_many_t t25 ON t0.k = t25.k
+JOIN gr_many_t t26 ON t0.k = t26.k
+JOIN gr_many_t t27 ON t0.k = t27.k
+JOIN gr_many_t t28 ON t0.k = t28.k
+JOIN gr_many_t t29 ON t0.k = t29.k
+JOIN gr_many_t t30 ON t0.k = t30.k
+JOIN gr_many_t t31 ON t0.k = t31.k
+GROUP BY t0.k;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'gr_many_mv';
+----
+6
+
+statement ok
+INSERT INTO gr_many_t VALUES (3, 30);
+
+statement ok
+PRAGMA refresh('gr_many_mv');
+
+query I
+SELECT contains(content, 'openivm_current_gr_many_mv')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_many_mv.sql');
+----
+true
+
+query I
+SELECT contains(content, 'openivm_src_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_many_mv.sql');
+----
+false
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM gr_many_mv
+    EXCEPT ALL SELECT k, COUNT(DISTINCT v) AS cd FROM gr_many_t GROUP BY k
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, COUNT(DISTINCT v) AS cd FROM gr_many_t GROUP BY k
+    EXCEPT ALL SELECT * FROM gr_many_mv
+);
+----
+0
+
+# GROUP_RECOMPUTE measure-only updates can update the stored SUM directly when
+# the changed source column is not part of keys, filters, joins, or nonlinear aggregates.
+statement ok
+CREATE TABLE gr_measure_t(id INTEGER, k INTEGER, measure_amount DOUBLE, label VARCHAR);
+
+statement ok
+INSERT INTO gr_measure_t VALUES
+    (1, 10, 2.5, 'a'),
+    (2, 10, 4.0, 'b'),
+    (3, 20, 7.0, 'c');
+
+statement ok
+CREATE MATERIALIZED VIEW gr_measure_mv AS
+SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
+       k,
+       COUNT(DISTINCT id) AS cd,
+       SUM(measure_amount) AS measure_amount_sum
+FROM gr_measure_t
+GROUP BY k;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'gr_measure_mv';
+----
+6
+
+statement ok
+UPDATE gr_measure_t SET measure_amount = 9.0 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('gr_measure_mv');
+
+query I
+SELECT contains(content, 'openivm_measure_delta')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_measure_mv.sql');
+----
+true
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM gr_measure_mv
+    EXCEPT ALL
+    SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
+           k,
+           COUNT(DISTINCT id) AS cd,
+           SUM(measure_amount) AS measure_amount_sum
+    FROM gr_measure_t
+    GROUP BY k
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
+           k,
+           COUNT(DISTINCT id) AS cd,
+           SUM(measure_amount) AS measure_amount_sum
+    FROM gr_measure_t
+    GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM gr_measure_mv
+);
+----
+0
+
+# The direct measure update is only valid for simple SUM(column). Expressions
+# must keep the generic affected-key recompute path.
+statement ok
+CREATE TABLE gr_measure_expr_t(id INTEGER, k INTEGER, measure_amount DOUBLE);
+
+statement ok
+INSERT INTO gr_measure_expr_t VALUES
+    (1, 10, 2.5),
+    (2, 10, 4.0),
+    (3, 20, 7.0);
+
+statement ok
+CREATE MATERIALIZED VIEW gr_measure_expr_mv AS
+SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
+       k,
+       COUNT(DISTINCT id) AS cd,
+       SUM(measure_amount * 2) AS measure_amount_sum
+FROM gr_measure_expr_t
+GROUP BY k;
+
+statement ok
+UPDATE gr_measure_expr_t SET measure_amount = 9.0 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('gr_measure_expr_mv');
+
+query I
+SELECT contains(content, 'openivm_measure_delta')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_measure_expr_mv.sql');
+----
+false
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM gr_measure_expr_mv
+    EXCEPT ALL
+    SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
+           k,
+           COUNT(DISTINCT id) AS cd,
+           SUM(measure_amount * 2) AS measure_amount_sum
+    FROM gr_measure_expr_t
+    GROUP BY k
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
+           k,
+           COUNT(DISTINCT id) AS cd,
+           SUM(measure_amount * 2) AS measure_amount_sum
+    FROM gr_measure_expr_t
+    GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM gr_measure_expr_mv
+);
+----
+0

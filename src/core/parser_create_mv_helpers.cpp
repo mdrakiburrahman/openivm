@@ -61,12 +61,12 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " nullified_columns_json varchar default null,"
 	              " distinct_aux_meta_json varchar default null,"
 	              " semi_anti_aux_meta_json varchar default null,"
-	              " window_partition_lineage_json varchar default null)");
+	              " lineage_json varchar default null)");
 	// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 	// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "distinct_aux_meta_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "semi_anti_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "window_partition_lineage_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "lineage_json varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
@@ -100,6 +100,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " pending_estimate_ts timestamp default null,"
 	              " source_catalog varchar default null,"
 	              " source_schema varchar default null,"
+	              " source_table_id bigint default null,"
 	              " primary key(view_name, table_name))");
 	// Backfill for existing databases without the columns (added post-release).
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "last_refresh_ts timestamp default null");
@@ -107,6 +108,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "pending_estimate_ts timestamp default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_schema varchar default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_table_id bigint default null");
 
 	// Refresh history: stores execution stats for learned cost model calibration.
 	// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.

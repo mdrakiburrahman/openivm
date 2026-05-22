@@ -45,9 +45,9 @@ CREATE MATERIALIZED VIEW cwpc_mv AS
     FROM s1;
 
 query III
-SELECT CASE WHEN window_partition_lineage_json IS NOT NULL THEN 1 ELSE 0 END,
-       CASE WHEN contains(window_partition_lineage_json, '"lookup_col":"company_id"') THEN 1 ELSE 0 END,
-       CASE WHEN contains(window_partition_lineage_json, '"lookup_col":"name"') THEN 1 ELSE 0 END
+SELECT CASE WHEN lineage_json IS NOT NULL THEN 1 ELSE 0 END,
+       CASE WHEN contains(lineage_json, '"lookup_col":"company_id"') THEN 1 ELSE 0 END,
+       CASE WHEN contains(lineage_json, '"lookup_col":"name"') THEN 1 ELSE 0 END
 FROM openivm_views
 WHERE view_name = 'cwpc_mv';
 ----

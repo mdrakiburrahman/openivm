@@ -4,33 +4,18 @@
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_locks.hpp"
-#include "rules/column_hider.hpp"
-#include "duckdb/main/client_data.hpp"
 #include "core/sql_utils.hpp"
-#include "upsert/refresh_compiler.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh_internal.hpp"
-#include "lpts_pipeline.hpp"
-#include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
-#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_error_context.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/planner/planner.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_join.hpp"
-#include "duckdb/planner/operator/logical_cte.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
-#include <cctype>
 #include <chrono>
 
 namespace duckdb {
@@ -75,6 +60,13 @@ public:
 		steps.push_back({next_step++, step_name, duration_ms, detail});
 	}
 
+	void AddMeasuredStep(const string &step_name, int64_t duration_ms, const string &detail = string()) {
+		if (!enabled) {
+			return;
+		}
+		steps.push_back({next_step++, step_name, duration_ms, detail});
+	}
+
 	void AddTotal() {
 		AddStep("total_refresh", total_start);
 	}
@@ -112,12 +104,17 @@ private:
 	vector<RefreshProfileStep> steps;
 };
 
+static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadata, Connection &con,
+                                const string &view_catalog_name, const string &view_schema_name,
+                                const string &view_name, const string &attached_db_catalog_name,
+                                const string &attached_db_schema_name, DeltaActivityResult *active_activity);
+
 // Generate and execute refresh SQL for a single view under its per-view lock.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
-static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
+static bool RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
-                              const string &attached_db_schema_name) {
+                              const string &attached_db_schema_name, bool skip_empty_refresh) {
 	RefreshProfiler profiler(context, vn);
 	auto lock_start = std::chrono::steady_clock::now();
 	ViewLockGuard view_guard(vn);
@@ -137,6 +134,19 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
 	}
 	profiler.AddStep("acquire_locks", lock_start, to_string(delta_table_names.size()) + " delta locks");
+	DeltaActivityResult delta_activity;
+	DeltaActivityResult *precomputed_delta_activity = nullptr;
+	if (skip_empty_refresh) {
+		if (TrySkipEmptyRefresh(context, probe_meta, probe_con, view_catalog_name, view_schema_name, vn,
+		                        attached_db_catalog_name, attached_db_schema_name, &delta_activity)) {
+			profiler.AddTotal();
+			profiler.Flush(*context.db.get());
+			return true;
+		}
+		if (!delta_activity.active_delta_table_names.empty() || delta_activity.requires_full_refresh) {
+			precomputed_delta_activity = &delta_activity;
+		}
+	}
 	// Track whether we're inside an open exec_con transaction so any exception path can
 	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
 	// Connection destructor, which can leak uncommitted writes into the WAL under some
@@ -145,42 +155,22 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 	Connection exec_con(*context.db.get());
 	bool tx_open = false;
 	try {
-		// Check if adaptive cost model is active — if so, compute estimate for history recording.
-		bool record_history = false;
+		bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 		RefreshCostEstimate cost_estimate = {};
-		Value adaptive_val;
-		if (context.TryGetCurrentSetting("openivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull() &&
-		    adaptive_val.GetValue<bool>()) {
-			auto adaptive_start = std::chrono::steady_clock::now();
-			// Compute cost estimate before refresh (for history recording).
-			// GenerateRefreshSQL also computes this when adaptive is on, but we need
-			// the estimate here to record alongside the actual execution time.
-			Connection cost_con(*context.db.get());
-			cost_con.BeginTransaction();
-			RefreshMetadata cost_meta(cost_con);
-			auto vq = cost_meta.GetViewQuery(vn);
-			if (!vq.empty()) {
-				Parser cp;
-				cp.ParseQuery(vq);
-				Planner pl(*cost_con.context);
-				pl.CreatePlan(cp.statements[0]->Copy());
-				Optimizer opt(*pl.binder, *cost_con.context);
-				auto plan = opt.Optimize(std::move(pl.plan));
-				cost_estimate = EstimateRefreshCost(*cost_con.context, *plan, vn);
-				record_history = true;
-			}
-			cost_con.Rollback();
-			profiler.AddStep("adaptive_cost_estimate", adaptive_start,
-			                 record_history ? "record_history=true" : "record_history=false");
-		}
 
 		// For cross_system (DuckLake) MVs, split the refresh SQL into data ops (dl catalog)
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
+		RefreshCompileProfile compile_profile;
 		auto generate_start = std::chrono::steady_clock::now();
-		string sql = GenerateRefreshSQL(
-		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr);
+		string sql =
+		    GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
+		                       attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
+		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
+		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr);
+		for (const auto &step : compile_profile.steps) {
+			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
+		}
 		profiler.AddStep("generate_refresh_sql", generate_start,
 		                 "sql_bytes=" + to_string(sql.size()) + ", meta_pre_bytes=" + to_string(meta_pre_sql.size()) +
 		                     ", meta_post_bytes=" + to_string(meta_post_sql.size()));
@@ -196,7 +186,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			OPENIVM_DEBUG_PRINT("[UPSERT] openivm_compile_only=true; skipping execution for '%s'\n", vn.c_str());
 			profiler.AddTotal();
 			profiler.Flush(*context.db.get());
-			return;
+			return true;
 		}
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
@@ -324,7 +314,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		}
 
 		// Record execution history for the learned cost model.
-		if (record_history) {
+		if (!cost_estimate.strategy_label.empty()) {
 			auto history_start = std::chrono::steady_clock::now();
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 			// Determine which method was used. Priority:
@@ -353,6 +343,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		}
 		profiler.AddTotal();
 		profiler.Flush(*context.db.get());
+		return false;
 	} catch (...) {
 		// Ensure the transaction is rolled back before we propagate the exception.
 		// This covers the case where Query() itself threw (vs returning HasError) —
@@ -371,6 +362,41 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		profiler.Flush(*context.db.get());
 		throw;
 	}
+}
+
+static bool SkipEmptyDeltasEnabled(ClientContext &context) {
+	return SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
+}
+
+static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadata, Connection &con,
+                                const string &view_catalog_name, const string &view_schema_name,
+                                const string &view_name, const string &attached_db_catalog_name,
+                                const string &attached_db_schema_name, DeltaActivityResult *active_activity) {
+	if (!SkipEmptyDeltasEnabled(context)) {
+		return false;
+	}
+	if (metadata.GetViewType(view_name) == RefreshType::FULL_REFRESH) {
+		return false;
+	}
+
+	auto view_query_sql = metadata.GetViewQuery(view_name);
+	auto delta_tables = metadata.GetDeltaTables(view_name);
+	auto activity = BuildDeltaActivityResult(metadata, con, view_name, view_query_sql, delta_tables, view_catalog_name,
+	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+	if (!activity.active_delta_table_names.empty() || activity.requires_full_refresh) {
+		if (active_activity) {
+			*active_activity = std::move(activity);
+		}
+		return false;
+	}
+
+	for (auto &advance : activity.ducklake_snapshot_advances) {
+		if (advance.snapshot_id >= 0) {
+			metadata.UpdateDuckLakeRefreshMetadata(view_name, advance.table_name, advance.snapshot_id);
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
+	return true;
 }
 
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
@@ -471,83 +497,10 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		for (auto &dep : upstream) {
 			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
 			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep,
-			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name);
+			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name,
+			                  /*skip_empty_refresh=*/true);
 		}
 	}
-
-	// Early exit: skip refresh if all delta tables are empty.
-	// Placed AFTER upstream cascade so that upstream refreshes have a chance to populate
-	// our delta tables before we check.
-	Value skip_empty_val;
-	bool skip_empty_enabled = true;
-	if (context.TryGetCurrentSetting("openivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
-		skip_empty_enabled = skip_empty_val.GetValue<bool>();
-	}
-	if (skip_empty_enabled) {
-		auto view_type = metadata.GetViewType(view_name);
-		if (view_type != RefreshType::FULL_REFRESH) {
-			auto delta_tables = metadata.GetDeltaTables(view_name);
-			bool all_empty = true;
-
-			for (auto &dt : delta_tables) {
-				if (metadata.IsDuckLakeTable(view_name, dt)) {
-					Connection snap_con(*context.db.get());
-					auto loc =
-					    ResolveDuckLakeSourceLocation(snap_con, view_name, dt, view_catalog_name, view_schema_name,
-					                                  attached_db_catalog_name, attached_db_schema_name);
-					RefreshMetadata snap_metadata(snap_con);
-					auto ducklake_current_snap = snap_metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
-					if (ducklake_current_snap < 0) {
-						all_empty = false;
-						break;
-					}
-					auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
-					if (last_snap == ducklake_current_snap) {
-						continue;
-					}
-					string insertions =
-					    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-					                                    loc.table_name, last_snap, ducklake_current_snap);
-					string deletions =
-					    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-					                                    loc.table_name, last_snap, ducklake_current_snap);
-					auto has_changes = snap_con.Query("SELECT EXISTS(SELECT 1 FROM ("
-					                                  "(SELECT 1 FROM " +
-					                                  insertions +
-					                                  " LIMIT 1) "
-					                                  "UNION ALL "
-					                                  "(SELECT 1 FROM " +
-					                                  deletions + " LIMIT 1)) openivm_delta_probe LIMIT 1)");
-					if (has_changes->HasError() || has_changes->RowCount() == 0 ||
-					    has_changes->GetValue(0, 0).IsNull() || has_changes->GetValue(0, 0).GetValue<bool>()) {
-						all_empty = false;
-						break;
-					}
-					continue;
-				}
-				string delta_probe = SqlUtils::QuoteIdentifier(dt);
-				if (cross_system) {
-					delta_probe = metadata.ResolveDeltaQualifiedName(view_name, dt);
-				} else if (!view_catalog_name.empty() && !view_schema_name.empty()) {
-					delta_probe = SqlUtils::FullName(view_catalog_name, view_schema_name, dt);
-				}
-				auto last_update = metadata.GetLastUpdate(view_name, dt);
-				if (last_update.empty()) {
-					all_empty = false;
-					break;
-				}
-				auto stats = metadata.GetStandardDeltaChangeStats(delta_probe, last_update);
-				if (!stats.ok || stats.total > 0) {
-					all_empty = false;
-					break;
-				}
-			}
-			if (all_empty) {
-				OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
-				return;
-			}
-		}
-	} // skip_empty_enabled
 
 	// Check for refresh hooks (custom SQL to run before/after/instead of IVM)
 	string hook_sql;
@@ -560,6 +513,14 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			hook_mode = StringUtil::Lower(hook_r->GetValue(1, 0).ToString());
 		}
 	}
+	bool has_refresh_hook = !hook_sql.empty();
+
+	// Hook-bearing refreshes keep the old pre-hook empty skip semantics. Hook-free refreshes
+	// compute the same delta activity under the view lock and reuse it during SQL generation.
+	if (has_refresh_hook && TrySkipEmptyRefresh(context, metadata, con, view_catalog_name, view_schema_name, view_name,
+	                                            attached_db_catalog_name, attached_db_schema_name, nullptr)) {
+		return;
+	}
 
 	if (!hook_sql.empty() && hook_mode == "before") {
 		auto hr = con.Query(hook_sql);
@@ -569,8 +530,10 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	}
 
 	if (hook_mode != "replace") {
-		RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system,
-		                  attached_db_catalog_name, attached_db_schema_name);
+		if (RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system,
+		                      attached_db_catalog_name, attached_db_schema_name, !has_refresh_hook)) {
+			return;
+		}
 	}
 
 	if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
@@ -586,7 +549,8 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		for (auto &dep : downstream) {
 			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
 			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep,
-			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name);
+			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name,
+			                  /*skip_empty_refresh=*/true);
 		}
 	}
 }

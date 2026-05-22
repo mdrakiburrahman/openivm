@@ -10,6 +10,47 @@ namespace duckdb {
 
 // Zero-initialized 64-element float list, used as COALESCE default for NULL list aggregates.
 static constexpr const char *ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
+static constexpr idx_t GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD = 32;
+static constexpr idx_t GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD = 16ULL * 1024ULL * 1024ULL;
+
+static idx_t EstimateGroupRecomputeAffectedVariants(const string &view_query_sql,
+                                                    const vector<GroupRecomputeDeltaSpec> &delta_table_specs) {
+	idx_t variants = 0;
+	for (auto &spec : delta_table_specs) {
+		variants += SqlUtils::CountTableReferences(view_query_sql, spec.base_table);
+	}
+	return variants;
+}
+
+static bool ShouldUseCurrentDiffGroupRecompute(const string &view_query_sql,
+                                               const vector<GroupRecomputeDeltaSpec> &delta_table_specs) {
+	idx_t variants = EstimateGroupRecomputeAffectedVariants(view_query_sql, delta_table_specs);
+	return variants >= GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD ||
+	       variants * view_query_sql.size() >= GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD;
+}
+
+static string BuildCurrentDiffGroupRecomputeSQL(const string &view_name, const string &data_table,
+                                                const string &view_query_sql, const vector<string> &group_columns) {
+	string current_temp = SqlUtils::QuoteIdentifier("openivm_current_" + view_name);
+	string affected_temp = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
+	string target_match = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
+	string recompute_match = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_recompute");
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + current_temp + " AS\n" + view_query_sql + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp + " AS\nSELECT DISTINCT " + group_csv +
+	       "\nFROM (\n  (SELECT * FROM " + current_temp + " EXCEPT ALL SELECT * FROM " + data_table +
+	       ")\n  UNION ALL\n  (SELECT * FROM " + data_table + " EXCEPT ALL SELECT * FROM " + current_temp +
+	       ")\n) openivm_changed;\n\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp +
+	       " AS openivm_aff WHERE " + target_match + "\n);\n\n";
+	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + current_temp +
+	       " AS openivm_recompute\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp + " AS openivm_aff WHERE " +
+	       recompute_match + "\n);\n\n";
+	sql += "DROP TABLE IF EXISTS " + affected_temp + ";\nDROP TABLE IF EXISTS " + current_temp + ";\n";
+	return sql;
+}
 
 static string BuildUpdatedAggregateColumn(const string &col) {
 	return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
@@ -20,16 +61,24 @@ static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
 	       fn + "(v." + col + ", d." + col + ") END";
 }
 
-static string JoinPrefixedSQLFragments(const vector<string> &fragments, const string &prefix) {
-	return StringUtil::Join(fragments, fragments.size(), ", ",
-	                        [&](const string &fragment) { return prefix + fragment; });
+static string BuildAvgFormula(const string &sum_expr, const string &count_expr) {
+	return sum_expr + "::DOUBLE / NULLIF(" + count_expr + ", 0)";
 }
 
-static string BuildNullSafeSQLFragmentMatch(const vector<string> &columns, const string &left_prefix,
-                                            const string &right_prefix) {
-	return StringUtil::Join(columns, columns.size(), " AND ", [&](const string &column) {
-		return left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
-	});
+static string BuildVarianceFormula(const string &sum_expr, const string &sum_sq_expr, const string &count_expr,
+                                   bool is_population, bool needs_sqrt, bool clamp_variance) {
+	string denom = is_population ? "NULLIF(" + count_expr + ", 0)" : "NULLIF(" + count_expr + " - 1, 0)";
+	string var_raw =
+	    "((" + sum_sq_expr + ") - (" + sum_expr + ") * (" + sum_expr + ") / (" + count_expr + ")) / " + denom;
+	string var_safe = clamp_variance ? "GREATEST(" + var_raw + ", 0::DOUBLE)" : var_raw;
+	return needs_sqrt ? "sqrt(" + var_safe + ")" : var_safe;
+}
+
+static string BuildGuardedVarianceFormula(const string &sum_expr, const string &sum_sq_expr, const string &count_expr,
+                                          bool is_population, bool needs_sqrt) {
+	int threshold = is_population ? 0 : 1;
+	return "CASE WHEN " + count_expr + " > " + std::to_string(threshold) + " THEN " +
+	       BuildVarianceFormula(sum_expr, sum_sq_expr, count_expr, is_population, needs_sqrt, true) + " ELSE NULL END";
 }
 
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
@@ -57,54 +106,52 @@ static string MatchPrefix(const string &col, const string &prefix) {
 	return "";
 }
 
+static bool IsDecomposedAggregateType(const string &aggregate_type) {
+	static const unordered_set<string> DECOMPOSED_TYPES = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
+	                                                       "variance", "var_samp", "var_pop"};
+	return DECOMPOSED_TYPES.count(aggregate_type);
+}
+
 static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &columns) {
 	DerivedAggDecomposition result;
-	static const string sum_prefix(openivm::SUM_COL_PREFIX);
-	static const string count_prefix(openivm::COUNT_COL_PREFIX);
-	// Sum-of-squares prefixes (check longer ones first to avoid false matches)
-	static const string sum_sqp_prefix(openivm::SUM_SQP_COL_PREFIX); // stddev_pop
-	static const string var_sqp_prefix(openivm::VAR_SQP_COL_PREFIX); // var_pop
-	static const string sum_sq_prefix(openivm::SUM_SQ_COL_PREFIX);   // stddev_samp
-	static const string var_sq_prefix(openivm::VAR_SQ_COL_PREFIX);   // var_samp
-
 	for (auto &col : columns) {
 		// Check sum-of-squares prefixes BEFORE sum (they start with openivm_sum_ or openivm_var_)
 		// Assignments moved out of if-conditions to satisfy bugprone-assignment-in-if-condition.
 		string alias;
-		alias = MatchPrefix(col, sum_sqp_prefix);
+		alias = MatchPrefix(col, openivm::SUM_SQP_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = true;
 			result.is_population[alias] = true;
 			continue;
 		}
-		alias = MatchPrefix(col, var_sqp_prefix);
+		alias = MatchPrefix(col, openivm::VAR_SQP_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = false;
 			result.is_population[alias] = true;
 			continue;
 		}
-		alias = MatchPrefix(col, sum_sq_prefix);
+		alias = MatchPrefix(col, openivm::SUM_SQ_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = true;
 			result.is_population[alias] = false;
 			continue;
 		}
-		alias = MatchPrefix(col, var_sq_prefix);
+		alias = MatchPrefix(col, openivm::VAR_SQ_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = false;
 			result.is_population[alias] = false;
 			continue;
 		}
-		alias = MatchPrefix(col, sum_prefix);
+		alias = MatchPrefix(col, openivm::SUM_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_cols[alias] = col;
 			continue;
 		}
-		alias = MatchPrefix(col, count_prefix);
+		alias = MatchPrefix(col, openivm::COUNT_COL_PREFIX);
 		if (!alias.empty()) {
 			result.count_cols[alias] = col;
 		}
@@ -116,29 +163,6 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 		}
 	}
 	return result;
-}
-
-// Types that can be added/subtracted in `sum(case mult=false then -<col> else <col> end)`.
-// Anything else (VARCHAR, BOOLEAN, LIST, STRUCT, MAP, ...) breaks the delta path.
-static bool IsSummableType(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::UHUGEINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-	case LogicalTypeId::DECIMAL:
-		return true;
-	default:
-		return false;
-	}
 }
 
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
@@ -155,12 +179,12 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 		auto key_ids = index_catalog_entry->column_ids;
 		for (size_t i = 0; i < key_ids.size(); i++) {
-			keys.emplace_back(SqlUtils::QuoteIdentifier(column_names[key_ids[i]]));
+			keys.emplace_back(column_names[key_ids[i]]);
 		}
 	} else {
 		// No index (e.g. DuckLake) — use group column names from metadata
 		for (auto &col : group_column_names) {
-			keys.emplace_back(SqlUtils::QuoteIdentifier(col));
+			keys.emplace_back(col);
 		}
 	}
 
@@ -171,10 +195,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	bool has_non_summable_col = false;
 	for (size_t i = 0; i < column_names.size(); i++) {
 		const auto &column = column_names[i];
-		if (keys_set.find(SqlUtils::QuoteIdentifier(column)) == keys_set.end() &&
-		    column != string(openivm::MULTIPLICITY_COL)) {
+		if (keys_set.find(column) == keys_set.end() && column != string(openivm::MULTIPLICITY_COL)) {
 			aggregates.push_back(SqlUtils::QuoteIdentifier(column));
-			if (i < column_types.size() && !IsSummableType(column_types[i])) {
+			if (i < column_types.size() && !IsSummableLogicalType(column_types[i])) {
 				has_non_summable_col = true;
 			}
 		}
@@ -231,8 +254,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// computed expression — sum-of-deltas is wrong for that expression.
 	bool has_computed_over_derived = false;
 	if (!aggregate_types.empty()) {
-		static const unordered_set<string> DECOMPOSED_TYPES_CHK = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
-		                                                           "variance", "var_samp", "var_pop"};
 		// Pass 1 — "type excess": more non-decomposed aggregate types than
 		// aggregate columns (INCLUDING hidden helpers like openivm_match_count and
 		// openivm_*) means at least one aggregate is consumed inside a computed
@@ -242,7 +263,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// RewriteLeftJoinMatchCount adds a real COUNT to the plan).
 		idx_t non_decomposed_type_count = 0;
 		for (auto &t : aggregate_types) {
-			if (!DECOMPOSED_TYPES_CHK.count(t)) {
+			if (!IsDecomposedAggregateType(t)) {
 				non_decomposed_type_count++;
 			}
 		}
@@ -292,7 +313,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				if (decomp.derived_cols.count(column) || column.find("openivm_") != string::npos) {
 					continue;
 				}
-				while (probe_idx < aggregate_types.size() && DECOMPOSED_TYPES_CHK.count(aggregate_types[probe_idx])) {
+				while (probe_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[probe_idx])) {
 					probe_idx++;
 				}
 				if (probe_idx >= aggregate_types.size()) {
@@ -348,8 +369,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// aggregate_types has one entry per ORIGINAL aggregate expression (before plan rewrites).
 	// Decomposed aggregates (avg, stddev, variance) are replaced by hidden columns in the
 	// plan rewrite, so we skip their entries to keep the mapping aligned with user-visible columns.
-	static const unordered_set<string> DECOMPOSED_TYPES = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
-	                                                       "variance", "var_samp", "var_pop"};
 	unordered_map<string, string> col_agg_type;
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
@@ -358,7 +377,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)
-			while (type_idx < aggregate_types.size() && DECOMPOSED_TYPES.count(aggregate_types[type_idx])) {
+			while (type_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[type_idx])) {
 				type_idx++;
 			}
 			if (type_idx < aggregate_types.size()) {
@@ -377,9 +396,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// for VARCHAR etc. regardless of whether the negative branch is reached.
 		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
 		// the MERGE path below.
-		string keys_tuple = StringUtil::Join(keys, ", ");
-		string match_delete = BuildNullSafeSQLFragmentMatch(keys, "openivm_aff.", "openivm_tgt.");
-		string match_insert = BuildNullSafeSQLFragmentMatch(keys, "openivm_aff.", "openivm_recompute.");
+		string keys_tuple = SqlUtils::JoinQuotedColumns(keys);
+		string match_delete = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_tgt.");
+		string match_insert = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_recompute.");
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, "  " + affected, "openivm_tgt",
@@ -388,7 +407,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	// CTE: consolidate deltas per group
 	string cte_select_string = "select ";
-	cte_select_string += StringUtil::Join(keys, ", ") + ", ";
+	cte_select_string += SqlUtils::JoinQuotedColumns(keys) + ", ";
 	for (auto &column : aggregates) {
 		string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
 		if (insert_only && agg_type == "min") {
@@ -416,13 +435,13 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		cte_from_string += " WHERE " + delta_ts_filter;
 	}
 	cte_from_string += "\n";
-	string cte_group_by_string = "group by " + StringUtil::Join(keys, ", ");
+	string cte_group_by_string = "group by " + SqlUtils::JoinQuotedColumns(keys);
 
 	string cte_body = cte_select_string + cte_from_string + cte_group_by_string;
 
 	// MERGE: single-pass upsert — UPDATE existing groups, INSERT new groups.
 	// Uses IS NOT DISTINCT FROM for NULL-safe key matching.
-	string on_clause = BuildNullSafeSQLFragmentMatch(keys, "v.", "d.");
+	string on_clause = SqlUtils::BuildNullSafeKeyPredicate(keys, "v.", "d.");
 
 	auto &derived_cols = decomp.derived_cols;
 	auto &d_sum_cols = decomp.sum_cols;
@@ -444,7 +463,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	string update_set;
 	string insert_cols, insert_vals;
 	{
-		const string &zeros_list = ZEROS_LIST;
 		bool first_agg = true;
 
 		// Build update_set and insert_vals in the SAME column order as aggregates.
@@ -481,29 +499,16 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 					string new_n = BuildUpdatedAggregateColumn(count_col);
 					bool is_pop = decomp.is_population.count(column) && decomp.is_population.at(column);
 					bool do_sqrt = decomp.needs_sqrt.count(column) && decomp.needs_sqrt.at(column);
-					int threshold = is_pop ? 0 : 1;
-
-					string denom = is_pop ? "NULLIF(" + new_n + ", 0)" : "NULLIF(" + new_n + " - 1, 0)";
-					string var_raw =
-					    "((" + new_sq + ") - (" + new_sum + ") * (" + new_sum + ") / (" + new_n + ")) / " + denom;
 					// 0::DOUBLE so GREATEST binds to DOUBLE, not INTEGER (would up-cast silently).
-					string var_safe = "GREATEST(" + var_raw + ", 0::DOUBLE)";
-					string formula = do_sqrt ? "sqrt(" + var_safe + ")" : var_safe;
-					update_set += column + " = CASE WHEN " + new_n + " > " + std::to_string(threshold) + " THEN " +
-					              formula + " ELSE NULL END";
-
-					string d_denom = is_pop ? "NULLIF(d." + count_col + ", 0)" : "NULLIF(d." + count_col + " - 1, 0)";
-					string d_var_raw = "((d." + sum_sq_col + ") - (d." + sum_col + ") * (d." + sum_col + ") / (d." +
-					                   count_col + ")) / " + d_denom;
-					string d_var_safe = "GREATEST(" + d_var_raw + ", 0::DOUBLE)";
-					string d_formula = do_sqrt ? "sqrt(" + d_var_safe + ")" : d_var_safe;
-					insert_vals += "CASE WHEN d." + count_col + " > " + std::to_string(threshold) + " THEN " +
-					               d_formula + " ELSE NULL END";
+					update_set += column + " = " + BuildGuardedVarianceFormula(new_sum, new_sq, new_n, is_pop, do_sqrt);
+					insert_vals += BuildGuardedVarianceFormula("d." + sum_col, "d." + sum_sq_col, "d." + count_col,
+					                                           is_pop, do_sqrt);
 				} else {
 					// AVG
-					update_set += column + " = " + BuildUpdatedAggregateColumn(sum_col) + "::DOUBLE / NULLIF(" +
-					              BuildUpdatedAggregateColumn(count_col) + ", 0)";
-					insert_vals += "d." + sum_col + "::DOUBLE / NULLIF(d." + count_col + ", 0)";
+					update_set +=
+					    column + " = " +
+					    BuildAvgFormula(BuildUpdatedAggregateColumn(sum_col), BuildUpdatedAggregateColumn(count_col));
+					insert_vals += BuildAvgFormula("d." + sum_col, "d." + count_col);
 				}
 			} else {
 				// Regular aggregate column
@@ -521,7 +526,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				insert_vals += "d." + column;
 			}
 		}
-		insert_cols = StringUtil::Join(keys, ", ") + ", " + StringUtil::Join(aggregates, ", ");
+		insert_cols = SqlUtils::JoinQuotedColumns(keys) + ", " + StringUtil::Join(aggregates, ", ");
 	}
 
 	string merge_query;
@@ -608,12 +613,12 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
 		              lj_update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
-		merge_query += JoinPrefixedSQLFragments(keys, "d.") + ", " + cond_insert_vals + ");\n";
+		merge_query += SqlUtils::JoinQualifiedQuotedColumns(keys, "d") + ", " + cond_insert_vals + ");\n";
 	} else {
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
 		              update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
-		merge_query += JoinPrefixedSQLFragments(keys, "d.") + ", " + insert_vals + ");\n";
+		merge_query += SqlUtils::JoinQualifiedQuotedColumns(keys, "d") + ", " + insert_vals + ");\n";
 	}
 
 	string upsert_query = merge_query + "\n";
@@ -674,7 +679,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		if (column_names[i] == string(openivm::MULTIPLICITY_COL) || column_names[i] == string(openivm::TIMESTAMP_COL)) {
 			continue;
 		}
-		if (!IsSummableType(column_types[i])) {
+		if (!IsSummableLogicalType(column_types[i])) {
 			has_non_summable_col = true;
 			break;
 		}
@@ -700,7 +705,6 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	string cte = "WITH openivm_delta AS (\n  SELECT ";
 	string update_set;
 	bool first = true;
-	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 
 	for (auto &raw_col : column_names) {
 		if (raw_col == mul || d_derived.count(raw_col)) {
@@ -717,8 +721,8 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			// list_reduce-add. NULL-list COALESCE preserves the previous semantics
 			// for empty groups.
 			cte += "COALESCE(list_reduce(list(list_transform(" + column + ", lambda x: " + mul +
-			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])), " + zeros_list +
-			       ") AS d_" + column;
+			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])), " +
+			       string(ZEROS_LIST) + ") AS d_" + column;
 			update_set += column + " = list_transform(list_zip(" + column + ", (SELECT d_" + column +
 			              " FROM openivm_delta)), lambda x: x[1] + x[2])";
 		} else {
@@ -746,15 +750,11 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			string sum_sq_col = d_sum_sq.at(alias);
 			bool is_pop = decomp.is_population.count(alias) && decomp.is_population.at(alias);
 			bool do_sqrt = decomp.needs_sqrt.count(alias) && decomp.needs_sqrt.at(alias);
-			string denom = is_pop ? "NULLIF(" + count_col + ", 0)" : "NULLIF(" + count_col + " - 1, 0)";
-			string var_expr =
-			    "((" + sum_sq_col + ") - (" + sum_col + ") * (" + sum_col + ") / (" + count_col + ")) / " + denom;
-			string formula = do_sqrt ? "sqrt(" + var_expr + ")" : var_expr;
+			string formula = BuildVarianceFormula(sum_col, sum_sq_col, count_col, is_pop, do_sqrt, false);
 			result += "UPDATE " + data_table + " SET " + alias + " = " + formula + ";\n";
 		} else {
 			// AVG: recompute from sum/count
-			result += "UPDATE " + data_table + " SET " + alias + " = " + sum_col + "::DOUBLE / NULLIF(" + count_col +
-			          ", 0);\n";
+			result += "UPDATE " + data_table + " SET " + alias + " = " + BuildAvgFormula(sum_col, count_col) + ";\n";
 		}
 	}
 
@@ -858,6 +858,11 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
+	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large plan\n");
+		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
+	}
+
 	// For each source table T_i, build a "view query restricted to T_i's delta" variant by
 	// substituting the qualified `cat.schema.<base>` reference with a delta-filtered subquery,
 	// then project DISTINCT group_columns. Union across sources gives the affected-keys set.
@@ -879,14 +884,8 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			    ")";
 		} else {
 			string delta_basename = string(openivm::DELTA_PREFIX) + base;
-			string delta_filter;
-			if (!spec.last_update.empty()) {
-				delta_filter = " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-				               SqlUtils::EscapeValue(spec.last_update) + "'::TIMESTAMP";
-			}
-			delta_subselect = "(SELECT * EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
-			                  string(openivm::TIMESTAMP_COL) + ") FROM " + catalog_prefix +
-			                  SqlUtils::QuoteIdentifier(delta_basename) + delta_filter + ")";
+			delta_subselect =
+			    BuildStandardDeltaRowsSQL(catalog_prefix + SqlUtils::QuoteIdentifier(delta_basename), spec.last_update);
 		}
 
 		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when

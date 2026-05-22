@@ -3,7 +3,10 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include <algorithm>
+#include <functional>
 #include <sstream>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -182,8 +185,11 @@ vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 }
 
 vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
-	// Find all views that depend on delta_<view_name> or openivm_data_<view_name> as a source.
+	// Find all reachable views that depend on delta_<view_name> or openivm_data_<view_name> as a source.
 	// DuckLake chained MVs use openivm_data_* (data table) instead of delta_* (delta table).
+	//
+	// The returned order must be topological over the reachable downstream DAG. Reverse postorder DFS keeps
+	// fanout branches before their fan-in children.
 	vector<string> result;
 	unordered_set<string> visited;
 
@@ -192,20 +198,23 @@ vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 		string data_name = IncrementalTableNames::DataTableName(vn);
 		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
 		                            " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) +
-		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "'");
+		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "' ORDER BY view_name");
 		if (!dependents->HasError()) {
 			for (size_t i = 0; i < dependents->RowCount(); i++) {
 				string dep = dependents->GetValue(0, i).ToString();
-				if (visited.find(dep) == visited.end()) {
-					visited.insert(dep);
-					result.push_back(dep); // closest first
-					collect(dep);          // then recurse deeper
+				if (dep == view_name) {
+					continue;
+				}
+				if (visited.insert(dep).second) {
+					collect(dep);
+					result.push_back(dep);
 				}
 			}
 		}
 	};
 	collect(view_name);
-	return result; // topological order: closest descendants first
+	std::reverse(result.begin(), result.end());
+	return result; // topological order: downstream parents before fan-in children
 }
 
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
@@ -336,12 +345,62 @@ int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string
 	return result->GetValue(0, 0).GetValue<int64_t>();
 }
 
-void RefreshMetadata::UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id) {
-	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " +
-	                        to_string(snapshot_id) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-	                        "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name,
+                                                                                       const string &table_name,
+                                                                                       const string &catalog_name,
+                                                                                       const string &schema_name) {
+	DuckLakeSourceIdentity identity;
+	auto result =
+	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
+		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
+	}
+	if (catalog_name.empty()) {
+		return identity;
+	}
+
+	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
+	string schema_filter = schema_name.empty() ? "main" : schema_name;
+	auto current_result =
+	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE t.end_snapshot IS NULL AND "
+	              "s.end_snapshot IS NULL AND t.table_name = '" +
+	              SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" + SqlUtils::EscapeValue(schema_filter) +
+	              "' ORDER BY t.table_id DESC LIMIT 1");
+	if (current_result->HasError() || current_result->RowCount() == 0 || current_result->GetValue(0, 0).IsNull()) {
+		return identity;
+	}
+
+	identity.resolved = true;
+	identity.current_table_id = current_result->GetValue(0, 0).GetValue<int64_t>();
+	identity.changed = identity.stored_table_id >= 0 && identity.stored_table_id != identity.current_table_id;
+	if (identity.stored_table_id == identity.current_table_id) {
+		return identity;
+	}
+	auto update =
+	    con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
+	              " SET source_table_id = " + to_string(identity.current_table_id) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	if (update->HasError()) {
+		OPENIVM_DEBUG_PRINT("[DuckLake] Could not backfill source_table_id for %s.%s: %s\n", view_name.c_str(),
+		                    table_name.c_str(), update->GetError().c_str());
+	}
+	return identity;
+}
+
+string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
+                                                        const string &snapshot_expr) {
+	return "UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " + snapshot_expr +
+	       ", last_update = now(), last_refresh_ts = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+	       "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "';\n";
+}
+
+void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name,
+                                                    int64_t snapshot_id) {
+	auto result = con.Query(BuildDuckLakeRefreshMetadataSQL(view_name, table_name, to_string(snapshot_id)));
 	if (result->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake snapshot ID: " + result->GetError());
+		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake refresh metadata: " + result->GetError());
 	}
 }
 
@@ -550,6 +609,27 @@ static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
 	}
 }
 
+static bool ReadRefreshLineageEntry(Connection &con, const string &view_name, const string &kind, string &entry) {
+	auto result = con.Query("SELECT lineage_json FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	auto objects = ExtractJsonObjectsFromArray(json, "items");
+	for (auto &object : objects) {
+		string object_kind;
+		if (ExtractJsonString(object, "k", object_kind) && object_kind == kind) {
+			entry = std::move(object);
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
@@ -600,19 +680,15 @@ bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMet
 }
 
 bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
-	auto result = con.Query("SELECT window_partition_lineage_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
-	if (json.empty()) {
+	out.clear();
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "window_partition", json)) {
 		return false;
 	}
 	vector<string> objects = ExtractJsonObjectsFromArray(json, "ops");
 	for (auto &object : objects) {
 		WindowPartitionLineageOp op;
-		if (!ExtractJsonString(object, "kind", op.kind) || !ExtractJsonString(object, "out", op.output_col) ||
+		if (!ExtractJsonString(object, "k", op.kind) || !ExtractJsonString(object, "out", op.output_col) ||
 		    !ExtractJsonString(object, "source", op.source) ||
 		    !ExtractJsonString(object, "source_col", op.source_col)) {
 			continue;
@@ -632,14 +708,8 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 }
 
 bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
-	auto result = con.Query("SELECT window_partition_lineage_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
-	string kind;
-	if (!ExtractJsonString(json, "kind", kind) || kind != "projection_key") {
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "projection_key", json)) {
 		return false;
 	}
 	if (!ExtractJsonString(json, "out", out.output_col) || !ExtractJsonString(json, "key_source", out.key_source) ||

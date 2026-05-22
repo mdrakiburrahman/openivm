@@ -1113,3 +1113,122 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Source table in a non-default schema with MV in the default schema must refresh
+# using the source schema's delta table, not main.openivm_delta_*.
+statement ok
+CREATE SCHEMA mvq_src_schema;
+
+statement ok
+CREATE TABLE mvq_src_schema.t3(k INT, v INT);
+
+statement ok
+INSERT INTO mvq_src_schema.t3 VALUES (1, 10), (1, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mvq_cross_schema_source AS
+SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k;
+
+statement ok
+INSERT INTO mvq_src_schema.t3 VALUES (1, 30), (2, 40);
+
+statement ok
+PRAGMA refresh('mvq_cross_schema_source');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mvq_cross_schema_source
+  EXCEPT ALL
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+  EXCEPT ALL
+  SELECT * FROM mvq_cross_schema_source
+);
+----
+0
+
+# Reserved source column names must survive CREATE-time LPTS rendering and refresh SQL.
+statement ok
+CREATE TABLE mvq_reserved_source ("group" INT, "select" INT);
+
+statement ok
+INSERT INTO mvq_reserved_source VALUES (1, 10), (1, 20), (2, 30), (3, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mvq_reserved AS
+SELECT "group", SUM("select") AS total, COUNT(*) AS cnt
+FROM mvq_reserved_source
+WHERE "group" IS NOT NULL
+GROUP BY "group";
+
+statement ok
+INSERT INTO mvq_reserved_source VALUES (1, 5), (4, 50);
+
+statement ok
+UPDATE mvq_reserved_source SET "group" = 2 WHERE "group" = 3;
+
+statement ok
+DELETE FROM mvq_reserved_source WHERE "group" = 1 AND "select" = 10;
+
+statement ok
+PRAGMA refresh('mvq_reserved');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mvq_reserved
+  EXCEPT ALL
+  SELECT "group", SUM("select") AS total, COUNT(*) AS cnt
+  FROM mvq_reserved_source
+  WHERE "group" IS NOT NULL
+  GROUP BY "group"
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT "group", SUM("select") AS total, COUNT(*) AS cnt
+  FROM mvq_reserved_source
+  WHERE "group" IS NOT NULL
+  GROUP BY "group"
+  EXCEPT ALL
+  SELECT * FROM mvq_reserved
+);
+----
+0
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+INSERT INTO mvq_src_schema.t3 VALUES (2, 50);
+
+statement ok
+PRAGMA refresh('mvq_cross_schema_source');
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mvq_cross_schema_source
+  EXCEPT ALL
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT k, COUNT(*) AS c, SUM(v) AS s FROM mvq_src_schema.t3 GROUP BY k
+  EXCEPT ALL
+  SELECT * FROM mvq_cross_schema_source
+);
+----
+0

@@ -24,7 +24,6 @@ public:
 	static string EscapeSingleQuotes(const string &input);
 	static void ReplaceMaterializedView(string &query);
 	static string ExtractViewQuery(string &query);
-	static string ExtractViewName(const string &query);
 	static string SQLToLowercase(const string &sql);
 	static void RemoveRedundantWhitespaces(string &query);
 	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
@@ -41,8 +40,14 @@ public:
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
+	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
+		Value setting_value;
+		if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {
+			return setting_value.GetValue<bool>();
+		}
+		return default_value;
+	}
 	static bool IsDelta(const string &name);
-	static string GenerateDeltaTable(string &query);
 	static string JoinQuotedColumns(const vector<string> &columns);
 	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
 	static string BuildAllNullPredicate(const vector<string> &columns);
@@ -60,6 +65,7 @@ public:
 	                                                const string &replacement);
 	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
 	static string FindTableReference(const string &sql, const string &table_name);
+	static idx_t CountTableReferences(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.

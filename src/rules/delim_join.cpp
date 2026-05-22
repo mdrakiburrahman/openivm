@@ -68,6 +68,33 @@ static void VerifyDelimJoinTypes(LogicalOperator *node) {
 	}
 }
 
+static bool IsSemiAntiJoinType(JoinType join_type) {
+	return join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::RIGHT_SEMI ||
+	       join_type == JoinType::RIGHT_ANTI;
+}
+
+static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
+	if (op.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		return false;
+	}
+	auto &join = op.Cast<LogicalComparisonJoin>();
+	if (!IsSemiAntiJoinType(join.join_type) || join.conditions.empty() || join.predicate) {
+		return false;
+	}
+	for (auto &condition : join.conditions) {
+		if (condition.comparison != ExpressionType::COMPARE_EQUAL &&
+		    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			return false;
+		}
+	}
+	for (auto &expr : join.duplicate_eliminated_columns) {
+		if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+	}
+	return !join.duplicate_eliminated_columns.empty();
+}
+
 static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const BaseLeafInfo &leaf) {
 	if (leaf.path.empty()) {
 		return;
@@ -91,14 +118,20 @@ static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const 
 	}
 }
 
-static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, Binder &binder,
-                                                       LogicalComparisonJoin &delim_join, LogicalDelimGet &delim_get) {
+static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, LogicalComparisonJoin &delim_join,
+                                                       LogicalDelimGet &delim_get, bool allow_ordinal_fallback) {
 	if (delim_join.children.size() != 2) {
 		throw InternalException("DELIM_JOIN must have two children");
 	}
 	const idx_t source_child_idx = delim_join.delim_flipped ? 1 : 0;
+	delim_join.children[source_child_idx]->ResolveOperatorTypes();
+	auto source_bindings = delim_join.children[source_child_idx]->GetColumnBindings();
 	auto source_copy = delim_join.children[source_child_idx]->Copy(context);
+	source_copy->ResolveOperatorTypes();
 	auto copy_bindings = source_copy->GetColumnBindings();
+	if (source_bindings.size() != copy_bindings.size()) {
+		throw InternalException("DELIM_JOIN source copy changed binding count");
+	}
 
 	vector<unique_ptr<Expression>> exprs;
 	exprs.reserve(delim_join.duplicate_eliminated_columns.size());
@@ -107,11 +140,20 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, B
 			throw NotImplementedException("DELIM_JOIN duplicate-eliminated expression must be a column reference");
 		}
 		auto &col_ref = expr->Cast<BoundColumnRefExpression>();
-		if (col_ref.binding.column_index >= copy_bindings.size()) {
-			throw InternalException("DELIM_JOIN duplicate-eliminated column index out of range");
+		idx_t source_ordinal = DConstants::INVALID_INDEX;
+		for (idx_t i = 0; i < source_bindings.size(); i++) {
+			if (source_bindings[i] == col_ref.binding) {
+				source_ordinal = i;
+				break;
+			}
 		}
-		exprs.push_back(
-		    make_uniq<BoundColumnRefExpression>(col_ref.return_type, copy_bindings[col_ref.binding.column_index]));
+		if (source_ordinal == DConstants::INVALID_INDEX) {
+			if (!allow_ordinal_fallback || col_ref.binding.column_index >= copy_bindings.size()) {
+				throw InternalException("DELIM_JOIN duplicate-eliminated binding not found in source child");
+			}
+			source_ordinal = col_ref.binding.column_index;
+		}
+		exprs.push_back(make_uniq<BoundColumnRefExpression>(col_ref.return_type, copy_bindings[source_ordinal]));
 	}
 	if (exprs.empty()) {
 		throw NotImplementedException("DELIM_JOIN without duplicate-eliminated columns is not supported");
@@ -201,7 +243,7 @@ static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_binding
 	throw InternalException("IncrementalDelimJoinRule: original output binding not found in rewritten term");
 }
 
-static bool ReplaceDelimGets(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node,
+static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,
                              vector<ReplacementBinding> &replacement_bindings,
                              LogicalComparisonJoin *active_delim_join = nullptr) {
 	if (node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
@@ -210,7 +252,7 @@ static bool ReplaceDelimGets(ClientContext &context, Binder &binder, unique_ptr<
 		}
 		auto &delim_get = node->Cast<LogicalDelimGet>();
 		auto old_bindings = delim_get.GetColumnBindings();
-		node = BuildDelimKeySource(context, binder, *active_delim_join, delim_get);
+		node = BuildDelimKeySource(context, *active_delim_join, delim_get, true);
 		auto new_bindings = node->GetColumnBindings();
 		if (old_bindings.size() != new_bindings.size()) {
 			throw InternalException("DELIM_GET replacement changed binding count");
@@ -231,7 +273,7 @@ static bool ReplaceDelimGets(ClientContext &context, Binder &binder, unique_ptr<
 		if (!child) {
 			continue;
 		}
-		replaced = ReplaceDelimGets(context, binder, child, replacement_bindings, next_delim) || replaced;
+		replaced = ReplaceDelimGets(context, child, replacement_bindings, next_delim) || replaced;
 	}
 	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && replaced && !replacement_bindings.empty()) {
 		ColumnBindingReplacer replacer;
@@ -359,6 +401,64 @@ static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original
 
 } // namespace
 
+static bool ReplaceSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,
+                                         vector<ReplacementBinding> *active_replacements = nullptr,
+                                         LogicalComparisonJoin *active_delim_join = nullptr) {
+	if (!node) {
+		return false;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		if (!active_delim_join || !active_replacements) {
+			return false;
+		}
+		auto &delim_get = node->Cast<LogicalDelimGet>();
+		auto old_bindings = delim_get.GetColumnBindings();
+		try {
+			node = BuildDelimKeySource(context, *active_delim_join, delim_get, false);
+		} catch (Exception &) {
+			return false;
+		}
+		auto new_bindings = node->GetColumnBindings();
+		if (old_bindings.size() != new_bindings.size()) {
+			throw InternalException("DELIM_GET replacement changed binding count");
+		}
+		for (idx_t i = 0; i < old_bindings.size(); i++) {
+			active_replacements->emplace_back(old_bindings[i], new_bindings[i]);
+		}
+		return true;
+	}
+
+	if (IsSafeSemiAntiDelimJoin(*node)) {
+		vector<ReplacementBinding> local_replacements;
+		auto &join = node->Cast<LogicalComparisonJoin>();
+		bool replaced = false;
+		for (auto &child : node->children) {
+			replaced = ReplaceSafeSemiAntiDelimGets(context, child, &local_replacements, &join) || replaced;
+		}
+		if (replaced && !local_replacements.empty()) {
+			ColumnBindingReplacer replacer;
+			replacer.replacement_bindings = local_replacements;
+			RebindAllExpressions(*node, replacer);
+			join.duplicate_eliminated_columns.clear();
+			node->type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
+			node->ResolveOperatorTypes();
+			OPENIVM_DEBUG_PRINT(
+			    "[PlanRewrite] Rewrote equality SEMI/ANTI DELIM_JOIN to distinct-key comparison join\n");
+		}
+		return replaced;
+	}
+
+	bool replaced = false;
+	for (auto &child : node->children) {
+		replaced = ReplaceSafeSemiAntiDelimGets(context, child, active_replacements, active_delim_join) || replaced;
+	}
+	return replaced;
+}
+
+bool RewriteSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+	return ReplaceSafeSemiAntiDelimGets(context, plan);
+}
+
 ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
 	ClientContext &context = pw.input.context;
 	Binder &binder = pw.input.optimizer.binder;
@@ -405,7 +505,7 @@ ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
 		}
 
 		vector<ReplacementBinding> delim_replacements;
-		ReplaceDelimGets(context, binder, term, delim_replacements);
+		ReplaceDelimGets(context, term, delim_replacements);
 		output_replacements.insert(output_replacements.end(), delim_replacements.begin(), delim_replacements.end());
 
 		auto term_bindings = term->GetColumnBindings();

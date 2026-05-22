@@ -8,6 +8,8 @@
 #include "duckdb/planner/logical_operator.hpp"
 #include "upsert/refresh_compiler.hpp"
 
+#include <chrono>
+
 namespace duckdb {
 
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
@@ -29,6 +31,55 @@ struct DeltaFastPathFlags {
 	bool skip_agg_delete = false;
 	bool skip_proj_delete = false;
 	bool minmax_incremental = false;
+	vector<string> active_delta_table_names;
+};
+
+struct DuckLakeSnapshotAdvance {
+	DuckLakeSnapshotAdvance() {
+	}
+
+	DuckLakeSnapshotAdvance(string table_name_p, int64_t snapshot_id_p)
+	    : table_name(std::move(table_name_p)), snapshot_id(snapshot_id_p) {
+	}
+
+	string table_name;
+	int64_t snapshot_id = -1;
+};
+
+struct DeltaActivityResult {
+	bool has_join = false;
+	idx_t tables_with_changes = 0;
+	bool any_has_deletes = false;
+	bool all_ducklake = true;
+	bool requires_full_refresh = false;
+	vector<string> active_delta_table_names;
+	vector<DuckLakeSnapshotAdvance> ducklake_snapshot_advances;
+};
+
+struct DuckLakeTableActivity {
+	bool ok = false;
+	bool has_changes = false;
+	bool has_deletes = false;
+	bool requires_full_refresh = false;
+};
+
+struct RefreshCostEstimate;
+
+struct RefreshCompileProfileStep {
+	string step_name;
+	int64_t duration_ms;
+	string detail;
+};
+
+struct RefreshCompileProfile {
+	vector<RefreshCompileProfileStep> steps;
+
+	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
+	             const string &detail = string()) {
+		auto duration_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		steps.push_back({step_name, duration_ms, detail});
+	}
 };
 
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
@@ -47,6 +98,11 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_temp_table = "");
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
+bool IsSummableLogicalType(const LogicalType &type);
+string NormalizeColumnNameForMatch(const string &name);
+string BaseTableNameFromDeltaKey(const string &delta_key);
+string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                 const string &extra_predicate = "");
 
 string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
                                   const string &attached_db_catalog_name);
@@ -98,7 +154,17 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const string &view_name, const string &view_query_sql,
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name, bool cross_system);
+                                             const string &attached_db_schema_name, bool cross_system,
+                                             const DeltaActivityResult *precomputed_delta_activity = nullptr);
+DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                             const string &view_query_sql, const vector<string> &delta_table_names,
+                                             const string &view_catalog_name, const string &view_schema_name,
+                                             const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name);
+DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                                    const string &table_name, const string &catalog_name,
+                                                    const string &schema_name, int64_t last_snapshot_id,
+                                                    int64_t current_snapshot_id);
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                    const string &view_query_sql, const vector<string> &delta_table_names,
@@ -107,11 +173,18 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                    bool cross_system, bool emit_cascade_delta = false);
+bool TryBuildGroupMeasureUpdateRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                       const string &view_query_sql, const vector<string> &active_delta_table_names,
+                                       const vector<string> &column_names, const vector<LogicalType> &column_types,
+                                       const string &data_table, const string &view_catalog_name,
+                                       const string &view_schema_name, string &upsert_query);
 
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,
-                          string *out_post_meta = nullptr);
+                          string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
+                          const DeltaActivityResult *precomputed_delta_activity = nullptr,
+                          RefreshCostEstimate *out_adaptive_estimate = nullptr);
 
 } // namespace duckdb
 
