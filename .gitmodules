@@ -9,6 +9,7 @@
 [submodule "third_party/lpts"]
 	path = third_party/lpts
 	url = https://github.com/mdrakiburrahman/lpts.git
+	branch = openivm-spark
 [submodule ".claude/skills/shared"]
 	path = .claude/skills/shared
 	url = https://github.com/ila/duckdb-claude-skills.git
