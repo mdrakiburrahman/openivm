@@ -485,7 +485,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
 	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
 
-	// AGGREGATE_GROUP / AGGREGATE_HAVING cascade-delta dispatch (OPENIVM-BUG fix).
+	// AGGREGATE_GROUP cascade-delta dispatch (OPENIVM-BUG fix).
 	//
 	// Background: when openivm_force_view_delta_cascade=true (openivm-spark sets this on every
 	// AGGREGATE_GROUP/AGGREGATE_HAVING compile so that downstream MVs see a per-key view-delta
@@ -497,14 +497,21 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// SIMPLE_PROJECTION aggregates by (key, non-key) — so downstream INNER JOINs on the non-key
 	// columns evaluate to UNKNOWN and the stale row is never deleted from the downstream MV.
 	//
-	// Fix: when force_view_delta_cascade=true AND the AGGREGATE_GROUP/HAVING refresh would take
-	// the recompute branch in CompileAggregateGroups, route through CompileGroupRecompute with
+	// Fix: when force_view_delta_cascade=true AND the AGGREGATE_GROUP refresh would take the
+	// recompute branch in CompileAggregateGroups, route through CompileGroupRecompute with
 	// emit_cascade_delta=true so the cascade-delta is built from REAL openivm_old_<view> /
 	// openivm_new_<view> snapshots + signed-multiset insert. The Spark rewriter already handles
 	// this SQL pattern (it's the same shape WINDOW_PARTITION / GROUP_RECOMPUTE use today).
 	//
-	// Excluded: source_has_full_outer (both with and without full_outer_merge) — those branches
-	// have separate `BuildFullOuterAffectedGroupRefresh` semantics that we leave untouched.
+	// Excluded:
+	//   - source_has_full_outer (both with/without full_outer_merge) — separate
+	//     `BuildFullOuterAffectedGroupRefresh` semantics we leave untouched.
+	//   - AGGREGATE_HAVING — CompileGroupRecompute's affected-key subquery substitutes delta-only
+	//     scans into the view query and applies HAVING to partial aggregates (e.g. filters
+	//     SUM(delta) > 100 instead of SUM(base+delta) > 100), so it misses groups whose FULL sum
+	//     crosses the HAVING threshold via the delta. AGGREGATE_HAVING also stores hidden helper
+	//     columns (openivm_count_star) in <mv>__ivm_data that the bare view_query_sql does not
+	//     project. Keep the legacy BuildAffectedKeyRefreshSQL path for HAVING.
 	bool aggregate_recompute_emits_cascade_delta = false;
 	vector<GroupRecomputeDeltaSpec> aggregate_recompute_delta_specs;
 	string aggregate_recompute_lpts_prefix;
@@ -514,8 +521,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		bool force_view_delta_cascade =
 		    context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
 		    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>();
-		bool eligible_refresh_type = (view_query_type == RefreshType::AGGREGATE_GROUP ||
-		                              view_query_type == RefreshType::AGGREGATE_HAVING);
+		bool eligible_refresh_type = (view_query_type == RefreshType::AGGREGATE_GROUP);
 		if (force_view_delta_cascade && eligible_refresh_type && !source_has_full_outer && !group_cols.empty()) {
 			auto active_delta_table_names = fast_paths.active_delta_table_names;
 			bool compile_only_active = SqlUtils::GetBoolSetting(context, "openivm_compile_only", false);
@@ -556,18 +562,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
-			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
-			    aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
-			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
-			    &aggregate_recompute_emits_cascade_delta);
+			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);
 		} else {
-			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			    /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
-			    /*insert_only=*/false, agg_types, column_types, aggregate_cascade_specs_ptr,
-			    aggregate_recompute_lpts_prefix,
-			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
-			    &aggregate_recompute_emits_cascade_delta);
+			upsert_query =
+			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+			                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols,
+			                           internal_catalog_prefix, /*insert_only=*/false, agg_types, column_types);
 		}
 		break;
 	}
