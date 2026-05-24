@@ -169,7 +169,10 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
                               const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types,
-                              const vector<LogicalType> &column_types) {
+                              const vector<LogicalType> &column_types,
+                              const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs,
+                              const string &cascade_lpts_table_prefix, bool emit_cascade_delta,
+                              bool *out_handled_cascade_delta) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 
@@ -389,6 +392,24 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 
 	if (needs_group_recompute || (has_minmax && !insert_only)) {
+		// Cascade-delta dispatch: when the caller (refresh_sql.cpp) requested cascade-delta
+		// emission AND we have the inputs CompileGroupRecompute needs (non-empty group_columns,
+		// non-empty delta_specs), route through the snapshot+signed-multiset path so the
+		// downstream cascade-delta is built from real old/new view-query rows instead of the
+		// LPTS sum-delta + NULL companion pair (which is wrong for MIN/MAX and breaks
+		// SIMPLE_PROJECTION-with-JOIN downstreams). See OPENIVM-BUG.md §root-cause and
+		// ChainedMinMaxJoinSpec for the regression net.
+		if (emit_cascade_delta && cascade_delta_specs && !cascade_delta_specs->empty() &&
+		    !group_column_names.empty()) {
+			OPENIVM_DEBUG_PRINT(
+			    "[CompileAggregateGroups] cascade-delta requested + recompute branch → dispatching "
+			    "to CompileGroupRecompute(emit_cascade_delta=true)\n");
+			if (out_handled_cascade_delta) {
+				*out_handled_cascade_delta = true;
+			}
+			return CompileGroupRecompute(view_name, view_query_sql, group_column_names, *cascade_delta_specs,
+			                             catalog_prefix, cascade_lpts_table_prefix, /*emit_cascade_delta=*/true);
+		}
 		// Group-recompute strategy: delete affected groups, re-insert from original query.
 		// Always triggered by non-summable columns (LIST aggregates, VARCHAR literals,
 		// CASE results, etc.) — even in insert-only mode, the MERGE path emits
@@ -858,7 +879,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
-	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
+	if (!emit_cascade_delta && ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large plan\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
 	}

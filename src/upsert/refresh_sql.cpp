@@ -484,6 +484,69 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto agg_types = metadata.GetAggregateTypes(view_name);
 	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
 	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
+
+	// AGGREGATE_GROUP / AGGREGATE_HAVING cascade-delta dispatch (OPENIVM-BUG fix).
+	//
+	// Background: when openivm_force_view_delta_cascade=true (openivm-spark sets this on every
+	// AGGREGATE_GROUP/AGGREGATE_HAVING compile so that downstream MVs see a per-key view-delta
+	// even when no downstream is registered in the per-compile DuckDB session), the legacy path
+	// in CompileAggregateGroups's recompute branch emits the cascade-delta via the LPTS
+	// ComputeDelta query PLUS a NULL-padded retract/add-back companion (`refresh_sql.cpp:898-960`
+	// below). For MIN/MAX (and other recompute-driving aggregates) the LPTS sum-delta produces
+	// rows with WRONG non-key values, and the NULL companion cancels out when a downstream
+	// SIMPLE_PROJECTION aggregates by (key, non-key) — so downstream INNER JOINs on the non-key
+	// columns evaluate to UNKNOWN and the stale row is never deleted from the downstream MV.
+	//
+	// Fix: when force_view_delta_cascade=true AND the AGGREGATE_GROUP/HAVING refresh would take
+	// the recompute branch in CompileAggregateGroups, route through CompileGroupRecompute with
+	// emit_cascade_delta=true so the cascade-delta is built from REAL openivm_old_<view> /
+	// openivm_new_<view> snapshots + signed-multiset insert. The Spark rewriter already handles
+	// this SQL pattern (it's the same shape WINDOW_PARTITION / GROUP_RECOMPUTE use today).
+	//
+	// Excluded: source_has_full_outer (both with and without full_outer_merge) — those branches
+	// have separate `BuildFullOuterAffectedGroupRefresh` semantics that we leave untouched.
+	bool aggregate_recompute_emits_cascade_delta = false;
+	vector<GroupRecomputeDeltaSpec> aggregate_recompute_delta_specs;
+	string aggregate_recompute_lpts_prefix;
+	const vector<GroupRecomputeDeltaSpec> *aggregate_cascade_specs_ptr = nullptr;
+	{
+		Value force_cascade_val;
+		bool force_view_delta_cascade =
+		    context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
+		    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>();
+		bool eligible_refresh_type = (view_query_type == RefreshType::AGGREGATE_GROUP ||
+		                              view_query_type == RefreshType::AGGREGATE_HAVING);
+		if (force_view_delta_cascade && eligible_refresh_type && !source_has_full_outer && !group_cols.empty()) {
+			auto active_delta_table_names = fast_paths.active_delta_table_names;
+			bool compile_only_active = SqlUtils::GetBoolSetting(context, "openivm_compile_only", false);
+			if (active_delta_table_names.empty() && compile_only_active) {
+				active_delta_table_names = delta_table_names;
+			}
+			if (!active_delta_table_names.empty()) {
+				bool has_ducklake_source = false;
+				for (auto &dt : active_delta_table_names) {
+					if (metadata.IsDuckLakeTable(view_name, dt)) {
+						has_ducklake_source = true;
+						break;
+					}
+				}
+				string dl_cat;
+				if (has_ducklake_source) {
+					dl_cat = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
+				}
+				string dl_sch = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
+				aggregate_recompute_delta_specs = BuildGroupRecomputeDeltaSpecs(
+				    metadata, view_name, con, active_delta_table_names, dl_cat, dl_sch);
+				string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
+				string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
+				aggregate_recompute_lpts_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
+				if (!aggregate_recompute_delta_specs.empty()) {
+					aggregate_cascade_specs_ptr = &aggregate_recompute_delta_specs;
+				}
+			}
+		}
+	}
+
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(view_query_type));
 	auto dispatch_start = profile_now();
 	switch (view_query_type) {
@@ -493,12 +556,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
-			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);
+			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
+			    aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
+			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
+			    &aggregate_recompute_emits_cascade_delta);
 		} else {
-			upsert_query =
-			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols,
-			                           internal_catalog_prefix, /*insert_only=*/false, agg_types, column_types);
+			upsert_query = CompileAggregateGroups(
+			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+			    /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
+			    /*insert_only=*/false, agg_types, column_types, aggregate_cascade_specs_ptr,
+			    aggregate_recompute_lpts_prefix,
+			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
+			    &aggregate_recompute_emits_cascade_delta);
 		}
 		break;
 	}
@@ -520,7 +589,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
-			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);
+			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
+			    aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
+			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
+			    &aggregate_recompute_emits_cascade_delta);
 		}
 		break;
 	}
@@ -727,8 +799,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		has_downstream = true;
 	}
 	bool recompute_handles_own_cascade_delta =
-	    emit_cascade_delta_for_recompute &&
-	    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE);
+	    aggregate_recompute_emits_cascade_delta ||
+	    (emit_cascade_delta_for_recompute &&
+	     (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE));
 	auto build_snapshot_companion = [&]() {
 		string col_list;
 		for (auto &col : column_names) {
@@ -825,13 +898,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	if (skip_compute_delta_for_refresh || view_query_type == RefreshType::WINDOW_PARTITION ||
 	    view_query_type == RefreshType::GROUP_RECOMPUTE || view_query_type == RefreshType::DISTINCT_INCREMENTAL ||
-	    view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
+	    view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE || aggregate_recompute_emits_cascade_delta) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping ComputeDelta for %s\n",
 		                    skip_compute_delta_for_refresh                         ? "SIMPLE_PROJECTION_KEY"
 		                    : view_query_type == RefreshType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
 		                    : view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
 		                    : view_query_type == RefreshType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
-		                                                                           : "WINDOW_PARTITION");
+		                    : view_query_type == RefreshType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
+		                                                                           : "AGGREGATE_GROUP_RECOMPUTE_CASCADE");
 		delta_query = "";
 		if (has_downstream && !recompute_handles_own_cascade_delta) {
 			build_snapshot_companion();
