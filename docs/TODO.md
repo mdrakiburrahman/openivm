@@ -2,13 +2,13 @@
 
 ## P0: Cost Model Audit
 
-- [ ] **Review cost model heuristics.** The current model (`src/upsert/refresh_cost_model.cpp`) uses `COUNT(*)` queries for cardinality at refresh time — expensive and blocks the refresh. Consider caching or using DuckDB's statistics instead.
-- [ ] **Join cost is oversimplified.** `2^(N-1) * total_base_scan` ignores join selectivity, index availability, and join type (LEFT JOIN partial recompute is much cheaper than inclusion-exclusion).
-- [ ] **Recompute cost ignores processing.** `total_base_scan + mv_card` doesn't account for join or aggregate processing overhead during full recomputation.
-- [ ] **Fanout estimate is naive.** `mv_card / base_card` assumes uniform distribution — heavily skewed joins will produce wildly wrong estimates.
-- [ ] **No filter selectivity.** A view with `WHERE price > 1000` that filters 99% of rows still gets the same cost as an unfiltered view.
-- [ ] **Outer join and semi/anti cost detail.** The cost model should distinguish counting-based upsert, outer-join partial recompute, and semi/anti aux-state refresh.
-- [ ] **Validate with real workloads.** Run the cost model on TPC-H derived views and compare its predictions against measured refresh times.
+- [ ] **Reduce cardinality probe cost.** The current model (`src/upsert/refresh_cost_model.cpp`) still issues `COUNT(*)` queries for base tables, delta tables, and DuckLake insertion/deletion sets. Reuse refresh delta activity, cache recent counts, or use DuckDB statistics where the estimate is good enough.
+- [ ] **Calibrate join refresh cost.** The model accounts for DuckLake N-term joins and FK pruning, but still prices joins mostly from input sizes and term counts. Validate selectivity, skew, join type, and CPU/write costs against measured refresh time.
+- [ ] **Calibrate recompute cost.** Full recompute estimates still undercount join, aggregate, window, distinct, and write-side processing overhead.
+- [ ] **Validate fanout estimates.** The model uses MV cardinality and table cardinality as a fanout proxy. Measure skewed joins and selective filters where average fanout is misleading.
+- [ ] **Complete strategy-specific estimates.** Audit costs for counting-based upsert, group recompute, window partition recompute, outer-join MERGE, DISTINCT aux-state, and semi/anti aux-state refresh.
+- [ ] **Test learned model calibration.** Track predicted vs actual refresh time per strategy, expose/use the refresh-history `strategy` column consistently, and verify cold-start thresholds.
+- [ ] **Validate with real workloads.** Run the cost model on TPC-derived and synthetic stress views. Report decision accuracy, predicted/actual latency, and regret when the model chooses the slower strategy.
 
 ## P1: Correctness & Robustness
 
@@ -21,7 +21,7 @@
 ## P2: Documentation
 
 - [ ] **Performance evaluation methodology.** Write a doc explaining how to measure IVM refresh latency, what variables to control, and what metrics to report.
-- [ ] **Known limitations page.** Consolidate all operator/feature limitations into a single `docs/limitations.md`.
+- [ ] **Refresh cost reference.** Document the current `PRAGMA refresh_cost` output columns, learned calibration fields, and interpretation of cost-model decisions.
 - [ ] **Cross-system usage guide.** The paper describes cross-system IVM (DuckDB→PostgreSQL). Document how to set this up.
 
 ## P3: Performance Evaluation
@@ -34,9 +34,10 @@
 
 ## P4: Benchmarking Suite
 
-The current suite covers projection, filter, grouped aggregate, 2-way join, 3-way join at 1K–1M rows with 1%–50% delta ratios.
+The current suite covers projection, filter, grouped aggregate, and common join shapes at 1K–1M rows with 1%–50% delta ratios.
 
-- [ ] **Add missing benchmark operators.** FULL OUTER JOIN, SEMI/ANTI, window views, LIST, STDDEV/VARIANCE, and mixed operator stacks.
+- [ ] **Audit benchmark operator coverage.** Add targeted cases for any missing FULL OUTER JOIN, SEMI/ANTI, window, LIST, STDDEV/VARIANCE, DISTINCT aux-state, and mixed operator stack behavior.
+- [ ] **Cost-model accuracy benchmark.** Record predicted incremental/full time, actual refresh time, decision, calibration state, and regret ratio.
 - [ ] **Mixed DML workload.** INSERT + DELETE + UPDATE interleaved in the same refresh cycle to stress delta consolidation.
 - [ ] **TPC-H derived queries.** Q1 (grouped aggregates + filter), Q3 (3-way join + aggregate), Q5 (multi-join + aggregate), Q6 (filter + aggregate) as materialized views with incremental refresh after base table inserts.
 - [ ] **Latency distribution.** Report p50/p95/p99 refresh times, not just median, to catch tail latency from large deltas or skewed groups.
