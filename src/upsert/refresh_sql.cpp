@@ -541,8 +541,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					dl_cat = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
 				}
 				string dl_sch = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
-				aggregate_recompute_delta_specs = BuildGroupRecomputeDeltaSpecs(
-				    metadata, view_name, con, active_delta_table_names, dl_cat, dl_sch);
+				aggregate_recompute_delta_specs =
+				    BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, active_delta_table_names, dl_cat, dl_sch);
 				string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 				string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
 				aggregate_recompute_lpts_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
@@ -905,7 +905,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                    : view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
 		                    : view_query_type == RefreshType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
 		                    : view_query_type == RefreshType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
-		                                                                           : "AGGREGATE_GROUP_RECOMPUTE_CASCADE");
+		                                                                       : "AGGREGATE_GROUP_RECOMPUTE_CASCADE");
 		delta_query = "";
 		if (has_downstream && !recompute_handles_own_cascade_delta) {
 			build_snapshot_companion();
@@ -981,58 +981,74 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				keys_set.insert(column_names[kid]);
 			}
 
-			// PR #2 cascade-companion: emit per-key zero-valued retract/add-back
-			// rows directly into the delta-view as inline INSERTs (no TEMP TABLE
-			// scratch). The Spark-side rewriter (SparkRefreshRewriter) splits the
-			// refresh program statement-by-statement and recreates each delta
-			// table fresh per refresh — temp tables created mid-program from
-			// upstream's build_affected_snapshot_companion(keys) helper do not
-			// survive across the rewriter's split, so use NULLs in non-key
-			// columns instead and rely on SUM(NULL)=NULL preservation.
-			string col_list, val_list_neg, val_list_pos;
-			bool has_count_star_col = false;
-			for (auto &col : column_names) {
-				if (!col_list.empty()) {
-					col_list += ", ";
-					val_list_neg += ", ";
-					val_list_pos += ", ";
-				}
-				col_list += col;
-				if (col == string(openivm::COUNT_STAR_COL)) {
-					has_count_star_col = true;
-				}
-				if (keys_set.count(col)) {
-					val_list_neg += "d." + col;
-					val_list_pos += "d." + col;
-				} else if (col == openivm::MULTIPLICITY_COL) {
-					val_list_neg += "-1";
-					val_list_pos += "1";
-				} else {
-					val_list_neg += "NULL";
-					val_list_pos += "NULL";
+			// Dispatch on openivm_force_view_delta_cascade:
+			//   false (default DuckDB mode): use upstream build_affected_snapshot_companion(keys),
+			//     which uses TEMP TABLEs to snapshot the affected groups and emit signed (-1 old,
+			//     +1 new) rows. This is the correctness path for native openivm + downstream MVs.
+			//   true (openivm-spark): use inline per-key NULL retract/add-back rows. The Spark-side
+			//     SparkRefreshRewriter splits the refresh program statement-by-statement and
+			//     recreates each delta table fresh per refresh, so the upstream TEMP TABLE scratch
+			//     does not survive across the split. NULLs in non-key columns rely on
+			//     SUM(NULL)=NULL preservation downstream.
+			bool spark_inline_companion = false;
+			{
+				Value force_cascade_val;
+				if (context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
+				    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>()) {
+					spark_inline_companion = true;
 				}
 			}
-			string join_cond = SqlUtils::BuildNullSafeMatch(keys, "d", "m");
 
-			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_neg +
-			                  " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) + " > 0";
-			if (!delta_ts_filter.empty()) {
-				companion_query += " AND d." + delta_ts_filter;
-			}
-			companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
+			if (!spark_inline_companion) {
+				build_affected_snapshot_companion(keys);
+			} else {
+				string col_list, val_list_neg, val_list_pos;
+				bool has_count_star_col = false;
+				for (auto &col : column_names) {
+					if (!col_list.empty()) {
+						col_list += ", ";
+						val_list_neg += ", ";
+						val_list_pos += ", ";
+					}
+					col_list += col;
+					if (col == string(openivm::COUNT_STAR_COL)) {
+						has_count_star_col = true;
+					}
+					if (keys_set.count(col)) {
+						val_list_neg += "d." + col;
+						val_list_pos += "d." + col;
+					} else if (col == openivm::MULTIPLICITY_COL) {
+						val_list_neg += "-1";
+						val_list_pos += "1";
+					} else {
+						val_list_neg += "NULL";
+						val_list_pos += "NULL";
+					}
+				}
+				string join_cond = SqlUtils::BuildNullSafeMatch(keys, "d", "m");
 
-			if (has_count_star_col) {
-				companion_query += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_pos +
-				                   " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) +
-				                   " < 0 AND d." + string(openivm::COUNT_STAR_COL) + " > 0";
+				companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_neg +
+				                  " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) +
+				                  " > 0";
 				if (!delta_ts_filter.empty()) {
 					companion_query += " AND d." + delta_ts_filter;
 				}
-				companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + " AND m." +
-				                   string(openivm::COUNT_STAR_COL) + " + d." + string(openivm::MULTIPLICITY_COL) +
-				                   " * d." + string(openivm::COUNT_STAR_COL) + " > 0);\n";
+				companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
+
+				if (has_count_star_col) {
+					companion_query += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_pos +
+					                   " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) +
+					                   " < 0 AND d." + string(openivm::COUNT_STAR_COL) + " > 0";
+					if (!delta_ts_filter.empty()) {
+						companion_query += " AND d." + delta_ts_filter;
+					}
+					companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond +
+					                   " AND m." + string(openivm::COUNT_STAR_COL) + " + d." +
+					                   string(openivm::MULTIPLICITY_COL) + " * d." + string(openivm::COUNT_STAR_COL) +
+					                   " > 0);\n";
+				}
+				OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 			}
-			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 		}
 	}
 

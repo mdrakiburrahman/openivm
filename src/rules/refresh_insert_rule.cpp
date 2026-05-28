@@ -153,7 +153,6 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	       " WHERE rowid IN (SELECT rowid FROM (" + subquery_string + ") openivm_deleted_rows)";
 }
 
-
 static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
 	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
@@ -591,9 +590,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						}
 					} else {
 						try {
-							insert_string = BuildDeleteDeltaInsertFromPlan(
-							    *con.context, delta_entry_del, full_delta_table_name, full_table_name,
-							    plan->children[0]);
+							insert_string =
+							    BuildDeleteDeltaInsertFromPlan(*con.context, delta_entry_del, full_delta_table_name,
+							                                   full_table_name, plan->children[0]);
 						} catch (...) {
 							throw NotImplementedException(
 							    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");

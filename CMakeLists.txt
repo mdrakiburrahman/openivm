@@ -60,7 +60,8 @@ set(EXTENSION_SOURCES
     ${LPTS_DIR}/src/cte_nodes.cpp
     ${LPTS_DIR}/src/lpts_helpers.cpp
     ${LPTS_DIR}/src/lpts_ast.cpp
-    ${LPTS_DIR}/src/lpts_pipeline.cpp)
+    ${LPTS_DIR}/src/lpts_pipeline.cpp
+    ${LPTS_DIR}/src/dialect_function_map.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
