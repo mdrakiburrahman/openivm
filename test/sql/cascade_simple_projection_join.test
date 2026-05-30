@@ -27,7 +27,10 @@ CREATE MATERIALIZED VIEW cspj_eq_mv AS
     JOIN cspj_eq_security s ON w.security_id = s.security_id;
 
 statement ok
-PRAGMA compile_refresh('cspj_eq_mv');
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_eq_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 query I
 SELECT CASE
@@ -101,7 +104,10 @@ CREATE MATERIALIZED VIEW cspj_rng_mv AS
      AND t.txn_ts BETWEEN w.start_ts AND w.end_ts;
 
 statement ok
-PRAGMA compile_refresh('cspj_rng_mv');
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_rng_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 query I
 SELECT CASE
@@ -184,7 +190,10 @@ CREATE MATERIALIZED VIEW cspj_tri_mv AS
     JOIN cspj_tri_broker b ON a.broker_id = b.broker_id;
 
 statement ok
-PRAGMA compile_refresh('cspj_tri_mv');
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_tri_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 query I
 SELECT CASE
@@ -264,7 +273,10 @@ CREATE MATERIALIZED VIEW cspj_cte_mv AS
     JOIN cspj_cte_security s ON h.security_id = s.security_id;
 
 statement ok
-PRAGMA compile_refresh('cspj_cte_mv');
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_cte_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 query I
 SELECT CASE
