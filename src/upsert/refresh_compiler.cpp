@@ -397,8 +397,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// non-empty delta_specs), route through the snapshot+signed-multiset path so the
 		// downstream cascade-delta is built from real old/new view-query rows instead of the
 		// LPTS sum-delta + NULL companion pair (which is wrong for MIN/MAX and breaks
-		// SIMPLE_PROJECTION-with-JOIN downstreams). See OPENIVM-BUG.md §root-cause and
-		// ChainedMinMaxJoinSpec for the regression net.
+		// SIMPLE_PROJECTION-with-JOIN downstreams).
 		if (emit_cascade_delta && cascade_delta_specs && !cascade_delta_specs->empty() && !group_column_names.empty()) {
 			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] cascade-delta requested + recompute branch → dispatching "
 			                    "to CompileGroupRecompute(emit_cascade_delta=true)\n");
