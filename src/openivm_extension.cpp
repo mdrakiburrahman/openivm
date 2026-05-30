@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "core/openivm_extension.hpp"
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"
@@ -200,50 +201,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	// Compile-only mode. When true, `PRAGMA refresh(...)` (and the
-	// `PRAGMA compile_refresh(...)` convenience) generate the refresh SQL
-	// artifact (controlled by `openivm_files_path`) but skip the actual
-	// execution. Used by openivm-spark to compile refresh plans without
-	// mutating the source DuckDB database.
-	db_config.AddExtensionOption("openivm_compile_only",
-	                             "when true, PRAGMA refresh writes the SQL artifact but does not execute it",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-
-	// Force-emit the AGGREGATE_GROUP / AGGREGATE_HAVING downstream "retract
-	// companion" INSERT into openivm_delta_<view> even when no downstream MV
-	// is registered yet. In native DuckDB mode the companion is gated by a
-	// runtime metadata check (`openivm_delta_tables` rows referencing this
-	// MV's delta view); openivm-spark compiles each MV in an isolated DuckDB
-	// subprocess where no such entries exist, so without this flag the
-	// AGGREGATE_GROUP refresh produces an additive-only view-delta that
-	// breaks cascade for downstream MVs whose semantics depend on multiset
-	// retraction (COUNT(*), MIN/MAX, DISTINCT etc.). Setting this flag to
-	// true makes the compiled SQL self-contained for the cascade case.
-	//
-	// Defaults to false to preserve native DuckDB-mode behavior. openivm-spark
-	// sets it to true in its compile script.
-	db_config.AddExtensionOption("openivm_force_view_delta_cascade",
-	                             "force emission of the AGGREGATE_GROUP retract companion to openivm_delta_<view> "
-	                             "even when no downstream MV is registered (compile-for-cascade mode)",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-
-	// Force-emit signed cascade rows for WINDOW_PARTITION / GROUP_RECOMPUTE even
-	// when no downstream MV is registered yet. Used by openivm-spark's
-	// compile-only bridge, which runs each MV in an isolated DuckDB subprocess
-	// with an empty openivm_delta_tables catalog.
-	db_config.AddExtensionOption(openivm::EMIT_CASCADE_DELTA_FOR_RECOMPUTE,
-	                             "force emission of signed cascade rows for WINDOW_PARTITION / GROUP_RECOMPUTE "
-	                             "into openivm_delta_<view> even when no downstream MV is registered",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-
-	// Target SQL dialect for the lpts pipeline. Forwarded to LogicalPlanToAst
-	// and AstToCteList at every refresh-SQL generation call site so the
-	// emitted SQL is in the requested dialect ('duckdb' (default), 'postgres',
-	// or 'spark').
-	db_config.AddExtensionOption("openivm_target_dialect",
-	                             "target SQL dialect for refresh-SQL generation "
-	                             "('duckdb' (default), 'postgres', or 'spark')",
-	                             LogicalType::VARCHAR, Value("duckdb"));
+	// (Removed: openivm_compile_only, openivm_force_view_delta_cascade,
+	//  openivm_emit_cascade_delta_for_recompute, openivm_target_dialect.)
+	// These four PRAGMAs have been replaced by the per-call CompileFacts
+	// blob passed through the openivm_compile_with_facts(view_name, facts_json)
+	// table function. See src/include/compile_facts.hpp and B1-facts-schema.md.
 
 	Connection con(instance);
 
@@ -352,6 +314,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	compute_delta_function.named_parameters["view_name"];
 	CreateTableFunctionInfo compute_delta_function_info(compute_delta_function);
 	catalog.CreateTableFunction(*con.context, &compute_delta_function_info);
+
+	// openivm_compile_with_facts(view_name VARCHAR, facts_json VARCHAR)
+	//   → (refresh_type INTEGER, refresh_type_name VARCHAR, stmt_order INTEGER,
+	//      stmt_kind VARCHAR, sql VARCHAR)
+	//
+	// Per-call compile-only entry point. Replaces the legacy `compile_refresh`
+	// PRAGMA + the three process-wide PRAGMAs (openivm_compile_only,
+	// openivm_target_dialect, openivm_force_view_delta_cascade). Every knob is
+	// passed via the JSON facts blob; see B1-facts-schema.md.
+	TableFunction openivm_compile_with_facts_function(
+	    "openivm_compile_with_facts", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    openivm::OpenIvmCompileWithFactsExecute, openivm::OpenIvmCompileWithFactsBind,
+	    openivm::OpenIvmCompileWithFactsInit);
+	CreateTableFunctionInfo openivm_compile_with_facts_info(openivm_compile_with_facts_function);
+	catalog.CreateTableFunction(*con.context, &openivm_compile_with_facts_info);
+
 	con.Commit();
 
 	// Use the locked pragma_function_t variant: generates SQL and executes it under a
@@ -372,19 +350,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cross_system);
 
-	// PRAGMA compile_refresh('view_name') — compile-only path used by openivm-spark.
-	//
-	// Generates the refresh SQL for `view_name` using the current value of
-	// `openivm_target_dialect` (defaults to 'duckdb'), but never executes it.
-	// The artifact file under `openivm_files_path` is still written as a
-	// side effect.
-	//
-	// The PRAGMA emits a single result row with the columns:
-	//   refresh_type        INTEGER  — RefreshType enum value (see openivm_constants.hpp).
-	//   refresh_type_name   VARCHAR  — human-readable form (e.g. 'AGGREGATE_GROUP').
-	//   sql                 VARCHAR  — assembled refresh SQL in the target dialect.
-	auto compile_refresh = PragmaFunction::PragmaCall("compile_refresh", CompileRefreshQuery, {LogicalType::VARCHAR});
-	loader.RegisterFunction(compile_refresh);
+	// Note: the legacy PRAGMA compile_refresh('view_name') is removed in C4.
+	// Compile-only callers must use the openivm_compile_with_facts(view_name,
+	// facts_json) table function registered above.
 
 	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.
 	auto refresh_status = PragmaFunction::PragmaCall(
