@@ -20,7 +20,10 @@ CREATE MATERIALIZED VIEW cspl_in2_mv AS
     FROM cspl_in2_item;
 
 statement ok
-PRAGMA compile_refresh('cspl_in2_mv');
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspl_in2_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 query I
 SELECT CASE
@@ -81,7 +84,10 @@ CREATE MATERIALIZED VIEW cspl_in10_mv AS
     FROM cspl_in10_item;
 
 statement ok
-PRAGMA compile_refresh('cspl_in10_mv');
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspl_in10_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 query I
 SELECT CASE
@@ -154,7 +160,10 @@ CREATE MATERIALIZED VIEW cspl_in50_mv AS
     FROM cspl_in50_item;
 
 statement ok
-PRAGMA compile_refresh('cspl_in50_mv');
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspl_in50_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 query I
 SELECT CASE
