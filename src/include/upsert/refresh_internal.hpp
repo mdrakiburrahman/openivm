@@ -172,7 +172,8 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name, bool cross_system,
-                                             const DeltaActivityResult *precomputed_delta_activity = nullptr);
+                                             const DeltaActivityResult *precomputed_delta_activity = nullptr,
+                                             const openivm::CompileFacts *facts = nullptr);
 DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                              const string &view_query_sql, const vector<string> &delta_table_names,
                                              const string &view_catalog_name, const string &view_schema_name,

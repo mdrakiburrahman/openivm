@@ -217,7 +217,8 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name, bool cross_system,
-                                             const DeltaActivityResult *precomputed_delta_activity) {
+                                             const DeltaActivityResult *precomputed_delta_activity,
+                                             const openivm::CompileFacts *facts) {
 	DeltaActivityResult summary;
 	if (precomputed_delta_activity) {
 		summary = *precomputed_delta_activity;
@@ -232,6 +233,15 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	flags.skip_proj_delete = flags.insert_only;
 	flags.minmax_incremental = flags.insert_only;
 	flags.active_delta_table_names = summary.active_delta_table_names;
+
+	// When a CompileFacts is supplied with non-empty pending_deltas, the
+	// caller's declared deltas (openivm-spark's per-batch DML log) supersede
+	// the runtime probe — the staging delta tables themselves are empty
+	// during compile, so the runtime probe would always report insert_only
+	// regardless of what the caller actually plans to apply. See B5 [1].
+	if (facts && !facts->pending_deltas.empty()) {
+		flags.minmax_incremental = facts->AllPendingDeltasInsertOnly();
+	}
 
 	if (!SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true)) {
 		flags.skip_agg_delete = false;
