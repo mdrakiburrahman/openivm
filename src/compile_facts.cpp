@@ -505,7 +505,8 @@ static void PushBucket(CompileWithFactsBindData &bd, const string &kind, const s
 			continue;
 		}
 		if (c == ';') {
-			string trimmed = StringUtil::Trim(current);
+			string trimmed = current;
+			StringUtil::Trim(trimmed);
 			if (!trimmed.empty()) {
 				bd.stmt_kinds.push_back(kind);
 				bd.stmt_sqls.push_back(trimmed + ";");
@@ -515,7 +516,8 @@ static void PushBucket(CompileWithFactsBindData &bd, const string &kind, const s
 			current += c;
 		}
 	}
-	string tail = StringUtil::Trim(current);
+	string tail = current;
+	StringUtil::Trim(tail);
 	if (!tail.empty()) {
 		bd.stmt_kinds.push_back(kind);
 		bd.stmt_sqls.push_back(tail + ";");

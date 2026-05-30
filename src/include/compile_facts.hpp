@@ -95,21 +95,21 @@ private:
 	bool installed;
 };
 
-// Forward declarations for the table function implementation. These mirror
-// the existing `compile_refresh` PRAGMA but emit one row per top-level SQL
+// Table function entry points for `openivm_compile_with_facts`. These mirror
+// the former `compile_refresh` PRAGMA but emit one row per top-level SQL
 // statement so consumers don't have to split on `;` themselves.
-struct TableFunctionBindInput;
-struct TableFunctionInitInput;
-struct TableFunctionInput;
-class DataChunk;
-class LogicalType;
-class FunctionData;
-class GlobalTableFunctionState;
-
-unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names);
-unique_ptr<GlobalTableFunctionState> OpenIvmCompileWithFactsInit(ClientContext &context, TableFunctionInitInput &input);
-void OpenIvmCompileWithFactsExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+//
+// The signatures intentionally use the duckdb:: types directly (no forward
+// decls in this namespace — otherwise the C++ name-lookup picks
+// `duckdb::openivm::TableFunctionInput` first and shadows the real type).
+unique_ptr<duckdb::FunctionData>
+OpenIvmCompileWithFactsBind(duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
+                            duckdb::vector<duckdb::LogicalType> &return_types,
+                            duckdb::vector<duckdb::string> &names);
+unique_ptr<duckdb::GlobalTableFunctionState> OpenIvmCompileWithFactsInit(duckdb::ClientContext &context,
+                                                                         duckdb::TableFunctionInitInput &input);
+void OpenIvmCompileWithFactsExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &data_p,
+                                    duckdb::DataChunk &output);
 
 } // namespace openivm
 } // namespace duckdb
