@@ -1,4 +1,5 @@
 #include "rules/refresh_insert_rule.hpp"
+#include "compile_facts.hpp"
 #include "rules/schema_evolution.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -125,7 +126,7 @@ static string QuotedExpressionString(const unique_ptr<Expression> &expr, const B
 static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
                                        const string &full_delta_table_name, unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
-	SqlDialect dialect = ReadOpenIvmTargetDialect(context);
+	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
 	auto ast = LogicalPlanToAst(context, source_plan, dialect);
 	auto cte_list = AstToCteList(*ast, dialect);
 	string subquery_string = cte_list->ToQuery(false);
@@ -140,7 +141,7 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
                                              unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 	string data_cols = BuildDeltaDataColumns(delta_entry);
-	SqlDialect dialect = ReadOpenIvmTargetDialect(context);
+	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
 	auto ast = LogicalPlanToAst(context, source_plan, dialect);
 	auto cte_list = AstToCteList(*ast, dialect);
 	string subquery_string = cte_list->ToQuery(false);
@@ -575,7 +576,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						try {
 							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
 							string data_cols = BuildDeltaDataColumns(delta_entry_del);
-							SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
+							SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
 							auto ast = LogicalPlanToAst(*con.context, join->children[1], dialect);
 							auto cte_list = AstToCteList(*ast, dialect);
 							string rowid_sql = cte_list->ToQuery(false);
@@ -601,7 +602,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				} else {
 					try {
 						string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-						SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
+						SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
 						auto ast = LogicalPlanToAst(*con.context, plan->children[0], dialect);
 						auto cte_list = AstToCteList(*ast, dialect);
 						string subquery_string = cte_list->ToQuery(false);
