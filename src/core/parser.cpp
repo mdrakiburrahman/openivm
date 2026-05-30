@@ -114,7 +114,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		auto name_resolution_start = create_profile_now();
 		auto full_view_name = SqlUtils::ExtractTableName(statement->query);
-		bool statement_needs_original_sql_for_lpts = QueryNeedsOriginalSqlForLpts(statement->query);
 		// Keep the user's raw AS-query as the source of truth for original-SQL fallback.
 		// Do not recover this from DuckDB's parsed QueryNode::ToString(): that path is a
 		// best-effort pretty-printer and has segfaulted on set-operation query nodes with
@@ -292,43 +291,36 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			                        "output_cols=" + to_string(output_names.size()));
 
 			auto lpts_start = create_profile_now();
-			if (statement_needs_original_sql_for_lpts || QueryNeedsOriginalSqlForLpts(original_view_query)) {
+			try {
+				// CREATE MATERIALIZED VIEW is a server-side DDL path that
+				// always stores the view body in DuckDB's own dialect — the
+				// stored body is replayed via DuckDB's planner on every
+				// refresh. The legacy openivm_target_dialect PRAGMA used to
+				// be read here too but that conflated the create-time and
+				// refresh-time dialects. After C4 the refresh-time dialect
+				// comes from per-call CompileFacts; the create-time dialect
+				// is and always was DUCKDB.
+				SqlDialect dialect = SqlDialect::DUCKDB;
+				auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
+				auto cte_list = AstToCteList(*ast, dialect);
+				view_query = cte_list->ToQuery(true, output_names);
+				if (!view_query.empty() && view_query.back() == ';') {
+					view_query.pop_back();
+				}
+				StringUtil::Trim(view_query);
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
+			} catch (const std::exception &e) {
+				// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
+				// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
 				view_query = original_view_query;
 				lpts_fallback = true;
-				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
 				                    view_query.c_str());
-			} else {
-				try {
-					// CREATE MATERIALIZED VIEW is a server-side DDL path that
-					// always stores the view body in DuckDB's own dialect — the
-					// stored body is replayed via DuckDB's planner on every
-					// refresh. The legacy openivm_target_dialect PRAGMA used to
-					// be read here too but that conflated the create-time and
-					// refresh-time dialects. After C4 the refresh-time dialect
-					// comes from per-call CompileFacts; the create-time dialect
-					// is and always was DUCKDB.
-					SqlDialect dialect = SqlDialect::DUCKDB;
-					auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
-					auto cte_list = AstToCteList(*ast, dialect);
-					view_query = cte_list->ToQuery(true, output_names);
-					if (!view_query.empty() && view_query.back() == ';') {
-						view_query.pop_back();
-					}
-					StringUtil::Trim(view_query);
-					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
-				} catch (const std::exception &e) {
-					// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
-					// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
-					view_query = original_view_query;
-					lpts_fallback = true;
-					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
-					                    view_query.c_str());
-				} catch (...) {
-					view_query = original_view_query;
-					lpts_fallback = true;
-					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
-					                    view_query.c_str());
-				}
+			} catch (...) {
+				view_query = original_view_query;
+				lpts_fallback = true;
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
+				                    view_query.c_str());
 			}
 			// For views that LPTS silently mis-serializes (GROUPING SETS / ROLLUP / CUBE
 			// → plain GROUP BY; STRUCT_PACK field names → tN_col aliases; etc.), detect
@@ -581,13 +573,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		bool has_full_outer_aggregate = classification.found_full_outer && classification.found_aggregation;
 
 		bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
-		// String-level PIVOT detection survives DuckDB's pre-bind unfolding (the bound
-		// plan no longer contains LOGICAL_PIVOT, so `facts.has_pivot` is false for
-		// queries that read "PIVOT ..." in SQL). Use the original query text as a
-		// belt-and-suspenders signal so refresh stays on the FULL_REFRESH path.
-		bool query_text_needs_full_refresh = QueryNeedsOriginalSqlForLpts(original_view_query);
-		bool has_unsupported_incremental_construct =
-		    facts.has_unsupported_set_operation || facts.has_pivot || query_text_needs_full_refresh;
+		// PIVOT is unfolded into CASE-aggregate form during DuckDB's pre-bind step,
+		// so the bound plan handed to openivm is a regular aggregate that the
+		// standard incremental classifier handles correctly. Detection therefore
+		// relies on `facts.has_unsupported_set_operation` and `facts.has_pivot`
+		// from plan-level analysis. Don't add a string-level PIVOT gate here:
+		// that demotes valid incremental cases to FULL_REFRESH (see CLAUDE.md:
+		// "do not fix OpenIVM correctness bugs by avoiding incrementalization").
+		bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
 		if (has_unsupported_incremental_construct) {
 			// These views are maintained by full refresh, so store the user's query directly.
 			// The CREATE-time IVM rewrites can add hidden columns for incremental paths (e.g.

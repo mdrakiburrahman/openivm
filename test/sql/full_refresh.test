@@ -230,7 +230,7 @@ CREATE MATERIALIZED VIEW mv_pivot AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_pivot';
 ----
-3
+0
 
 statement ok
 INSERT INTO pivot_src VALUES ('south', 'cost', 3), ('north', 'sales', 2);
