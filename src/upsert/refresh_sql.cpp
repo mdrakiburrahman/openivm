@@ -624,10 +624,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		bool sa_insert_only = has_argminmax ? false : insert_only;
 		RefreshMetadata::FilteredGroupCountAuxMeta aux_meta;
 		if (metadata.GetFilteredGroupCountAuxMeta(view_name, aux_meta)) {
-			EnsureFilteredGroupCountAuxState(metadata, con, view_name, aux_meta, delta_table_names,
-			                                 internal_catalog_name, internal_schema_name, internal_catalog_prefix,
-			                                 view_catalog_name, view_schema_name, attached_db_catalog_name,
-			                                 attached_db_schema_name);
+			if (!active_facts.compile_only) {
+				EnsureFilteredGroupCountAuxState(metadata, con, view_name, aux_meta, delta_table_names,
+				                                 internal_catalog_name, internal_schema_name, internal_catalog_prefix,
+				                                 view_catalog_name, view_schema_name, attached_db_catalog_name,
+				                                 attached_db_schema_name);
+			}
 			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
 			string delta_source_sql =
 			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
@@ -661,9 +663,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::DISTINCT_INCREMENTAL: {
 		RefreshMetadata::DistinctAuxMeta aux_meta;
 		if (metadata.GetDistinctAuxMeta(view_name, aux_meta)) {
-			EnsureDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
-			                       internal_schema_name, internal_catalog_prefix, view_catalog_name, view_schema_name,
-			                       attached_db_catalog_name, attached_db_schema_name);
+			if (!active_facts.compile_only) {
+				EnsureDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
+				                       internal_schema_name, internal_catalog_prefix, view_catalog_name,
+				                       view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			}
 			auto group_columns = metadata.GetGroupColumns(view_name);
 			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
 			string delta_source_sql =
@@ -686,9 +690,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::SEMI_ANTI_RECOMPUTE: {
 		RefreshMetadata::SemiAntiAuxMeta aux_meta;
 		if (metadata.GetSemiAntiAuxMeta(view_name, aux_meta)) {
-			EnsureSemiAntiAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
-			                       internal_schema_name, internal_catalog_prefix, view_catalog_name, view_schema_name,
-			                       attached_db_catalog_name, attached_db_schema_name);
+			if (!active_facts.compile_only) {
+				EnsureSemiAntiAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
+				                       internal_schema_name, internal_catalog_prefix, view_catalog_name,
+				                       view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			}
 			auto left_input = ResolveSemiAntiSourceInput(metadata, con, view_name, aux_meta.left_table,
 			                                             delta_table_names, view_catalog_name, view_schema_name,
 			                                             attached_db_catalog_name, attached_db_schema_name);

@@ -175,19 +175,11 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		                 "sql_bytes=" + to_string(sql.size()) + ", meta_pre_bytes=" + to_string(meta_pre_sql.size()) +
 		                     ", meta_post_bytes=" + to_string(meta_post_sql.size()));
 
-		// Compile-only mode: the SQL artifact has been written (via the
-		// `openivm_files_path` side effect inside GenerateRefreshSQL); skip
-		// the execution + transaction + history-recording machinery. Used by
-		// openivm-spark to compile refresh plans without mutating the source
-		// DuckDB database.
-		Value compile_only_val;
-		if (context.TryGetCurrentSetting("openivm_compile_only", compile_only_val) && !compile_only_val.IsNull() &&
-		    compile_only_val.GetValue<bool>()) {
-			OPENIVM_DEBUG_PRINT("[UPSERT] openivm_compile_only=true; skipping execution for '%s'\n", vn.c_str());
-			profiler.AddTotal();
-			profiler.Flush(*context.db.get());
-			return true;
-		}
+		// Compile-only execution is no longer reachable from the PRAGMA refresh
+		// path. Callers wanting compile-only behaviour now use the
+		// openivm_compile_with_facts() table function, which never invokes
+		// UpsertDeltaQueriesLocked. The legacy `openivm_compile_only` PRAGMA
+		// has been removed.
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
