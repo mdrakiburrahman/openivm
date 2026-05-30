@@ -13,11 +13,6 @@ namespace duckdb {
 // Utility functions for SQL string manipulation.
 // Originally from the compiler extension; inlined here to remove the external dependency.
 
-/// Read the `openivm_target_dialect` extension setting and parse it.
-/// Returns SqlDialect::DUCKDB if the setting is unset or NULL.
-/// Throws InvalidInputException on unrecognised values.
-SqlDialect ReadOpenIvmTargetDialect(ClientContext &context);
-
 class SqlUtils {
 public:
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
