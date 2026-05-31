@@ -201,12 +201,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	// (Removed: openivm_compile_only, openivm_force_view_delta_cascade,
-	//  openivm_emit_cascade_delta_for_recompute, openivm_target_dialect.)
-	// These four PRAGMAs have been replaced by the per-call CompileFacts
-	// blob passed through the openivm_compile_with_facts(view_name, facts_json)
-	// table function. See src/include/compile_facts.hpp and B1-facts-schema.md.
-
 	Connection con(instance);
 
 	// Migration: add new columns to existing openivm_views tables
@@ -319,10 +313,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//   → (refresh_type INTEGER, refresh_type_name VARCHAR, stmt_order INTEGER,
 	//      stmt_kind VARCHAR, sql VARCHAR)
 	//
-	// Per-call compile-only entry point. Replaces the legacy `compile_refresh`
-	// PRAGMA + the three process-wide PRAGMAs (openivm_compile_only,
-	// openivm_target_dialect, openivm_force_view_delta_cascade). Every knob is
-	// passed via the JSON facts blob; see B1-facts-schema.md.
+	// Per-call compile-only entry point. Emits one row per top-level
+	// refresh statement; concatenate by stmt_order to reconstruct the full
+	// refresh program. The facts_json controls dialect (target_dialect),
+	// compile-only behaviour, and downstream-cascade hints; see
+	// compile_facts.hpp for the schema.
 	TableFunction openivm_compile_with_facts_function(
 	    "openivm_compile_with_facts", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	    openivm::OpenIvmCompileWithFactsExecute, openivm::OpenIvmCompileWithFactsBind,
@@ -349,10 +344,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "refresh_cross_system", UpsertDeltaQueriesLocked,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cross_system);
-
-	// Note: the legacy PRAGMA compile_refresh('view_name') is removed in C4.
-	// Compile-only callers must use the openivm_compile_with_facts(view_name,
-	// facts_json) table function registered above.
 
 	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.
 	auto refresh_status = PragmaFunction::PragmaCall(

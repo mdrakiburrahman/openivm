@@ -31,230 +31,152 @@ CompileFacts CompileFacts::Default(SqlDialect dialect) {
 //------------------------------------------------------------------------------
 // Minimal handrolled JSON parser
 //
-// We deliberately avoid yyjson / DuckDB's JSON extension here so that the
-// openivm extension does not gain a transitive dependency on optional
-// extensions. The schema is small (a handful of strings/bools and two
-// arrays of fixed-shape objects), so a single-pass scanner is sufficient.
+// Follows the substring-based pattern openivm already uses for its own
+// metadata JSON (see the anonymous helpers in core/refresh_metadata.cpp:
+// ExtractJsonString / ExtractJsonStringArray / ExtractJsonObjectsFromArray).
+// The CompileFacts JSON wire form is closed-loop — both writers (openivm's
+// own test fixtures and the openivm-spark driver) emit canonical form with
+// no extra whitespace and only the escape characters openivm itself
+// produces. A full JSON parser is unnecessary, and adding yyjson / the
+// DuckDB JSON extension would pull in an optional transitive dependency.
 //
-// Implements the subset required by `CompileFacts`:
-//   - top-level object
-//   - string / number / boolean / null primitives
-//   - object members ("key": value)
-//   - array of objects (downstreams, pending_deltas)
-//
-// Throws `InvalidInputException` on malformed input.
+// These helpers are file-scoped on purpose — they assume the closed-loop
+// invariants above and are not safe for general-purpose JSON.
 //------------------------------------------------------------------------------
 
 namespace {
 
-struct JsonScanner {
-	const string &src;
-	size_t pos = 0;
-
-	explicit JsonScanner(const string &s) : src(s) {
-	}
-
-	[[noreturn]] void Fail(const string &msg) const {
-		throw InvalidInputException("openivm_compile_with_facts: " + msg + " at offset " + std::to_string(pos));
-	}
-
-	void SkipWs() {
-		while (pos < src.size()) {
-			char c = src[pos];
-			if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-				pos++;
-			} else {
-				break;
-			}
-		}
-	}
-
-	char Peek() {
-		SkipWs();
-		if (pos >= src.size()) {
-			Fail("unexpected end of JSON");
-		}
-		return src[pos];
-	}
-
-	void Expect(char c) {
-		SkipWs();
-		if (pos >= src.size() || src[pos] != c) {
-			Fail(string("expected '") + c + "'");
-		}
-		pos++;
-	}
-
-	bool TryConsume(char c) {
-		SkipWs();
-		if (pos < src.size() && src[pos] == c) {
-			pos++;
-			return true;
-		}
+bool ExtractJsonString(const string &json, const string &key, string &val) {
+	string needle = "\"" + key + "\":\"";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
 		return false;
 	}
-
-	string ParseString() {
-		Expect('"');
-		string out;
-		while (pos < src.size()) {
-			char c = src[pos++];
-			if (c == '"') {
-				return out;
-			}
-			if (c == '\\') {
-				if (pos >= src.size()) {
-					Fail("unterminated string escape");
-				}
-				char esc = src[pos++];
-				switch (esc) {
-				case '"':
-					out += '"';
-					break;
-				case '\\':
-					out += '\\';
-					break;
-				case '/':
-					out += '/';
-					break;
-				case 'b':
-					out += '\b';
-					break;
-				case 'f':
-					out += '\f';
-					break;
-				case 'n':
-					out += '\n';
-					break;
-				case 'r':
-					out += '\r';
-					break;
-				case 't':
-					out += '\t';
-					break;
-				case 'u':
-					// We only need ASCII for our schema — accept and pass
-					// through the 4 hex digits as a placeholder rather than
-					// fully implementing UTF-16 surrogate decoding.
-					if (pos + 4 > src.size()) {
-						Fail("truncated \\u escape");
-					}
-					out += '?';
-					pos += 4;
-					break;
-				default:
-					Fail(string("invalid string escape \\") + esc);
-				}
+	pos += needle.size();
+	val.clear();
+	while (pos < json.size()) {
+		char c = json[pos];
+		if (c == '\\' && pos + 1 < json.size()) {
+			char esc = json[pos + 1];
+			if (esc == 'n') {
+				val += '\n';
 			} else {
-				out += c;
+				val += esc;
 			}
+			pos += 2;
+			continue;
 		}
-		Fail("unterminated string literal");
-	}
-
-	bool ParseBool() {
-		SkipWs();
-		if (pos + 4 <= src.size() && src.compare(pos, 4, "true") == 0) {
-			pos += 4;
+		if (c == '"') {
 			return true;
 		}
-		if (pos + 5 <= src.size() && src.compare(pos, 5, "false") == 0) {
-			pos += 5;
-			return false;
-		}
-		Fail("expected boolean");
+		val += c;
+		pos++;
 	}
+	return false;
+}
 
-	int ParseInt() {
-		SkipWs();
-		size_t start = pos;
-		if (pos < src.size() && (src[pos] == '-' || src[pos] == '+')) {
-			pos++;
-		}
-		while (pos < src.size() && std::isdigit(static_cast<unsigned char>(src[pos]))) {
-			pos++;
-		}
-		if (start == pos) {
-			Fail("expected integer");
-		}
-		try {
-			return std::stoi(src.substr(start, pos - start));
-		} catch (std::exception &) {
-			Fail("integer out of range");
-		}
+bool ExtractJsonBool(const string &json, const string &key, bool &val) {
+	string needle = "\"" + key + "\":";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
 	}
+	pos += needle.size();
+	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) {
+		pos++;
+	}
+	if (pos + 4 <= json.size() && json.compare(pos, 4, "true") == 0) {
+		val = true;
+		return true;
+	}
+	if (pos + 5 <= json.size() && json.compare(pos, 5, "false") == 0) {
+		val = false;
+		return true;
+	}
+	return false;
+}
 
-	// Skip a value of any type so we can ignore unknown top-level fields
-	// (forward-compat per B5 item 4).
-	void SkipValue() {
-		SkipWs();
-		if (pos >= src.size()) {
-			Fail("unexpected end of JSON while skipping value");
-		}
-		char c = src[pos];
-		if (c == '"') {
-			ParseString();
-		} else if (c == '{') {
-			SkipObject();
-		} else if (c == '[') {
-			SkipArray();
-		} else if (c == 't' || c == 'f') {
-			ParseBool();
-		} else if (c == 'n') {
-			if (pos + 4 > src.size() || src.compare(pos, 4, "null") != 0) {
-				Fail("expected 'null'");
+bool ExtractJsonInt(const string &json, const string &key, int &val) {
+	string needle = "\"" + key + "\":";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
+	}
+	pos += needle.size();
+	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) {
+		pos++;
+	}
+	size_t start = pos;
+	if (pos < json.size() && (json[pos] == '-' || json[pos] == '+')) {
+		pos++;
+	}
+	while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
+		pos++;
+	}
+	if (start == pos) {
+		return false;
+	}
+	try {
+		val = std::stoi(json.substr(start, pos - start));
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key) {
+	vector<string> objects;
+	string needle = "\"" + key + "\":[";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return objects;
+	}
+	pos += needle.size();
+	int depth = 0;
+	bool in_string = false;
+	bool escaped = false;
+	size_t object_start = string::npos;
+	for (; pos < json.size(); pos++) {
+		char c = json[pos];
+		if (in_string) {
+			if (escaped) {
+				escaped = false;
+			} else if (c == '\\') {
+				escaped = true;
+			} else if (c == '"') {
+				in_string = false;
 			}
-			pos += 4;
-		} else {
-			// Number — read digits / decimal / sign / exponent
-			while (pos < src.size()) {
-				char ch = src[pos];
-				if (std::isdigit(static_cast<unsigned char>(ch)) || ch == '-' || ch == '+' || ch == '.' || ch == 'e' ||
-				    ch == 'E') {
-					pos++;
-				} else {
-					break;
+			continue;
+		}
+		if (c == '"') {
+			in_string = true;
+			continue;
+		}
+		if (c == '{') {
+			if (depth == 0) {
+				object_start = pos;
+			}
+			depth++;
+			continue;
+		}
+		if (c == '}') {
+			if (depth > 0) {
+				depth--;
+				if (depth == 0 && object_start != string::npos) {
+					objects.push_back(json.substr(object_start, pos - object_start + 1));
+					object_start = string::npos;
 				}
 			}
+			continue;
+		}
+		if (c == ']' && depth == 0) {
+			break;
 		}
 	}
+	return objects;
+}
 
-	void SkipObject() {
-		Expect('{');
-		SkipWs();
-		if (TryConsume('}')) {
-			return;
-		}
-		while (true) {
-			ParseString();
-			Expect(':');
-			SkipValue();
-			if (TryConsume(',')) {
-				continue;
-			}
-			Expect('}');
-			return;
-		}
-	}
-
-	void SkipArray() {
-		Expect('[');
-		SkipWs();
-		if (TryConsume(']')) {
-			return;
-		}
-		while (true) {
-			SkipValue();
-			if (TryConsume(',')) {
-				continue;
-			}
-			Expect(']');
-			return;
-		}
-	}
-};
-
-static SqlDialect ParseDialectString(const string &s) {
+SqlDialect ParseDialectString(const string &s) {
 	// Reuse the lpts helper so dialect names stay in lockstep with the
 	// LPTS pipeline. LPTS throws on unrecognised values which is exactly
 	// the contract we want.
@@ -270,129 +192,39 @@ static SqlDialect ParseDialectString(const string &s) {
 } // namespace
 
 CompileFacts ParseFactsJson(const string &json) {
-	JsonScanner s(json);
 	CompileFacts out;
 
-	s.Expect('{');
-	bool saw_dialect = false;
-	bool first = true;
-	while (true) {
-		s.SkipWs();
-		if (first && s.TryConsume('}')) {
-			throw InvalidInputException(
-			    "openivm_compile_with_facts: required field 'target_dialect' missing or not a string");
-		}
-		first = false;
-
-		string key = s.ParseString();
-		s.Expect(':');
-
-		if (key == "schema_version") {
-			out.schema_version = s.ParseInt();
-			if (out.schema_version != CompileFacts::CURRENT_SCHEMA_VERSION) {
-				// Reserved-for-future; accept any int but only emit a debug
-				// trace if it differs from the current expectation.
-			}
-		} else if (key == "target_dialect") {
-			string val = s.ParseString();
-			out.target_dialect = ParseDialectString(val);
-			saw_dialect = true;
-		} else if (key == "compile_only") {
-			out.compile_only = s.ParseBool();
-		} else if (key == "force_view_delta_cascade") {
-			out.force_view_delta_cascade = s.ParseBool();
-		} else if (key == "downstreams") {
-			s.Expect('[');
-			s.SkipWs();
-			if (!s.TryConsume(']')) {
-				while (true) {
-					CompileFacts::DownstreamView d;
-					s.Expect('{');
-					bool obj_first = true;
-					while (true) {
-						s.SkipWs();
-						if (obj_first && s.TryConsume('}')) {
-							break;
-						}
-						obj_first = false;
-						string k = s.ParseString();
-						s.Expect(':');
-						if (k == "name") {
-							d.name = s.ParseString();
-						} else if (k == "cascade") {
-							d.cascade = s.ParseBool();
-						} else {
-							s.SkipValue(); // unknown sub-field — ignore
-						}
-						if (s.TryConsume(',')) {
-							continue;
-						}
-						s.Expect('}');
-						break;
-					}
-					out.downstreams.push_back(std::move(d));
-					if (s.TryConsume(',')) {
-						continue;
-					}
-					s.Expect(']');
-					break;
-				}
-			}
-		} else if (key == "pending_deltas") {
-			s.Expect('[');
-			s.SkipWs();
-			if (!s.TryConsume(']')) {
-				while (true) {
-					CompileFacts::PendingDelta d;
-					s.Expect('{');
-					bool obj_first = true;
-					while (true) {
-						s.SkipWs();
-						if (obj_first && s.TryConsume('}')) {
-							break;
-						}
-						obj_first = false;
-						string k = s.ParseString();
-						s.Expect(':');
-						if (k == "base") {
-							d.base = s.ParseString();
-						} else if (k == "op") {
-							d.op = s.ParseString();
-						} else if (k == "ts") {
-							d.ts = s.ParseString();
-						} else {
-							s.SkipValue();
-						}
-						if (s.TryConsume(',')) {
-							continue;
-						}
-						s.Expect('}');
-						break;
-					}
-					out.pending_deltas.push_back(std::move(d));
-					if (s.TryConsume(',')) {
-						continue;
-					}
-					s.Expect(']');
-					break;
-				}
-			}
-		} else {
-			// Unknown top-level key — IGNORE for forward-compat (B5 item 4).
-			s.SkipValue();
-		}
-
-		if (s.TryConsume(',')) {
-			continue;
-		}
-		s.Expect('}');
-		break;
-	}
-
-	if (!saw_dialect) {
+	string dialect_str;
+	if (!ExtractJsonString(json, "target_dialect", dialect_str)) {
 		throw InvalidInputException(
 		    "openivm_compile_with_facts: required field 'target_dialect' missing or not a string");
 	}
+	out.target_dialect = ParseDialectString(dialect_str);
+
+	int sv = 0;
+	if (ExtractJsonInt(json, "schema_version", sv)) {
+		out.schema_version = sv;
+	}
+	ExtractJsonBool(json, "compile_only", out.compile_only);
+	ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
+
+	for (auto &obj : ExtractJsonObjectsFromArray(json, "downstreams")) {
+		CompileFacts::DownstreamView d;
+		if (!ExtractJsonString(obj, "name", d.name)) {
+			continue;
+		}
+		ExtractJsonBool(obj, "cascade", d.cascade);
+		out.downstreams.push_back(std::move(d));
+	}
+
+	for (auto &obj : ExtractJsonObjectsFromArray(json, "pending_deltas")) {
+		CompileFacts::PendingDelta d;
+		ExtractJsonString(obj, "base", d.base);
+		ExtractJsonString(obj, "op", d.op);
+		ExtractJsonString(obj, "ts", d.ts);
+		out.pending_deltas.push_back(std::move(d));
+	}
+
 	return out;
 }
 

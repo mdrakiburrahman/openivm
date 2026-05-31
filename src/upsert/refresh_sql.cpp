@@ -507,33 +507,30 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
 	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
 
-	// AGGREGATE_GROUP cascade-delta dispatch (OPENIVM-BUG fix).
+	// AGGREGATE_GROUP cascade-delta dispatch.
 	//
-	// Background: when openivm_force_view_delta_cascade=true (openivm-spark sets this on every
-	// AGGREGATE_GROUP/AGGREGATE_HAVING compile so that downstream MVs see a per-key view-delta
-	// even when no downstream is registered in the per-compile DuckDB session), the legacy path
-	// in CompileAggregateGroups's recompute branch emits the cascade-delta via the LPTS
-	// ComputeDelta query PLUS a NULL-padded retract/add-back companion (`refresh_sql.cpp:898-960`
-	// below). For MIN/MAX (and other recompute-driving aggregates) the LPTS sum-delta produces
-	// rows with WRONG non-key values, and the NULL companion cancels out when a downstream
-	// SIMPLE_PROJECTION aggregates by (key, non-key) — so downstream INNER JOINs on the non-key
-	// columns evaluate to UNKNOWN and the stale row is never deleted from the downstream MV.
+	// When force_view_delta_cascade=true, CompileAggregateGroups's recompute
+	// branch emits the cascade-delta via the LPTS ComputeDelta query plus a
+	// NULL-padded retract/add-back companion. For MIN/MAX (and other
+	// recompute-driving aggregates) the LPTS sum-delta produces rows with
+	// stale non-key values, and the NULL companion cancels out when a
+	// downstream SIMPLE_PROJECTION aggregates by (key, non-key) — so
+	// downstream INNER JOINs on the non-key columns evaluate to UNKNOWN and
+	// the stale row is never deleted from the downstream MV.
 	//
-	// Fix: when force_view_delta_cascade=true AND the AGGREGATE_GROUP refresh would take the
-	// recompute branch in CompileAggregateGroups, route through CompileGroupRecompute with
-	// emit_cascade_delta=true so the cascade-delta is built from REAL openivm_old_<view> /
-	// openivm_new_<view> snapshots + signed-multiset insert. The Spark rewriter already handles
-	// this SQL pattern (it's the same shape WINDOW_PARTITION / GROUP_RECOMPUTE use today).
+	// Route through CompileGroupRecompute with emit_cascade_delta=true so the
+	// cascade-delta is built from real openivm_old_<view> / openivm_new_<view>
+	// snapshots + signed-multiset insert.
 	//
 	// Excluded:
-	//   - source_has_full_outer (both with/without full_outer_merge) — separate
-	//     `BuildFullOuterAffectedGroupRefresh` semantics we leave untouched.
-	//   - AGGREGATE_HAVING — CompileGroupRecompute's affected-key subquery substitutes delta-only
-	//     scans into the view query and applies HAVING to partial aggregates (e.g. filters
-	//     SUM(delta) > 100 instead of SUM(base+delta) > 100), so it misses groups whose FULL sum
-	//     crosses the HAVING threshold via the delta. AGGREGATE_HAVING also stores hidden helper
-	//     columns (openivm_count_star) in <mv>__ivm_data that the bare view_query_sql does not
-	//     project. Keep the legacy BuildAffectedKeyRefreshSQL path for HAVING.
+	//   - source_has_full_outer — handled by BuildFullOuterAffectedGroupRefresh
+	//     with its own semantics.
+	//   - AGGREGATE_HAVING — CompileGroupRecompute substitutes delta-only
+	//     scans into the view query and applies HAVING to partial aggregates
+	//     (e.g. filters SUM(delta) > 100 instead of SUM(base + delta) > 100),
+	//     missing groups whose full sum crosses the threshold via the delta.
+	//     AGGREGATE_HAVING also stores hidden helper columns (openivm_count_star)
+	//     in <mv>__ivm_data that the bare view_query_sql does not project.
 	bool aggregate_recompute_emits_cascade_delta = false;
 	vector<GroupRecomputeDeltaSpec> aggregate_recompute_delta_specs;
 	string aggregate_recompute_lpts_prefix;
@@ -737,9 +734,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				OPENIVM_DEBUG_PRINT("[UPSERT] GROUP_RECOMPUTE has no active deltas after filtering\n");
 				break;
 			}
-			// openivm_compile_only emits the refresh SQL template regardless of current
-			// delta activity (the spark driver re-runs it against its own deltas), so
-			// fall back to the full delta_table_names list to keep the template intact.
+			// Compile-only callers receive the refresh SQL template and
+			// re-run it against their own deltas downstream, so the
+			// empty-active-deltas short-circuit (which only applies when
+			// openivm itself executes the refresh) is bypassed here.
 			active_delta_table_names = delta_table_names;
 		}
 		if (TryBuildGroupMeasureUpdateRefresh(metadata, con, view_name, view_query_sql, active_delta_table_names,
@@ -793,20 +791,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                                  " WHERE table_name = '" + SqlUtils::EscapeValue(delta_view_name_bare) + "'");
 	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
-	// openivm_force_view_delta_cascade: when set, force the AGGREGATE_GROUP /
-	// AGGREGATE_HAVING refresh path to also emit the per-key retract companion
-	// (refresh_sql.cpp:620 `companion_query`) even if no other MV currently
-	// references this MV's delta view. Used by openivm-spark when compiling
-	// each MV in an isolated DuckDB subprocess — the metadata table is empty
-	// there, but the Spark side may register downstream MVs against this MV's
-	// delta after the compile returns.
+	// force_view_delta_cascade biases has_downstream=true for AGGREGATE_GROUP
+	// and AGGREGATE_HAVING so the per-key retract companion is emitted even
+	// when no downstream MV is currently registered in openivm_delta_tables.
 	//
-	// Scope: ONLY enabled for AGGREGATE_GROUP and AGGREGATE_HAVING. The
-	// SIMPLE_AGGREGATE snapshot-companion (refresh_sql.cpp:477 build_snapshot_companion)
-	// uses a CREATE TEMP TABLE / DROP TABLE pre/post-pair which openivm-spark's
-	// SparkRefreshRewriter does not currently transform; enabling it would
-	// generate Spark-unparseable SQL. WINDOW_PARTITION / GROUP_RECOMPUTE use the
-	// dedicated pragma below.
+	// Scope: AGGREGATE_GROUP and AGGREGATE_HAVING only. The SIMPLE_AGGREGATE
+	// snapshot companion relies on CREATE TEMP TABLE / DROP TABLE pre/post
+	// pairs that not all dialects can carry across statement boundaries.
+	// WINDOW_PARTITION and GROUP_RECOMPUTE go through the
+	// emit_cascade_delta_for_recompute path below.
 	{
 		if (active_facts.force_view_delta_cascade &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
@@ -1003,18 +996,21 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				keys_set.insert(column_names[kid]);
 			}
 
-			// Dispatch on openivm_force_view_delta_cascade:
-			//   false (default DuckDB mode): use upstream build_affected_snapshot_companion(keys),
-			//     which uses TEMP TABLEs to snapshot the affected groups and emit signed (-1 old,
-			//     +1 new) rows. This is the correctness path for native openivm + downstream MVs.
-			//   true (openivm-spark): use inline per-key NULL retract/add-back rows. The Spark-side
-			//     SparkRefreshRewriter splits the refresh program statement-by-statement and
-			//     recreates each delta table fresh per refresh, so the upstream TEMP TABLE scratch
-			//     does not survive across the split. NULLs in non-key columns rely on
-			//     SUM(NULL)=NULL preservation downstream.
-			bool spark_inline_companion = active_facts.force_view_delta_cascade;
+			// Dispatch on force_view_delta_cascade:
+			//   false (default): build_affected_snapshot_companion(keys)
+			//     uses TEMP TABLEs to snapshot the affected groups and
+			//     emits signed (-1 old, +1 new) rows. Correctness path for
+			//     downstream MVs that consume the cascade delta in the same
+			//     session.
+			//   true: emit inline per-key NULL retract/add-back rows. For
+			//     callers whose downstream executor splits the refresh
+			//     program statement-by-statement and recreates each delta
+			//     table fresh per refresh, so the TEMP TABLE scratch does
+			//     not survive across the split. NULLs in non-key columns
+			//     rely on SUM(NULL)=NULL preservation downstream.
+			bool inline_companion = active_facts.force_view_delta_cascade;
 
-			if (!spark_inline_companion) {
+			if (!inline_companion) {
 				build_affected_snapshot_companion(keys);
 			} else {
 				string col_list, val_list_neg, val_list_pos;

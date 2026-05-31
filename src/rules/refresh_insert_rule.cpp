@@ -513,11 +513,11 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 					return;
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-					// DELETE FROM t WHERE rowid IN (subquery) compiles to a SEMI JOIN on rowid.
-					// LPTS (pinned at the spark-fork commit) can't serialize the full SEMI JOIN
-					// because `rowid` is a virtual column that loses its binding after the
-					// join. Serialize only the right child (the subquery returning rowids) and
-					// wrap it as WHERE rowid IN (...) against the base table.
+					// DELETE FROM t WHERE rowid IN (subquery) compiles to a SEMI JOIN on
+					// rowid. LPTS cannot serialise the full SEMI JOIN because `rowid` is a
+					// virtual column whose binding is lost after the join. Serialise only
+					// the right child (the subquery returning rowids) and wrap it as
+					// WHERE rowid IN (...) against the base table.
 					auto *join = dynamic_cast<LogicalComparisonJoin *>(plan->children[0].get());
 					if (join && IsSemiJoinOnRowId(*join) && !join->children.empty()) {
 						try {

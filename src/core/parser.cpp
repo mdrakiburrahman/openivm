@@ -292,14 +292,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 			auto lpts_start = create_profile_now();
 			try {
-				// CREATE MATERIALIZED VIEW is a server-side DDL path that
-				// always stores the view body in DuckDB's own dialect — the
-				// stored body is replayed via DuckDB's planner on every
-				// refresh. The legacy openivm_target_dialect PRAGMA used to
-				// be read here too but that conflated the create-time and
-				// refresh-time dialects. After C4 the refresh-time dialect
-				// comes from per-call CompileFacts; the create-time dialect
-				// is and always was DUCKDB.
+				// CREATE MATERIALIZED VIEW always stores the view body in
+				// DuckDB's own dialect (the stored body is replayed via
+				// DuckDB's planner on every refresh). The refresh-time
+				// dialect is selected per call via `CompileFacts`.
 				SqlDialect dialect = SqlDialect::DUCKDB;
 				auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
 				auto cte_list = AstToCteList(*ast, dialect);

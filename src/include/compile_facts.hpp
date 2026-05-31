@@ -11,13 +11,11 @@
 namespace duckdb {
 namespace openivm {
 
-// Per-call compile context. Replaces the three former PRAGMAs
-// (`openivm_target_dialect`, `openivm_compile_only`,
-//  `openivm_force_view_delta_cascade`) plus the recompute-cascade flag that
-// previously shared a driver with `force_view_delta_cascade`.
-//
-// See B1-facts-schema.md for full wire-format semantics. Field names are
-// snake_case to match the JSON form 1:1.
+// Per-call compile context for `openivm_compile_with_facts`. Carries the
+// target SQL dialect, the compile-only toggle, the downstream-cascade hints
+// and the caller's pending DML deltas. Field names are snake_case to match
+// the JSON wire form 1:1 — `ParseFactsJson` deserialises the JSON object
+// directly into these fields.
 class CompileFacts {
 public:
 	struct DownstreamView {
@@ -36,7 +34,7 @@ public:
 	int schema_version = CURRENT_SCHEMA_VERSION;
 	SqlDialect target_dialect = SqlDialect::DUCKDB; // required when parsed from JSON
 	bool compile_only = false;                      // default false
-	bool force_view_delta_cascade = false;          // default false (unifies both legacy PRAGMAs)
+	bool force_view_delta_cascade = false;
 	vector<DownstreamView> downstreams;
 	vector<PendingDelta> pending_deltas;
 
@@ -57,14 +55,14 @@ public:
 	}
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
-	// Used by native DuckDB callers (PRAGMA refresh) which have no JSON facts
-	// — every field stays at its conservative default.
+	// Used by native PRAGMA-refresh callers which have no JSON facts — every
+	// field stays at its conservative default.
 	static CompileFacts Default(SqlDialect dialect = SqlDialect::DUCKDB);
 };
 
 // Parses a `CompileFacts` from JSON. Throws InvalidInputException on
 // malformed JSON, missing required `target_dialect`, or wrong types.
-// Unknown top-level fields are silently IGNORED (forward-compat per B5 [4]).
+// Unknown top-level fields are silently ignored for forward compatibility.
 CompileFacts ParseFactsJson(const string &json);
 
 // RAII installer for `CompileFacts` on the active ClientContext. The
@@ -72,9 +70,9 @@ CompileFacts ParseFactsJson(const string &json);
 // receive the facts through their function signatures (the DuckDB
 // optimizer API gives them only `ClientContext &`), so we stash the facts
 // on `ClientContext::registered_state` while the bind/compile is in flight
-// and remove them on scope exit. Native PRAGMA-refresh callers that never
-// construct this slot see an empty `registered_state` entry and fall back
-// to a default-constructed `CompileFacts` (the back-compat invariant).
+// and remove them on scope exit. Callers that never construct this slot
+// see an empty `registered_state` entry and fall back to a
+// default-constructed `CompileFacts`.
 class CompileFactsContextSlot {
 public:
 	// Slot key used in `ClientContext::registered_state`.
@@ -95,9 +93,9 @@ private:
 	bool installed;
 };
 
-// Table function entry points for `openivm_compile_with_facts`. These mirror
-// the former `compile_refresh` PRAGMA but emit one row per top-level SQL
-// statement so consumers don't have to split on `;` themselves.
+// Table function entry points for `openivm_compile_with_facts`. The
+// function emits one row per top-level SQL statement so consumers don't
+// have to split on `;` themselves.
 //
 // The signatures intentionally use the duckdb:: types directly (no forward
 // decls in this namespace — otherwise the C++ name-lookup picks

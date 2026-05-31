@@ -234,11 +234,11 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	flags.minmax_incremental = flags.insert_only;
 	flags.active_delta_table_names = summary.active_delta_table_names;
 
-	// When a CompileFacts is supplied with non-empty pending_deltas, the
-	// caller's declared deltas (openivm-spark's per-batch DML log) supersede
-	// the runtime probe — the staging delta tables themselves are empty
-	// during compile, so the runtime probe would always report insert_only
-	// regardless of what the caller actually plans to apply. See B5 [1].
+	// When CompileFacts supplies non-empty pending_deltas, the caller's
+	// declared deltas take precedence over the runtime probe. The runtime
+	// staging delta tables are empty at compile time so the probe would
+	// always report insert_only; the caller is the source of truth for
+	// what DML will actually be applied.
 	if (facts && !facts->pending_deltas.empty()) {
 		flags.minmax_incremental = facts->AllPendingDeltasInsertOnly();
 	}
