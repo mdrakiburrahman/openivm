@@ -339,9 +339,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
 	RefreshType view_query_type = metadata.GetViewType(view_name);
-	// Was: PRAGMA openivm_emit_cascade_delta_for_recompute. Now folded into
-	// facts.force_view_delta_cascade — the cascade-delta-for-recompute flag
-	// only ever fired on top of force_view_delta_cascade in real use.
 	bool emit_cascade_delta_for_recompute =
 	    active_facts.force_view_delta_cascade &&
 	    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE);
