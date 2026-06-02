@@ -13,49 +13,14 @@ namespace duckdb {
 
 namespace {
 
-static void AddStrategyReason(vector<DeltaStrategyReason> &strategy_reasons, DeltaStrategyReason reason) {
-	for (auto existing : strategy_reasons) {
-		if (existing == reason) {
-			return;
-		}
-	}
-	strategy_reasons.push_back(reason);
-}
-
-static void AddModelFeature(vector<DeltaModelFeature> &features, DeltaModelFeature feature) {
-	for (auto existing : features) {
-		if (existing == feature) {
-			return;
-		}
-	}
-	features.push_back(feature);
-}
-
-static void AddUnsupportedReason(vector<DeltaUnsupportedReason> &reasons, DeltaUnsupportedReason reason) {
-	for (auto existing : reasons) {
-		if (existing == reason) {
-			return;
-		}
-	}
-	reasons.push_back(reason);
-}
-
-static void AddUpdateSemantics(vector<DeltaUpdateSemantics> &semantics, DeltaUpdateSemantics entry) {
-	for (auto existing : semantics) {
+template <class T>
+static void AddUnique(vector<T> &entries, T entry) {
+	for (auto existing : entries) {
 		if (existing == entry) {
 			return;
 		}
 	}
-	semantics.push_back(entry);
-}
-
-static void AddAuxState(vector<DeltaAuxStateKind> &states, DeltaAuxStateKind state) {
-	for (auto existing : states) {
-		if (existing == state) {
-			return;
-		}
-	}
-	states.push_back(state);
+	entries.push_back(entry);
 }
 
 static void AddVisibleGroupNames(vector<string> &group_columns, const vector<string> &names) {
@@ -130,7 +95,7 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 		}
 		if (!exists) {
 			aggregate_columns.push_back(col_name);
-			AddStrategyReason(strategy_reasons, DeltaStrategyReason::JOIN_KEY_GROUP_FALLBACK);
+			AddUnique(strategy_reasons, DeltaStrategyReason::JOIN_KEY_GROUP_FALLBACK);
 		}
 	}
 }
@@ -278,13 +243,13 @@ static idx_t AddModelNode(DeltaViewModel &model, DeltaModelNode node) {
 
 static void AddNodeAuxRequirements(DeltaModelNode &node, const DeltaViewModel &model) {
 	if (model.HasDistinctAux() && node.kind == DeltaModelNodeKind::DISTINCT) {
-		AddAuxState(node.required_aux_states, DeltaAuxStateKind::DISTINCT_COUNT);
+		AddUnique(node.required_aux_states, DeltaAuxStateKind::DISTINCT_COUNT);
 	}
 	if (model.HasFilteredGroupCountAux() && node.kind == DeltaModelNodeKind::AGGREGATE) {
-		AddAuxState(node.required_aux_states, DeltaAuxStateKind::FILTERED_GROUP_COUNT);
+		AddUnique(node.required_aux_states, DeltaAuxStateKind::FILTERED_GROUP_COUNT);
 	}
 	if (model.HasSemiAntiAux() && node.kind == DeltaModelNodeKind::SEMI_ANTI) {
-		AddAuxState(node.required_aux_states, DeltaAuxStateKind::SEMI_ANTI_MATCH);
+		AddUnique(node.required_aux_states, DeltaAuxStateKind::SEMI_ANTI_MATCH);
 	}
 }
 
@@ -339,80 +304,92 @@ static void BuildUnsupportedReasons(DeltaViewModel &model, const CreateMVPlanFac
                                     const DeltaViewModelInput &input) {
 	const auto &analysis = facts.analysis;
 	if (facts.has_unsupported_set_operation) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_SET_OPERATION);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_SET_OPERATION);
 	}
 	if (facts.has_pivot) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_PIVOT);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_PIVOT);
 	}
 	if (analysis.found_volatile_expression) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FUNCTION);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FUNCTION);
 	}
 	if (analysis.found_non_foldable_unnest) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_UNNEST);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_UNNEST);
 	}
 	if (analysis.found_unsupported_aggregate) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_AGGREGATE);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_AGGREGATE);
 	}
 	if (analysis.found_unsupported_filtered_aggregate) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FILTERED_AGGREGATE);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FILTERED_AGGREGATE);
 	}
 	if (analysis.found_unsupported_join_type) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_JOIN_TYPE);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_JOIN_TYPE);
 	}
 	if (analysis.found_unsupported_order_by) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_ORDER_BY);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_ORDER_BY);
 	}
 	if (analysis.found_unsupported_operator) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
 	}
 	if (analysis.found_grouping_sets && model.group_columns.empty()) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::GROUPING_SETS_NO_KEYS);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::GROUPING_SETS_NO_KEYS);
 	}
 	if (analysis.found_filtered_list && model.group_columns.empty()) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::FILTERED_LIST_NO_KEYS);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::FILTERED_LIST_NO_KEYS);
 	}
 	if (analysis.found_semi_anti_join && analysis.found_aggregation) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_WITH_AGGREGATE);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_WITH_AGGREGATE);
 	}
 	if (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_MISSING_AUX);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_MISSING_AUX);
 	}
 	if (!analysis.incremental_compatible && model.unsupported_reasons.empty()) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
 	}
 }
 
 static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
 	if (!model.unsupported_reasons.empty()) {
-		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
+		AddUnique(model.features, DeltaModelFeature::FULL_ONLY);
 	}
 	if (analysis.found_projection || (!analysis.found_aggregation && !analysis.found_join && !analysis.found_window)) {
-		AddModelFeature(model.features, DeltaModelFeature::LINEAR);
+		AddUnique(model.features, DeltaModelFeature::LINEAR);
 	}
 	if (analysis.found_join && !analysis.found_left_join && !analysis.found_full_outer &&
 	    !analysis.found_semi_anti_join) {
-		AddModelFeature(model.features, DeltaModelFeature::BILINEAR);
+		AddUnique(model.features, DeltaModelFeature::BILINEAR);
 	}
 	if (analysis.found_left_join || analysis.found_full_outer) {
-		AddModelFeature(model.features, DeltaModelFeature::OUTER_JOIN_STATEFUL);
+		AddUnique(model.features, DeltaModelFeature::OUTER_JOIN_STATEFUL);
 	}
 	if (analysis.found_aggregation) {
 		if (analysis.found_minmax || analysis.found_count_distinct || analysis.found_list ||
 		    analysis.found_filtered_list) {
-			AddModelFeature(model.features, DeltaModelFeature::AGGREGATE_NON_LINEAR);
+			AddUnique(model.features, DeltaModelFeature::AGGREGATE_NON_LINEAR);
 		} else {
-			AddModelFeature(model.features, DeltaModelFeature::AGGREGATE_LINEAR);
+			AddUnique(model.features, DeltaModelFeature::AGGREGATE_LINEAR);
 		}
 	}
+	if (analysis.found_having) {
+		AddUnique(model.features, DeltaModelFeature::AGGREGATE_HAVING);
+	}
+	if (analysis.found_count_distinct) {
+		AddUnique(model.features, DeltaModelFeature::COUNT_DISTINCT_STATEFUL);
+	}
+	if (analysis.found_filtered_list) {
+		AddUnique(model.features, DeltaModelFeature::FILTERED_LIST_STATEFUL);
+	}
+	if (analysis.found_grouping_sets) {
+		AddUnique(model.features, DeltaModelFeature::GROUPING_SETS_STATEFUL);
+	}
 	if (analysis.found_window && !model.window_partition_columns.empty()) {
-		AddModelFeature(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
+		AddUnique(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
 	}
 	if (!model.HasFeature(DeltaModelFeature::FULL_ONLY)) {
 		if (input.distinct_aux_candidate) {
-			AddModelFeature(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
+			AddUnique(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
 		}
 		if (input.semi_anti_aux_candidate) {
-			AddModelFeature(model.features, DeltaModelFeature::SEMI_ANTI_STATEFUL);
+			AddUnique(model.features, DeltaModelFeature::SEMI_ANTI_STATEFUL);
 		}
 	}
 }
@@ -424,20 +401,20 @@ static bool IsAggregateRefreshType(RefreshType type) {
 
 static void BuildUpdateSemantics(DeltaViewModel &model, const PlanAnalysis &analysis) {
 	if (model.type != RefreshType::FULL_REFRESH) {
-		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::DELETE_SENSITIVE);
-		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::UPDATE_SENSITIVE);
+		AddUnique(model.update_semantics, DeltaUpdateSemantics::DELETE_SENSITIVE);
+		AddUnique(model.update_semantics, DeltaUpdateSemantics::UPDATE_SENSITIVE);
 	}
 	if (model.type == RefreshType::SIMPLE_PROJECTION) {
-		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
-		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::PROJECTION_DELETE_SKIP_SAFE);
+		AddUnique(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
+		AddUnique(model.update_semantics, DeltaUpdateSemantics::PROJECTION_DELETE_SKIP_SAFE);
 	}
 	if (IsAggregateRefreshType(model.type) && !analysis.found_count_distinct && !analysis.found_list &&
 	    !analysis.found_filtered_list) {
-		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
-		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::AGGREGATE_DELETE_SKIP_SAFE);
+		AddUnique(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
+		AddUnique(model.update_semantics, DeltaUpdateSemantics::AGGREGATE_DELETE_SKIP_SAFE);
 	}
 	if (analysis.found_minmax && !analysis.found_count_distinct && !analysis.found_list) {
-		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::MINMAX_INSERT_ONLY_SAFE);
+		AddUnique(model.update_semantics, DeltaUpdateSemantics::MINMAX_INSERT_ONLY_SAFE);
 	}
 }
 
@@ -479,6 +456,53 @@ static void BuildBaseAffectedDomains(DeltaViewModel &model, const CreateMVPlanFa
 	}
 }
 
+static bool ModelHasNodeKind(const DeltaViewModel &model, DeltaModelNodeKind kind) {
+	for (auto &node : model.nodes) {
+		if (node.kind == kind) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ModelHasUnsupportedReason(const DeltaViewModel &model, DeltaUnsupportedReason reason) {
+	for (auto existing : model.unsupported_reasons) {
+		if (existing == reason) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ModelHasNonStructuralUnsupportedReason(const DeltaViewModel &model) {
+	for (auto reason : model.unsupported_reasons) {
+		switch (reason) {
+		case DeltaUnsupportedReason::UNSUPPORTED_FUNCTION:
+		case DeltaUnsupportedReason::UNSUPPORTED_UNNEST:
+		case DeltaUnsupportedReason::UNSUPPORTED_AGGREGATE:
+		case DeltaUnsupportedReason::UNSUPPORTED_FILTERED_AGGREGATE:
+		case DeltaUnsupportedReason::UNSUPPORTED_JOIN_TYPE:
+		case DeltaUnsupportedReason::UNSUPPORTED_ORDER_BY:
+		case DeltaUnsupportedReason::UNSUPPORTED_OPERATOR:
+			return true;
+		default:
+			break;
+		}
+	}
+	return false;
+}
+
+static bool ModelHasAuxState(const DeltaViewModel &model, DeltaAuxStateKind state) {
+	for (auto &node : model.nodes) {
+		for (auto existing : node.required_aux_states) {
+			if (existing == state) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &facts,
                               const vector<string> &output_names) {
 	const auto &analysis = facts.analysis;
@@ -506,7 +530,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 			}
 		}
 		if (!model.group_columns.empty()) {
-			AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::DELIM_AGGREGATE_GROUP_FALLBACK);
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::DELIM_AGGREGATE_GROUP_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] DELIM/DEPENDENT aggregate: using %zu visible key columns for "
 			                    "GROUP_RECOMPUTE\n",
 			                    model.group_columns.size());
@@ -518,7 +542,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 		auto before = model.group_columns.size();
 		AddVisibleGroupNames(model.group_columns, DeriveScalarDelimKeyColumnNames(facts, output_names));
 		if (model.group_columns.size() > before) {
-			AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::SCALAR_DELIM_PROJECTION_GROUP_FALLBACK);
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::SCALAR_DELIM_PROJECTION_GROUP_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Scalar DELIM/DEPENDENT projection: using %zu visible key columns "
 			                    "for GROUP_RECOMPUTE\n",
 			                    model.group_columns.size());
@@ -529,7 +553,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 		auto before = model.group_columns.size();
 		AddVisibleGroupNames(model.group_columns, DeriveAggregateGroupColumnNames(facts, output_names, false));
 		if (model.group_columns.size() > before) {
-			AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK);
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Nested aggregate: using %zu visible inner group columns for "
 			                    "GROUP_RECOMPUTE\n",
 			                    model.group_columns.size());
@@ -540,7 +564,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 		auto before = model.group_columns.size();
 		AddVisibleGroupNames(model.group_columns, DeriveAggregateGroupColumnNames(facts, output_names, true));
 		if (model.group_columns.size() > before) {
-			AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK);
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Repeated CTE aggregate under join: using %zu visible group columns "
 			                    "for GROUP_RECOMPUTE\n",
 			                    model.group_columns.size());
@@ -559,7 +583,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	if (analysis.found_join && analysis.found_aggregation && !model.group_columns.empty()) {
 		idx_t expected_linear_outputs = model.group_columns.size() + model.aggregate_types.size();
 		if (output_names.size() > expected_linear_outputs) {
-			AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK);
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Join-over-aggregate exposes %zu columns but only %zu are "
 			                    "group/aggregate outputs -- using GROUP_RECOMPUTE\n",
 			                    output_names.size(), expected_linear_outputs);
@@ -567,10 +591,10 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	}
 
 	if (has_union_over_agg) {
-		AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::UNION_OVER_AGGREGATE);
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::UNION_OVER_AGGREGATE);
 	}
 	if (analysis.found_nested_aggregate) {
-		AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK);
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK);
 	}
 }
 
@@ -680,6 +704,14 @@ const char *DeltaModelFeatureName(DeltaModelFeature feature) {
 		return "AGGREGATE_LINEAR";
 	case DeltaModelFeature::AGGREGATE_NON_LINEAR:
 		return "AGGREGATE_NON_LINEAR";
+	case DeltaModelFeature::AGGREGATE_HAVING:
+		return "AGGREGATE_HAVING";
+	case DeltaModelFeature::COUNT_DISTINCT_STATEFUL:
+		return "COUNT_DISTINCT_STATEFUL";
+	case DeltaModelFeature::FILTERED_LIST_STATEFUL:
+		return "FILTERED_LIST_STATEFUL";
+	case DeltaModelFeature::GROUPING_SETS_STATEFUL:
+		return "GROUPING_SETS_STATEFUL";
 	case DeltaModelFeature::DISTINCT_STATEFUL:
 		return "DISTINCT_STATEFUL";
 	case DeltaModelFeature::WINDOW_AFFECTED_PARTITION:
@@ -848,6 +880,88 @@ bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_
 	return true;
 }
 
+DeltaPlanDecision BuildDeltaPlanDecision(const DeltaViewModel &model) {
+	DeltaPlanDecision decision;
+	auto finish = [&decision](RefreshType type, const char *reason) -> DeltaPlanDecision {
+		decision.refresh_type = type;
+		decision.reasons.push_back(reason);
+		return decision;
+	};
+	if (model.nodes.empty()) {
+		decision.exact_refresh_type = false;
+		return finish(RefreshType::FULL_REFRESH, "operator_model_missing");
+	}
+
+	const bool has_window = ModelHasNodeKind(model, DeltaModelNodeKind::WINDOW);
+	const bool has_grouping_sets = model.HasFeature(DeltaModelFeature::GROUPING_SETS_STATEFUL);
+	const bool has_semi_anti = ModelHasNodeKind(model, DeltaModelNodeKind::SEMI_ANTI);
+	const bool has_aggregate = ModelHasNodeKind(model, DeltaModelNodeKind::AGGREGATE);
+	const bool has_projection = ModelHasNodeKind(model, DeltaModelNodeKind::PROJECT);
+	const bool has_distinct = ModelHasNodeKind(model, DeltaModelNodeKind::DISTINCT);
+	const bool has_groups = !model.group_columns.empty();
+
+	if (ModelHasUnsupportedReason(model, DeltaUnsupportedReason::UNSUPPORTED_SET_OPERATION) ||
+	    ModelHasUnsupportedReason(model, DeltaUnsupportedReason::UNSUPPORTED_PIVOT)) {
+		return finish(RefreshType::FULL_REFRESH, "unsupported_create_shape");
+	}
+	if (has_window) {
+		return finish(RefreshType::WINDOW_PARTITION, "window_partition");
+	}
+	if (has_grouping_sets) {
+		return finish(has_groups ? RefreshType::GROUP_RECOMPUTE : RefreshType::FULL_REFRESH,
+		              has_groups ? "grouping_sets_group_recompute" : "grouping_sets_full");
+	}
+	if (has_semi_anti && has_aggregate) {
+		return finish(RefreshType::FULL_REFRESH, "semi_anti_aggregate_full");
+	}
+	if (has_semi_anti) {
+		auto type = ModelHasAuxState(model, DeltaAuxStateKind::SEMI_ANTI_MATCH) ? RefreshType::SEMI_ANTI_RECOMPUTE
+		                                                                        : RefreshType::FULL_REFRESH;
+		return finish(type, type == RefreshType::SEMI_ANTI_RECOMPUTE ? "semi_anti_aux" : "semi_anti_missing_aux");
+	}
+	if (ModelHasNonStructuralUnsupportedReason(model)) {
+		return finish(RefreshType::FULL_REFRESH, "unsupported_incremental_construct");
+	}
+	if (model.HasFeature(DeltaModelFeature::FILTERED_LIST_STATEFUL)) {
+		return finish(has_groups ? RefreshType::GROUP_RECOMPUTE : RefreshType::FULL_REFRESH,
+		              has_groups ? "filtered_list_group_recompute" : "filtered_list_full");
+	}
+	if (model.HasFeature(DeltaModelFeature::COUNT_DISTINCT_STATEFUL) && has_groups) {
+		return finish(RefreshType::GROUP_RECOMPUTE, "count_distinct_group_recompute");
+	}
+	if (has_distinct && !model.distinct_at_top && has_aggregate) {
+		auto type = ModelHasAuxState(model, DeltaAuxStateKind::DISTINCT_COUNT) ? RefreshType::DISTINCT_INCREMENTAL
+		                                                                       : RefreshType::GROUP_RECOMPUTE;
+		return finish(type, type == RefreshType::DISTINCT_INCREMENTAL ? "distinct_aux" : "distinct_group_recompute");
+	}
+	if (model.union_distinct_over_agg && has_groups) {
+		return finish(RefreshType::GROUP_RECOMPUTE, "union_distinct_over_aggregate");
+	}
+	if (has_distinct && model.distinct_at_top && has_groups) {
+		return finish(RefreshType::AGGREGATE_GROUP, "top_distinct_group");
+	}
+	if (model.HasFeature(DeltaModelFeature::AGGREGATE_HAVING) && has_aggregate && has_groups) {
+		return finish(RefreshType::AGGREGATE_HAVING, "aggregate_having");
+	}
+	if (!model.strategy_reasons.empty() && has_groups) {
+		return finish(RefreshType::GROUP_RECOMPUTE, "strategy_group_recompute");
+	}
+	if (has_aggregate && has_groups) {
+		return finish(RefreshType::AGGREGATE_GROUP, "aggregate_group");
+	}
+	if (has_aggregate) {
+		return finish(RefreshType::SIMPLE_AGGREGATE, "simple_aggregate");
+	}
+	if (has_projection) {
+		return finish(RefreshType::SIMPLE_PROJECTION, "simple_projection");
+	}
+	return finish(RefreshType::FULL_REFRESH, "unrecognized_pattern");
+}
+
+bool DeltaPlanDecisionMatchesModel(const DeltaPlanDecision &decision, const DeltaViewModel &model) {
+	return !decision.exact_refresh_type || decision.refresh_type == model.type;
+}
+
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	D_ASSERT(input.facts);
 	D_ASSERT(input.output_names);
@@ -870,7 +984,7 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	if ((analysis.found_left_join || analysis.found_full_outer) && analysis.found_aggregation &&
 	    OuterJoinAggregateNeedsRecompute(facts, analysis.group_index)) {
 		model.has_minmax_metadata = true;
-		AddStrategyReason(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE);
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE);
 		OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper -- "
 		                    "using group-recompute metadata\n");
 	}
@@ -883,8 +997,8 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	BuildModelFeatures(model, analysis, input);
 	SelectRefreshType(model, analysis, input.has_unsupported_incremental_construct);
 	if (model.warn_unrecognized_pattern) {
-		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNRECOGNIZED_PATTERN);
-		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNRECOGNIZED_PATTERN);
+		AddUnique(model.features, DeltaModelFeature::FULL_ONLY);
 	}
 	AttachAuxRequirements(model, input);
 	BuildUpdateSemantics(model, analysis);

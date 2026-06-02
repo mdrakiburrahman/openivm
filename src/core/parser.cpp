@@ -592,6 +592,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lineage_start)
 		        .count();
 		idx_t lineage_entry_count = view_model.LineageEntryCount();
+		auto shadow_decision = BuildDeltaPlanDecision(view_model);
+		bool shadow_matches = DeltaPlanDecisionMatchesModel(shadow_decision, view_model);
+		if (!shadow_matches) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta shadow decision mismatch: actual=%s shadow=%s exact=%d\n",
+			                    RefreshTypeName(view_model.type), RefreshTypeName(shadow_decision.refresh_type),
+			                    (int)shadow_decision.exact_refresh_type);
+		}
+		D_ASSERT(!shadow_decision.exact_refresh_type || shadow_matches);
 		RefreshType refresh_type = view_model.type;
 		auto aggregate_columns = std::move(view_model.group_columns);
 		auto aggregate_types = std::move(view_model.aggregate_types);
@@ -635,6 +643,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		for (auto semantics : view_model.update_semantics) {
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta update semantics: %s\n", DeltaUpdateSemanticsName(semantics));
+		}
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta shadow refresh type: %s (exact=%d)\n",
+		                    RefreshTypeName(shadow_decision.refresh_type), (int)shadow_decision.exact_refresh_type);
+		for (auto &reason : shadow_decision.reasons) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta shadow reason: %s\n", reason.c_str());
 		}
 		for (auto &domain : view_model.affected_domains) {
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Affected domain: %s keys=%zu sources=%zu delta_local=%d "

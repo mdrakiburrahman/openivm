@@ -24,6 +24,10 @@ enum class DeltaModelFeature {
 	OUTER_JOIN_STATEFUL,
 	AGGREGATE_LINEAR,
 	AGGREGATE_NON_LINEAR,
+	AGGREGATE_HAVING,
+	COUNT_DISTINCT_STATEFUL,
+	FILTERED_LIST_STATEFUL,
+	GROUPING_SETS_STATEFUL,
 	DISTINCT_STATEFUL,
 	WINDOW_AFFECTED_PARTITION,
 	SEMI_ANTI_STATEFUL,
@@ -111,6 +115,12 @@ struct DeltaLineageFact {
 	string lookup_output_column;
 };
 
+struct DeltaPlanDecision {
+	RefreshType refresh_type = RefreshType::FULL_REFRESH;
+	vector<string> reasons;
+	bool exact_refresh_type = true;
+};
+
 struct FilteredGroupCountAuxRequirement {
 	RefreshMetadata::FilteredGroupCountAuxMeta meta;
 	string create_source;
@@ -175,6 +185,8 @@ const char *DeltaUpdateSemanticsName(DeltaUpdateSemantics semantics);
 const char *DeltaAffectedDomainKindName(DeltaAffectedDomainKind kind);
 bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names);
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input);
+DeltaPlanDecision BuildDeltaPlanDecision(const DeltaViewModel &model);
+bool DeltaPlanDecisionMatchesModel(const DeltaPlanDecision &decision, const DeltaViewModel &model);
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                    const vector<string> &output_names);
 string BuildDeltaViewModelLineageJson(const DeltaViewModel &model);
