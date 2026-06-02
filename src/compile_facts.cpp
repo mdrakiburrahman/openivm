@@ -32,12 +32,12 @@ CompileFacts CompileFacts::Default(SqlDialect dialect) {
 // Minimal handrolled JSON parser
 //
 // Follows the substring-based pattern openivm already uses for its own
-// metadata JSON (see the anonymous helpers in core/refresh_metadata.cpp:
-// ExtractJsonString / ExtractJsonStringArray / ExtractJsonObjectsFromArray).
+// metadata JSON (see the anonymous helpers in core/refresh_metadata.cpp).
 // The CompileFacts JSON wire form is closed-loop — both writers (openivm's
 // own test fixtures and the openivm-spark driver) emit canonical form with
 // no extra whitespace and only the escape characters openivm itself
-// produces. A full JSON parser is unnecessary, and adding yyjson / the
+// produces. The current facts surface only needs scalar strings, booleans,
+// and integers; a full JSON parser is unnecessary, and adding yyjson / the
 // DuckDB JSON extension would pull in an optional transitive dependency.
 //
 // These helpers are file-scoped on purpose — they assume the closed-loop
@@ -124,58 +124,6 @@ bool ExtractJsonInt(const string &json, const string &key, int &val) {
 	}
 }
 
-vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key) {
-	vector<string> objects;
-	string needle = "\"" + key + "\":[";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return objects;
-	}
-	pos += needle.size();
-	int depth = 0;
-	bool in_string = false;
-	bool escaped = false;
-	size_t object_start = string::npos;
-	for (; pos < json.size(); pos++) {
-		char c = json[pos];
-		if (in_string) {
-			if (escaped) {
-				escaped = false;
-			} else if (c == '\\') {
-				escaped = true;
-			} else if (c == '"') {
-				in_string = false;
-			}
-			continue;
-		}
-		if (c == '"') {
-			in_string = true;
-			continue;
-		}
-		if (c == '{') {
-			if (depth == 0) {
-				object_start = pos;
-			}
-			depth++;
-			continue;
-		}
-		if (c == '}') {
-			if (depth > 0) {
-				depth--;
-				if (depth == 0 && object_start != string::npos) {
-					objects.push_back(json.substr(object_start, pos - object_start + 1));
-					object_start = string::npos;
-				}
-			}
-			continue;
-		}
-		if (c == ']' && depth == 0) {
-			break;
-		}
-	}
-	return objects;
-}
-
 SqlDialect ParseDialectString(const string &s) {
 	// Reuse the lpts helper so dialect names stay in lockstep with the
 	// LPTS pipeline. LPTS throws on unrecognised values which is exactly
@@ -207,23 +155,6 @@ CompileFacts ParseFactsJson(const string &json) {
 	}
 	ExtractJsonBool(json, "compile_only", out.compile_only);
 	ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
-
-	for (auto &obj : ExtractJsonObjectsFromArray(json, "downstreams")) {
-		CompileFacts::DownstreamView d;
-		if (!ExtractJsonString(obj, "name", d.name)) {
-			continue;
-		}
-		ExtractJsonBool(obj, "cascade", d.cascade);
-		out.downstreams.push_back(std::move(d));
-	}
-
-	for (auto &obj : ExtractJsonObjectsFromArray(json, "pending_deltas")) {
-		CompileFacts::PendingDelta d;
-		ExtractJsonString(obj, "base", d.base);
-		ExtractJsonString(obj, "op", d.op);
-		ExtractJsonString(obj, "ts", d.ts);
-		out.pending_deltas.push_back(std::move(d));
-	}
 
 	return out;
 }
@@ -287,14 +218,10 @@ CompileFacts CompileFactsContextSlot::Get(ClientContext &ctx) {
 //
 // The bind step parses the JSON into a `CompileFacts`, installs it onto
 // `ClientContext::registered_state` via `CompileFactsContextSlot`, then
-// invokes `GenerateRefreshSQL`. The resulting SQL is split into logical
-// buckets (meta_pre / companion / data / cleanup / meta_post) and each
-// top-level statement becomes its own output row. The slot is removed
-// before bind returns so optimizer rules in later refresh calls don't see
-// stale facts.
-//
-// The actual row-per-statement splitting is added in a later commit; this
-// commit emits a single concatenated SQL row to keep the diff manageable.
+// invokes `GenerateRefreshSQL`. The resulting SQL is split into logical buckets
+// (meta_pre / data / meta_post) and each top-level statement becomes its own
+// output row. The slot is removed before bind returns so optimizer rules in
+// later refresh calls don't see stale facts.
 //------------------------------------------------------------------------------
 
 namespace {

@@ -258,8 +258,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	//      passes its parsed JSON facts here in a future commit).
 	//   2. The ClientContext slot installed by CompileFactsContextSlot.
 	//   3. A default-constructed CompileFacts (compile_only=false,
-	//      target_dialect=DUCKDB, no downstreams). This preserves native
-	//      PRAGMA refresh behaviour for callers that never construct a slot.
+	//      target_dialect=DUCKDB). This preserves native PRAGMA refresh
+	//      behaviour for callers that never construct a slot.
 	openivm::CompileFacts active_facts = facts_in ? *facts_in : openivm::CompileFactsContextSlot::Get(context);
 	auto profile_now = []() {
 		return std::chrono::steady_clock::now();

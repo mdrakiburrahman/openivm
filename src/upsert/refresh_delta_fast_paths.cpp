@@ -219,6 +219,7 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const string &attached_db_schema_name, bool cross_system,
                                              const DeltaActivityResult *precomputed_delta_activity,
                                              const openivm::CompileFacts *facts) {
+	(void)facts;
 	DeltaActivityResult summary;
 	if (precomputed_delta_activity) {
 		summary = *precomputed_delta_activity;
@@ -233,15 +234,6 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	flags.skip_proj_delete = flags.insert_only;
 	flags.minmax_incremental = flags.insert_only;
 	flags.active_delta_table_names = summary.active_delta_table_names;
-
-	// When CompileFacts supplies non-empty pending_deltas, the caller's
-	// declared deltas take precedence over the runtime probe. The runtime
-	// staging delta tables are empty at compile time so the probe would
-	// always report insert_only; the caller is the source of truth for
-	// what DML will actually be applied.
-	if (facts && !facts->pending_deltas.empty()) {
-		flags.minmax_incremental = facts->AllPendingDeltasInsertOnly();
-	}
 
 	if (!SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true)) {
 		flags.skip_agg_delete = false;

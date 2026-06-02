@@ -11,48 +11,19 @@
 namespace duckdb {
 namespace openivm {
 
-// Per-call compile context for `openivm_compile_with_facts`. Carries the
-// target SQL dialect, the compile-only toggle, the downstream-cascade hints
-// and the caller's pending DML deltas. Field names are snake_case to match
-// the JSON wire form 1:1 — `ParseFactsJson` deserialises the JSON object
-// directly into these fields.
+// Per-call compile context for `openivm_compile_with_facts`. The JSON wire
+// schema intentionally exposes only fields consumed by planning today: schema
+// version, target SQL dialect, compile-only mode, and the view-delta cascade
+// override. Field names are snake_case to match the JSON wire form 1:1 —
+// `ParseFactsJson` deserialises the JSON object directly into these fields.
 class CompileFacts {
 public:
-	struct DownstreamView {
-		string name;
-		bool cascade = true;
-	};
-	struct PendingDelta {
-		string base; // base table short name
-		string op;   // "INSERT" | "OVERWRITE" | "UPDATE_BEFORE" |
-		             // "UPDATE_AFTER" | "DELETE" | "MV_VIEW_DELTA"
-		string ts;   // diagnostic timestamp string
-	};
-
 	// Reserved for future schema evolution. Current valid value is 1.
 	static constexpr int CURRENT_SCHEMA_VERSION = 1;
 	int schema_version = CURRENT_SCHEMA_VERSION;
 	SqlDialect target_dialect = SqlDialect::DUCKDB; // required when parsed from JSON
 	bool compile_only = false;                      // default false
 	bool force_view_delta_cascade = false;
-	vector<DownstreamView> downstreams;
-	vector<PendingDelta> pending_deltas;
-
-	// Derived helpers — pure functions of fields above.
-	bool HasDownstreams() const {
-		return !downstreams.empty();
-	}
-	bool AllPendingDeltasInsertOnly() const {
-		if (pending_deltas.empty()) {
-			return false;
-		}
-		for (auto &d : pending_deltas) {
-			if (d.op != "INSERT" && d.op != "OVERWRITE") {
-				return false;
-			}
-		}
-		return true;
-	}
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every
