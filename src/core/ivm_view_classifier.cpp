@@ -4,7 +4,9 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
 
+#include <algorithm>
 #include <unordered_set>
 
 namespace duckdb {
@@ -27,6 +29,33 @@ static void AddModelFeature(vector<DeltaModelFeature> &features, DeltaModelFeatu
 		}
 	}
 	features.push_back(feature);
+}
+
+static void AddUnsupportedReason(vector<DeltaUnsupportedReason> &reasons, DeltaUnsupportedReason reason) {
+	for (auto existing : reasons) {
+		if (existing == reason) {
+			return;
+		}
+	}
+	reasons.push_back(reason);
+}
+
+static void AddUpdateSemantics(vector<DeltaUpdateSemantics> &semantics, DeltaUpdateSemantics entry) {
+	for (auto existing : semantics) {
+		if (existing == entry) {
+			return;
+		}
+	}
+	semantics.push_back(entry);
+}
+
+static void AddAuxState(vector<DeltaAuxStateKind> &states, DeltaAuxStateKind state) {
+	for (auto existing : states) {
+		if (existing == state) {
+			return;
+		}
+	}
+	states.push_back(state);
 }
 
 static void AddVisibleGroupNames(vector<string> &group_columns, const vector<string> &names) {
@@ -106,8 +135,255 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 	}
 }
 
+static bool ContainsStringCI(const vector<string> &values, const string &candidate) {
+	for (auto &value : values) {
+		if (StringUtil::CIEquals(value, candidate)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void AddStringCI(vector<string> &values, const string &candidate) {
+	if (!candidate.empty() && !ContainsStringCI(values, candidate)) {
+		values.push_back(candidate);
+	}
+}
+
+static vector<string> SourceTablesFromFacts(const CreateMVPlanFacts &facts) {
+	vector<string> tables;
+	for (auto &occurrence : facts.source_occurrences) {
+		AddStringCI(tables, occurrence.table);
+	}
+	if (tables.empty()) {
+		for (auto &entry : facts.source_table_info) {
+			AddStringCI(tables, entry.second.table_name);
+		}
+		std::sort(tables.begin(), tables.end(), [](const string &left, const string &right) {
+			return StringUtil::Lower(left) < StringUtil::Lower(right);
+		});
+	}
+	return tables;
+}
+
+static vector<string> SourceTablesFromChildren(const DeltaViewModel &model, const vector<idx_t> &children) {
+	vector<string> tables;
+	for (auto child_id : children) {
+		if (child_id >= model.nodes.size()) {
+			continue;
+		}
+		for (auto &source : model.nodes[child_id].source_tables) {
+			AddStringCI(tables, source);
+		}
+	}
+	return tables;
+}
+
+static void SplitOutputColumns(const vector<string> &input, vector<string> &visible, vector<string> &hidden) {
+	for (auto &name : input) {
+		if (name.empty()) {
+			continue;
+		}
+		if (IncrementalTableNames::IsInternalColumn(name)) {
+			hidden.push_back(name);
+		} else {
+			visible.push_back(name);
+		}
+	}
+}
+
+static DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET:
+		return DeltaModelNodeKind::SCAN;
+	case LogicalOperatorType::LOGICAL_FILTER:
+		return DeltaModelNodeKind::FILTER;
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		return DeltaModelNodeKind::PROJECT;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		return DeltaModelNodeKind::AGGREGATE;
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		return DeltaModelNodeKind::WINDOW;
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		return DeltaModelNodeKind::DISTINCT;
+	case LogicalOperatorType::LOGICAL_UNION:
+		return DeltaModelNodeKind::UNION;
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+		return DeltaModelNodeKind::TOP_K;
+	case LogicalOperatorType::LOGICAL_UNNEST:
+		return DeltaModelNodeKind::UNNEST;
+	case LogicalOperatorType::LOGICAL_CTE_REF:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		return DeltaModelNodeKind::CTE;
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
+		auto *join = dynamic_cast<LogicalJoin *>(&op);
+		if (join && (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
+		             join->join_type == JoinType::MARK)) {
+			return DeltaModelNodeKind::SEMI_ANTI;
+		}
+		return DeltaModelNodeKind::JOIN;
+	}
+	default:
+		return DeltaModelNodeKind::OTHER;
+	}
+}
+
+static DeltaRuleKind RuleKindForNode(DeltaModelNodeKind kind, LogicalOperator &op, const DeltaViewModel &model,
+                                     const PlanAnalysis &analysis) {
+	if (!model.unsupported_reasons.empty()) {
+		return DeltaRuleKind::FULL_ONLY;
+	}
+	switch (kind) {
+	case DeltaModelNodeKind::SCAN:
+	case DeltaModelNodeKind::FILTER:
+	case DeltaModelNodeKind::PROJECT:
+	case DeltaModelNodeKind::UNION:
+	case DeltaModelNodeKind::UNNEST:
+	case DeltaModelNodeKind::CTE:
+		return DeltaRuleKind::LINEAR;
+	case DeltaModelNodeKind::JOIN: {
+		auto *join = dynamic_cast<LogicalJoin *>(&op);
+		if (join && (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
+		             join->join_type == JoinType::OUTER)) {
+			return DeltaRuleKind::STATEFUL;
+		}
+		return DeltaRuleKind::PRODUCT;
+	}
+	case DeltaModelNodeKind::AGGREGATE:
+		return analysis.found_minmax || analysis.found_count_distinct || analysis.found_list ||
+		               analysis.found_filtered_list
+		           ? DeltaRuleKind::NON_LINEAR
+		           : DeltaRuleKind::STATEFUL;
+	case DeltaModelNodeKind::WINDOW:
+	case DeltaModelNodeKind::DISTINCT:
+	case DeltaModelNodeKind::SEMI_ANTI:
+	case DeltaModelNodeKind::TOP_K:
+		return DeltaRuleKind::STATEFUL;
+	default:
+		return DeltaRuleKind::FULL_ONLY;
+	}
+}
+
+static idx_t AddModelNode(DeltaViewModel &model, DeltaModelNode node) {
+	node.id = model.nodes.size();
+	model.nodes.push_back(std::move(node));
+	return model.nodes.back().id;
+}
+
+static void AddNodeAuxRequirements(DeltaModelNode &node, const DeltaViewModel &model) {
+	if (model.HasDistinctAux() && node.kind == DeltaModelNodeKind::DISTINCT) {
+		AddAuxState(node.required_aux_states, DeltaAuxStateKind::DISTINCT_COUNT);
+	}
+	if (model.HasFilteredGroupCountAux() && node.kind == DeltaModelNodeKind::AGGREGATE) {
+		AddAuxState(node.required_aux_states, DeltaAuxStateKind::FILTERED_GROUP_COUNT);
+	}
+	if (model.HasSemiAntiAux() && node.kind == DeltaModelNodeKind::SEMI_ANTI) {
+		AddAuxState(node.required_aux_states, DeltaAuxStateKind::SEMI_ANTI_MATCH);
+	}
+}
+
+static idx_t BuildModelNodeForPlan(DeltaViewModel &model, LogicalOperator *op, const CreateMVPlanFacts &facts,
+                                   const vector<string> &output_names) {
+	if (!op) {
+		return DConstants::INVALID_INDEX;
+	}
+	vector<idx_t> children;
+	for (auto &child : op->children) {
+		auto child_id = BuildModelNodeForPlan(model, child.get(), facts, output_names);
+		if (child_id != DConstants::INVALID_INDEX) {
+			children.push_back(child_id);
+		}
+	}
+
+	DeltaModelNode node;
+	node.kind = NodeKindForOperator(*op);
+	node.rule = RuleKindForNode(node.kind, *op, model, facts.analysis);
+	node.children = std::move(children);
+	node.source_tables = SourceTablesFromChildren(model, node.children);
+	AddNodeAuxRequirements(node, model);
+
+	if (node.kind == DeltaModelNodeKind::SCAN) {
+		auto *get = dynamic_cast<LogicalGet *>(op);
+		if (get) {
+			auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
+			if (occurrence_it != facts.occurrence_by_index.end()) {
+				AddStringCI(node.source_tables, occurrence_it->second.table);
+			}
+			SplitOutputColumns(get->names, node.output_columns, node.hidden_columns);
+		}
+	}
+	if (node.kind == DeltaModelNodeKind::AGGREGATE) {
+		node.affected_key_columns = model.group_columns;
+	}
+	if (node.kind == DeltaModelNodeKind::WINDOW) {
+		node.affected_key_columns = model.window_partition_columns;
+	}
+	if (op == facts.root) {
+		SplitOutputColumns(output_names, node.output_columns, node.hidden_columns);
+	}
+	return AddModelNode(model, std::move(node));
+}
+
+static void BuildModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+	model.nodes.clear();
+	model.root_node = BuildModelNodeForPlan(model, facts.root, facts, output_names);
+}
+
+static void BuildUnsupportedReasons(DeltaViewModel &model, const CreateMVPlanFacts &facts,
+                                    const DeltaViewModelInput &input) {
+	const auto &analysis = facts.analysis;
+	if (facts.has_unsupported_set_operation) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_SET_OPERATION);
+	}
+	if (facts.has_pivot) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_PIVOT);
+	}
+	if (analysis.found_volatile_expression) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FUNCTION);
+	}
+	if (analysis.found_non_foldable_unnest) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_UNNEST);
+	}
+	if (analysis.found_unsupported_aggregate) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_AGGREGATE);
+	}
+	if (analysis.found_unsupported_filtered_aggregate) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FILTERED_AGGREGATE);
+	}
+	if (analysis.found_unsupported_join_type) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_JOIN_TYPE);
+	}
+	if (analysis.found_unsupported_order_by) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_ORDER_BY);
+	}
+	if (analysis.found_unsupported_operator) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
+	}
+	if (analysis.found_grouping_sets && model.group_columns.empty()) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::GROUPING_SETS_NO_KEYS);
+	}
+	if (analysis.found_filtered_list && model.group_columns.empty()) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::FILTERED_LIST_NO_KEYS);
+	}
+	if (analysis.found_semi_anti_join && analysis.found_aggregation) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_WITH_AGGREGATE);
+	}
+	if (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_MISSING_AUX);
+	}
+	if (!analysis.incremental_compatible && model.unsupported_reasons.empty()) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
+	}
+}
+
 static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
-	if (input.has_unsupported_incremental_construct || !analysis.incremental_compatible) {
+	if (!model.unsupported_reasons.empty()) {
 		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
 	}
 	if (analysis.found_projection || (!analysis.found_aggregation && !analysis.found_join && !analysis.found_window)) {
@@ -131,15 +407,6 @@ static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analys
 	if (analysis.found_window && !model.window_partition_columns.empty()) {
 		AddModelFeature(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
 	}
-	if (analysis.found_semi_anti_join && !input.semi_anti_aux_candidate) {
-		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
-	}
-	if (analysis.found_grouping_sets && model.group_columns.empty()) {
-		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
-	}
-	if (analysis.found_filtered_list && model.group_columns.empty()) {
-		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
-	}
 	if (!model.HasFeature(DeltaModelFeature::FULL_ONLY)) {
 		if (input.distinct_aux_candidate) {
 			AddModelFeature(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
@@ -147,6 +414,68 @@ static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analys
 		if (input.semi_anti_aux_candidate) {
 			AddModelFeature(model.features, DeltaModelFeature::SEMI_ANTI_STATEFUL);
 		}
+	}
+}
+
+static bool IsAggregateRefreshType(RefreshType type) {
+	return type == RefreshType::SIMPLE_AGGREGATE || type == RefreshType::AGGREGATE_GROUP ||
+	       type == RefreshType::AGGREGATE_HAVING;
+}
+
+static void BuildUpdateSemantics(DeltaViewModel &model, const PlanAnalysis &analysis) {
+	if (model.type != RefreshType::FULL_REFRESH) {
+		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::DELETE_SENSITIVE);
+		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::UPDATE_SENSITIVE);
+	}
+	if (model.type == RefreshType::SIMPLE_PROJECTION) {
+		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
+		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::PROJECTION_DELETE_SKIP_SAFE);
+	}
+	if (IsAggregateRefreshType(model.type) && !analysis.found_count_distinct && !analysis.found_list &&
+	    !analysis.found_filtered_list) {
+		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
+		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::AGGREGATE_DELETE_SKIP_SAFE);
+	}
+	if (analysis.found_minmax && !analysis.found_count_distinct && !analysis.found_list) {
+		AddUpdateSemantics(model.update_semantics, DeltaUpdateSemantics::MINMAX_INSERT_ONLY_SAFE);
+	}
+}
+
+static void AddAffectedDomain(DeltaViewModel &model, DeltaAffectedDomain domain) {
+	for (auto &existing : model.affected_domains) {
+		if (existing.kind != domain.kind) {
+			continue;
+		}
+		bool same_keys = existing.key_columns.size() == domain.key_columns.size();
+		for (idx_t i = 0; same_keys && i < existing.key_columns.size(); i++) {
+			same_keys = StringUtil::CIEquals(existing.key_columns[i], domain.key_columns[i]);
+		}
+		if (same_keys) {
+			return;
+		}
+	}
+	model.affected_domains.push_back(std::move(domain));
+}
+
+static void BuildBaseAffectedDomains(DeltaViewModel &model, const CreateMVPlanFacts &facts) {
+	if (!model.group_columns.empty()) {
+		DeltaAffectedDomain domain;
+		domain.kind = DeltaAffectedDomainKind::GROUP;
+		domain.key_columns = model.group_columns;
+		domain.source_tables = SourceTablesFromFacts(facts);
+		domain.delta_local = !facts.analysis.found_join && facts.source_occurrences.size() <= 1;
+		domain.needs_base_lookup = facts.analysis.found_join;
+		AddAffectedDomain(model, std::move(domain));
+	}
+	if (model.HasSemiAntiAux()) {
+		DeltaAffectedDomain domain;
+		domain.kind = DeltaAffectedDomainKind::SEMI_ANTI_PREDICATE;
+		domain.key_columns = model.semi_anti_aux.left_cols;
+		AddStringCI(domain.source_tables, model.semi_anti_aux.left_table);
+		AddStringCI(domain.source_tables, model.semi_anti_aux.right_table);
+		domain.delta_local = false;
+		domain.needs_base_lookup = true;
+		AddAffectedDomain(model, std::move(domain));
 	}
 }
 
@@ -311,6 +640,7 @@ static void ValidateModelInvariants(const DeltaViewModel &model) {
 	         !model.window_partition_columns.empty());
 	D_ASSERT(model.type != RefreshType::DISTINCT_INCREMENTAL || model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL));
 	D_ASSERT(model.type != RefreshType::SEMI_ANTI_RECOMPUTE || model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL));
+	D_ASSERT(model.root_node == DConstants::INVALID_INDEX || model.root_node < model.nodes.size());
 }
 
 } // namespace
@@ -363,6 +693,123 @@ const char *DeltaModelFeatureName(DeltaModelFeature feature) {
 	}
 }
 
+const char *DeltaModelNodeKindName(DeltaModelNodeKind kind) {
+	switch (kind) {
+	case DeltaModelNodeKind::SCAN:
+		return "SCAN";
+	case DeltaModelNodeKind::FILTER:
+		return "FILTER";
+	case DeltaModelNodeKind::PROJECT:
+		return "PROJECT";
+	case DeltaModelNodeKind::JOIN:
+		return "JOIN";
+	case DeltaModelNodeKind::AGGREGATE:
+		return "AGGREGATE";
+	case DeltaModelNodeKind::WINDOW:
+		return "WINDOW";
+	case DeltaModelNodeKind::DISTINCT:
+		return "DISTINCT";
+	case DeltaModelNodeKind::SEMI_ANTI:
+		return "SEMI_ANTI";
+	case DeltaModelNodeKind::UNION:
+		return "UNION";
+	case DeltaModelNodeKind::TOP_K:
+		return "TOP_K";
+	case DeltaModelNodeKind::UNNEST:
+		return "UNNEST";
+	case DeltaModelNodeKind::CTE:
+		return "CTE";
+	default:
+		return "OTHER";
+	}
+}
+
+const char *DeltaRuleKindName(DeltaRuleKind kind) {
+	switch (kind) {
+	case DeltaRuleKind::LINEAR:
+		return "LINEAR";
+	case DeltaRuleKind::PRODUCT:
+		return "PRODUCT";
+	case DeltaRuleKind::STATEFUL:
+		return "STATEFUL";
+	case DeltaRuleKind::NON_LINEAR:
+		return "NON_LINEAR";
+	case DeltaRuleKind::FULL_ONLY:
+		return "FULL_ONLY";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+const char *DeltaUnsupportedReasonName(DeltaUnsupportedReason reason) {
+	switch (reason) {
+	case DeltaUnsupportedReason::UNSUPPORTED_SET_OPERATION:
+		return "UNSUPPORTED_SET_OPERATION";
+	case DeltaUnsupportedReason::UNSUPPORTED_PIVOT:
+		return "UNSUPPORTED_PIVOT";
+	case DeltaUnsupportedReason::UNSUPPORTED_FUNCTION:
+		return "UNSUPPORTED_FUNCTION";
+	case DeltaUnsupportedReason::UNSUPPORTED_UNNEST:
+		return "UNSUPPORTED_UNNEST";
+	case DeltaUnsupportedReason::UNSUPPORTED_AGGREGATE:
+		return "UNSUPPORTED_AGGREGATE";
+	case DeltaUnsupportedReason::UNSUPPORTED_FILTERED_AGGREGATE:
+		return "UNSUPPORTED_FILTERED_AGGREGATE";
+	case DeltaUnsupportedReason::UNSUPPORTED_JOIN_TYPE:
+		return "UNSUPPORTED_JOIN_TYPE";
+	case DeltaUnsupportedReason::UNSUPPORTED_ORDER_BY:
+		return "UNSUPPORTED_ORDER_BY";
+	case DeltaUnsupportedReason::UNSUPPORTED_OPERATOR:
+		return "UNSUPPORTED_OPERATOR";
+	case DeltaUnsupportedReason::GROUPING_SETS_NO_KEYS:
+		return "GROUPING_SETS_NO_KEYS";
+	case DeltaUnsupportedReason::FILTERED_LIST_NO_KEYS:
+		return "FILTERED_LIST_NO_KEYS";
+	case DeltaUnsupportedReason::SEMI_ANTI_WITH_AGGREGATE:
+		return "SEMI_ANTI_WITH_AGGREGATE";
+	case DeltaUnsupportedReason::SEMI_ANTI_MISSING_AUX:
+		return "SEMI_ANTI_MISSING_AUX";
+	case DeltaUnsupportedReason::UNRECOGNIZED_PATTERN:
+		return "UNRECOGNIZED_PATTERN";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+const char *DeltaUpdateSemanticsName(DeltaUpdateSemantics semantics) {
+	switch (semantics) {
+	case DeltaUpdateSemantics::APPEND_ONLY_SAFE:
+		return "APPEND_ONLY_SAFE";
+	case DeltaUpdateSemantics::DELETE_SENSITIVE:
+		return "DELETE_SENSITIVE";
+	case DeltaUpdateSemantics::UPDATE_SENSITIVE:
+		return "UPDATE_SENSITIVE";
+	case DeltaUpdateSemantics::MINMAX_INSERT_ONLY_SAFE:
+		return "MINMAX_INSERT_ONLY_SAFE";
+	case DeltaUpdateSemantics::PROJECTION_DELETE_SKIP_SAFE:
+		return "PROJECTION_DELETE_SKIP_SAFE";
+	case DeltaUpdateSemantics::AGGREGATE_DELETE_SKIP_SAFE:
+		return "AGGREGATE_DELETE_SKIP_SAFE";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+const char *DeltaAffectedDomainKindName(DeltaAffectedDomainKind kind) {
+	switch (kind) {
+	case DeltaAffectedDomainKind::GROUP:
+		return "GROUP";
+	case DeltaAffectedDomainKind::WINDOW_PARTITION:
+		return "WINDOW_PARTITION";
+	case DeltaAffectedDomainKind::PROJECTION_KEY:
+		return "PROJECTION_KEY";
+	case DeltaAffectedDomainKind::SEMI_ANTI_PREDICATE:
+		return "SEMI_ANTI_PREDICATE";
+	default:
+		return "UNKNOWN";
+	}
+}
+
 bool DeltaViewModel::HasFeature(DeltaModelFeature feature) const {
 	for (auto existing : features) {
 		if (existing == feature) {
@@ -370,6 +817,17 @@ bool DeltaViewModel::HasFeature(DeltaModelFeature feature) const {
 		}
 	}
 	return false;
+}
+
+idx_t DeltaViewModel::LineageEntryCount() const {
+	idx_t count = 0;
+	if (!window_lineage_ops.empty()) {
+		count++;
+	}
+	if (has_projection_lineage) {
+		count++;
+	}
+	return count;
 }
 
 bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names) {
@@ -421,30 +879,106 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 		model.full_outer_join_cols = ExtractFullOuterJoinMetadata(facts);
 	}
 
+	BuildUnsupportedReasons(model, facts, input);
 	BuildModelFeatures(model, analysis, input);
 	SelectRefreshType(model, analysis, input.has_unsupported_incremental_construct);
+	if (model.warn_unrecognized_pattern) {
+		AddUnsupportedReason(model.unsupported_reasons, DeltaUnsupportedReason::UNRECOGNIZED_PATTERN);
+		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
+	}
 	AttachAuxRequirements(model, input);
+	BuildUpdateSemantics(model, analysis);
+	BuildBaseAffectedDomains(model, facts);
+	if (input.build_operator_model) {
+		BuildModelNodes(model, facts, output_names);
+	}
 	ValidateModelInvariants(model);
 	return model;
 }
 
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                    const vector<string> &output_names) {
-	model.lineage_entries.clear();
+	model.window_lineage_ops.clear();
+	model.has_projection_lineage = false;
+	model.projection_lineage = RefreshMetadata::ProjectionKeyLineage();
+	model.lineage_facts.clear();
 	const auto &analysis = facts.analysis;
 	if (model.type == RefreshType::WINDOW_PARTITION) {
-		string lineage_entry = BuildWindowPartitionLineageEntryJson(facts, model.window_partition_columns);
-		if (!lineage_entry.empty()) {
-			model.lineage_entries.push_back(std::move(lineage_entry));
+		if (BuildWindowPartitionLineageOps(facts, model.window_partition_columns, model.window_lineage_ops)) {
+			DeltaAffectedDomain domain;
+			domain.kind = DeltaAffectedDomainKind::WINDOW_PARTITION;
+			domain.key_columns = model.window_partition_columns;
+			domain.delta_local = true;
+			for (auto &op : model.window_lineage_ops) {
+				AddStringCI(domain.source_tables, op.source);
+				if (op.kind == "lookup") {
+					domain.delta_local = false;
+					domain.needs_base_lookup = true;
+				}
+				DeltaLineageFact fact;
+				fact.kind = DeltaLineageKind::WINDOW_PARTITION;
+				fact.source_table = op.source;
+				fact.source_column = op.source_col;
+				fact.output_column = op.output_col;
+				fact.lookup_table = op.lookup;
+				fact.lookup_column = op.lookup_col;
+				fact.lookup_output_column = op.lookup_out;
+				model.lineage_facts.push_back(std::move(fact));
+			}
+			AddAffectedDomain(model, std::move(domain));
 		}
 		return;
 	}
 	if (model.type == RefreshType::SIMPLE_PROJECTION && !analysis.found_left_join && !analysis.found_full_outer) {
-		string lineage_entry = BuildProjectionKeyLineageEntryJson(facts, output_names);
-		if (!lineage_entry.empty()) {
-			model.lineage_entries.push_back(std::move(lineage_entry));
+		if (BuildProjectionKeyLineage(facts, output_names, model.projection_lineage)) {
+			model.has_projection_lineage = true;
+			DeltaAffectedDomain domain;
+			domain.kind = DeltaAffectedDomainKind::PROJECTION_KEY;
+			domain.key_columns.push_back(model.projection_lineage.output_col);
+			domain.delta_local = true;
+			for (auto &arm : model.projection_lineage.arms) {
+				AddStringCI(domain.source_tables, arm.source);
+				if (!arm.steps.empty()) {
+					domain.delta_local = false;
+					domain.needs_base_lookup = true;
+				}
+				DeltaLineageFact fact;
+				fact.kind = DeltaLineageKind::PROJECTION_KEY;
+				fact.source_table = arm.source;
+				fact.source_occurrence = arm.occurrence;
+				fact.source_column = arm.source_col;
+				fact.output_column = model.projection_lineage.output_col;
+				if (!arm.steps.empty()) {
+					fact.lookup_table = arm.steps.back().table;
+					fact.lookup_column = arm.steps.back().lookup_col;
+					fact.lookup_output_column = arm.steps.back().lookup_out;
+				}
+				model.lineage_facts.push_back(std::move(fact));
+			}
+			AddAffectedDomain(model, std::move(domain));
 		}
 	}
+	if (model.HasSemiAntiAux()) {
+		for (auto &col : model.semi_anti_aux.left_cols) {
+			DeltaLineageFact fact;
+			fact.kind = DeltaLineageKind::SEMI_ANTI_PREDICATE;
+			fact.source_table = model.semi_anti_aux.left_table;
+			fact.source_column = col;
+			fact.output_column = col;
+			model.lineage_facts.push_back(std::move(fact));
+		}
+	}
+}
+
+string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
+	vector<string> entries;
+	if (!model.window_lineage_ops.empty()) {
+		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(model.window_lineage_ops));
+	}
+	if (model.has_projection_lineage) {
+		entries.push_back(RefreshMetadata::ProjectionKeyLineageToJson(model.projection_lineage));
+	}
+	return BuildRefreshLineageJson(entries);
 }
 
 } // namespace duckdb

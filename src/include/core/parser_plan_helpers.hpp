@@ -2,6 +2,7 @@
 #define OPENIVM_PARSER_PLAN_HELPERS_HPP
 
 #include "core/incremental_checker.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/parser.hpp"
 #include "duckdb.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
@@ -103,8 +104,10 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
                                        const vector<string> &output_names);
 string BuildRefreshLineageJson(const vector<string> &entries);
-string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &partition_columns);
-string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &output_names);
+bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out);
+bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                               RefreshMetadata::ProjectionKeyLineage &out);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);

@@ -391,6 +391,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		model_input.output_names = &output_names;
 		model_input.has_unsupported_incremental_construct = has_unsupported_incremental_construct;
 		model_input.keep_window_join_partitions = keep_window_join_partitions;
+		model_input.build_operator_model = false;
 		auto prelim_view_model = BuildDeltaViewModel(model_input);
 
 		// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
@@ -582,14 +583,15 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			                           semi_anti_extract.output_cols};
 			model_input.semi_anti_aux_candidate = &semi_anti_aux_candidate;
 		}
+		model_input.build_operator_model = true;
 		auto view_model = BuildDeltaViewModel(model_input);
 		auto lineage_start = create_profile_now();
 		PopulateDeltaViewModelLineage(view_model, facts, output_names);
-		string lineage_json = BuildRefreshLineageJson(view_model.lineage_entries);
+		string lineage_json = BuildDeltaViewModelLineageJson(view_model);
 		int64_t lineage_duration_ms =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lineage_start)
 		        .count();
-		idx_t lineage_entry_count = view_model.lineage_entries.size();
+		idx_t lineage_entry_count = view_model.LineageEntryCount();
 		RefreshType refresh_type = view_model.type;
 		auto aggregate_columns = std::move(view_model.group_columns);
 		auto aggregate_types = std::move(view_model.aggregate_types);
@@ -627,6 +629,24 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		for (auto feature : view_model.features) {
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta model feature: %s\n", DeltaModelFeatureName(feature));
+		}
+		for (auto reason : view_model.unsupported_reasons) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta unsupported reason: %s\n", DeltaUnsupportedReasonName(reason));
+		}
+		for (auto semantics : view_model.update_semantics) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta update semantics: %s\n", DeltaUpdateSemanticsName(semantics));
+		}
+		for (auto &domain : view_model.affected_domains) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Affected domain: %s keys=%zu sources=%zu delta_local=%d "
+			                    "needs_lookup=%d\n",
+			                    DeltaAffectedDomainKindName(domain.kind), domain.key_columns.size(),
+			                    domain.source_tables.size(), (int)domain.delta_local, (int)domain.needs_base_lookup);
+		}
+		for (auto &node : view_model.nodes) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta node %llu: %s rule=%s children=%zu sources=%zu keys=%zu\n",
+			                    static_cast<unsigned long long>(node.id), DeltaModelNodeKindName(node.kind),
+			                    DeltaRuleKindName(node.rule), node.children.size(), node.source_tables.size(),
+			                    node.affected_key_columns.size());
 		}
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 		for (const auto &t : table_names) {

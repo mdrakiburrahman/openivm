@@ -828,19 +828,20 @@ string BuildRefreshLineageJson(const vector<string> &entries) {
 	       StringUtil::Join(entries, entries.size(), ",", [](const string &entry) { return entry; }) + "]}";
 }
 
-string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                               RefreshMetadata::ProjectionKeyLineage &out) {
 	if (!facts.root) {
-		return "";
+		return false;
 	}
 	auto *top_projection = facts.first_projection;
 	if (!top_projection) {
-		return "";
+		return false;
 	}
 	if (facts.source_occurrences.size() < 3) {
-		return "";
+		return false;
 	}
 	if (facts.projection_lineage_edges.empty()) {
-		return "";
+		return false;
 	}
 
 	for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
@@ -883,9 +884,10 @@ string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const 
 		lineage.key_occurrence = key_ref.occurrence;
 		lineage.key_col = key_ref.column;
 		lineage.arms = std::move(arms);
-		return RefreshMetadata::ProjectionKeyLineageToJson(lineage);
+		out = std::move(lineage);
+		return true;
 	}
-	return "";
+	return false;
 }
 
 using WindowLineageOp = RefreshMetadata::WindowPartitionLineageOp;
@@ -958,14 +960,16 @@ static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const 
 	return false;
 }
 
-string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &partition_columns) {
+bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                    vector<WindowLineageOp> &out) {
+	out.clear();
 	if (!facts.root || partition_columns.empty()) {
-		return "";
+		return false;
 	}
 	vector<WindowLineageOp> direct_ops;
 	CollectWindowPartitionRefs(facts, partition_columns, direct_ops);
 	if (direct_ops.empty()) {
-		return "";
+		return false;
 	}
 
 	vector<WindowLineageOp> partition_ops;
@@ -1039,7 +1043,8 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 		}
 	}
 
-	return RefreshMetadata::WindowPartitionLineageToJson(ops);
+	out = std::move(ops);
+	return !out.empty();
 }
 
 void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
