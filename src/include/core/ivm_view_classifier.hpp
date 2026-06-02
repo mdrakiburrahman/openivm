@@ -18,6 +18,18 @@ enum class DeltaStrategyReason {
 	OUTER_JOIN_AGGREGATE_RECOMPUTE
 };
 
+enum class DeltaModelFeature {
+	LINEAR,
+	BILINEAR,
+	OUTER_JOIN_STATEFUL,
+	AGGREGATE_LINEAR,
+	AGGREGATE_NON_LINEAR,
+	DISTINCT_STATEFUL,
+	WINDOW_AFFECTED_PARTITION,
+	SEMI_ANTI_STATEFUL,
+	FULL_ONLY
+};
+
 struct FilteredGroupCountAuxRequirement {
 	RefreshMetadata::FilteredGroupCountAuxMeta meta;
 	string create_source;
@@ -40,6 +52,7 @@ struct DeltaViewModel {
 	vector<string> window_partition_columns;
 	vector<string> aggregate_types;
 	vector<string> lineage_entries;
+	vector<DeltaModelFeature> features;
 	string full_outer_join_cols;
 	RefreshMetadata::DistinctAuxMeta distinct_aux;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux;
@@ -59,9 +72,11 @@ struct DeltaViewModel {
 	bool HasSemiAntiAux() const {
 		return !semi_anti_aux.aux_table.empty();
 	}
+	bool HasFeature(DeltaModelFeature feature) const;
 };
 
 const char *DeltaStrategyReasonName(DeltaStrategyReason reason);
+const char *DeltaModelFeatureName(DeltaModelFeature feature);
 bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names);
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input);
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,

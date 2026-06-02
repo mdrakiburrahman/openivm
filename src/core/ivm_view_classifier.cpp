@@ -20,6 +20,15 @@ static void AddStrategyReason(vector<DeltaStrategyReason> &strategy_reasons, Del
 	strategy_reasons.push_back(reason);
 }
 
+static void AddModelFeature(vector<DeltaModelFeature> &features, DeltaModelFeature feature) {
+	for (auto existing : features) {
+		if (existing == feature) {
+			return;
+		}
+	}
+	features.push_back(feature);
+}
+
 static void AddVisibleGroupNames(vector<string> &group_columns, const vector<string> &names) {
 	for (auto &name : names) {
 		if (!IncrementalTableNames::IsInternalColumn(name)) {
@@ -93,6 +102,50 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 		if (!exists) {
 			aggregate_columns.push_back(col_name);
 			AddStrategyReason(strategy_reasons, DeltaStrategyReason::JOIN_KEY_GROUP_FALLBACK);
+		}
+	}
+}
+
+static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
+	if (input.has_unsupported_incremental_construct || !analysis.incremental_compatible) {
+		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
+	}
+	if (analysis.found_projection || (!analysis.found_aggregation && !analysis.found_join && !analysis.found_window)) {
+		AddModelFeature(model.features, DeltaModelFeature::LINEAR);
+	}
+	if (analysis.found_join && !analysis.found_left_join && !analysis.found_full_outer &&
+	    !analysis.found_semi_anti_join) {
+		AddModelFeature(model.features, DeltaModelFeature::BILINEAR);
+	}
+	if (analysis.found_left_join || analysis.found_full_outer) {
+		AddModelFeature(model.features, DeltaModelFeature::OUTER_JOIN_STATEFUL);
+	}
+	if (analysis.found_aggregation) {
+		if (analysis.found_minmax || analysis.found_count_distinct || analysis.found_list ||
+		    analysis.found_filtered_list) {
+			AddModelFeature(model.features, DeltaModelFeature::AGGREGATE_NON_LINEAR);
+		} else {
+			AddModelFeature(model.features, DeltaModelFeature::AGGREGATE_LINEAR);
+		}
+	}
+	if (analysis.found_window && !model.window_partition_columns.empty()) {
+		AddModelFeature(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
+	}
+	if (analysis.found_semi_anti_join && !input.semi_anti_aux_candidate) {
+		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
+	}
+	if (analysis.found_grouping_sets && model.group_columns.empty()) {
+		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
+	}
+	if (analysis.found_filtered_list && model.group_columns.empty()) {
+		AddModelFeature(model.features, DeltaModelFeature::FULL_ONLY);
+	}
+	if (!model.HasFeature(DeltaModelFeature::FULL_ONLY)) {
+		if (input.distinct_aux_candidate) {
+			AddModelFeature(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
+		}
+		if (input.semi_anti_aux_candidate) {
+			AddModelFeature(model.features, DeltaModelFeature::SEMI_ANTI_STATEFUL);
 		}
 	}
 }
@@ -193,8 +246,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 }
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis,
-                              bool has_unsupported_incremental_construct, bool has_distinct_aux_candidate,
-                              bool has_semi_anti_aux_candidate) {
+                              bool has_unsupported_incremental_construct) {
 	if (has_unsupported_incremental_construct) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_window) {
@@ -204,7 +256,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_semi_anti_join && analysis.found_aggregation) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
-		model.type = has_semi_anti_aux_candidate ? RefreshType::SEMI_ANTI_RECOMPUTE : RefreshType::FULL_REFRESH;
+		model.type = model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL) ? RefreshType::SEMI_ANTI_RECOMPUTE
+		                                                                     : RefreshType::FULL_REFRESH;
 	} else if (!analysis.incremental_compatible) {
 		model.type = RefreshType::FULL_REFRESH;
 		model.warn_unsupported_incremental = true;
@@ -215,7 +268,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_count_distinct && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && !model.distinct_at_top && analysis.found_aggregation) {
-		model.type = has_distinct_aux_candidate ? RefreshType::DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
+		model.type = model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) ? RefreshType::DISTINCT_INCREMENTAL
+		                                                                    : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
@@ -250,6 +304,15 @@ static void AttachAuxRequirements(DeltaViewModel &model, const DeltaViewModelInp
 	}
 }
 
+static void ValidateModelInvariants(const DeltaViewModel &model) {
+	D_ASSERT(!model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) || model.HasDistinctAux());
+	D_ASSERT(!model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL) || model.HasSemiAntiAux());
+	D_ASSERT(!model.HasFeature(DeltaModelFeature::WINDOW_AFFECTED_PARTITION) ||
+	         !model.window_partition_columns.empty());
+	D_ASSERT(model.type != RefreshType::DISTINCT_INCREMENTAL || model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL));
+	D_ASSERT(model.type != RefreshType::SEMI_ANTI_RECOMPUTE || model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL));
+}
+
 } // namespace
 
 const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
@@ -273,6 +336,40 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 	default:
 		return "UNKNOWN";
 	}
+}
+
+const char *DeltaModelFeatureName(DeltaModelFeature feature) {
+	switch (feature) {
+	case DeltaModelFeature::LINEAR:
+		return "LINEAR";
+	case DeltaModelFeature::BILINEAR:
+		return "BILINEAR";
+	case DeltaModelFeature::OUTER_JOIN_STATEFUL:
+		return "OUTER_JOIN_STATEFUL";
+	case DeltaModelFeature::AGGREGATE_LINEAR:
+		return "AGGREGATE_LINEAR";
+	case DeltaModelFeature::AGGREGATE_NON_LINEAR:
+		return "AGGREGATE_NON_LINEAR";
+	case DeltaModelFeature::DISTINCT_STATEFUL:
+		return "DISTINCT_STATEFUL";
+	case DeltaModelFeature::WINDOW_AFFECTED_PARTITION:
+		return "WINDOW_AFFECTED_PARTITION";
+	case DeltaModelFeature::SEMI_ANTI_STATEFUL:
+		return "SEMI_ANTI_STATEFUL";
+	case DeltaModelFeature::FULL_ONLY:
+		return "FULL_ONLY";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+bool DeltaViewModel::HasFeature(DeltaModelFeature feature) const {
+	for (auto existing : features) {
+		if (existing == feature) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names) {
@@ -324,9 +421,10 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 		model.full_outer_join_cols = ExtractFullOuterJoinMetadata(facts);
 	}
 
-	SelectRefreshType(model, analysis, input.has_unsupported_incremental_construct,
-	                  input.distinct_aux_candidate != nullptr, input.semi_anti_aux_candidate != nullptr);
+	BuildModelFeatures(model, analysis, input);
+	SelectRefreshType(model, analysis, input.has_unsupported_incremental_construct);
 	AttachAuxRequirements(model, input);
+	ValidateModelInvariants(model);
 	return model;
 }
 

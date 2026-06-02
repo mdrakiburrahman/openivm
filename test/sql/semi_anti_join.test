@@ -22,6 +22,11 @@ statement ok
 CREATE MATERIALIZED VIEW mv_saj_semi AS
     SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2;
 
+query II
+SELECT type, (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_saj_semi';
+----
+9	1
+
 query I
 SELECT COUNT(*) FROM (
     SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2

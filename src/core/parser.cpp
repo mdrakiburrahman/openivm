@@ -625,6 +625,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		for (auto reason : view_model.strategy_reasons) {
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Strategy reason: %s\n", DeltaStrategyReasonName(reason));
 		}
+		for (auto feature : view_model.features) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Delta model feature: %s\n", DeltaModelFeatureName(feature));
+		}
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 		for (const auto &t : table_names) {
 			OPENIVM_DEBUG_PRINT(" %s", t.c_str());
