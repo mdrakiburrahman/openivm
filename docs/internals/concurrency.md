@@ -2,7 +2,7 @@
 
 ## Refresh serialization
 
-Each materialized view has a per-view mutex. When `PRAGMA ivm('view_name')` runs, it
+Each materialized view has a per-view mutex. When `PRAGMA refresh('view_name')` runs, it
 acquires the view's lock before generating or executing any SQL. This prevents two
 concurrent refresh calls from applying overlapping deltas to the same view.
 
@@ -30,12 +30,12 @@ bound at plan time. `AT VERSION` pinning reads exactly the state at that snapsho
 
 ## Refresh cursor advance — race-safe timestamp bookkeeping
 
-Each `(view, base_table)` pair tracks two timestamps in `_duckdb_ivm_delta_tables`:
+Each `(view, base_table)` pair tracks two timestamps in `openivm_delta_tables`:
 
 | Column | Set to | Used by |
 |---|---|---|
-| `last_update` | `MAX(_duckdb_ivm_timestamp) + 1µs` over rows visible in *this transaction's snapshot*. Falls back to `now()` if the snapshot saw zero delta rows. | The base-delta scan filter on the *next* refresh: `_duckdb_ivm_timestamp >= last_update`. |
-| `last_refresh_ts` | `now()` at refresh-transaction-start wall clock. | Filtering `delta_<view>` companion rows from chained refreshes (companion rows carry refresh-time timestamps, not base-row timestamps, so they need a separate cursor). |
+| `last_update` | `MAX(openivm_timestamp) + 1µs` over rows visible in *this transaction's snapshot*. Falls back to `now()` if the snapshot saw zero delta rows. | The base-delta scan filter on the *next* refresh: `openivm_timestamp >= last_update`. |
+| `last_refresh_ts` | `now()` at refresh-transaction-start wall clock. | Filtering `openivm_delta_<view>` companion rows from chained refreshes (companion rows carry refresh-time timestamps, not base-row timestamps, so they need a separate cursor). |
 
 `last_update` is anchored to `MAX(base_ts)+1µs` rather than `now()` to make the cursor race-safe. The naive `now()` approach has a subtle bug:
 
@@ -45,13 +45,13 @@ Each `(view, base_table)` pair tracks two timestamps in `_duckdb_ivm_delta_table
 4. We set `last_update = now()` (which is *less than* this row's ts).
 5. The next refresh's filter `ts >= last_update` includes this row again → double-application → MV drift.
 
-Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `src/upsert/openivm_upsert.cpp:1370–1403` for the implementation.
+Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `src/upsert/refresh.cpp:1370–1403` for the implementation.
 
 ## Lock hierarchy
 
 | Lock | Scope | Held during | Used by |
 |---|---|---|---|
-| View mutex | Per view name | Entire refresh cycle | `PRAGMA ivm()`, refresh daemon |
+| View mutex | Per view name | Entire refresh cycle | `PRAGMA refresh()`, refresh daemon |
 | Delta mutex | Per delta table name | Delta row insertion | Insert rule (DML triggers) |
 | Map mutex | Global (static) | Mutex map lookup | Internal — protects the mutex maps |
 

@@ -4,7 +4,7 @@
 // rewrite column references against a canonical representative and to check
 // compatibility of query vs view ECs (Goldstein-Larson filter-tree level 5).
 //
-// All consumers gated by `ivm_enable_view_matching`.
+// All consumers gated by `openivm_enable_view_matching`.
 
 #ifndef OPENIVM_MATCH_EQUIVALENCE_CLASSES_HPP
 #define OPENIVM_MATCH_EQUIVALENCE_CLASSES_HPP
@@ -15,7 +15,7 @@
 #include "duckdb/planner/expression.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 class EquivalenceClassMap {
 public:
@@ -49,7 +49,7 @@ private:
 	vector<unique_ptr<Value>> constants_;
 };
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb
 
 #endif

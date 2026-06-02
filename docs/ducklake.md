@@ -27,7 +27,7 @@ CREATE MATERIALIZED VIEW dl.product_summary AS
 
 -- Insert new data and refresh
 INSERT INTO dl.sales VALUES (1, 5, 50);
-PRAGMA ivm('product_summary');
+PRAGMA refresh('product_summary');
 
 SELECT * FROM dl.product_summary ORDER BY pname;
 -- Alpha | 150 | 2
@@ -39,21 +39,21 @@ SELECT * FROM dl.product_summary ORDER BY pname;
 ### Detection
 
 OpenIVM automatically detects DuckLake tables at view creation time. When a base table
-is backed by a DuckLake catalog, its entry in `_duckdb_ivm_delta_tables` is stored with
+is backed by a DuckLake catalog, its entry in `openivm_delta_tables` is stored with
 `catalog_type = 'ducklake'`. No user configuration is needed — DuckLake-specific
 optimizations activate automatically.
 
 ### Delta detection (no delta tables)
 
-Standard DuckDB tables use separate delta tables (`delta_<table>`) with a multiplicity
+Standard DuckDB tables use separate delta tables (`openivm_delta_<table>`) with a multiplicity
 column and timestamp. DuckLake tables don't need delta tables — DuckLake's built-in
 change tracking provides the same information natively.
 
 OpenIVM reads rows inserted and deleted between two snapshots directly from DuckLake.
-Insertions get multiplicity `true`; deletions get multiplicity `false`. This produces
+Insertions get multiplicity `+1`; deletions get multiplicity `-1`. This produces
 the same delta format as standard delta tables but without maintaining a separate copy.
 
-The last-refreshed snapshot ID is stored in `_duckdb_ivm_delta_tables` and updated
+The last-refreshed snapshot ID is stored in `openivm_delta_tables` and updated
 after each refresh. The next refresh reads changes between the stored snapshot and the
 current one.
 
@@ -84,7 +84,7 @@ This is algebraically equivalent to inclusion-exclusion but avoids the exponenti
 | 4 | 15 | 4 |
 | 5 | 31 | 5 |
 
-N-term telescoping can be disabled with `SET ivm_ducklake_nterm = false`, which falls
+N-term telescoping can be disabled with `SET openivm_ducklake_nterm = false`, which falls
 back to the standard 2^N - 1 inclusion-exclusion rule (also works with DuckLake tables).
 
 ### Empty-delta term skipping
@@ -106,11 +106,10 @@ DuckLake-backed views support the same operator families as standard DuckDB tabl
 - Left, right, and full outer joins use the standard partial-recompute/MERGE paths
 - UNION ALL
 - DISTINCT
+- Semi/anti joins for supported aux-state shapes
 - Window functions on supported single-table shapes
 - CTEs and decorrelated subqueries
 - Chained/cascading materialized views
-
-Semi/anti aux-state support is currently documented for standard delta-table maintenance. DuckLake semi/anti views should be verified before relying on incremental refresh.
 
 ## Limitations
 

@@ -13,7 +13,7 @@ CREATE MATERIALIZED VIEW sales_summary AS
     FROM sales GROUP BY region;
 
 INSERT INTO sales VALUES ('US', 50), ('JP', 300);
-PRAGMA ivm('sales_summary');
+PRAGMA refresh('sales_summary');
 ```
 
 ## How IVM handles it
@@ -21,7 +21,7 @@ PRAGMA ivm('sales_summary');
 **Algebraic rule:**
 
 ```
-new_MV[key] = old_MV[key] + delta_agg[key]
+new_MV[key] = old_MV[key] + openivm_delta_agg[key]
 ```
 
 For each group key, the delta aggregate is computed from the delta table and merged with the existing value. New groups are inserted; groups whose aggregates reach zero are deleted.
@@ -36,20 +36,20 @@ The delta table is scanned, grouped by the same keys as the view, and consolidat
 -- Aggregate the delta rows, preserving multiplicity as a grouping key
 -- This separates insertions from deletions so the upsert can fold them correctly
 WITH scan_0 (...) AS (
-    SELECT region, amount, _duckdb_ivm_multiplicity
-    FROM delta_sales
-    WHERE _duckdb_ivm_timestamp >= '...'
+    SELECT region, amount, openivm_multiplicity
+    FROM openivm_delta_sales
+    WHERE openivm_timestamp >= '...'
 ),
 aggregate_1 (...) AS (
-    SELECT region, _duckdb_ivm_multiplicity, sum(amount), count_star()
+    SELECT region, openivm_multiplicity, sum(amount), count_star()
     FROM scan_0
-    GROUP BY region, _duckdb_ivm_multiplicity
+    GROUP BY region, openivm_multiplicity
 ),
 projection_2 (...) AS (
-    SELECT region, sum_amount, count_star, _duckdb_ivm_multiplicity
+    SELECT region, sum_amount, count_star, openivm_multiplicity
     FROM aggregate_1
 )
-INSERT INTO delta_sales_summary (region, total, cnt, _duckdb_ivm_multiplicity)
+INSERT INTO openivm_delta_sales_summary (region, total, cnt, openivm_multiplicity)
 SELECT * FROM projection_2;
 ```
 
@@ -58,16 +58,16 @@ SELECT * FROM projection_2;
 ```sql
 -- Consolidate delta rows: fold insertions (+1) and deletions (-1) into a single net delta per group.
 -- With integer-weighted multiplicity, this is just SUM(_w * col) — no CASE round-trip needed.
-WITH ivm_cte AS (
+WITH refresh_cte AS (
     SELECT region,
-        SUM(_duckdb_ivm_multiplicity * total) AS total,
-        SUM(_duckdb_ivm_multiplicity * cnt) AS cnt
-    FROM delta_sales_summary
+        SUM(openivm_multiplicity * total) AS total,
+        SUM(openivm_multiplicity * cnt) AS cnt
+    FROM openivm_delta_sales_summary
     GROUP BY region
 )
 -- Single-pass MERGE: update existing groups and insert new ones atomically
 -- IS NOT DISTINCT FROM handles NULL group keys correctly (NULL = NULL)
-MERGE INTO sales_summary v USING ivm_cte d
+MERGE INTO sales_summary v USING refresh_cte d
 ON v.region IS NOT DISTINCT FROM d.region
 -- Existing group: add the net delta to the current aggregate values
 WHEN MATCHED THEN UPDATE SET total = v.total + d.total, cnt = v.cnt + d.cnt

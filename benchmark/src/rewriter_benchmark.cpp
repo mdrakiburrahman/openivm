@@ -508,8 +508,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			}
 			// Drop orphaned data/delta tables from all catalogs
 			auto orphaned = con.Query("SELECT table_catalog, table_name FROM information_schema.tables "
-			                          "WHERE (table_name LIKE '_ivm_data_mv_q%' OR table_name LIKE 'delta_mv_q%'"
-			                          "    OR table_name LIKE 'ivm_delta_mv_q%') AND table_schema = 'main'");
+			                          "WHERE (table_name LIKE 'openivm_data_mv_q%' OR table_name LIKE "
+			                          "'openivm_delta_mv_q%') AND table_schema = 'main'");
 			if (orphaned && !orphaned->HasError()) {
 				for (idx_t r = 0; r < orphaned->RowCount(); r++) {
 					string cat = orphaned->GetValue(0, r).ToString();
@@ -518,8 +518,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				}
 			}
 			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM _duckdb_ivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM _duckdb_ivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
+			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
 		}
 
 		int delta_idx = 0;
@@ -644,10 +644,10 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
 						auto check_result = con.Query("SELECT type FROM " + native_catalog +
-						                              "._duckdb_ivm_views WHERE view_name = '" + mv_name + "'");
+						                              ".openivm_views WHERE view_name = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
-							int64_t ivm_type = check_result->GetValue(0, 0).GetValue<int64_t>();
-							is_incremental = (ivm_type != 3) ? 1 : 0;
+							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
+							is_incremental = (refresh_type != 3) ? 1 : 0;
 						}
 
 						// Phase 3: Apply deltas
@@ -658,9 +658,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							delta_idx = 0;
 						phase_reached = 4;
 
-						// Phase 4: PRAGMA ivm()
+						// Phase 4: PRAGMA refresh()
 						start = std::chrono::steady_clock::now();
-						auto refresh_result = con.Query("PRAGMA ivm('" + mv_name + "')");
+						auto refresh_result = con.Query("PRAGMA refresh('" + mv_name + "')");
 						if (refresh_result && refresh_result->HasError()) {
 							error = refresh_result->GetError();
 							if (IsFatalError(error)) {
@@ -1325,8 +1325,9 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		}
 
 		// Metadata-vs-OpenIVM confusion matrix: only count queries where MV creation succeeded
-		// (so we have a real ivm_type to compare against).
-		if (phase == 3 || phase == 4 || phase == 5 || phase == 6) {
+		// (so we have a real refresh_type to compare against).
+		bool has_actual_classification = phase == 3 || phase == 4 || phase == 5 || phase == 6;
+		if (has_actual_classification) {
 			bool actual_incr = (worker.result_incremental != 0);
 			if (meta_incremental < 0) {
 				stats.meta_missing++;
@@ -1345,9 +1346,10 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 		// Build CSV line — meta_is_incremental column is blank when metadata is missing
 		string meta_str = (meta_incremental < 0) ? "" : std::to_string(meta_incremental);
+		string actual_str = has_actual_classification ? std::to_string(worker.result_incremental) : "";
 		std::ostringstream csv_line;
 		csv_line << query_name << "," << std::to_string(phase) << "," << meta_str << ","
-		         << std::to_string(worker.result_incremental) << "," << std::to_string(worker.result_correct) << ","
+		         << actual_str << "," << std::to_string(worker.result_correct) << ","
 		         << FormatNumber(worker.result_time_select_ms) << "," << FormatNumber(worker.result_time_mv_ms) << ","
 		         << FormatNumber(worker.result_time_refresh_ms) << "," << FormatNumber(worker.result_time_verify_ms)
 		         << ",\"" << error_msg << "\"";

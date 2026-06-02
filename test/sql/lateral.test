@@ -1,0 +1,487 @@
+# name: test/sql/lateral.test
+# description: materialized view maintenance for LATERAL / DELIM_JOIN plans
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE lat_customer (c_id INT, c_w_id INT);
+
+statement ok
+CREATE TABLE lat_history (h_c_id INT, h_c_w_id INT, h_amount INT);
+
+statement ok
+INSERT INTO lat_customer VALUES (1, 1), (1, 1), (2, 1);
+
+statement ok
+INSERT INTO lat_history VALUES (1, 1, 10), (1, 1, 20), (2, 1, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat AS
+    SELECT c.c_id, c.c_w_id, lat.total_payments
+    FROM lat_customer c
+    JOIN LATERAL (
+        SELECT SUM(h_amount) AS total_payments
+        FROM lat_history
+        WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+    ) lat ON true;
+
+# DELIM/DEPENDENT aggregate views use affected-key recompute, not scalar aggregate upsert.
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat';
+----
+6
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+    EXCEPT ALL SELECT * FROM mv_lat
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat
+    EXCEPT ALL
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+);
+----
+0
+
+# Row-local UNNEST over base columns is a linear lateral expansion.
+statement ok
+CREATE TABLE lat_unnest_stock (
+    s_w_id INT,
+    s_i_id INT,
+    s_quantity INT,
+    d1 VARCHAR,
+    d2 VARCHAR,
+    d3 VARCHAR
+);
+
+statement ok
+INSERT INTO lat_unnest_stock VALUES
+    (1, 10, 5, 'a', 'b', 'c'),
+    (1, 11, 0, 'd', 'e', 'f'),
+    (2, 20, 8, 'x', 'y', 'z'),
+    (2, 20, 8, 'x', 'y', 'z');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_unnest_projection AS
+    SELECT s.s_w_id, s.s_i_id, u.dist_info
+    FROM lat_unnest_stock s
+    CROSS JOIN UNNEST([s.d1, s.d2, s.d3]) AS u(dist_info)
+    WHERE s.s_quantity > 0;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_unnest_projection';
+----
+2
+
+statement ok
+INSERT INTO lat_unnest_stock VALUES
+    (2, 21, 7, 'p', 'q', 'r'),
+    (3, 30, -1, 'n1', 'n2', 'n3');
+
+statement ok
+DELETE FROM lat_unnest_stock WHERE s_i_id = 10;
+
+statement ok
+UPDATE lat_unnest_stock SET d2 = 'yy', s_quantity = 9 WHERE s_i_id = 20;
+
+statement ok
+PRAGMA refresh('mv_lat_unnest_projection');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_unnest_projection
+    EXCEPT ALL
+    SELECT s.s_w_id, s.s_i_id, u.dist_info
+    FROM lat_unnest_stock s
+    CROSS JOIN UNNEST([s.d1, s.d2, s.d3]) AS u(dist_info)
+    WHERE s.s_quantity > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.s_w_id, s.s_i_id, u.dist_info
+    FROM lat_unnest_stock s
+    CROSS JOIN UNNEST([s.d1, s.d2, s.d3]) AS u(dist_info)
+    WHERE s.s_quantity > 0
+    EXCEPT ALL
+    SELECT * FROM mv_lat_unnest_projection
+);
+----
+0
+
+# Row-local UNNEST after a join should use the join delta terms and then expand each changed row.
+statement ok
+CREATE TABLE lat_unnest_stock_agg (s_w_id INT, s_i_id INT, qty INT);
+
+statement ok
+CREATE TABLE lat_unnest_item_agg (i_id INT, price INT);
+
+statement ok
+INSERT INTO lat_unnest_stock_agg VALUES (1, 10, 5), (1, 11, 25), (2, 20, 50);
+
+statement ok
+INSERT INTO lat_unnest_item_agg VALUES (10, 30), (11, 60), (20, 70);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_unnest_join_agg AS
+    SELECT u.flag, COUNT(*) AS rows_seen, SUM(s.qty * i.price) AS value_seen
+    FROM lat_unnest_stock_agg s
+    JOIN lat_unnest_item_agg i ON s.s_i_id = i.i_id
+    CROSS JOIN UNNEST([s.qty < 20, i.price > 50]) AS u(flag)
+    GROUP BY u.flag;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_unnest_join_agg';
+----
+0
+
+statement ok
+INSERT INTO lat_unnest_stock_agg VALUES (3, 30, 10);
+
+statement ok
+INSERT INTO lat_unnest_item_agg VALUES (30, 80);
+
+statement ok
+DELETE FROM lat_unnest_stock_agg WHERE s_w_id = 1 AND s_i_id = 10;
+
+statement ok
+UPDATE lat_unnest_item_agg SET price = 40 WHERE i_id = 20;
+
+statement ok
+UPDATE lat_unnest_stock_agg SET qty = 15 WHERE s_i_id = 11;
+
+statement ok
+PRAGMA refresh('mv_lat_unnest_join_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_unnest_join_agg
+    EXCEPT ALL
+    SELECT u.flag, COUNT(*) AS rows_seen, SUM(s.qty * i.price) AS value_seen
+    FROM lat_unnest_stock_agg s
+    JOIN lat_unnest_item_agg i ON s.s_i_id = i.i_id
+    CROSS JOIN UNNEST([s.qty < 20, i.price > 50]) AS u(flag)
+    GROUP BY u.flag
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT u.flag, COUNT(*) AS rows_seen, SUM(s.qty * i.price) AS value_seen
+    FROM lat_unnest_stock_agg s
+    JOIN lat_unnest_item_agg i ON s.s_i_id = i.i_id
+    CROSS JOIN UNNEST([s.qty < 20, i.price > 50]) AS u(flag)
+    GROUP BY u.flag
+    EXCEPT ALL
+    SELECT * FROM mv_lat_unnest_join_agg
+);
+----
+0
+
+# COUNT(DISTINCT) over row-local UNNEST uses affected-group recompute, not full refresh.
+statement ok
+CREATE TABLE lat_unnest_cd (
+    s_w_id INT,
+    s_i_id INT,
+    d1 VARCHAR,
+    d2 VARCHAR,
+    d3 VARCHAR,
+    d4 VARCHAR
+);
+
+statement ok
+INSERT INTO lat_unnest_cd VALUES
+    (1, 10, 'a', 'b', 'a', 'c'),
+    (1, 11, 'b', 'd', 'e', 'e'),
+    (2, 20, 'x', 'y', 'z', 'x');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_unnest_count_distinct AS
+    WITH exploded AS (
+        SELECT s.s_w_id, s.s_i_id, u.dist_code
+        FROM lat_unnest_cd s
+        CROSS JOIN UNNEST([s.d1, s.d2, s.d3, s.d4]) AS u(dist_code)
+    )
+    SELECT s_w_id, COUNT(DISTINCT dist_code) AS dist_codes
+    FROM exploded
+    GROUP BY s_w_id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_unnest_count_distinct';
+----
+6
+
+statement ok
+INSERT INTO lat_unnest_cd VALUES
+    (2, 21, 'y', 'n', 'o', 'p'),
+    (3, 30, 'm', 'm', 'n', 'o');
+
+statement ok
+DELETE FROM lat_unnest_cd WHERE s_i_id = 10;
+
+statement ok
+UPDATE lat_unnest_cd SET d2 = 'qq' WHERE s_i_id = 20;
+
+statement ok
+PRAGMA refresh('mv_lat_unnest_count_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_unnest_count_distinct
+    EXCEPT ALL
+    SELECT * FROM (
+        WITH exploded AS (
+            SELECT s.s_w_id, s.s_i_id, u.dist_code
+            FROM lat_unnest_cd s
+            CROSS JOIN UNNEST([s.d1, s.d2, s.d3, s.d4]) AS u(dist_code)
+        )
+        SELECT s_w_id, COUNT(DISTINCT dist_code) AS dist_codes
+        FROM exploded
+        GROUP BY s_w_id
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        WITH exploded AS (
+            SELECT s.s_w_id, s.s_i_id, u.dist_code
+            FROM lat_unnest_cd s
+            CROSS JOIN UNNEST([s.d1, s.d2, s.d3, s.d4]) AS u(dist_code)
+        )
+        SELECT s_w_id, COUNT(DISTINCT dist_code) AS dist_codes
+        FROM exploded
+        GROUP BY s_w_id
+    )
+    EXCEPT ALL
+    SELECT * FROM mv_lat_unnest_count_distinct
+);
+----
+0
+
+# Scalar correlated subqueries use DuckDB's SINGLE DELIM_JOIN shape.
+statement ok
+CREATE TABLE lat_scalar_wh(w_id INT, w_name VARCHAR);
+
+statement ok
+INSERT INTO lat_scalar_wh VALUES (1, 'w1'), (2, 'w2'), (4, 'w4');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_scalar AS
+    WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+    SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+    FROM numbers;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_scalar';
+----
+6
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+    EXCEPT ALL SELECT * FROM mv_lat_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_scalar
+    EXCEPT ALL
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+);
+----
+0
+
+statement ok
+UPDATE lat_scalar_wh SET w_name = 'w1x' WHERE w_id = 1;
+
+statement ok
+DELETE FROM lat_scalar_wh WHERE w_id = 2;
+
+statement ok
+INSERT INTO lat_scalar_wh VALUES (3, 'w3');
+
+statement ok
+PRAGMA refresh('mv_lat_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+    EXCEPT ALL SELECT * FROM mv_lat_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_scalar
+    EXCEPT ALL
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+);
+----
+0
+
+statement ok
+DELETE FROM lat_scalar_wh WHERE w_id = 1;
+
+statement ok
+UPDATE lat_scalar_wh SET w_name = 'w4x' WHERE w_id = 4;
+
+statement ok
+INSERT INTO lat_scalar_wh VALUES (5, 'w5');
+
+statement ok
+PRAGMA refresh('mv_lat_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+    EXCEPT ALL SELECT * FROM mv_lat_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_scalar
+    EXCEPT ALL
+    (WITH numbers AS (SELECT generate_series AS n FROM generate_series(1, 5))
+     SELECT n, (SELECT w_name FROM lat_scalar_wh WHERE w_id = n) AS wh_name
+     FROM numbers)
+);
+----
+0
+
+# LATERAL table functions should keep original SQL for creation but still refresh incrementally.
+statement ok
+CREATE TABLE lat_wh (w_id INT, w_name VARCHAR);
+
+statement ok
+INSERT INTO lat_wh VALUES (1, 'w1'), (2, 'w2');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_series AS
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot);
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_series';
+----
+2
+
+statement ok
+INSERT INTO lat_wh VALUES (3, 'w3');
+
+statement ok
+PRAGMA refresh('mv_lat_series');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot)
+    EXCEPT ALL
+    SELECT * FROM mv_lat_series
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_series
+    EXCEPT ALL
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot)
+);
+----
+0
+
+statement ok
+INSERT INTO lat_history VALUES (1, 1, 7);
+
+statement ok
+UPDATE lat_history SET h_amount = 6 WHERE h_c_id = 2 AND h_c_w_id = 1 AND h_amount = 5;
+
+statement ok
+INSERT INTO lat_customer VALUES (3, 1);
+
+statement ok
+INSERT INTO lat_history VALUES (3, 1, 9);
+
+statement ok
+DELETE FROM lat_customer WHERE rowid = (SELECT min(rowid) FROM lat_customer WHERE c_id = 1 AND c_w_id = 1);
+
+statement ok
+PRAGMA refresh('mv_lat');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+    EXCEPT ALL SELECT * FROM mv_lat
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat
+    EXCEPT ALL
+    (SELECT c.c_id, c.c_w_id, lat.total_payments
+     FROM lat_customer c
+     JOIN LATERAL (
+         SELECT SUM(h_amount) AS total_payments
+         FROM lat_history
+         WHERE h_c_id = c.c_id AND h_c_w_id = c.c_w_id
+     ) lat ON true)
+);
+----
+0

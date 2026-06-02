@@ -1,0 +1,35 @@
+#include "match/view_catalog_index.hpp"
+
+namespace duckdb {
+namespace openivm {
+
+vector<ViewCandidate> ViewCatalogIndex::CandidatesForQuery(const vector<string> &query_source_tables,
+                                                           const vector<string> &query_group_columns,
+                                                           const vector<string> &query_output_columns) {
+	(void)query_source_tables;
+	(void)query_group_columns;
+	(void)query_output_columns;
+	// TODO: when dirty_, rebuild the filter tree from `openivm_views`;
+	// descend by (source-table bitmap → group cols → output cols) to a small
+	// leaf set; populate pending_row_estimate from `openivm_delta_tables`
+	// (refreshed if older than `openivm_match_estimate_ttl_ms`).
+	return {};
+}
+
+void ViewCatalogIndex::OnViewCreated(const string &view_name) {
+	(void)view_name;
+	dirty_ = true;
+}
+
+void ViewCatalogIndex::OnViewDropped(const string &view_name) {
+	(void)view_name;
+	dirty_ = true;
+}
+
+void ViewCatalogIndex::OnViewRefreshed(const string &view_name) {
+	(void)view_name;
+	// pending_row_estimate changes; tree structure unchanged.
+}
+
+} // namespace openivm
+} // namespace duckdb

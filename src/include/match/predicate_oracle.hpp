@@ -2,7 +2,7 @@
 //
 // Default mode 'interval' covers Goldstein-Larson range subsumption (<, <=,
 // >, >=, BETWEEN, IN on numeric/date/timestamp). Mode 'sat' is a stub for
-// future SAT/SMT integration. Mode selected via the `ivm_predicate_oracle`
+// future SAT/SMT integration. Mode selected via the `openivm_predicate_oracle`
 // setting.
 //
 // Returns a residual predicate when implication holds with extra view rows;
@@ -17,7 +17,7 @@
 #include "match/equivalence_classes.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 enum class ImplicationResult : uint8_t {
 	IMPLIED,          // p_q → p_v with no extra rows
@@ -40,12 +40,12 @@ public:
 
 private:
 	ClientContext &context_;
-	// Mode read from `ivm_predicate_oracle`: 'syntactic' | 'interval'
+	// Mode read from `openivm_predicate_oracle`: 'syntactic' | 'interval'
 	// (default) | 'sat' (stub).
 	string oracle_mode_;
 };
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb
 
 #endif

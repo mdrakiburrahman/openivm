@@ -1,8 +1,8 @@
 // Constraint cache for view matching.
 //
 // Lazy cache of `TableCatalogEntry::GetConstraints()` per table, persisted in
-// `_duckdb_ivm_constraints_cache`. Adds RELY-style trusted-but-not-enforced
-// FK declarations (Oracle/DB2 pattern) via `PRAGMA ivm_declare_rely_fk(...)`,
+// `openivm_constraints_cache`. Adds RELY-style trusted-but-not-enforced
+// FK declarations (Oracle/DB2 pattern) via `PRAGMA openivm_declare_rely_fk(...)`,
 // used by the matcher for join elimination.
 
 #ifndef OPENIVM_MATCH_CONSTRAINT_CACHE_HPP
@@ -14,7 +14,7 @@
 #include <unordered_map>
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 struct CachedConstraint {
 	string table_name;
@@ -47,7 +47,7 @@ private:
 	std::unordered_map<string, vector<CachedConstraint>> cache_;
 };
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb
 
 #endif

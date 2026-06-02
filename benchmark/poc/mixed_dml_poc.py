@@ -73,8 +73,8 @@ BYPASS = (
 	"GROUP BY o.o_region ORDER BY o_region;"
 )
 CASCADE = (
-	"SET ivm_cascade_refresh='downstream';\n"
-	"PRAGMA ivm('mv_a');\n"
+	"SET openivm_cascade_refresh='downstream';\n"
+	"PRAGMA refresh('mv_a');\n"
 	"SELECT o_region, revenue, cnt FROM mv_b ORDER BY o_region;"
 )
 STALE_RES = (
@@ -82,10 +82,10 @@ STALE_RES = (
 	"    SELECT o_region, revenue, cnt FROM mv_b "
 	"    UNION ALL "
 	"    SELECT o.o_region, "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 	"                    ELSE -dl.l_qty*dl.l_price END) AS revenue, "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
-	"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) AS cnt "
+	"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 	"    GROUP BY o.o_region "
 	") x GROUP BY o_region ORDER BY o_region;"
 )
@@ -177,7 +177,7 @@ def one_run(n_orders: int, avg_li: int, workload: str, n_affected: int, strategy
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
 		setup = setup_sql(n_orders, avg_li) + MV_A + MV_B
-		setup += "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\n"
+		setup += "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\n"
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}")
@@ -191,7 +191,7 @@ def correctness_check(n_orders: int, avg_li: int, workload: str, n_affected: int
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
 		setup = setup_sql(n_orders, avg_li) + MV_A + MV_B
-		setup += "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\n"
+		setup += "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\n"
 		run_sql(db, setup)
 		apply_workload(db, n_orders, n_lineitem, workload, n_affected)
 		bypass_res = collect_result(db, "bypass")
@@ -200,7 +200,7 @@ def correctness_check(n_orders: int, avg_li: int, workload: str, n_affected: int
 	with tempfile.TemporaryDirectory() as tmp2:
 		db2 = os.path.join(tmp2, "bench.db")
 		setup = setup_sql(n_orders, avg_li) + MV_A + MV_B
-		setup += "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\n"
+		setup += "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\n"
 		run_sql(db2, setup)
 		apply_workload(db2, n_orders, n_lineitem, workload, n_affected)
 		cascade_res = collect_result(db2, "cascade")
@@ -289,7 +289,7 @@ def main() -> int:
 					continue
 				rows.append({
 					"workload": w,
-					"delta_fraction": f,
+					"openivm_delta_fraction": f,
 					"n_affected": n_affected,
 					"strategy": strategy,
 					"reps": len(samples),
@@ -304,7 +304,7 @@ def main() -> int:
 		w = csv.DictWriter(
 			fp,
 			fieldnames=[
-				"workload", "delta_fraction", "n_affected",
+				"workload", "openivm_delta_fraction", "n_affected",
 				"strategy", "reps", "median_s", "min_s", "max_s",
 			],
 			extrasaction="ignore",
@@ -315,7 +315,7 @@ def main() -> int:
 	# === Summary ===
 	by: dict = {}
 	for r in rows:
-		by.setdefault(r["workload"], {}).setdefault(r["delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
+		by.setdefault(r["workload"], {}).setdefault(r["openivm_delta_fraction"], {})[r["strategy"]] = r["median_s"] * 1000
 	for workload in sorted(by):
 		print(f"\n=== {workload} ===")
 		print(f"{'delta':>8}  {'bypass':>8}  {'cascade':>8}  {'stl+res':>8}  winner        speedup")

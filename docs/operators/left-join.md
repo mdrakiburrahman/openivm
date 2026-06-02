@@ -27,7 +27,7 @@ Initial result:
 ```sql
 -- Bob gets an order: his NULL row is replaced with real data
 INSERT INTO orders VALUES (2, 'Bolt', 50);
-PRAGMA ivm('customer_orders');
+PRAGMA refresh('customer_orders');
 ```
 
 | name | product | amount |
@@ -59,7 +59,9 @@ The upsert uses **partial recompute** instead of counting-based consolidation:
 
 This avoids the complexity of tracking NULL↔non-NULL transitions incrementally. The cost is proportional to the number of affected left keys, not the total table size.
 
-The parser injects a hidden `_ivm_left_key` column containing the preserved-side join key (see [Metadata Columns](../internals/metadata-columns.md#_ivm_left_key)).
+The parser injects a hidden `openivm_left_key` column containing the preserved-side join key (see [Metadata Columns](../internals/metadata-columns.md#openivm_left_key)).
+
+For grouped aggregates over LEFT/RIGHT JOINs, OpenIVM uses the Larson & Zhou MERGE path by default (`openivm_left_join_merge=true`) when the aggregate shape is safe. Unsafe aggregate shapes use affected-group recompute instead.
 
 ## Compiled SQL (2-table join, 3 terms)
 
@@ -69,7 +71,7 @@ The parser injects a hidden `_ivm_left_key` column containing the preserved-side
 -- Term 1: new/deleted customers matched against current orders
 -- Left-side has deltas → keep LEFT JOIN semantics
 -- New customers with no orders correctly produce NULL-extended rows
-scan_0 = SELECT id, name, mul FROM delta_customers WHERE ts >= '...'
+scan_0 = SELECT id, name, mul FROM openivm_delta_customers WHERE ts >= '...'
 scan_1 = SELECT customer_id, product, amount FROM orders
 join_2 = scan_0 LEFT JOIN scan_1 ON (id = customer_id)
 
@@ -78,19 +80,19 @@ join_2 = scan_0 LEFT JOIN scan_1 ON (id = customer_id)
 -- We only want rows where the new order actually matches a customer
 -- (not every customer NULL-extended against the empty right side)
 scan_4 = SELECT id, name FROM customers
-scan_5 = SELECT customer_id, product, amount, mul FROM delta_orders WHERE ts >= '...'
+scan_5 = SELECT customer_id, product, amount, mul FROM openivm_delta_orders WHERE ts >= '...'
 join_6 = scan_4 INNER JOIN scan_5 ON (id = customer_id)
 
--- Term 3: delta_customers ⨝ delta_orders (cross-delta correction)
+-- Term 3: openivm_delta_customers ⨝ openivm_delta_orders (cross-delta correction)
 -- Left-side has deltas → keep LEFT JOIN semantics
 -- Combined multiplicity = (-1)^(k-1) * w1 * w2 with k=2 → (-1) * w1 * w2
 -- (Möbius inclusion-exclusion sign × Z-set bilinear product — see inner-join.md)
-join_11 = delta_customers LEFT JOIN delta_orders ON (id = customer_id)
+join_11 = openivm_delta_customers LEFT JOIN openivm_delta_orders ON (id = customer_id)
 projection_12 = SELECT ..., (-1) * mul1 * mul2 AS combined_mul FROM join_11
 
 -- Combine all terms into a single delta stream
 union_13 = term1 UNION ALL term2 UNION ALL term3
-INSERT INTO delta_customer_orders (..., _duckdb_ivm_multiplicity)
+INSERT INTO openivm_delta_customer_orders (..., openivm_multiplicity)
 SELECT ... FROM union_13;
 ```
 
@@ -100,9 +102,9 @@ SELECT ... FROM union_13;
 -- Step 1: find all left keys affected by this refresh cycle
 -- These are the customers whose rows may have changed
 -- Step 2: delete those customers' entire set of rows from the MV
-DELETE FROM customer_orders WHERE (_ivm_left_key) IN (
-    SELECT DISTINCT _ivm_left_key FROM delta_customer_orders
-    WHERE _duckdb_ivm_timestamp >= '{ts}'
+DELETE FROM customer_orders WHERE (openivm_left_key) IN (
+    SELECT DISTINCT openivm_left_key FROM openivm_delta_customer_orders
+    WHERE openivm_timestamp >= '{ts}'
 );
 
 -- Step 3: re-insert from the original query, filtered to affected keys only
@@ -112,12 +114,12 @@ DELETE FROM customer_orders WHERE (_ivm_left_key) IN (
 --   value→value (order amount changed)
 INSERT INTO customer_orders
 SELECT * FROM (
-    SELECT c.name, o.product, o.amount, c.id AS _ivm_left_key
+    SELECT c.name, o.product, o.amount, c.id AS openivm_left_key
     FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
-) _ivm_lj
-WHERE (_ivm_left_key) IN (
-    SELECT DISTINCT _ivm_left_key FROM delta_customer_orders
-    WHERE _duckdb_ivm_timestamp >= '{ts}'
+) openivm_lj
+WHERE (openivm_left_key) IN (
+    SELECT DISTINCT openivm_left_key FROM openivm_delta_customer_orders
+    WHERE openivm_timestamp >= '{ts}'
 );
 ```
 
@@ -150,6 +152,12 @@ The inclusion-exclusion generates 2^3 - 1 = 7 terms. Terms where only `bonuses` 
 ## Limitations
 
 - Partial recompute is proportional to the number of affected left keys, not the number of changed rows. If many left keys are affected, the recompute may scan a large portion of the base tables.
-- `AGGREGATE_GROUP` views with LEFT JOIN sources use group recompute (not the standard MERGE), since NULL handling in aggregate deltas is not decomposable.
-- **LEFT JOIN with a *computed* aggregate argument** (anything other than a plain bound column reference — `COALESCE`, `CASE`, an arithmetic expression, a constant) is also forced onto the group-recompute path even when the delta is insert-only. The Larson-Zhou MERGE template doesn't correctly handle the case where a new right-side row converts an existing NULL-padded row into a match for these expressions, so the classifier sets `has_minmax=true` (overloaded as a "use group-recompute" signal) and skips the MERGE fast path. See `src/upsert/openivm_compile_upsert.cpp:289–315`.
+- `AGGREGATE_GROUP` views with LEFT JOIN sources use MERGE only for supported aggregate shapes. If `openivm_left_join_merge=false`, or if the aggregate shape is unsafe, OpenIVM uses affected-group recompute.
+- **LEFT JOIN with a *computed* aggregate argument** (anything other than a plain bound column reference — `COALESCE`, `CASE`, an arithmetic expression, a constant) is also forced onto the group-recompute path even when the delta is insert-only. The Larson-Zhou MERGE template doesn't correctly handle the case where a new right-side row converts an existing NULL-padded row into a match for these expressions, so the classifier sets `has_minmax=true` (overloaded as a "use group-recompute" signal) and skips the MERGE fast path. See `src/upsert/refresh_compiler.cpp:289–315`.
 - Maximum 16 tables in the join (same limit as [inner join](inner-join.md)).
+
+## Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `openivm_left_join_merge` | `true` | Use incremental MERGE for supported LEFT/RIGHT JOIN aggregate views |

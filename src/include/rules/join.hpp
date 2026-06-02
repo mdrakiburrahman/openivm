@@ -1,5 +1,5 @@
-#ifndef IVM_JOIN_RULE_HPP
-#define IVM_JOIN_RULE_HPP
+#ifndef OPENIVM_JOIN_RULE_HPP
+#define OPENIVM_JOIN_RULE_HPP
 
 #include "rules/rule.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -25,9 +25,21 @@ void DemoteLeftJoins(LogicalOperator *node);
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf);
 
-class IvmJoinRule : public IvmRule {
+unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
+                                                 const vector<LogicalType> &types, Binder &binder);
+
+ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bindings,
+                                        unique_ptr<LogicalOperator> &result, LogicalOperator &root);
+
+class IncrementalJoinRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
+	// Join is bilinear: linear in each input separately. The delta rule expands
+	// to 2^N − 1 inclusion-exclusion terms (or N for DuckLake N-term telescoping),
+	// each weighted by the Z-set product times a Möbius sign.
+	Linearity GetLinearity() const override {
+		return Linearity::BILINEAR;
+	}
 };
 
 } // namespace duckdb

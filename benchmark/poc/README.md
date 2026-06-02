@@ -33,7 +33,7 @@ to re-run the join?
 
 ### 2M lineitem scale (500K orders × 4)
 
-| delta_frac | IVM (ms) | bypass (ms) | winner | speedup |
+| openivm_delta_frac | IVM (ms) | bypass (ms) | winner | speedup |
 |---|---|---|---|---|
 | 0.01%  | 31  | 44  | IVM    | 1.41x |
 | 1%     | 37  | 45  | IVM    | 1.22x |
@@ -47,7 +47,7 @@ Crossover: ~10-15% delta.
 
 ### 6M lineitem scale (1.5M orders × 4) — TPC-H SF1-ish
 
-| delta_frac | IVM (ms) | bypass (ms) | winner | speedup |
+| openivm_delta_frac | IVM (ms) | bypass (ms) | winner | speedup |
 |---|---|---|---|---|
 | 0.1%   | 35  | 103 | IVM    | 2.94x |
 | 1%     | 40  | 90  | IVM    | 2.28x |
@@ -107,7 +107,7 @@ Run: `python3 join_poc.py --n-orders 1500000 --avg-li 4 --reps 3`.
 
 1. **`CREATE MATERIALIZED VIEW` parser strips newlines between `AS` and
    `SELECT`** — had to collapse to single-line SQL. Check
-   `src/core/openivm_parser.cpp`.
+   `src/core/parser.cpp`.
 2. **`DROP MATERIALIZED VIEW` returns "Cannot drop this type yet"** — blocks
    the rebuild-strategy measurement.
 

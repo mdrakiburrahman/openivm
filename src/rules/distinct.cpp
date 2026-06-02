@@ -1,7 +1,7 @@
 #include "rules/distinct.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "rules/openivm_rewrite_rule.hpp"
+#include "rules/incremental_rewrite_rule.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -11,9 +11,9 @@
 
 namespace duckdb {
 
-ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
+ModifiedPlan IncrementalDistinctRule::Rewrite(PlanWrapper pw) {
 	auto *distinct_node = dynamic_cast<LogicalDistinct *>(pw.plan.get());
-	OPENIVM_DEBUG_PRINT("[IvmDistinctRule] Rewriting DISTINCT node, %zu targets\n",
+	OPENIVM_DEBUG_PRINT("[IncrementalDistinctRule] Rewriting DISTINCT node, %zu targets\n",
 	                    distinct_node->distinct_targets.size());
 
 	// Save the DISTINCT's output bindings before rewrite — these are what parent operators
@@ -22,7 +22,7 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
 
 	// 1. Recurse into child first (gets delta with multiplicity)
-	auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
+	auto child_mul = IncrementalRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
 	auto rewritten_child = std::move(child_mul.op);
 	ColumnBinding input_mul_binding = child_mul.mul_binding;
 
@@ -32,8 +32,8 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 
 	// 2. Build a LOGICAL_AGGREGATE_AND_GROUP_BY that replaces the DISTINCT node.
 	// Group-by keys = all child columns EXCEPT multiplicity
-	// Aggregate = COUNT(*) as _ivm_distinct_count
-	// Multiplicity is added as a group-by key (same as IvmAggregateRule)
+	// Aggregate = COUNT(*) as openivm_distinct_count
+	// Multiplicity is added as a group-by key (same as IncrementalAggregateRule)
 	idx_t group_index = binder.GenerateTableIndex();
 	idx_t aggregate_index = binder.GenerateTableIndex();
 
@@ -42,7 +42,7 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 	vector<unique_ptr<Expression>> count_args;
 	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
 	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = ivm::DISTINCT_COUNT_COL;
+	count_expr->alias = openivm::DISTINCT_COUNT_COL;
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(count_expr));
@@ -62,12 +62,12 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
 	}
 
-	// Add multiplicity as the last group-by key (same pattern as IvmAggregateRule)
+	// Add multiplicity as the last group-by key (same pattern as IncrementalAggregateRule)
 	ColumnBinding mod_mul_binding;
 	mod_mul_binding.column_index = agg_node->groups.size();
 	mod_mul_binding.table_index = group_index;
 
-	auto mul_expr = make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, input_mul_binding);
+	auto mul_expr = make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, pw.mul_type, input_mul_binding);
 	grouping_set.insert(agg_node->groups.size());
 	agg_node->groups.push_back(std::move(mul_expr));
 	agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(pw.mul_type)));
@@ -100,7 +100,7 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 	replacer.stop_operator = pw.plan.get();
 	replacer.VisitOperator(*pw.root);
 
-	OPENIVM_DEBUG_PRINT("[IvmDistinctRule] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
+	OPENIVM_DEBUG_PRINT("[IncrementalDistinctRule] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
 	                    "table=%lu col=%lu\n",
 	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index,
 	                    (unsigned long)mod_mul_binding.column_index);

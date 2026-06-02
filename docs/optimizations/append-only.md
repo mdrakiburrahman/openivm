@@ -21,22 +21,22 @@ cleanup steps during refresh:
 
 | Setting | Default | Description |
 |---|---|---|
-| `ivm_skip_aggregate_delete` | `true` | Skip zero-row DELETE for grouped aggregates when insert-only |
-| `ivm_skip_projection_delete` | `true` | Skip DELETE and consolidation for projections when insert-only |
-| `ivm_minmax_incremental` | `true` | Use GREATEST/LEAST for MIN/MAX when insert-only |
+| `openivm_skip_aggregate_delete` | `true` | Skip zero-row DELETE for grouped aggregates when insert-only |
+| `openivm_skip_projection_delete` | `true` | Skip DELETE and consolidation for projections when insert-only |
+| `openivm_minmax_incremental` | `true` | Use GREATEST/LEAST for MIN/MAX when insert-only |
 
 Set to `false` to disable and fall back to the traditional IVM path:
 ```sql
-SET ivm_skip_aggregate_delete = false;
-SET ivm_skip_projection_delete = false;
-SET ivm_minmax_incremental = false;
+SET openivm_skip_aggregate_delete = false;
+SET openivm_skip_projection_delete = false;
+SET openivm_minmax_incremental = false;
 ```
 
 ## When it applies
 
 The optimization activates when two conditions are met:
 
-1. **All base table deltas are insert-only** — no rows with `_duckdb_ivm_multiplicity < 0`.
+1. **All base table deltas are insert-only** — no rows with `openivm_multiplicity < 0`.
 2. **The delta view produces only insert rows** — the join's Möbius inclusion-exclusion sign times the leaf weights doesn't produce any negative-weight rows.
 
 Condition 2 depends on the join rule used:
@@ -66,8 +66,8 @@ At refresh time, before compiling the upsert SQL:
 
 **Standard tables**: Query each delta table for delete rows:
 ```sql
-SELECT COUNT(*) FROM delta_table
-WHERE _duckdb_ivm_timestamp >= last_update AND _duckdb_ivm_multiplicity < 0
+SELECT COUNT(*) FROM openivm_delta_table
+WHERE openivm_timestamp >= last_update AND openivm_multiplicity < 0
 ```
 Also checks total row count to determine if the delta is empty (no changes at all).
 
@@ -83,8 +83,8 @@ semantics without needing a `GROUP BY` consolidation:
 ```sql
 INSERT INTO mv
 SELECT <data columns>
-FROM delta_view, generate_series(1, _duckdb_ivm_multiplicity::BIGINT)
-WHERE _duckdb_ivm_multiplicity > 0;
+FROM openivm_delta_view, generate_series(1, openivm_multiplicity::BIGINT)
+WHERE openivm_multiplicity > 0;
 ```
 
 The `generate_series(1, _w)` cross-product replicates each row exactly `_w` times. For the
@@ -101,4 +101,4 @@ and the fan-out happens here rather than in a join's UNION ALL.
 | MIN/MAX group-recompute | Delete affected groups + re-query from base | **MERGE with GREATEST/LEAST** |
 | Net consolidation (projections) | `GROUP BY all_cols HAVING SUM(_w) != 0` | **Skipped** |
 | ROW_NUMBER DELETE (projections) | Window function + JOIN to find rows to remove | **Skipped** |
-| INSERT (projections) | `generate_series(1, _net)` from the consolidated CTE | Direct `INSERT FROM delta_view, generate_series(1, _w) WHERE _w > 0` (no consolidation CTE) |
+| INSERT (projections) | `generate_series(1, _net)` from the consolidated CTE | Direct `INSERT FROM openivm_delta_view, generate_series(1, _w) WHERE _w > 0` (no consolidation CTE) |

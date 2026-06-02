@@ -12,7 +12,7 @@ CREATE MATERIALIZED VIEW emp_names AS
     SELECT id, name FROM employees;
 
 INSERT INTO employees VALUES (3, 'Charlie', 'Eng');
-PRAGMA ivm('emp_names');
+PRAGMA refresh('emp_names');
 ```
 
 Expressions in SELECT such as `a * 2`, `b + c`, and `CASE WHEN` work transparently — they are applied to the delta rows the same way they would be applied to the base rows.
@@ -32,7 +32,7 @@ CREATE MATERIALIZED VIEW cheap_products AS
     SELECT id, name, price FROM products WHERE price < 20;
 
 INSERT INTO products VALUES (3, 'Bolt', 5);
-PRAGMA ivm('cheap_products');
+PRAGMA refresh('cheap_products');
 ```
 
 ## How IVM handles it
@@ -58,18 +58,18 @@ For deletes, OpenIVM first joins the net-negative tuples to the MV data table an
 ```sql
 -- Scan the delta table for rows changed since the last refresh
 -- Each row carries the original columns plus a multiplicity flag
-WITH scan_0 (t0_id, t0_name, t0__duckdb_ivm_multiplicity) AS (
-    SELECT id, name, _duckdb_ivm_multiplicity
-    FROM delta_employees
-    WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
+WITH scan_0 (t0_id, t0_name, t0_openivm_multiplicity) AS (
+    SELECT id, name, openivm_multiplicity
+    FROM openivm_delta_employees
+    WHERE openivm_timestamp >= '{ts}'::TIMESTAMP
 ),
 -- Apply the same projection as the view definition
 -- The projection is "free" — just pass through the requested columns
-projection_1 (t1_id, t1_name, t1__duckdb_ivm_multiplicity) AS (
-    SELECT t0_id, t0_name, t0__duckdb_ivm_multiplicity
+projection_1 (t1_id, t1_name, t1_openivm_multiplicity) AS (
+    SELECT t0_id, t0_name, t0_openivm_multiplicity
     FROM scan_0
 )
-INSERT INTO delta_emp_names (id, name, _duckdb_ivm_multiplicity)
+INSERT INTO openivm_delta_emp_names (id, name, openivm_multiplicity)
 SELECT * FROM projection_1;
 ```
 
@@ -79,10 +79,10 @@ SELECT * FROM projection_1;
 
 ```sql
 -- Scan the delta table for rows changed since the last refresh
-WITH scan_0 (t0_id, t0_name, t0_price, t0__duckdb_ivm_multiplicity) AS (
-    SELECT id, name, price, _duckdb_ivm_multiplicity
-    FROM delta_products
-    WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
+WITH scan_0 (t0_id, t0_name, t0_price, t0_openivm_multiplicity) AS (
+    SELECT id, name, price, openivm_multiplicity
+    FROM openivm_delta_products
+    WHERE openivm_timestamp >= '{ts}'::TIMESTAMP
 ),
 -- Apply the WHERE predicate to the delta rows
 -- Only rows that satisfy the filter are propagated — the rest are irrelevant
@@ -90,11 +90,11 @@ filter_1 AS (
     SELECT * FROM scan_0
     WHERE (t0_price) < (20)
 ),
-projection_2 (t1_id, t1_name, t1_price, t1__duckdb_ivm_multiplicity) AS (
-    SELECT t0_id, t0_name, t0_price, t0__duckdb_ivm_multiplicity
+projection_2 (t1_id, t1_name, t1_price, t1_openivm_multiplicity) AS (
+    SELECT t0_id, t0_name, t0_price, t0_openivm_multiplicity
     FROM filter_1
 )
-INSERT INTO delta_cheap_products (id, name, price, _duckdb_ivm_multiplicity)
+INSERT INTO openivm_delta_cheap_products (id, name, price, openivm_multiplicity)
 SELECT * FROM projection_2;
 ```
 
@@ -112,46 +112,46 @@ The upsert is identical for projection and filter views. Shown here for the proj
 -- Join negative net tuples to the MV first, then rank only matched candidates.
 -- ROW_NUMBER assigns a deterministic ordering within each group of identical
 -- tuples, so exactly |_net| copies are removed starting from the lowest rowid.
-WITH _ivm_net AS (
+WITH openivm_net AS (
     SELECT id, name,
-        SUM(_duckdb_ivm_multiplicity) AS _net
-    FROM delta_emp_names
-    WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
+        SUM(openivm_multiplicity) AS _net
+    FROM openivm_delta_emp_names
+    WHERE openivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, name
-    HAVING SUM(_duckdb_ivm_multiplicity) != 0
+    HAVING SUM(openivm_multiplicity) != 0
 ),
-_ivm_delete_net AS (
-    SELECT * FROM _ivm_net WHERE _net < 0
+openivm_delete_net AS (
+    SELECT * FROM openivm_net WHERE _net < 0
 ),
-_ivm_delete_candidates AS (
+openivm_delete_candidates AS (
     SELECT v.rowid, v.id AS id, v.name AS name, d._net
     FROM emp_names v
-    JOIN _ivm_delete_net d
+    JOIN openivm_delete_net d
       ON v.id IS NOT DISTINCT FROM d.id
      AND v.name IS NOT DISTINCT FROM d.name
 ),
-_ivm_ranked_deletes AS (
+openivm_ranked_deletes AS (
     SELECT rowid, _net,
         ROW_NUMBER() OVER (PARTITION BY id, name ORDER BY rowid) AS _rn
-    FROM _ivm_delete_candidates
+    FROM openivm_delete_candidates
 )
 DELETE FROM emp_names WHERE rowid IN (
-    SELECT rowid FROM _ivm_ranked_deletes WHERE _rn <= -_net
+    SELECT rowid FROM openivm_ranked_deletes WHERE _rn <= -_net
 );
 
 -- Step 3: insert net-added copies
 -- generate_series(1, _net) replicates the tuple _net times for bag semantics
-WITH _ivm_net AS (
+WITH openivm_net AS (
     SELECT id, name,
-        SUM(_duckdb_ivm_multiplicity) AS _net
-    FROM delta_emp_names
-    WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
+        SUM(openivm_multiplicity) AS _net
+    FROM openivm_delta_emp_names
+    WHERE openivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, name
-    HAVING SUM(_duckdb_ivm_multiplicity) != 0
+    HAVING SUM(openivm_multiplicity) != 0
 )
 INSERT INTO emp_names SELECT id, name
-FROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)
-WHERE _ivm_net._net > 0;
+FROM openivm_net, generate_series(1, openivm_net._net::BIGINT)
+WHERE openivm_net._net > 0;
 ```
 
 ## Limitations

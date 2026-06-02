@@ -57,7 +57,7 @@ SELECT i, i%{n_orders}, i%500, 1+(i%10), ((i*2654435761)%1000000)/100.0
 FROM range({n_lineitem}) t(i);
 CREATE MATERIALIZED VIEW mv_a AS SELECT o.o_region, l.l_product, SUM(l.l_qty*l.l_price) AS revenue, COUNT(*) AS cnt FROM lineitem l JOIN orders o ON l.l_order_id=o.o_id GROUP BY o.o_region, l.l_product;
 CREATE MATERIALIZED VIEW mv_b AS SELECT o_region, SUM(revenue) AS revenue, SUM(cnt) AS cnt FROM mv_a GROUP BY o_region;
-PRAGMA ivm('mv_a'); PRAGMA ivm('mv_b');
+PRAGMA refresh('mv_a'); PRAGMA refresh('mv_b');
 """
 
 
@@ -72,16 +72,16 @@ STALE_RES = (
 	"    SELECT o_region, revenue, cnt FROM mv_b "
 	"    UNION ALL "
 	"    SELECT o.o_region, "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN dl.l_qty*dl.l_price "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN dl.l_qty*dl.l_price "
 	"                    ELSE -dl.l_qty*dl.l_price END), "
-	"           SUM(CASE WHEN dl._duckdb_ivm_multiplicity THEN 1 ELSE -1 END) "
-	"    FROM delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
+	"           SUM(CASE WHEN dl.openivm_multiplicity THEN 1 ELSE -1 END) "
+	"    FROM openivm_delta_lineitem dl JOIN orders o ON dl.l_order_id=o.o_id "
 	"    GROUP BY o.o_region "
 	") x GROUP BY o_region;"
 )
 CASCADE = (
-	"SET ivm_cascade_refresh='downstream';\n"
-	"PRAGMA ivm('mv_a');\n"
+	"SET openivm_cascade_refresh='downstream';\n"
+	"PRAGMA refresh('mv_a');\n"
 )
 
 
@@ -138,15 +138,15 @@ def scenario_hybrid(db: str, n_queries: int) -> float:
 	return time.perf_counter() - start
 
 
-def one_run(n_orders: int, avg_li: int, delta_fraction: float, n_queries: int, strategy: str) -> float:
+def one_run(n_orders: int, avg_li: int, openivm_delta_fraction: float, n_queries: int, strategy: str) -> float:
 	n_lineitem = n_orders * avg_li
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
 		out, err, rc = run_sql(db, setup(n_orders, avg_li))
 		if rc != 0:
 			raise RuntimeError(f"setup: {err}")
-		delta_rows = max(1, int(n_lineitem * delta_fraction))
-		run_sql(db, insert_delta_sql(n_lineitem, delta_rows, n_orders))
+		openivm_delta_rows = max(1, int(n_lineitem * openivm_delta_fraction))
+		run_sql(db, insert_delta_sql(n_lineitem, openivm_delta_rows, n_orders))
 		if strategy == "bypass_N":
 			return scenario_bypass_N(db, n_queries)
 		elif strategy == "cascade_once_N":

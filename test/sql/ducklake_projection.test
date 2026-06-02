@@ -29,22 +29,22 @@ statement ok
 CREATE MATERIALIZED VIEW dl.mv_emp AS SELECT id, name FROM dl.employees;
 
 statement ok
-SET ivm_profile_refresh = true;
+SET openivm_profile_refresh = true;
 
 # --- INSERT propagation ---
 statement ok
 INSERT INTO dl.employees VALUES (4, 'Diana', 'ops');
 
 statement ok
-PRAGMA ivm('mv_emp');
+PRAGMA refresh('mv_emp');
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('metadata_pre_sql', 'metadata_post_sql');
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('metadata_pre_sql', 'metadata_post_sql');
 ----
 2
 
 query I
-SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
 ----
 3
 
@@ -71,15 +71,15 @@ statement ok
 DELETE FROM dl.employees WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_emp');
+PRAGMA refresh('mv_emp');
 
 query I
-SELECT count(DISTINCT refresh_id) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_emp';
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile WHERE view_name = 'mv_emp';
 ----
 2
 
 statement ok
-SET ivm_profile_refresh = false;
+SET openivm_profile_refresh = false;
 
 query I
 SELECT COUNT(*) FROM (
@@ -120,7 +120,7 @@ statement ok
 DELETE FROM dl.products WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_prod');
+PRAGMA refresh('mv_prod');
 
 query I
 SELECT COUNT(*) FROM (
@@ -145,7 +145,7 @@ statement ok
 UPDATE dl.products SET price = 30.00 WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_prod');
+PRAGMA refresh('mv_prod');
 
 query I
 SELECT COUNT(*) FROM (
@@ -189,7 +189,7 @@ statement ok
 UPDATE dl.stress SET val = 'A' WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_stress');
+PRAGMA refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (
@@ -223,7 +223,7 @@ statement ok
 DELETE FROM dl.stress WHERE id = 3;
 
 statement ok
-PRAGMA ivm('mv_stress');
+PRAGMA refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (
@@ -260,7 +260,7 @@ statement ok
 INSERT INTO dl.stress VALUES (30, 'z');
 
 statement ok
-PRAGMA ivm('mv_stress');
+PRAGMA refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (
@@ -285,7 +285,7 @@ statement ok
 DELETE FROM dl.stress;
 
 statement ok
-PRAGMA ivm('mv_stress');
+PRAGMA refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM dl.mv_stress;
@@ -305,7 +305,7 @@ statement ok
 INSERT INTO dl.stress VALUES (10, 'new'), (10, 'new'), (11, 'also');
 
 statement ok
-PRAGMA ivm('mv_stress');
+PRAGMA refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (
@@ -327,7 +327,7 @@ SELECT COUNT(*) FROM (
 
 # --- Round 5: No-op refresh (no changes) ---
 statement ok
-PRAGMA ivm('mv_stress');
+PRAGMA refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (
@@ -363,7 +363,7 @@ CREATE MATERIALIZED VIEW dl.topkp_mv AS
     SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3;
 
 statement ok
-PRAGMA ivm('topkp_mv');
+PRAGMA refresh('topkp_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -379,6 +379,272 @@ SELECT COUNT(*) FROM (
     SELECT * FROM (SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3) _q
     EXCEPT ALL
     SELECT id, name, score FROM dl.topkp_mv
+);
+----
+0
+
+# ==========================================
+# 6. DuckLake catalog names are not hardcoded to dl
+# ==========================================
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_projection_alt.db' AS lakecat (TYPE ducklake);
+
+statement ok
+CREATE TABLE lakecat.alt_src (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO lakecat.alt_src VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW lakecat.alt_mv AS SELECT id, name FROM lakecat.alt_src;
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('openivm_data_alt_mv', 'openivm_delta_alt_mv');
+----
+2
+
+query I
+SELECT count(*) FROM openivm_delta_tables
+WHERE view_name = 'alt_mv'
+  AND table_name = 'alt_src'
+  AND source_catalog = 'lakecat';
+----
+1
+
+statement ok
+INSERT INTO lakecat.alt_src VALUES (3, 'three');
+
+statement ok
+PRAGMA refresh_options('lakecat', 'main', 'alt_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM lakecat.alt_src
+    EXCEPT ALL
+    SELECT id, name FROM lakecat.alt_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM lakecat.alt_mv
+    EXCEPT ALL
+    SELECT id, name FROM lakecat.alt_src
+);
+----
+0
+
+statement ok
+USE lakecat.main;
+
+statement ok
+CREATE MATERIALIZED VIEW alt_mv_from_use AS SELECT id, name FROM alt_src;
+
+statement ok
+USE memory.main;
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('openivm_data_alt_mv_from_use', 'openivm_delta_alt_mv_from_use');
+----
+2
+
+query I
+SELECT count(*) FROM openivm_delta_tables
+WHERE view_name = 'alt_mv_from_use'
+  AND table_name = 'alt_src'
+  AND source_catalog = 'lakecat';
+----
+1
+
+statement ok
+INSERT INTO lakecat.alt_src VALUES (4, 'four');
+
+statement ok
+PRAGMA refresh_options('lakecat', 'main', 'alt_mv_from_use');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM lakecat.alt_src
+    EXCEPT ALL
+    SELECT id, name FROM lakecat.alt_mv_from_use
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM lakecat.alt_mv_from_use
+    EXCEPT ALL
+    SELECT id, name FROM lakecat.alt_src
+);
+----
+0
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_projection_alt2.db' AS lakecat2 (TYPE ducklake);
+
+statement ok
+CREATE TABLE lakecat.cat_a (id INT, v INT);
+
+statement ok
+CREATE TABLE lakecat2.cat_b (id INT, label VARCHAR);
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW lakecat.mv_two_catalogs AS
+SELECT a.id, a.v, b.label
+FROM lakecat.cat_a a
+JOIN lakecat2.cat_b b USING (id);
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('openivm_data_mv_two_catalogs', 'openivm_delta_mv_two_catalogs');
+----
+2
+
+query II rowsort
+SELECT table_name, source_catalog
+FROM openivm_delta_tables
+WHERE view_name = 'mv_two_catalogs'
+ORDER BY table_name;
+----
+cat_a	lakecat
+cat_b	lakecat2
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (3, 30);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (3, 'three');
+
+statement ok
+PRAGMA refresh_options('lakecat', 'main', 'mv_two_catalogs');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+    EXCEPT ALL
+    SELECT id, v, label FROM lakecat.mv_two_catalogs
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, v, label FROM lakecat.mv_two_catalogs
+    EXCEPT ALL
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+);
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW lakecat2.mv_two_catalogs_inverse AS
+SELECT a.id, a.v, b.label
+FROM lakecat.cat_a a
+JOIN lakecat2.cat_b b USING (id);
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat2'
+  AND table_schema = 'main'
+  AND table_name IN ('openivm_data_mv_two_catalogs_inverse', 'openivm_delta_mv_two_catalogs_inverse');
+----
+2
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('openivm_data_mv_two_catalogs_inverse', 'openivm_delta_mv_two_catalogs_inverse');
+----
+0
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (4, 40);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (4, 'four');
+
+statement ok
+PRAGMA refresh_options('lakecat2', 'main', 'mv_two_catalogs_inverse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+    EXCEPT ALL
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_inverse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_inverse
+    EXCEPT ALL
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+);
+----
+0
+
+statement ok
+USE lakecat2.main;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_two_catalogs_from_use AS
+SELECT a.id, a.v, b.label
+FROM lakecat.cat_a a
+JOIN cat_b b USING (id);
+
+statement ok
+USE memory.main;
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat2'
+  AND table_schema = 'main'
+  AND table_name IN ('openivm_data_mv_two_catalogs_from_use', 'openivm_delta_mv_two_catalogs_from_use');
+----
+2
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (5, 50);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (5, 'five');
+
+statement ok
+PRAGMA refresh_options('lakecat2', 'main', 'mv_two_catalogs_from_use');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+    EXCEPT ALL
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_from_use
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_from_use
+    EXCEPT ALL
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
 );
 ----
 0
@@ -401,7 +667,7 @@ CREATE MATERIALIZED VIEW dl.mv_value_join AS
       ON c.credit = v.credit;
 
 query I
-SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_value_join';
+SELECT type FROM openivm_views WHERE view_name = 'mv_value_join';
 ----
 2
 
@@ -409,7 +675,7 @@ statement ok
 UPDATE dl.value_customers SET credit = 'GC' WHERE id = 3;
 
 statement ok
-PRAGMA ivm('mv_value_join');
+PRAGMA refresh('mv_value_join');
 
 query I
 SELECT COUNT(*) FROM (
@@ -440,7 +706,7 @@ statement ok
 INSERT INTO dl.topkp VALUES (6,'frank',99);
 
 statement ok
-PRAGMA ivm('topkp_mv');
+PRAGMA refresh('topkp_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -471,7 +737,7 @@ statement ok
 UPDATE dl.topkp SET score = 50 WHERE id = 2;
 
 statement ok
-PRAGMA ivm('topkp_mv');
+PRAGMA refresh('topkp_mv');
 
 query I
 SELECT COUNT(*) FROM (

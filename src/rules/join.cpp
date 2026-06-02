@@ -1,11 +1,10 @@
 #include "rules/join.hpp"
 #include "rules/ducklake_join.hpp"
-#include "rules/openivm_rewrite_rule.hpp"
-#include "core/ivm_delta_model.hpp"
+#include "rules/incremental_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "core/openivm_utils.hpp"
-#include "upsert/openivm_index_regen.hpp"
+#include "core/sql_utils.hpp"
+#include "upsert/refresh_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/constraint.hpp"
@@ -20,10 +19,8 @@
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
-#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_set_operation.hpp"
 
 namespace duckdb {
 
@@ -31,8 +28,18 @@ static uint64_t BindingKey(const ColumnBinding &binding) {
 	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
 }
 
+static idx_t CountBits(uint64_t value) {
+	idx_t count = 0;
+	while (value) {
+		count += value & 1ULL;
+		value >>= 1ULL;
+	}
+	return count;
+}
+
 struct JoinColumnRef {
 	size_t leaf_index;
+	LogicalGet *get;
 	string table_name;
 	string delta_name;
 	string column_name;
@@ -74,6 +81,8 @@ static void CollectJoinKeyProbes(LogicalOperator *node, const unordered_map<uint
 				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
 					continue;
 				}
+				OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Join key bindings: %s = %s\n",
+				                    left_binding.ToString().c_str(), right_binding.ToString().c_str());
 				auto left_entry = column_refs.find(BindingKey(left_binding));
 				auto right_entry = column_refs.find(BindingKey(right_binding));
 				if (left_entry == column_refs.end() || right_entry == column_refs.end()) {
@@ -94,17 +103,44 @@ static void CollectJoinKeyProbes(LogicalOperator *node, const unordered_map<uint
 	}
 }
 
+static string QualifyColumn(const string &alias, const string &column_name) {
+	return alias + "." + SqlUtils::QuoteIdentifier(column_name);
+}
+
+static string BuildPushedFilterSQL(LogicalGet &get, const string &alias) {
+	string filters;
+	for (auto &entry : get.table_filters.filters) {
+		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+			continue;
+		}
+		auto col_name = get.GetColumnName(ColumnIndex(entry.first));
+		if (!filters.empty()) {
+			filters += " AND ";
+		}
+		filters += "(" + entry.second->ToString(QualifyColumn(alias, col_name)) + ")";
+	}
+	return filters;
+}
+
+static string AppendFilterSQL(const string &predicate) {
+	return predicate.empty() ? string() : " AND " + predicate;
+}
+
 static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref, const string &delta_column,
                                  const JoinColumnRef &other_ref, const string &other_column) {
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + OpenIVMUtils::QuoteIdentifier(delta_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(delta_ref.delta_name) + " WHERE " +
-	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(delta_ref.last_update) +
-	             "'::TIMESTAMP) _ivm_delta_keys JOIN " + OpenIVMUtils::QuoteIdentifier(other_ref.table_name) +
-	             " _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." + OpenIVMUtils::QuoteIdentifier(other_column) +
-	             " LIMIT 1)";
+	string delta_filter = delta_ref.get ? BuildPushedFilterSQL(*delta_ref.get, "openivm_delta") : string();
+	string other_filter = other_ref.get ? BuildPushedFilterSQL(*other_ref.get, "openivm_other") : string();
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_delta", delta_column) +
+	             " AS openivm_key FROM " + SqlUtils::QuoteIdentifier(delta_ref.delta_name) + " openivm_delta WHERE " +
+	             QualifyColumn("openivm_delta", openivm::TIMESTAMP_COL) + " >= '" +
+	             SqlUtils::EscapeValue(delta_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(delta_filter) +
+	             ") openivm_delta_keys JOIN " + SqlUtils::QuoteIdentifier(other_ref.table_name) +
+	             " openivm_other ON openivm_delta_keys.openivm_key = " + QualifyColumn("openivm_other", other_column) +
+	             (other_filter.empty() ? string() : " WHERE " + other_filter) + " LIMIT 1)";
+	OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Key probe SQL: %s\n", sql.c_str());
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Could not probe key-domain intersection: %s\n",
+		OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Could not probe key-domain intersection: %s\n",
 		                    result->HasError() ? result->GetError().c_str() : "no result");
 		return true;
 	}
@@ -113,17 +149,22 @@ static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref
 
 static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref, const string &left_column,
                                   const JoinColumnRef &right_ref, const string &right_column) {
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + OpenIVMUtils::QuoteIdentifier(left_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(left_ref.delta_name) + " WHERE " +
-	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(left_ref.last_update) +
-	             "'::TIMESTAMP) _ivm_left_delta_keys JOIN (SELECT " + OpenIVMUtils::QuoteIdentifier(right_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(right_ref.delta_name) + " WHERE " +
-	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(right_ref.last_update) +
-	             "'::TIMESTAMP) _ivm_right_delta_keys ON _ivm_left_delta_keys._ivm_key = "
-	             "_ivm_right_delta_keys._ivm_key LIMIT 1)";
+	string left_filter = left_ref.get ? BuildPushedFilterSQL(*left_ref.get, "openivm_left_delta") : string();
+	string right_filter = right_ref.get ? BuildPushedFilterSQL(*right_ref.get, "openivm_right_delta") : string();
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_left_delta", left_column) +
+	             " AS openivm_key FROM " + SqlUtils::QuoteIdentifier(left_ref.delta_name) +
+	             " openivm_left_delta WHERE " + QualifyColumn("openivm_left_delta", openivm::TIMESTAMP_COL) + " >= '" +
+	             SqlUtils::EscapeValue(left_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(left_filter) +
+	             ") openivm_left_delta_keys JOIN (SELECT " + QualifyColumn("openivm_right_delta", right_column) +
+	             " AS openivm_key FROM " + SqlUtils::QuoteIdentifier(right_ref.delta_name) +
+	             " openivm_right_delta WHERE " + QualifyColumn("openivm_right_delta", openivm::TIMESTAMP_COL) +
+	             " >= '" + SqlUtils::EscapeValue(right_ref.last_update) + "'::TIMESTAMP" +
+	             AppendFilterSQL(right_filter) +
+	             ") openivm_right_delta_keys ON openivm_left_delta_keys.openivm_key = "
+	             "openivm_right_delta_keys.openivm_key LIMIT 1)";
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Could not probe delta key-domain intersection: %s\n",
+		OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Could not probe delta key-domain intersection: %s\n",
 		                    result->HasError() ? result->GetError().c_str() : "no result");
 		return true;
 	}
@@ -136,7 +177,7 @@ static void CollectExistingMultiplicityBindings(LogicalOperator *node, unordered
 	}
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
-		if (!ref.bound_columns.empty() && ref.bound_columns.back() == ivm::MULTIPLICITY_COL) {
+		if (!ref.bound_columns.empty() && ref.bound_columns.back() == openivm::MULTIPLICITY_COL) {
 			auto bindings = node->GetColumnBindings();
 			if (!bindings.empty()) {
 				mul_set.insert(BindingKey(bindings.back()));
@@ -220,13 +261,23 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		}
 		auto bindings = get->GetColumnBindings();
 		auto &column_ids = get->GetColumnIds();
-		idx_t count = std::min<idx_t>(bindings.size(), column_ids.size());
+		idx_t count = bindings.size();
 		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
-			if (BindingKey(bindings[col_idx]) != BindingKey(binding) || column_ids[col_idx].IsVirtualColumn()) {
+			if (BindingKey(bindings[col_idx]) != BindingKey(binding)) {
 				continue;
 			}
+			idx_t column_id_idx = col_idx;
+			if (!get->projection_ids.empty()) {
+				if (col_idx >= get->projection_ids.size()) {
+					return false;
+				}
+				column_id_idx = get->projection_ids[col_idx];
+			}
+			if (column_id_idx >= column_ids.size() || column_ids[column_id_idx].IsVirtualColumn()) {
+				return false;
+			}
 			table_name = get->GetTable().get()->name;
-			column_name = get->GetColumnName(column_ids[col_idx]);
+			column_name = get->GetColumnName(column_ids[column_id_idx]);
 			return true;
 		}
 		return false;
@@ -245,6 +296,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 			}
 			return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_binding, table_name, column_name);
 		}
+		return false;
 	}
 	if (node->children.size() == 1) {
 		auto bindings = node->GetColumnBindings();
@@ -347,7 +399,7 @@ void DemoteLeftJoins(LogicalOperator *node) {
 // This subsumes the previous global demote conditions without over-demoting in
 // chained-LJ shapes. For FULL OUTER aggregate views the upsert MERGE relies on
 // the IE delta containing only the matched-via-Δ portion (the unmatched parts
-// are tracked separately via _ivm_match_count); failing to demote there would
+// are tracked separately via openivm_match_count); failing to demote there would
 // leak phantom unmatched rows for groups untouched by the delta.
 static bool SubtreeHasDeltaLeaf(const vector<JoinLeafInfo> &leaves, uint64_t mask, const vector<size_t> &prefix) {
 	for (size_t i = 0; i < leaves.size(); i++) {
@@ -415,7 +467,7 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 			if (!proj_map.empty()) {
 				idx_t mul_idx = leaf.node->GetColumnBindings().size();
 				proj_map.push_back(mul_idx);
-				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
+				OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
 				                    child_side == 0 ? "left" : "right");
 			}
 		}
@@ -430,13 +482,15 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 struct DeltaStatus {
 	uint64_t insert_only_mask; // bit i=1: leaf i has no delete rows (insert-only or empty)
 	uint64_t empty_mask;       // bit i=1: leaf i has zero pending delta rows
+	uint64_t constant_mask;    // bit i=1: leaf has no mutable source table
+	uint64_t tiny_mask;        // bit i=1: leaf has a tiny non-empty delta
 };
 
 /// For each leaf, detect delta status in a single query per table.
 /// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
 static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_name,
                                      const vector<JoinLeafInfo> &leaves) {
-	DeltaStatus status = {0, 0};
+	DeltaStatus status = {0, 0, 0, 0};
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
 
@@ -450,7 +504,8 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 			if (IsConstantLeafSubtree(leaves[i].node)) {
 				status.empty_mask |= (1ULL << i);
 				status.insert_only_mask |= (1ULL << i);
-				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (constant values) has empty delta\n", i);
+				status.constant_mask |= (1ULL << i);
+				OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Leaf %zu (constant values) has empty delta\n", i);
 			}
 			continue;
 		}
@@ -465,39 +520,59 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 			// a non-changing input.
 			status.empty_mask |= (1ULL << i);
 			status.insert_only_mask |= (1ULL << i);
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (table function '%s') has empty delta\n", i,
+			status.constant_mask |= (1ULL << i);
+			OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Leaf %zu (table function '%s') has empty delta\n", i,
 			                    get->function.name.c_str());
 			continue;
 		}
-		string delta_name = OpenIVMUtils::DeltaName(table_ref.get()->name);
+		string delta_name = SqlUtils::DeltaName(table_ref.get()->name);
 		// Get last_update timestamp for this view+table pair
-		auto ts_result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                           " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
-		                           "' AND table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+		auto ts_result = con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                           " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+		                           SqlUtils::EscapeValue(delta_name) + "'");
 		if (ts_result->HasError() || ts_result->RowCount() == 0) {
 			continue;
 		}
 		string last_update = ts_result->GetValue(0, 0).ToString();
 
-		// Single query: get total row count and delete count since last_update
+		// Single query: get pending delta count, delete count, and current base
+		// cardinality. The base count lets us define "tiny" as <= max(8 rows,
+		// 5% of the source table), avoiding both a hard-coded absolute-only
+		// threshold and silly behavior on very small tables.
 		auto result =
-		    con.Query("SELECT COUNT(*), COUNT(*) FILTER (WHERE " + string(ivm::MULTIPLICITY_COL) + " < 0) FROM " +
-		              OpenIVMUtils::QuoteIdentifier(delta_name) + " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
-		              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+		    con.Query("SELECT "
+		              "(SELECT COUNT(*) FROM " +
+		              SqlUtils::QuoteIdentifier(delta_name) + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+		              SqlUtils::EscapeValue(last_update) +
+		              "'::TIMESTAMP), "
+		              "(SELECT COUNT(*) FROM " +
+		              SqlUtils::QuoteIdentifier(delta_name) + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+		              SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(openivm::MULTIPLICITY_COL) +
+		              " < 0), "
+		              "(SELECT COUNT(*) FROM " +
+		              SqlUtils::QuoteIdentifier(table_ref.get()->name) + ")");
 		if (result->HasError()) {
 			continue;
 		}
 		int64_t total_count = result->GetValue(0, 0).GetValue<int64_t>();
 		int64_t delete_count = result->GetValue(1, 0).GetValue<int64_t>();
+		int64_t base_count = result->GetValue(2, 0).GetValue<int64_t>();
 
 		if (total_count == 0) {
 			status.empty_mask |= (1ULL << i);
 			status.insert_only_mask |= (1ULL << i); // empty is trivially insert-only
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has empty delta\n", i, table_ref.get()->name.c_str());
-		} else if (delete_count == 0) {
-			status.insert_only_mask |= (1ULL << i);
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has insert-only delta\n", i,
+			OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Leaf %zu (%s) has empty delta\n", i,
 			                    table_ref.get()->name.c_str());
+		} else {
+			int64_t tiny_limit = std::max<int64_t>(8, (base_count + 19) / 20);
+			if (total_count <= tiny_limit) {
+				status.tiny_mask |= (1ULL << i);
+			}
+			if (delete_count == 0) {
+				status.insert_only_mask |= (1ULL << i);
+				OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Leaf %zu (%s) has insert-only delta\n", i,
+				                    table_ref.get()->name.c_str());
+			}
 		}
 	}
 	return status;
@@ -557,7 +632,7 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 			}
 			size_t pk_leaf = it->second;
 			relations.push_back({i, pk_leaf});
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
+			OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
 			                    table_ref.get()->name.c_str(), pk_leaf, fk.info.table.c_str());
 		}
 	}
@@ -585,320 +660,6 @@ static uint64_t ComputeSkipBits(const vector<FKRelation> &fk_relations, uint64_t
 	return skip_bits;
 }
 
-enum class JoinDeltaPruneReason { NONE, FK_INSERT_ONLY_PK, EMPTY_DELTA, KEY_DOMAIN_EMPTY };
-
-// Everything below separates "term planning" from "term construction".
-//
-// The join delta itself is still the same OpenIVM inclusion-exclusion formula:
-// enumerate every non-empty mask over the join leaves, replace masked leaves by
-// their delta scans, keep unmasked leaves as current base scans, then apply the
-// Möbius sign in the output multiplicity. Planning exists only to make the skip
-// decisions explicit before we copy/rebind a logical plan:
-//   - FK insert-only PK pruning removes masks that cancel algebraically.
-//   - Empty-delta pruning removes masks that would join against an empty input.
-//   - Key-domain pruning removes inner-join masks whose delta keys cannot match.
-//
-// Keeping these reasons as data is important for the longer-term delta model work:
-// the rule should first describe the delta terms it intends to build, and only
-// then lower those terms into DuckDB logical operators.
-struct JoinDeltaPlanningContext {
-	DeltaStatus delta_status;
-	bool skip_empty_enabled = true;
-	uint64_t skip_bits = 0;
-	uint64_t empty_mask = 0;
-	uint64_t total_terms = 0;
-	vector<JoinColumnRef> leaf_refs;
-	vector<vector<JoinKeyProbe>> key_probes;
-};
-
-struct JoinDeltaTermPlan {
-	uint64_t mask;
-	JoinDeltaPruneReason prune_reason;
-
-	bool IsKept() const {
-		return prune_reason == JoinDeltaPruneReason::NONE;
-	}
-};
-
-static const char *JoinDeltaPruneReasonName(JoinDeltaPruneReason reason) {
-	switch (reason) {
-	case JoinDeltaPruneReason::NONE:
-		return "kept";
-	case JoinDeltaPruneReason::FK_INSERT_ONLY_PK:
-		return "FK insert-only PK";
-	case JoinDeltaPruneReason::EMPTY_DELTA:
-		return "empty delta";
-	case JoinDeltaPruneReason::KEY_DOMAIN_EMPTY:
-		return "delta key-domain empty";
-	default:
-		return "unknown";
-	}
-}
-
-static bool GetBooleanSetting(ClientContext &context, const string &setting_name, bool default_value) {
-	Value setting_value;
-	if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {
-		return setting_value.GetValue<bool>();
-	}
-	return default_value;
-}
-
-static void CollectJoinKeyProbeMetadata(PlanWrapper &pw, Connection &con, const vector<JoinLeafInfo> &leaves,
-                                        JoinDeltaPlanningContext &planning) {
-	unordered_map<uint64_t, JoinColumnRef> column_refs;
-	for (size_t i = 0; i < leaves.size(); i++) {
-		LogicalGet *get = GetLeafScan(leaves[i]);
-		if (!get) {
-			continue;
-		}
-		auto table_ref = get->GetTable();
-		if (table_ref.get() == nullptr) {
-			continue;
-		}
-		string table_name = table_ref.get()->name;
-		string delta_name = OpenIVMUtils::DeltaName(table_name);
-		auto ts_result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                           " WHERE view_name = '" + OpenIVMUtils::EscapeValue(pw.view) +
-		                           "' AND table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
-		if (ts_result->HasError() || ts_result->RowCount() == 0 || ts_result->GetValue(0, 0).IsNull()) {
-			continue;
-		}
-		planning.leaf_refs[i].leaf_index = i;
-		planning.leaf_refs[i].table_name = table_name;
-		planning.leaf_refs[i].delta_name = delta_name;
-		planning.leaf_refs[i].last_update = ts_result->GetValue(0, 0).ToString();
-
-		auto leaf_bindings = leaves[i].node->GetColumnBindings();
-		for (auto &binding : leaf_bindings) {
-			string resolved_table;
-			string resolved_column;
-			if (!ResolveLeafBindingToBaseColumn(leaves[i].node, binding, resolved_table, resolved_column) ||
-			    !StringUtil::CIEquals(resolved_table, table_name)) {
-				continue;
-			}
-			planning.leaf_refs[i].column_name = resolved_column;
-			column_refs[BindingKey(binding)] = {i, table_name, delta_name, resolved_column,
-			                                    planning.leaf_refs[i].last_update};
-		}
-	}
-	CollectJoinKeyProbes(pw.plan.get(), column_refs, planning.key_probes);
-}
-
-static JoinDeltaPlanningContext BuildJoinDeltaPlanningContext(PlanWrapper &pw, ClientContext &context,
-                                                              const vector<JoinLeafInfo> &leaves, bool has_left_join) {
-	JoinDeltaPlanningContext planning;
-	size_t N = leaves.size();
-	planning.total_terms = (1ULL << N) - 1;
-	planning.leaf_refs.resize(N);
-	planning.key_probes.resize(N);
-
-	// Detect delta status for all leaves (single query per table: total + delete count).
-	// Used by both FK pruning and empty-delta skipping.
-	planning.delta_status = DetectDeltaStatus(context, pw.view, leaves);
-
-	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
-	if (GetBooleanSetting(context, "ivm_fk_pruning", true)) {
-		auto fk_relations = DetectFKRelations(context, leaves, pw.plan.get());
-		if (!fk_relations.empty()) {
-			planning.skip_bits = ComputeSkipBits(fk_relations, planning.delta_status.insert_only_mask);
-		}
-	}
-
-	// Empty-delta skipping: skip terms where any table in the mask has zero delta rows.
-	// A join with an empty input always produces zero rows.
-	planning.skip_empty_enabled = GetBooleanSetting(context, "ivm_skip_empty_deltas", true);
-	planning.empty_mask = planning.skip_empty_enabled ? planning.delta_status.empty_mask : 0;
-
-	if (planning.skip_empty_enabled && !has_left_join) {
-		Connection key_probe_con(*context.db);
-		CollectJoinKeyProbeMetadata(pw, key_probe_con, leaves, planning);
-	}
-	return planning;
-}
-
-static bool HasEmptyJoinKeyDomain(Connection &con, const JoinDeltaPlanningContext &planning, uint64_t mask, size_t N) {
-	if (!planning.skip_empty_enabled) {
-		return false;
-	}
-	// Key-domain pruning is deliberately best-effort and only runs for inner joins.
-	// For each delta-side leaf in the mask, we look at equi-join probes collected
-	// from the original join tree. If a delta key has no possible match on the
-	// other side, the whole term is empty. When both sides of a probe are in the
-	// mask, only the lower-index side performs the check so we do not issue the
-	// same delta-vs-delta EXISTS query twice.
-	for (size_t i = 0; i < N; i++) {
-		if (!(mask & (1ULL << i)) || planning.key_probes[i].empty() || planning.leaf_refs[i].last_update.empty()) {
-			continue;
-		}
-		for (auto &probe : planning.key_probes[i]) {
-			if (planning.leaf_refs[probe.other_leaf].last_update.empty()) {
-				continue;
-			}
-			bool has_match;
-			if (mask & (1ULL << probe.other_leaf)) {
-				if (i > probe.other_leaf) {
-					continue;
-				}
-				has_match = DeltaKeyHasDeltaMatch(con, planning.leaf_refs[i], probe.delta_column,
-				                                  planning.leaf_refs[probe.other_leaf], probe.other_column);
-			} else {
-				has_match = DeltaKeyHasBaseMatch(con, planning.leaf_refs[i], probe.delta_column,
-				                                 planning.leaf_refs[probe.other_leaf], probe.other_column);
-			}
-			if (!has_match) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-static vector<JoinDeltaTermPlan> PlanJoinDeltaTerms(ClientContext &context, const JoinDeltaPlanningContext &planning,
-                                                    size_t N, bool has_left_join) {
-	vector<JoinDeltaTermPlan> term_plans;
-	Connection key_probe_con(*context.db);
-	// Pruning order is semantic, not cosmetic:
-	//   1. FK pruning is an algebraic cancellation, independent of row counts.
-	//   2. Empty-delta pruning is a cheaper structural emptiness check.
-	//   3. Key-domain pruning can run SQL EXISTS probes, so it comes last.
-	//
-	// The first matching reason is recorded so debug output reflects why the
-	// physical term was not built. Kept masks proceed unchanged to BuildJoinDeltaTerm.
-	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
-		JoinDeltaPruneReason prune_reason = JoinDeltaPruneReason::NONE;
-		if (planning.skip_bits && (mask & planning.skip_bits)) {
-			prune_reason = JoinDeltaPruneReason::FK_INSERT_ONLY_PK;
-		} else if (planning.empty_mask && (mask & planning.empty_mask)) {
-			prune_reason = JoinDeltaPruneReason::EMPTY_DELTA;
-		} else if (!has_left_join && HasEmptyJoinKeyDomain(key_probe_con, planning, mask, N)) {
-			prune_reason = JoinDeltaPruneReason::KEY_DOMAIN_EMPTY;
-		}
-		term_plans.push_back({mask, prune_reason});
-	}
-	return term_plans;
-}
-
-static unique_ptr<Expression> BuildCombinedMultiplicityExpression(Binder &binder, const LogicalType &mul_type,
-                                                                  const vector<ColumnBinding> &mul_bindings) {
-	if (mul_bindings.empty()) {
-		throw InternalException("IvmJoinRule: join term has no delta multiplicity bindings");
-	}
-	// Combined multiplicity: (-1)^(k-1) * product(w_i), where k is the
-	// number of delta-side leaves in the mask.
-	//
-	// The product is the ordinary Z-set bilinear join product. The extra Möbius
-	// sign is specific to OpenIVM's refresh layout: by the time PRAGMA ivm()
-	// runs, base scans read the current table state R_now = R_old + delta R
-	// because DML has already been applied to source tables and mirrored into
-	// delta tables. Expanding
-	//
-	//   delta(R join S) = (R_old + dR) join (S_old + dS) - R_old join S_old
-	//
-	// in terms of current base scans means multi-delta terms are overcounted
-	// unless masks with even k are negated:
-	//
-	//   k=1:  dR join S_now                         positive
-	//   k=2:  dR join dS                            negative
-	//   k=3:  dR join dS join dT                    positive
-	//   k=4:  dR join dS join dT join dU            negative
-	//
-	// This is algebraically equivalent to the old-state/all-positive DBSP join
-	// formula, but it matches the physical state OpenIVM can scan cheaply.
-	FunctionBinder fbinder(binder);
-	unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[0]);
-	for (size_t i = 1; i < mul_bindings.size(); i++) {
-		vector<unique_ptr<Expression>> args;
-		args.push_back(std::move(product));
-		args.push_back(make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[i]));
-		ErrorData err;
-		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true /* is_operator */);
-		if (!product) {
-			throw InternalException("IvmJoinRule: failed to bind '*' for combined multiplicity: %s", err.RawMessage());
-		}
-	}
-	// Apply Möbius sign: (-1)^(k-1). Only flip when k is even.
-	if (mul_bindings.size() % 2 == 0) {
-		vector<unique_ptr<Expression>> args;
-		args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
-		args.push_back(std::move(product));
-		ErrorData err;
-		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
-		if (!product) {
-			throw InternalException("IvmJoinRule: failed to bind '*' for Möbius sign: %s", err.RawMessage());
-		}
-	}
-	return product;
-}
-
-static unique_ptr<LogicalOperator> BuildJoinDeltaTerm(PlanWrapper &pw, ClientContext &context, Binder &binder,
-                                                      const vector<JoinLeafInfo> &leaves, bool has_left_join,
-                                                      const JoinDeltaTermPlan &term_plan) {
-	auto term = pw.plan->Copy(context);
-	auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
-	term = std::move(renumbered.op);
-	LogicalOperator *term_root = term.get();
-	vector<ColumnBinding> mul_bindings;
-
-	// LEFT JOIN delta rule (per-LJ): demote each LJ to INNER iff its null-supplying
-	// subtree contains a delta-marked leaf in this mask.
-	//
-	// Why per-LJ rather than whole-term: in a chain like (base LJ d1) LJ d2
-	// with mask {d2}, demoting all left joins would collapse (base LJ d1) into
-	// (base IJ d1), dropping base rows unmatched in d1. Those rows are exactly
-	// the existing NULL-padded MV rows that need to flow through so the upsert
-	// layer can delete/reinsert affected keys. Per-LJ demotion keeps unrelated
-	// outer joins intact while still converting the join that sees the delta on
-	// its null-supplying side into the matched part needed by the delta term.
-	if (has_left_join) {
-		DemoteLeftJoinsForMask(term.get(), leaves, term_plan.mask);
-	}
-
-	// Replace delta leaves.
-	for (size_t i = 0; i < leaves.size(); i++) {
-		if (!(term_plan.mask & (1ULL << i))) {
-			continue;
-		}
-		if (leaves[i].get) {
-			DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
-			mul_bindings.push_back(delta_i.mul_binding);
-			GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
-		} else {
-			auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
-			auto rewritten = IVMRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
-			mul_bindings.push_back(rewritten.mul_binding);
-			subtree_ref = std::move(rewritten.op);
-		}
-		UpdateParentProjectionMap(term, leaves[i]);
-	}
-
-	term->ResolveOperatorTypes();
-
-	auto term_bindings = term->GetColumnBindings();
-	auto term_types = term->types;
-	vector<unique_ptr<Expression>> proj_exprs;
-
-	// Filter out multiplicity columns (O(1) lookup via hash set).
-	unordered_set<uint64_t> mul_set;
-	CollectExistingMultiplicityBindings(term.get(), mul_set);
-	for (auto &mb : mul_bindings) {
-		mul_set.insert(BindingKey(mb));
-	}
-	for (idx_t i = 0; i < term_bindings.size(); i++) {
-		if (!mul_set.count(BindingKey(term_bindings[i]))) {
-			proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
-		}
-	}
-
-	// Combined multiplicity: (-1)^(k-1) * ∏ w_i where k = |mask|.
-	// Z-set bilinear product times a Möbius inclusion-exclusion sign.
-	proj_exprs.push_back(BuildCombinedMultiplicityExpression(binder, pw.mul_type, mul_bindings));
-
-	auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
-	projection->children.push_back(std::move(term));
-	projection->ResolveOperatorTypes();
-	return std::move(projection);
-}
-
 // ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
@@ -908,95 +669,264 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
                                                                         bool has_left_join) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
-	auto planning = BuildJoinDeltaPlanningContext(pw, context, leaves, has_left_join);
-	auto term_plans = PlanJoinDeltaTerms(context, planning, N, has_left_join);
+
+	// Detect delta status for all leaves (single query per table: total + delete count).
+	// Used by both FK pruning and empty-delta skipping.
+	DeltaStatus delta_status = DetectDeltaStatus(context, pw.view, leaves);
+	uint64_t total_terms = (1ULL << N) - 1;
+	uint64_t non_empty_mask = total_terms & ~delta_status.empty_mask & ~delta_status.constant_mask;
+	idx_t non_empty_leaf_count = CountBits(non_empty_mask);
+
+	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
+	bool fk_pruning_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
+	uint64_t skip_bits = 0;
+	// FK pruning pays for catalog constraint inspection. When every leaf changed
+	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and
+	// the flag benchmark shows the inspection cost can dominate. Keep it for the
+	// main win case: one-sided PK/dimension changes.
+	bool fk_pruning_worthwhile = non_empty_leaf_count == 1;
+	if (fk_pruning_enabled && fk_pruning_worthwhile) {
+		auto fk_relations = DetectFKRelations(context, leaves, pw.plan.get());
+		if (!fk_relations.empty()) {
+			skip_bits = ComputeSkipBits(fk_relations, delta_status.insert_only_mask);
+		}
+	}
+
+	// Empty-delta skipping: skip terms where any table in the mask has zero delta rows.
+	// A join with an empty input always produces zero rows.
+	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
+	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
+
+	Connection key_probe_con(*context.db);
+	vector<JoinColumnRef> leaf_refs(N);
+	vector<vector<JoinKeyProbe>> key_probes(N);
+	// Key-domain pruning can erase the last remaining term when exactly one input
+	// changed and its delta keys cannot match the unchanged side. That is the
+	// important performance case covered by mv_inner_join. When multiple leaves
+	// changed in a small join with many pending delta rows, these probes are extra
+	// EXISTS joins on top of work we will still have to do, and the flag benchmark
+	// shows that overhead can dominate. Keep probing for single-source changes and
+	// for tiny multi-source changes where the probe is cheap.
+	bool all_non_empty_deltas_are_tiny = non_empty_mask && ((non_empty_mask & ~delta_status.tiny_mask) == 0);
+	bool key_domain_probe_enabled =
+	    skip_empty_enabled && !has_left_join && (non_empty_leaf_count == 1 || all_non_empty_deltas_are_tiny);
+	if (key_domain_probe_enabled) {
+		unordered_map<uint64_t, JoinColumnRef> column_refs;
+		for (size_t i = 0; i < N; i++) {
+			LogicalGet *get = GetLeafScan(leaves[i]);
+			if (!get) {
+				continue;
+			}
+			auto table_ref = get->GetTable();
+			if (table_ref.get() == nullptr) {
+				continue;
+			}
+			string table_name = table_ref.get()->name;
+			string delta_name = SqlUtils::DeltaName(table_name);
+			auto ts_result = key_probe_con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
+			                                     " WHERE view_name = '" + SqlUtils::EscapeValue(pw.view) +
+			                                     "' AND table_name = '" + SqlUtils::EscapeValue(delta_name) + "'");
+			if (ts_result->HasError() || ts_result->RowCount() == 0 || ts_result->GetValue(0, 0).IsNull()) {
+				continue;
+			}
+			leaf_refs[i].leaf_index = i;
+			leaf_refs[i].get = get;
+			leaf_refs[i].table_name = table_name;
+			leaf_refs[i].delta_name = delta_name;
+			leaf_refs[i].last_update = ts_result->GetValue(0, 0).ToString();
+
+			auto leaf_bindings = leaves[i].node->GetColumnBindings();
+			for (auto &binding : leaf_bindings) {
+				string resolved_table;
+				string resolved_column;
+				if (!ResolveLeafBindingToBaseColumn(leaves[i].node, binding, resolved_table, resolved_column) ||
+				    !StringUtil::CIEquals(resolved_table, table_name)) {
+					continue;
+				}
+				leaf_refs[i].column_name = resolved_column;
+				OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Column ref leaf=%zu binding=%s -> %s.%s\n", i,
+				                    binding.ToString().c_str(), resolved_table.c_str(), resolved_column.c_str());
+				column_refs[BindingKey(binding)] = {
+				    i, get, table_name, delta_name, resolved_column, leaf_refs[i].last_update};
+			}
+		}
+		CollectJoinKeyProbes(pw.plan.get(), column_refs, key_probes);
+	}
 
 	uint64_t pruned_count = 0;
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu)\n",
-	                    (unsigned long)planning.total_terms, (unsigned long)planning.skip_bits,
-	                    (unsigned long)planning.empty_mask);
-	for (auto &term_plan : term_plans) {
-		if (!term_plan.IsKept()) {
+	OPENIVM_DEBUG_PRINT(
+	    "[IncrementalJoinRule] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu)\n",
+	    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask);
+	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
+		// FK pruning: skip any term whose mask overlaps with insert-only PK leaves.
+		// All such terms cancel algebraically via XOR (see ComputeSkipBits).
+		if (skip_bits && (mask & skip_bits)) {
 			pruned_count++;
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Skipped term mask=%lu (%s)\n", (unsigned long)term_plan.mask,
-			                    JoinDeltaPruneReasonName(term_plan.prune_reason));
+			OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Pruned term mask=%lu (FK insert-only PK)\n",
+			                    (unsigned long)mask);
 			continue;
 		}
-		terms.push_back(BuildJoinDeltaTerm(pw, context, binder, leaves, has_left_join, term_plan));
+		// Empty-delta skipping: if any table in the mask has zero delta rows,
+		// the join term produces zero rows (join with empty input = empty).
+		if (empty_mask && (mask & empty_mask)) {
+			pruned_count++;
+			OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Skipped term mask=%lu (empty delta)\n", (unsigned long)mask);
+			continue;
+		}
+		bool key_domain_empty = false;
+		if (key_domain_probe_enabled) {
+			for (size_t i = 0; i < N && !key_domain_empty; i++) {
+				if (!(mask & (1ULL << i)) || key_probes[i].empty() || leaf_refs[i].last_update.empty()) {
+					continue;
+				}
+				for (auto &probe : key_probes[i]) {
+					if (leaf_refs[probe.other_leaf].last_update.empty()) {
+						continue;
+					}
+					bool has_match;
+					if (mask & (1ULL << probe.other_leaf)) {
+						if (i > probe.other_leaf) {
+							continue;
+						}
+						has_match = DeltaKeyHasDeltaMatch(key_probe_con, leaf_refs[i], probe.delta_column,
+						                                  leaf_refs[probe.other_leaf], probe.other_column);
+					} else {
+						has_match = DeltaKeyHasBaseMatch(key_probe_con, leaf_refs[i], probe.delta_column,
+						                                 leaf_refs[probe.other_leaf], probe.other_column);
+					}
+					if (!has_match) {
+						key_domain_empty = true;
+						break;
+					}
+				}
+			}
+		}
+		if (key_domain_empty) {
+			pruned_count++;
+			OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Skipped term mask=%lu (delta key-domain empty)\n",
+			                    (unsigned long)mask);
+			continue;
+		}
+		auto term = pw.plan->Copy(context);
+		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
+		term = std::move(renumbered.op);
+		LogicalOperator *term_root = term.get();
+		vector<ColumnBinding> mul_bindings;
+
+		// LEFT JOIN delta rule (per-LJ): demote each LJ to INNER iff its right
+		// subtree contains a delta-marked leaf in this mask.
+		//
+		// Why per-LJ rather than whole-term: in a chain like (base LJ d1) LJ d2
+		// with mask {Δd2}, demoting *all* LJs collapses (base LJ d1) into
+		// (base IJ d1), which drops base rows unmatched in d1 — the very rows
+		// whose existing NULL-padded MV entries need to be replaced when Δd2
+		// brings in a match. Per-LJ demote keeps the inner LJ intact so those
+		// keys still flow through and reach delta_mv (and the partial-recompute
+		// DELETE+re-INSERT in the upsert layer fixes them up correctly).
+		//
+		// This subsumes both original cases (right-only delta, both-sides delta)
+		// without over-demoting in chained-LJ shapes.
+		if (has_left_join) {
+			DemoteLeftJoinsForMask(term.get(), leaves, mask);
+		}
+
+		// Replace delta leaves
+		for (size_t i = 0; i < N; i++) {
+			if (mask & (1ULL << i)) {
+				if (leaves[i].get) {
+					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
+					mul_bindings.push_back(delta_i.mul_binding);
+					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
+				} else {
+					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
+					auto rewritten = IncrementalRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
+					mul_bindings.push_back(rewritten.mul_binding);
+					subtree_ref = std::move(rewritten.op);
+				}
+				UpdateParentProjectionMap(term, leaves[i]);
+			}
+		}
+
+		term->ResolveOperatorTypes();
+
+		// Build projection: original columns + combined multiplicity
+		auto term_bindings = term->GetColumnBindings();
+		auto term_types = term->types;
+		vector<unique_ptr<Expression>> proj_exprs;
+
+		// Filter out multiplicity columns (O(1) lookup via hash set)
+		unordered_set<uint64_t> mul_set;
+		CollectExistingMultiplicityBindings(term.get(), mul_set);
+		for (auto &mb : mul_bindings) {
+			mul_set.insert(BindingKey(mb));
+		}
+		for (idx_t i = 0; i < term_bindings.size(); i++) {
+			if (!mul_set.count(BindingKey(term_bindings[i]))) {
+				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
+			}
+		}
+
+		// Combined multiplicity: (-1)^(k-1) * ∏ w_i where k = |mask|.
+		// Z-set bilinear product times a Möbius inclusion-exclusion sign.
+		//
+		// The IE sign is required because OpenIVM's "current base" scan reads
+		// R_now = R_old + ΔR (deltas have already been applied to the source by
+		// the RefreshInsertRule at DML time). Expanding
+		//   Δ(R⋈S) = (R_old+ΔR)⋈(S_old+ΔS) − R_old⋈S_old
+		// gives an inclusion-exclusion sum: terms with k delta-side leaves carry
+		// sign (-1)^(k-1) so the overcounting from "current includes pending"
+		// cancels exactly. This is NOT the textbook DBSP delta-join formula
+		// (which uses old bases and gives all-positive terms) — it is the
+		// algebraically equivalent Möbius form for OpenIVM's data layout.
+		//
+		// Equivalence to the previous BOOLEAN XOR chain (true=+1, false=-1):
+		//   k=1: w_1                 = w_1                       (no sign flip)
+		//   k=2: -w_1·w_2            = NOT(w_1 == w_2)            (XOR true,true=false=-1)
+		//   k=3: w_1·w_2·w_3         (no sign flip)
+		//   k=4: -w_1·w_2·w_3·w_4    (sign flip)
+		// — verified algebraically on all sign combinations.
+		FunctionBinder fbinder(binder);
+		unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
+		for (size_t i = 1; i < mul_bindings.size(); i++) {
+			vector<unique_ptr<Expression>> args;
+			args.push_back(std::move(product));
+			args.push_back(make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[i]));
+			ErrorData err;
+			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true /* is_operator */);
+			if (!product) {
+				throw InternalException("IncrementalJoinRule: failed to bind '*' for combined multiplicity: %s",
+				                        err.RawMessage());
+			}
+		}
+		// Apply Möbius sign: (-1)^(k-1). Only flip when k is even.
+		if (mul_bindings.size() % 2 == 0) {
+			vector<unique_ptr<Expression>> args;
+			args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
+			args.push_back(std::move(product));
+			ErrorData err;
+			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
+			if (!product) {
+				throw InternalException("IncrementalJoinRule: failed to bind '*' for Möbius sign: %s",
+				                        err.RawMessage());
+			}
+		}
+		proj_exprs.push_back(std::move(product));
+
+		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
+		projection->children.push_back(std::move(term));
+		projection->ResolveOperatorTypes();
+		terms.push_back(std::move(projection));
 	}
 	if (pruned_count > 0) {
-		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Join term planning: %lu/%lu terms pruned, %lu remaining\n",
-		                    (unsigned long)pruned_count, (unsigned long)planning.total_terms,
-		                    (unsigned long)terms.size());
+		OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] FK pruning: %lu/%lu terms pruned, %lu remaining\n",
+		                    (unsigned long)pruned_count, (unsigned long)total_terms, (unsigned long)terms.size());
 	}
 	return terms;
 }
 
-// ============================================================================
-// AssembleUnionAll: combine terms with UNION ALL + clean projection
-// ============================================================================
-static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
-                                                    const vector<LogicalType> &types, Binder &binder) {
-	if (terms.empty()) {
-		vector<ColumnBinding> bindings;
-		auto table_index = binder.GenerateTableIndex();
-		for (idx_t i = 0; i < types.size(); i++) {
-			bindings.emplace_back(table_index, i);
-		}
-		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
-		empty->ResolveOperatorTypes();
-		return std::move(empty);
-	}
-	auto result = std::move(terms[0]);
-	for (size_t i = 1; i < terms.size(); i++) {
-		auto union_table_index = binder.GenerateTableIndex();
-		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result), std::move(terms[i]),
-		                                        LogicalOperatorType::LOGICAL_UNION, true);
-		result->types = types;
-	}
-
-	// Clean projection to disambiguate column names for LPTS
-	auto union_bindings = result->GetColumnBindings();
-	vector<unique_ptr<Expression>> clean_exprs;
-	for (idx_t i = 0; i < union_bindings.size(); i++) {
-		clean_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], union_bindings[i]));
-	}
-	auto clean_proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(clean_exprs));
-	clean_proj->children.push_back(std::move(result));
-	clean_proj->ResolveOperatorTypes();
-	return std::move(clean_proj);
-}
-
-// ============================================================================
-// ReplaceOutputBindings: map original bindings to new UNION ALL output
-// ============================================================================
-static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original_bindings,
-                                           unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
-	auto union_bindings = result->GetColumnBindings();
-	if (union_bindings.size() < 2) {
-		throw InternalException("Join rewrite produced too few bindings (%zu)", union_bindings.size());
-	}
-	ColumnBindingReplacer replacer;
-	idx_t map_count = std::min(original_bindings.size(), union_bindings.size() - 1);
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Binding replacement: %zu mappings (original=%zu, union=%zu)\n", map_count,
-	                    original_bindings.size(), union_bindings.size());
-	for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
-		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
-	}
-	replacer.stop_operator = result;
-	replacer.VisitOperator(root);
-	return union_bindings.back();
-}
-
-// ============================================================================
-// IvmJoinRule::Rewrite — main entry point
-// ============================================================================
-ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
+ModifiedPlan IncrementalJoinRule::Rewrite(PlanWrapper pw) {
 	ClientContext &context = pw.input.context;
 	Binder &binder = pw.input.optimizer.binder;
-	auto spec = GetDeltaOperatorSpec(pw.plan->type);
-	D_ASSERT(spec.rewrite_kind == DeltaRewriteKind::JOIN);
-	D_ASSERT(spec.linearity == Linearity::BILINEAR);
 	pw.plan->ResolveOperatorTypes();
 	const vector<ColumnBinding> all_original_bindings = pw.plan->GetColumnBindings();
 	unordered_set<uint64_t> existing_mul_set;
@@ -1011,12 +941,12 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	vector<JoinLeafInfo> leaves;
 	CollectJoinLeaves(pw.plan.get(), {}, leaves);
 	size_t N = leaves.size();
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Rewriting JOIN node, %zu leaves found\n", N);
+	OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Rewriting JOIN node, %zu leaves found\n", N);
 
 	if (N == 0) {
-		throw InternalException("IvmJoinRule: no leaves found in join tree");
+		throw InternalException("IncrementalJoinRule: no leaves found in join tree");
 	}
-	if (N > ivm::MAX_JOIN_TABLES) {
+	if (N > openivm::MAX_JOIN_TABLES) {
 		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
 	}
 
@@ -1028,9 +958,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	// 3. Build terms — use DuckLake N-term path when all leaves are DuckLake scans
 	// Check if all leaves are DuckLake scans AND N-term telescoping is enabled.
 	bool all_ducklake = true;
-	Value nterm_val;
-	if (context.TryGetCurrentSetting("ivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull() &&
-	    !nterm_val.GetValue<bool>()) {
+	if (!SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true)) {
 		all_ducklake = false; // forced to inclusion-exclusion
 	} else {
 		for (size_t i = 0; i < N; i++) {
@@ -1046,13 +974,13 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	                          : BuildInclusionExclusionTerms(pw, context, binder, leaves, has_left_join);
 
 	// 4. UNION ALL
-	auto result = AssembleUnionAll(terms, types, binder);
+	auto result = AssembleJoinUnionAll(terms, types, binder);
 
 	// 5. Rebind parent references
-	ColumnBinding new_mul_binding = ReplaceOutputBindings(original_bindings, result, *pw.root);
+	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *pw.root);
 
 	pw.plan = std::move(result);
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
+	OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
 	                    (unsigned long)new_mul_binding.table_index, (unsigned long)new_mul_binding.column_index);
 	return {std::move(pw.plan), new_mul_binding};
 }

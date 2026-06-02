@@ -1,7 +1,7 @@
 #include "match/constraint_cache.hpp"
 
 namespace duckdb {
-namespace ivm {
+namespace openivm {
 
 vector<CachedConstraint> ConstraintCache::GetConstraints(const string &table_name) {
 	std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -10,7 +10,7 @@ vector<CachedConstraint> ConstraintCache::GetConstraints(const string &table_nam
 		return it->second;
 	}
 	// TODO: query DuckDB catalog (TableCatalogEntry::GetConstraints) and
-	// `_duckdb_ivm_constraints_cache` to populate.
+	// `openivm_constraints_cache` to populate.
 	return {};
 }
 
@@ -39,7 +39,7 @@ bool ConstraintCache::HasFKToParent(const string &child_table, const vector<stri
 void ConstraintCache::DeclareRelyFK(const CachedConstraint &c) {
 	std::lock_guard<std::mutex> lock(cache_mutex_);
 	cache_[c.table_name].push_back(c);
-	// TODO: persist into _duckdb_ivm_constraints_cache.
+	// TODO: persist into openivm_constraints_cache.
 }
 
 void ConstraintCache::InvalidateTable(const string &table_name) {
@@ -47,5 +47,5 @@ void ConstraintCache::InvalidateTable(const string &table_name) {
 	cache_.erase(table_name);
 }
 
-} // namespace ivm
+} // namespace openivm
 } // namespace duckdb

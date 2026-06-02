@@ -1,10 +1,8 @@
 #include "rules/rule.hpp"
 
-#include "core/ivm_delta_model.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "core/openivm_utils.hpp"
-#include "rules/openivm_rewrite_rule.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
@@ -26,72 +24,6 @@
 
 namespace duckdb {
 
-static void AssertLinearRewrite(LogicalOperatorType op_type, const string &context) {
-	auto spec = GetDeltaOperatorSpec(op_type);
-	if (spec.linearity != Linearity::LINEAR) {
-		throw InternalException("%s helper used for non-linear operator %s", context,
-		                        LogicalOperatorToString(op_type).c_str());
-	}
-}
-
-idx_t FindColumnBindingIndex(const vector<ColumnBinding> &bindings, ColumnBinding target, const string &context) {
-	for (idx_t i = 0; i < bindings.size(); i++) {
-		if (bindings[i] == target) {
-			return i;
-		}
-	}
-	throw InternalException("%s does not contain multiplicity binding", context);
-}
-
-ColumnBinding RewriteLinearChild(PlanWrapper &pw, idx_t child_index) {
-	AssertLinearRewrite(pw.plan->type, "RewriteLinearChild");
-	if (child_index >= pw.plan->children.size()) {
-		throw InternalException("Linear operator %s does not have child %llu", LogicalOperatorToString(pw.plan->type),
-		                        (unsigned long long)child_index);
-	}
-	auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[child_index], pw.view, pw.root);
-	pw.plan->children[child_index] = std::move(child_mul.op);
-	return child_mul.mul_binding;
-}
-
-ModifiedPlan RewriteLinearProjectionWithMultiplicity(PlanWrapper pw) {
-	AssertLinearRewrite(pw.plan->type, "RewriteLinearProjectionWithMultiplicity");
-	auto child_mul_binding = RewriteLinearChild(pw);
-
-	auto projection_node = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(pw.plan));
-	auto mul_expression = make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, child_mul_binding);
-	projection_node->expressions.emplace_back(std::move(mul_expression));
-	projection_node->types.clear();
-	for (auto &expr : projection_node->expressions) {
-		projection_node->types.push_back(expr->return_type);
-	}
-
-	auto new_mul_binding = projection_node->GetColumnBindings().back();
-	projection_node->Verify(pw.input.context);
-	return {std::move(projection_node), new_mul_binding};
-}
-
-ModifiedPlan RewriteLinearUnion(PlanWrapper pw) {
-	AssertLinearRewrite(pw.plan->type, "RewriteLinearUnion");
-	if (pw.plan->children.size() != 2) {
-		throw InternalException("Linear UNION rewrite expected 2 children, found %llu",
-		                        (unsigned long long)pw.plan->children.size());
-	}
-	RewriteLinearChild(pw, 0);
-	RewriteLinearChild(pw, 1);
-
-	auto *set_op = dynamic_cast<LogicalSetOperation *>(pw.plan.get());
-	if (!set_op) {
-		throw InternalException("Linear UNION rewrite expected LogicalSetOperation");
-	}
-	set_op->column_count = pw.plan->children[0]->GetColumnBindings().size();
-	pw.plan->ResolveOperatorTypes();
-
-	auto union_bindings = pw.plan->GetColumnBindings();
-	ColumnBinding new_mul_binding = union_bindings.back();
-	return {std::move(pw.plan), new_mul_binding};
-}
-
 static AggregateFunction BindAggregateByName(ClientContext &context, const string &name,
                                              const vector<LogicalType> &arg_types) {
 	auto &catalog = Catalog::GetSystemCatalog(context);
@@ -107,7 +39,7 @@ static AggregateFunction BindAggregateByName(ClientContext &context, const strin
 
 static bool CompactDeltasEnabled(ClientContext &context) {
 	Value compact_val;
-	if (context.TryGetCurrentSetting("ivm_compact_deltas", compact_val) && !compact_val.IsNull()) {
+	if (context.TryGetCurrentSetting("openivm_compact_deltas", compact_val) && !compact_val.IsNull()) {
 		return compact_val.GetValue<bool>();
 	}
 	return true;
@@ -148,7 +80,7 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 	auto sum_func = BindAggregateByName(context, "sum", {input_types[base_col_count]});
 	auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
 	                                                    AggregateType::NON_DISTINCT);
-	sum_expr->alias = ivm::MULTIPLICITY_COL;
+	sum_expr->alias = openivm::MULTIPLICITY_COL;
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(sum_expr));
@@ -208,9 +140,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	// Get last snapshot from IVM metadata. Uses a separate connection because
 	// the optimizer holds a lock on the main context during plan rewriting.
 	Connection con(*context.db);
-	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
-	                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
-	                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
+	auto snap_result =
+	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
 	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: no snapshot ID recorded for DuckLake table '" + table_name + "' in view '" + view_name +
@@ -274,6 +206,12 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		auto get = make_uniq<LogicalGet>(table_idx, std::move(scan_fn), std::move(bind_data), std::move(col_types),
 		                                 std::move(col_names));
 		get->SetColumnIds(vector<ColumnIndex>(delta_col_ids));
+		for (auto &entry : old_get->table_filters.filters) {
+			if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+				continue;
+			}
+			get->table_filters.filters[entry.first] = entry.second->Copy();
+		}
 
 		// Set parameters so LPTS can reconstruct the ducklake_table_insertions/deletions SQL.
 		get->parameters = {Value(catalog_name), Value(schema_name), Value(table_name), Value::BIGINT(start_snap),
@@ -362,7 +300,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 
 	optional_ptr<TableCatalogEntry> opt_catalog_entry;
 	{
-		string delta_table = OpenIVMUtils::DeltaName(source_table->name);
+		string delta_table = SqlUtils::DeltaName(source_table->name);
 		string delta_table_schema = source_table->schema.name;
 		string delta_table_catalog = source_table->catalog.GetName();
 		QueryErrorContext error_context;
@@ -380,9 +318,9 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	vector<ColumnIndex> column_ids = {};
 	idx_t mul_oid = 0, ts_oid = 0, max_oid = 0;
 	for (auto &col : table_entry.GetColumns().Logical()) {
-		if (col.Name() == string(ivm::MULTIPLICITY_COL)) {
+		if (col.Name() == string(openivm::MULTIPLICITY_COL)) {
 			mul_oid = col.Oid();
-		} else if (col.Name() == string(ivm::TIMESTAMP_COL)) {
+		} else if (col.Name() == string(openivm::TIMESTAMP_COL)) {
 			ts_oid = col.Oid();
 		}
 		if (col.Oid() > max_oid) {
@@ -412,13 +350,19 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	delta_get_node = make_uniq<LogicalGet>(old_get->table_index, scan_function, std::move(bind_data),
 	                                       std::move(return_types), std::move(return_names));
 	delta_get_node->SetColumnIds(std::move(column_ids));
+	for (auto &entry : old_get->table_filters.filters) {
+		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+			continue;
+		}
+		delta_get_node->table_filters.filters[entry.first] = entry.second->Copy();
+	}
 
 	// Timestamp filter
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
-	auto timestamp_query = "select last_update from " + string(ivm::DELTA_TABLES_TABLE) + " where view_name = '" +
-	                       OpenIVMUtils::EscapeValue(view_name) + "' and table_name = '" +
-	                       OpenIVMUtils::EscapeValue(table_name) + "';";
+	auto timestamp_query = "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
+	                       SqlUtils::EscapeValue(view_name) + "' and table_name = '" +
+	                       SqlUtils::EscapeValue(table_name) + "';";
 	auto r = con.Query(timestamp_query);
 	if (r->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "IVM: failed to read last_update for view '" + view_name +
@@ -440,20 +384,13 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	// projection_ids
 	delta_get_node->projection_ids.clear();
 	idx_t n_base = old_get->GetColumnIds().size();
-	if (!old_get->projection_ids.empty()) {
-		for (auto &pid : old_get->projection_ids) {
-			delta_get_node->projection_ids.push_back(pid);
-		}
-	} else {
-		for (idx_t i = 0; i < n_base; i++) {
-			delta_get_node->projection_ids.push_back(i);
-		}
+	for (idx_t i = 0; i < n_base; i++) {
+		delta_get_node->projection_ids.push_back(i);
 	}
 	delta_get_node->projection_ids.push_back(n_base); // mul column
-	idx_t mul_proj_pos = delta_get_node->projection_ids.size() - 1;
-	new_mul_binding = ColumnBinding(old_get->table_index, mul_proj_pos);
 
 	delta_get_node->ResolveOperatorTypes();
+	new_mul_binding = delta_get_node->GetColumnBindings().back();
 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
 	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index,
 	                    (unsigned long)new_mul_binding.column_index, delta_get_node->GetColumnIds().size());

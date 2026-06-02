@@ -19,7 +19,7 @@ CREATE MATERIALIZED VIEW customers_with_orders AS
     );
 
 INSERT INTO orders VALUES (3, 75);
-PRAGMA ivm('customers_with_orders');
+PRAGMA refresh('customers_with_orders');
 ```
 
 `NOT EXISTS` and explicit `SEMI JOIN` / `ANTI JOIN` use the same maintenance path.
@@ -33,7 +33,7 @@ SEMI(left, right, p) = left tuples where match_count(left, right, p) > 0
 ANTI(left, right, p) = left tuples where match_count(left, right, p) = 0
 ```
 
-OpenIVM keeps an auxiliary table named `_ivm_semi_anti_state_<view>`. It stores one row per distinct left tuple, plus:
+OpenIVM keeps an auxiliary table named `openivm_semi_anti_state_<view>`. It stores one row per distinct left tuple, plus:
 
 | Column | Meaning |
 |---|---|

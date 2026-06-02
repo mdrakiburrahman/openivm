@@ -42,7 +42,7 @@ WHERE H_AMOUNT > 0;
 # The partition source column is the fifth source column, but it is the first MV
 # output column. Refresh must filter affected partitions on H_W_ID, not H_D_ID.
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_history_window';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_history_window';
 ----
 H_W_ID=H_W_ID
 
@@ -53,7 +53,7 @@ INSERT INTO dl.history_win VALUES
     (22, 4, 2, 4, 2, '2026-01-01 00:00:00', 267.00, 'Payment');
 
 statement ok
-PRAGMA ivm('mv_history_window');
+PRAGMA refresh('mv_history_window');
 
 query I
 SELECT count(*) FROM dl.mv_history_window;
@@ -124,9 +124,12 @@ LEFT JOIN dl.window_join_codes c
     ON e.code = c.code;
 
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_window_join';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_window_join';
 ----
 acct_id=acct_id
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
 
 statement ok
 INSERT INTO dl.window_join_codes VALUES (1, 'open');
@@ -138,7 +141,19 @@ INSERT INTO dl.window_join_events VALUES
     (20, 1, 1, 11);
 
 statement ok
-PRAGMA ivm('mv_window_join');
+PRAGMA refresh('mv_window_join');
+
+query I
+SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected_mv_window_join')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_join.sql');
+----
+true
+
+query I
+SELECT contains(content, 'DROP TABLE IF EXISTS openivm_old_affected_mv_window_join')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_join.sql');
+----
+true
 
 query I
 SELECT count(*) FROM (
@@ -161,7 +176,396 @@ SELECT count(*) FROM (
 0
 
 statement ok
-SET ivm_cascade_refresh = 'off';
+CREATE TABLE dl.trade_like (
+    t_id INT,
+    t_dts TIMESTAMP,
+    t_status INT,
+    t_type INT,
+    t_qty INT
+);
+
+statement ok
+CREATE TABLE dl.trade_history_like (
+    th_t_id INT,
+    th_dts TIMESTAMP,
+    th_status INT
+);
+
+statement ok
+CREATE TABLE dl.trade_status_like (
+    status_id INT,
+    status_name VARCHAR
+);
+
+statement ok
+CREATE TABLE dl.trade_type_like (
+    type_id INT,
+    type_name VARCHAR
+);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_trades_history_like AS
+SELECT
+    t_id AS trade_id,
+    t_dts AS trade_timestamp,
+    ts.status_name AS trade_status,
+    tt.type_name AS trade_type,
+    us.status_name AS update_status,
+    th_dts AS effective_timestamp,
+    COALESCE(
+        LAG(th_dts) OVER (
+            PARTITION BY t_id
+            ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+        ) - INTERVAL 1 MILLISECOND,
+        TIMESTAMP '9999-12-31 23:59:59.999'
+    ) AS end_timestamp,
+    CASE
+        WHEN ROW_NUMBER() OVER (
+            PARTITION BY t_id
+            ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+        ) = 1 THEN TRUE
+        ELSE FALSE
+    END AS is_current
+FROM dl.trade_like
+JOIN dl.trade_history_like
+    ON t_id = th_t_id
+JOIN dl.trade_type_like tt
+    ON t_type = tt.type_id
+JOIN dl.trade_status_like ts
+    ON t_status = ts.status_id
+JOIN dl.trade_status_like us
+    ON th_status = us.status_id;
+
+statement ok
+INSERT INTO dl.trade_status_like VALUES (1, 'new'), (2, 'settled'), (3, 'closed');
+
+statement ok
+INSERT INTO dl.trade_type_like VALUES (10, 'cash');
+
+statement ok
+INSERT INTO dl.trade_like VALUES
+    (100, '2026-01-01 09:00:00', 1, 10, 50),
+    (200, '2026-01-01 10:00:00', 1, 10, 60);
+
+statement ok
+INSERT INTO dl.trade_history_like VALUES
+    (100, '2026-01-01 09:05:00', 1),
+    (200, '2026-01-01 10:05:00', 1);
+
+statement ok
+PRAGMA refresh('mv_trades_history_like');
+
+statement ok
+INSERT INTO dl.trade_like VALUES
+    (100, '2026-01-02 09:00:00', 2, 10, 50),
+    (300, '2026-01-02 11:00:00', 1, 10, 70);
+
+statement ok
+INSERT INTO dl.trade_history_like VALUES
+    (100, '2026-01-02 09:05:00', 2),
+    (300, '2026-01-02 11:05:00', 1);
+
+statement ok
+PRAGMA refresh('mv_trades_history_like');
+
+query I
+SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected_mv_trades_history_like')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+----
+true
+
+query I
+SELECT contains(content, 'SELECT * FROM dl.main.openivm_data_mv_trades_history_like openivm_old_rows')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+----
+false
+
+query I
+SELECT contains(content, 'ducklake_table_insertions')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+----
+true
+
+statement ok
+UPDATE dl.trade_status_like SET status_name = 'settled-updated' WHERE status_id = 2;
+
+statement ok
+PRAGMA refresh('mv_trades_history_like');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_trades_history_like
+    EXCEPT ALL
+    SELECT
+        t_id AS trade_id,
+        t_dts AS trade_timestamp,
+        ts.status_name AS trade_status,
+        tt.type_name AS trade_type,
+        us.status_name AS update_status,
+        th_dts AS effective_timestamp,
+        COALESCE(
+            LAG(th_dts) OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        CASE
+            WHEN ROW_NUMBER() OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) = 1 THEN TRUE
+            ELSE FALSE
+        END AS is_current
+    FROM dl.trade_like
+    JOIN dl.trade_history_like
+        ON t_id = th_t_id
+    JOIN dl.trade_type_like tt
+        ON t_type = tt.type_id
+    JOIN dl.trade_status_like ts
+        ON t_status = ts.status_id
+    JOIN dl.trade_status_like us
+        ON th_status = us.status_id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        t_id AS trade_id,
+        t_dts AS trade_timestamp,
+        ts.status_name AS trade_status,
+        tt.type_name AS trade_type,
+        us.status_name AS update_status,
+        th_dts AS effective_timestamp,
+        COALESCE(
+            LAG(th_dts) OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) - INTERVAL 1 MILLISECOND,
+            TIMESTAMP '9999-12-31 23:59:59.999'
+        ) AS end_timestamp,
+        CASE
+            WHEN ROW_NUMBER() OVER (
+                PARTITION BY t_id
+                ORDER BY th_dts DESC, t_dts DESC, th_status DESC
+            ) = 1 THEN TRUE
+            ELSE FALSE
+        END AS is_current
+    FROM dl.trade_like
+    JOIN dl.trade_history_like
+        ON t_id = th_t_id
+    JOIN dl.trade_type_like tt
+        ON t_type = tt.type_id
+    JOIN dl.trade_status_like ts
+        ON t_status = ts.status_id
+    JOIN dl.trade_status_like us
+        ON th_status = us.status_id
+    EXCEPT ALL
+    SELECT * FROM dl.mv_trades_history_like
+);
+----
+0
+
+# Regression: chained DuckLake MV creation must not reconnect immediately after
+# DuckLake CTAS. Complex plans that read a DuckLake-backed MV and publish another
+# DuckLake MV can otherwise self-lock DuckLake's SQLite metadata catalog.
+statement ok
+CREATE TABLE dl.market_chain_src (
+    sym VARCHAR,
+    d DATE,
+    close_px DOUBLE,
+    volume INT
+);
+
+statement ok
+INSERT INTO dl.market_chain_src VALUES
+    ('AAA', '2026-01-01', 10.0, 100),
+    ('AAA', '2026-01-02', 12.0, 200),
+    ('AAA', '2026-01-03', 11.0, 150),
+    ('BBB', '2026-01-01', 20.0, 90),
+    ('BBB', '2026-01-02', 21.0, 110),
+    ('BBB', '2026-01-03', 22.0, 130);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.market_chain_base AS
+SELECT sym, d, close_px, volume
+FROM dl.market_chain_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.market_chain_scored AS
+WITH price_changes AS (
+    SELECT
+        sym,
+        d,
+        close_px,
+        volume,
+        LAG(close_px) OVER (PARTITION BY sym ORDER BY d) AS prev_close
+    FROM dl.market_chain_base
+),
+returns AS (
+    SELECT
+        sym,
+        d,
+        close_px,
+        volume,
+        CASE WHEN prev_close > 0 THEN (close_px - prev_close) / prev_close ELSE NULL END AS daily_return
+    FROM price_changes
+),
+symbol_stats AS (
+    SELECT
+        sym,
+        COUNT(*) AS trading_days,
+        AVG(daily_return) AS avg_return,
+        STDDEV(daily_return) AS return_volatility,
+        SUM(volume) AS total_volume
+    FROM returns
+    GROUP BY sym
+),
+global_stats AS (
+    SELECT
+        AVG(return_volatility) AS avg_volatility,
+        SUM(total_volume) AS market_volume
+    FROM symbol_stats
+)
+SELECT
+    ss.sym,
+    ss.trading_days,
+    ss.avg_return,
+    ss.return_volatility,
+    ss.total_volume,
+    ROUND(ss.return_volatility - gs.avg_volatility, 4) AS volatility_delta,
+    RANK() OVER (ORDER BY ss.total_volume DESC) AS volume_rank
+FROM symbol_stats ss
+CROSS JOIN global_stats gs;
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        sym,
+        trading_days,
+        ROUND(avg_return, 10) AS avg_return,
+        ROUND(return_volatility, 10) AS return_volatility,
+        total_volume,
+        volatility_delta,
+        volume_rank
+    FROM dl.market_chain_scored
+    EXCEPT ALL
+    SELECT * FROM (
+    WITH price_changes AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            LAG(close_px) OVER (PARTITION BY sym ORDER BY d) AS prev_close
+        FROM dl.market_chain_base
+    ),
+    returns AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            CASE WHEN prev_close > 0 THEN (close_px - prev_close) / prev_close ELSE NULL END AS daily_return
+        FROM price_changes
+    ),
+    symbol_stats AS (
+        SELECT
+            sym,
+            COUNT(*) AS trading_days,
+            AVG(daily_return) AS avg_return,
+            STDDEV(daily_return) AS return_volatility,
+            SUM(volume) AS total_volume
+        FROM returns
+        GROUP BY sym
+    ),
+    global_stats AS (
+        SELECT
+            AVG(return_volatility) AS avg_volatility,
+            SUM(total_volume) AS market_volume
+        FROM symbol_stats
+    )
+    SELECT
+        ss.sym,
+        ss.trading_days,
+        ROUND(ss.avg_return, 10) AS avg_return,
+        ROUND(ss.return_volatility, 10) AS return_volatility,
+        ss.total_volume,
+        ROUND(ss.return_volatility - gs.avg_volatility, 4) AS volatility_delta,
+        RANK() OVER (ORDER BY ss.total_volume DESC) AS volume_rank
+    FROM symbol_stats ss
+    CROSS JOIN global_stats gs
+    ) expected
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM (
+    WITH price_changes AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            LAG(close_px) OVER (PARTITION BY sym ORDER BY d) AS prev_close
+        FROM dl.market_chain_base
+    ),
+    returns AS (
+        SELECT
+            sym,
+            d,
+            close_px,
+            volume,
+            CASE WHEN prev_close > 0 THEN (close_px - prev_close) / prev_close ELSE NULL END AS daily_return
+        FROM price_changes
+    ),
+    symbol_stats AS (
+        SELECT
+            sym,
+            COUNT(*) AS trading_days,
+            AVG(daily_return) AS avg_return,
+            STDDEV(daily_return) AS return_volatility,
+            SUM(volume) AS total_volume
+        FROM returns
+        GROUP BY sym
+    ),
+    global_stats AS (
+        SELECT
+            AVG(return_volatility) AS avg_volatility,
+            SUM(total_volume) AS market_volume
+        FROM symbol_stats
+    )
+    SELECT
+        ss.sym,
+        ss.trading_days,
+        ROUND(ss.avg_return, 10) AS avg_return,
+        ROUND(ss.return_volatility, 10) AS return_volatility,
+        ss.total_volume,
+        ROUND(ss.return_volatility - gs.avg_volatility, 4) AS volatility_delta,
+        RANK() OVER (ORDER BY ss.total_volume DESC) AS volume_rank
+    FROM symbol_stats ss
+    CROSS JOIN global_stats gs
+    ) expected
+    EXCEPT ALL
+    SELECT
+        sym,
+        trading_days,
+        ROUND(avg_return, 10) AS avg_return,
+        ROUND(return_volatility, 10) AS return_volatility,
+        total_volume,
+        volatility_delta,
+        volume_rank
+    FROM dl.market_chain_scored
+);
+----
+0
+
+statement ok
+SET openivm_cascade_refresh = 'off';
 
 statement ok
 CREATE TABLE dl.accounts_crm_src (
@@ -222,7 +626,7 @@ LEFT JOIN "dl"."main"."accounts_tax" ltx
 WHERE c.ca_id IS NOT NULL;
 
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_accounts_like';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_accounts_like';
 ----
 account_id=ca_id
 
@@ -237,13 +641,13 @@ INSERT INTO dl.accounts_crm_src VALUES
     (20, '2026-01-01 10:00:00', 'NEW', 2, 1, 200);
 
 statement ok
-PRAGMA ivm('accounts_tax');
+PRAGMA refresh('accounts_tax');
 
 statement ok
-PRAGMA ivm('accounts_crm');
+PRAGMA refresh('accounts_crm');
 
 statement ok
-PRAGMA ivm('mv_accounts_like');
+PRAGMA refresh('mv_accounts_like');
 
 statement ok
 INSERT INTO dl.accounts_crm_src VALUES
@@ -251,10 +655,10 @@ INSERT INTO dl.accounts_crm_src VALUES
     (10, '2026-01-02 10:00:00', 'UPDATE', 2, 1, 150);
 
 statement ok
-PRAGMA ivm('accounts_crm');
+PRAGMA refresh('accounts_crm');
 
 statement ok
-PRAGMA ivm('mv_accounts_like');
+PRAGMA refresh('mv_accounts_like');
 
 query I
 SELECT count(*) FROM (
@@ -325,11 +729,11 @@ CREATE TABLE dl.retry_window_src (
 );
 
 statement ok
-INSERT INTO _duckdb_ivm_views (view_name, sql_string, type, last_update)
+INSERT INTO openivm_views (view_name, sql_string, type, last_update)
 VALUES ('mv_retry_window', 'stale interrupted create', 5, now());
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_retry_window';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_retry_window';
 ----
 1
 
@@ -342,7 +746,7 @@ SELECT
 FROM dl.retry_window_src;
 
 query I
-SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_retry_window';
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv_retry_window';
 ----
 1
 
@@ -429,12 +833,12 @@ SELECT count(*) FROM dl.mv_ducklake_stage_lock;
 20
 
 query I
-SELECT count(*) FROM information_schema.tables WHERE table_name = '_ivm_stage_mv_ducklake_stage_lock';
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_stage_mv_ducklake_stage_lock';
 ----
 0
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE TABLE dl.cascade_accounts_crm_src (
@@ -498,7 +902,7 @@ INSERT INTO dl.cascade_accounts_crm_src VALUES
 # MV before the other upstream parent has been refreshed; the later parent
 # refresh must still recover the downstream MV.
 statement ok
-PRAGMA ivm('cascade_accounts_tax');
+PRAGMA refresh('cascade_accounts_tax');
 
 query I
 SELECT count(*) FROM dl.mv_cascade_accounts_like;
@@ -506,7 +910,7 @@ SELECT count(*) FROM dl.mv_cascade_accounts_like;
 0
 
 statement ok
-PRAGMA ivm('cascade_accounts_crm');
+PRAGMA refresh('cascade_accounts_crm');
 
 query I
 SELECT count(*) FROM (
@@ -555,7 +959,7 @@ SELECT count(*) FROM (
 0
 
 statement ok
-SET ivm_cascade_refresh = 'downstream';
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE TABLE dl.window_upstream_src (
@@ -585,7 +989,7 @@ SELECT
 FROM dl.window_upstream_base;
 
 query I
-SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_window_upstream';
+SELECT group_columns FROM openivm_views WHERE view_name = 'mv_window_upstream';
 ----
 acct_id=acct_id
 
@@ -595,10 +999,10 @@ INSERT INTO dl.window_upstream_src VALUES
     (2, 10, 200);
 
 statement ok
-PRAGMA ivm('window_upstream_base');
+PRAGMA refresh('window_upstream_base');
 
 statement ok
-PRAGMA ivm('mv_window_upstream');
+PRAGMA refresh('mv_window_upstream');
 
 query I
 SELECT count(*) FROM (
@@ -623,10 +1027,10 @@ INSERT INTO dl.window_upstream_src VALUES
     (1, 20, 50);
 
 statement ok
-PRAGMA ivm('window_upstream_base');
+PRAGMA refresh('window_upstream_base');
 
 statement ok
-PRAGMA ivm('mv_window_upstream');
+PRAGMA refresh('mv_window_upstream');
 
 query I
 SELECT count(*) FROM (
@@ -666,7 +1070,7 @@ statement ok
 INSERT INTO dl.window_join_codes VALUES (2, 'closed');
 
 statement ok
-PRAGMA ivm('mv_window_join');
+PRAGMA refresh('mv_window_join');
 
 query I
 SELECT count(*) FROM (

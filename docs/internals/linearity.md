@@ -2,7 +2,7 @@
 
 Each IVM rewrite rule carries a **linearity classification** that determines how its
 delta-rule is derived from the operator's algebra. The classification is exposed on the
-`IvmRule` base class via `GetLinearity()` (see `src/include/rules/rule.hpp`):
+`IncrementalRule` base class via `GetLinearity()` (see `src/include/rules/rule.hpp`):
 
 ```cpp
 enum class Linearity { LINEAR, BILINEAR, NON_LINEAR };
@@ -20,13 +20,13 @@ state is needed and cost is proportional to `|delta|`.
 
 | Operator | Rule class |
 |---|---|
-| Table scan | `IvmScanRule` |
-| Projection | `IvmProjectionRule` |
-| Filter | `IvmFilterRule` |
-| UNION ALL (bag union) | `IvmUnionRule` |
-| `SUM`, `COUNT` (over linear inputs) | propagated through `IvmAggregateRule` |
+| Table scan | `IncrementalScanRule` |
+| Projection | `IncrementalProjectionRule` |
+| Filter | `IncrementalFilterRule` |
+| UNION ALL (bag union) | `IncrementalUnionRule` |
+| `SUM`, `COUNT` (over linear inputs) | propagated through `IncrementalAggregateRule` |
 
-`IvmAggregateRule` is structurally LINEAR — it just passes the multiplicity column
+`IncrementalAggregateRule` is structurally LINEAR — it just passes the multiplicity column
 through as a group-by key. AVG and STDDEV/VARIANCE are decomposed into linear helper
 columns before upsert compilation. Non-linear aggregate forms such as MIN/MAX deletes,
 LIST filters, and non-summable output columns are detected at compile time and routed
@@ -42,8 +42,8 @@ DuckLake N-term telescoping join, it's exactly N.
 
 | Operator | Rule class |
 |---|---|
-| INNER JOIN, CROSS JOIN, arbitrary-predicate joins | `IvmJoinRule` |
-| LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN | `IvmJoinRule` plus outer-join upsert paths |
+| INNER JOIN, CROSS JOIN, arbitrary-predicate joins | `IncrementalJoinRule` |
+| LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN | `IncrementalJoinRule` plus outer-join upsert paths |
 | DuckLake telescoping join | `BuildDuckLakeJoinTerms` |
 
 See [`operators/inner-join.md`](../operators/inner-join.md) for the algebraic derivation
@@ -61,9 +61,9 @@ inputs — there is no closed-form per-row rule. OpenIVM falls back to:
 
 | Operator | Rule class | Fallback |
 |---|---|---|
-| `DISTINCT` (δ in DBSP) | `IvmDistinctRule` | Group recompute via COUNT(*) sentinel |
-| `SEMI JOIN`, `ANTI JOIN` | `IvmJoinRule` + aux-state upsert | Match-count threshold state |
-| Window functions | `IvmWindowRule` | Partition recompute |
+| `DISTINCT` (δ in DBSP) | `IncrementalDistinctRule` | Group recompute via COUNT(*) sentinel |
+| `SEMI JOIN`, `ANTI JOIN` | `IncrementalJoinRule` + aux-state upsert | Match-count threshold state |
+| Window functions | `IncrementalWindowRule` | Partition recompute |
 
 DISTINCT is non-linear *even on positive Z-sets* — it drops duplicates, which can't be
 expressed as a sum over deltas. SEMI and ANTI joins are threshold operators over

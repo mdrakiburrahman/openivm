@@ -1,6 +1,6 @@
 # Automatic Refresh
 
-OpenIVM can automatically refresh materialized views on a schedule using `REFRESH EVERY`. A background daemon thread checks for due views every 30 seconds and refreshes them using the same `PRAGMA ivm()` pipeline.
+OpenIVM can automatically refresh materialized views on a schedule using `REFRESH EVERY`. A background daemon thread checks for due views every 30 seconds and refreshes them using the same `PRAGMA refresh()` pipeline.
 
 ## Syntax
 
@@ -10,7 +10,7 @@ CREATE MATERIALIZED VIEW mv REFRESH EVERY '5 minutes' AS
     SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
     FROM sales GROUP BY region;
 
--- No automatic refresh (default — manual PRAGMA ivm() only)
+-- No automatic refresh (default — manual PRAGMA refresh() only)
 CREATE MATERIALIZED VIEW mv AS
     SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
     FROM sales GROUP BY region;
@@ -18,15 +18,15 @@ CREATE MATERIALIZED VIEW mv AS
 
 Supported intervals: `N minutes`, `N hours`, `N days`. Minimum is 1 minute.
 
-Manual `PRAGMA ivm()` still works on views with `REFRESH EVERY` — the two mechanisms coexist.
+Manual `PRAGMA refresh()` still works on views with `REFRESH EVERY` — the two mechanisms coexist.
 
 ## How it works
 
 The refresh daemon is a background `std::thread` started at extension load. It:
 
 1. Wakes every 30 seconds
-2. Queries `_duckdb_ivm_views` for views with `refresh_interval IS NOT NULL`
-3. For each view where `now() - last_update >= interval`: calls `PRAGMA ivm('view_name')`
+2. Queries `openivm_views` for views with `refresh_interval IS NOT NULL`
+3. For each view where `now() - last_update >= interval`: calls `PRAGMA refresh('view_name')`
 4. Skips views that are already being refreshed (via `TryLockView`)
 
 The daemon holds a non-owning reference to the database and exits cleanly when the database is destroyed.
@@ -34,7 +34,7 @@ The daemon holds a non-owning reference to the database and exits cleanly when t
 ## Checking refresh status
 
 ```sql
-PRAGMA ivm_status('mv');
+PRAGMA refresh_status('mv');
 ```
 
 Returns a single row:
@@ -47,6 +47,7 @@ Returns a single row:
 | `next_refresh` | TIMESTAMP | Estimated next refresh (last_refresh + interval) |
 | `status` | VARCHAR | `idle` or `refreshing` |
 | `effective_interval` | BIGINT | Current interval after backoff (same as configured if no backoff) |
+| `refresh_strategy` | VARCHAR | Stored refresh type, such as `aggregate_group`, `window_partition`, or `full_refresh` |
 
 ## Adaptive backoff
 
@@ -54,18 +55,18 @@ When a refresh takes longer than its interval (e.g., a 3-minute refresh on a 1-m
 
 ```
 Warning: refresh of 'mv_sales' took 185s (interval: 60s).
-Increasing effective interval to 120s. Set ivm_adaptive_backoff = false to disable.
+Increasing effective interval to 120s. Set openivm_adaptive_backoff = false to disable.
 ```
 
 Backoff is runtime-only — the configured `refresh_interval` in metadata is never modified. Restarting the database resets all backoffs. Disable with:
 
 ```sql
-SET ivm_adaptive_backoff = false;
+SET openivm_adaptive_backoff = false;
 ```
 
 ## Crash safety
 
-If the process crashes mid-refresh (after the MERGE updates the MV but before `last_update` is advanced), the same deltas could be double-applied on restart. OpenIVM detects this via a `refresh_in_progress` flag in `_duckdb_ivm_views`:
+If the process crashes mid-refresh (after the MERGE updates the MV but before `last_update` is advanced), the same deltas could be double-applied on restart. OpenIVM detects this via a `refresh_in_progress` flag in `openivm_views`:
 
 - Set to `true` before the IVM query starts
 - Cleared after `last_update` is set
@@ -79,7 +80,7 @@ This adds two small UPDATE statements per refresh cycle (one before, one after t
 
 ## Concurrency
 
-Automatic refresh uses the same per-view locking as manual `PRAGMA ivm()`:
+Automatic refresh uses the same per-view locking as manual `PRAGMA refresh()`:
 
 - **Reads during refresh**: always safe (DuckDB MVCC — readers see a consistent snapshot)
 - **Two concurrent refreshes of the same view**: serialized by a per-view mutex. The daemon skips views that are locked (e.g., by a manual PRAGMA), and manual PRAGMAs wait for the daemon to finish.
@@ -89,17 +90,20 @@ Automatic refresh uses the same per-view locking as manual `PRAGMA ivm()`:
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `ivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than the interval |
+| `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than the interval |
+| `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon at extension load |
+| `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` |
+| `openivm_profile_retention_days` | BIGINT | `31` | Delete profile rows older than this many days when profiling writes new rows |
 
 The refresh interval itself is per-view, set at creation time via `REFRESH EVERY`.
 
 ## Metadata
 
-The `refresh_interval` and `refresh_in_progress` columns are stored in `_duckdb_ivm_views`:
+The `refresh_interval` and `refresh_in_progress` columns are stored in `openivm_views`:
 
 ```sql
 SELECT view_name, refresh_interval, refresh_in_progress
-FROM _duckdb_ivm_views
+FROM openivm_views
 WHERE refresh_interval IS NOT NULL;
 ```
 

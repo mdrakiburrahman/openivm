@@ -12,24 +12,38 @@ include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
-    src/core/openivm_parser.cpp
-    src/core/openivm_utils.cpp
-    src/core/openivm_metadata.cpp
-    src/core/ivm_delta_model.cpp
     src/core/ivm_view_classifier.cpp
-    src/core/ivm_plan_rewrite.cpp
-    src/upsert/openivm_upsert.cpp
-    src/upsert/openivm_compile_upsert.cpp
-    src/upsert/openivm_cost_model.cpp
-    src/upsert/openivm_index_regen.cpp
-    src/rules/openivm_rewrite_rule.cpp
-    src/rules/openivm_insert_rule.cpp
+    src/core/parser.cpp
+    src/core/parser_create_mv_helpers.cpp
+    src/core/parser_ddl.cpp
+    src/core/parser_parse.cpp
+    src/core/parser_plan_helpers.cpp
+    src/core/parser_sql_extractors.cpp
+    src/core/sql_utils.cpp
+    src/core/refresh_metadata.cpp
+    src/core/incremental_checker.cpp
+    src/core/plan_rewrite.cpp
+    src/core/plan_rewrite_aggregates.cpp
+    src/upsert/refresh.cpp
+    src/upsert/refresh_delta_fast_paths.cpp
+    src/upsert/refresh_group_measure.cpp
+    src/upsert/refresh_helpers.cpp
+    src/upsert/refresh_sql.cpp
+    src/upsert/refresh_window.cpp
+    src/upsert/refresh_compiler.cpp
+    src/upsert/refresh_compiler_aux.cpp
+    src/upsert/refresh_cost_model.cpp
+    src/upsert/refresh_index_regen.cpp
+    src/rules/incremental_rewrite_rule.cpp
+    src/rules/refresh_insert_rule.cpp
+    src/rules/schema_evolution.cpp
     src/rules/helpers.cpp
     src/rules/scan.cpp
     src/rules/filter.cpp
     src/rules/projection.cpp
     src/rules/aggregate.cpp
     src/rules/join.cpp
+    src/rules/join_output.cpp
     src/rules/delim_join.cpp
     src/rules/ducklake_join.cpp
     src/rules/union.cpp
@@ -37,13 +51,13 @@ set(EXTENSION_SOURCES
     src/rules/window.cpp
     src/rules/topk.cpp
     src/rules/column_hider.cpp
-    src/core/openivm_refresh_locks.cpp
-    src/core/openivm_refresh_daemon.cpp
+    src/core/refresh_locks.cpp
+    src/core/refresh_daemon.cpp
     src/match/plan_canonical.cpp
     src/match/predicate_oracle.cpp
     src/match/equivalence_classes.cpp
     src/match/constraint_cache.cpp
-    src/match/mv_catalog_index.cpp
+    src/match/view_catalog_index.cpp
     ${LPTS_DIR}/src/cte_nodes.cpp
     ${LPTS_DIR}/src/lpts_helpers.cpp
     ${LPTS_DIR}/src/lpts_ast.cpp

@@ -1,10 +1,10 @@
 # Refresh Strategies
 
-OpenIVM supports three refresh strategies for materialized views: **auto**, **incremental**, and **full**. The strategy determines how `PRAGMA ivm('view_name')` applies pending changes.
+OpenIVM supports three refresh strategies for materialized views: **auto**, **incremental**, and **full**. The strategy determines how `PRAGMA refresh('view_name')` applies pending changes.
 
 ## Refresh modes
 
-The `ivm_refresh_mode` setting controls which strategy is used at refresh time.
+The `openivm_refresh_mode` setting controls which strategy is used at refresh time.
 
 | Mode            | Behavior |
 |-----------------|---|
@@ -14,21 +14,21 @@ The `ivm_refresh_mode` setting controls which strategy is used at refresh time.
 
 ```sql
 -- Use incremental refresh (default)
-SET ivm_refresh_mode = 'incremental';
-PRAGMA ivm('monthly_totals');
+SET openivm_refresh_mode = 'incremental';
+PRAGMA refresh('monthly_totals');
 
 -- Let the system decide (incremental when supported, full otherwise)
-SET ivm_refresh_mode = 'auto';
-PRAGMA ivm('monthly_totals');
+SET openivm_refresh_mode = 'auto';
+PRAGMA refresh('monthly_totals');
 
 -- Force full recomputation
-SET ivm_refresh_mode = 'full';
-PRAGMA ivm('monthly_totals');
+SET openivm_refresh_mode = 'full';
+PRAGMA refresh('monthly_totals');
 ```
 
 ## Upsert compilation by view type
 
-The incremental refresh compiles different SQL depending on the view's `IVMType` (see [Parser: IVM compatibility classification](../internals/parser.md#ivm-compatibility-classification)).
+The incremental refresh compiles different SQL depending on the view's `RefreshType` (see [Parser: IVM compatibility classification](../internals/parser.md#ivm-compatibility-classification)).
 
 | View type | Strategy | Why |
 |---|---|---|
@@ -47,33 +47,33 @@ MERGE requires a key to match source and target rows. `AGGREGATE_GROUP` views ha
 
 > **Note:** This feature is experimental. The cost model heuristics may change in future releases.
 
-When `ivm_adaptive_refresh` is enabled, OpenIVM estimates the cost of incremental refresh versus full recomputation before each refresh and picks the cheaper option. This is useful when delta sizes vary unpredictably.
+When `openivm_adaptive_refresh` is enabled, OpenIVM estimates the cost of incremental refresh versus full recomputation before each refresh and picks the cheaper option. This is useful when delta sizes vary unpredictably.
 
 ```sql
-SET ivm_adaptive_refresh = true;
-PRAGMA ivm('monthly_totals');
+SET openivm_adaptive_refresh = true;
+PRAGMA refresh('monthly_totals');
 ```
 
-The cost model compares estimated cardinalities of the delta tables against the base tables. When `ivm_adaptive_refresh` is `false` (the default), the system always uses IVM for views that support it.
+The cost model compares estimated cardinalities of the delta tables against the base tables. When `openivm_adaptive_refresh` is `false` (the default), the system always uses IVM for views that support it.
 
 For FULL OUTER JOIN views, the static model applies higher upsert cost multipliers (3x for aggregates, 1.5x for projections) to account for the additional recompute phases (unmatched-row key extraction, NULL group recompute). The learned regression model self-corrects from execution history after a few refreshes.
 
 ### Inspecting the cost estimate
 
-`PRAGMA ivm_cost('view_name')` returns the cost model's recommendation without performing a refresh.
+`PRAGMA refresh_cost('view_name')` returns the cost model's recommendation without performing a refresh.
 
 ```sql
-PRAGMA ivm_cost('monthly_totals');
+PRAGMA refresh_cost('monthly_totals');
 ```
 
 Returns a single row:
 
-| decision | ivm_cost | recompute_cost |
+| decision | incremental_cost | recompute_cost |
 |---|---|---|
 | incremental | 1200.0 | 50000.0 |
 
 - `decision`: `incremental` or `full`, based on which cost is lower.
-- `ivm_cost`: estimated cost of applying deltas.
+- `incremental_cost`: estimated cost of applying deltas.
 - `recompute_cost`: estimated cost of a full DELETE + INSERT.
 
 ## Automatic full-refresh detection
@@ -97,7 +97,7 @@ Views that use operators not yet supported for IVM are classified as `FULL_REFRE
 `INNER JOIN`, `CROSS JOIN`, arbitrary-predicate joins, `LEFT JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN` are supported for incremental maintenance. Supported `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` projection shapes use an aux-state path.
 
 ```sql
--- Prints a warning; subsequent PRAGMA ivm() uses full refresh
+-- Prints a warning; subsequent PRAGMA refresh() uses full refresh
 CREATE MATERIALIZED VIEW with_unsupported AS
   SELECT MEDIAN(amount) FROM orders;
 ```
