@@ -125,10 +125,10 @@ static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const str
 }
 
 static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
-	// openivm_compile_only and openivm_target_dialect have been replaced by
-	// the per-call CompileFacts (see compile_facts.hpp). Only the remaining
-	// session-scoped planning settings still need to be mirrored onto the
-	// fresh planning connection.
+	// Per-call compile context (target dialect, compile_only, cascade hints) is
+	// carried by CompileFacts — see compile_facts.hpp. Only the remaining
+	// session-scoped planning settings still need to be mirrored onto the fresh
+	// planning connection.
 	static const char *PLANNING_SETTINGS[] = {
 	    "openivm_skip_empty_deltas",
 	    "openivm_fk_pruning",
@@ -803,7 +803,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			has_downstream = true;
 		}
 	}
-	// openivm_emit_cascade_delta_for_recompute: WINDOW_PARTITION / GROUP_RECOMPUTE
+	// emit_cascade_delta_for_recompute: WINDOW_PARTITION / GROUP_RECOMPUTE
 	// compile their own signed-multiset view-delta into openivm_delta_<view>.
 	// Treat the MV as cascade-capable so cleanup retains the emitted rows even
 	// in compile-for-cascade sessions with no registered downstream metadata.
