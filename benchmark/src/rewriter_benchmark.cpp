@@ -357,13 +357,45 @@ static string FormatQueryList(const vector<string> &names, size_t max_show = 10)
 
 // ===== Stats Struct =====
 
+static constexpr uint8_t PHASE_DUCKDB_VALIDATION_FAILED = 1;
+static constexpr uint8_t PHASE_MV_CREATION_FAILED = 2;
+static constexpr uint8_t PHASE_DELTA_FAILED = 3;
+static constexpr uint8_t PHASE_REFRESH_FAILED = 4;
+static constexpr uint8_t PHASE_VERIFY_FAILED = 5;
+static constexpr uint8_t PHASE_OK = 6;
+static constexpr uint8_t PHASE_TIMEOUT = 98;
+static constexpr uint8_t PHASE_CRASH = 99;
+
+static string PhaseName(uint8_t phase) {
+	switch (phase) {
+	case PHASE_DUCKDB_VALIDATION_FAILED:
+		return "duckdb_validation_failed";
+	case PHASE_MV_CREATION_FAILED:
+		return "mv_creation_failed";
+	case PHASE_DELTA_FAILED:
+		return "delta_failed";
+	case PHASE_REFRESH_FAILED:
+		return "refresh_failed";
+	case PHASE_VERIFY_FAILED:
+		return "verify_failed";
+	case PHASE_OK:
+		return "ok";
+	case PHASE_TIMEOUT:
+		return "timeout";
+	case PHASE_CRASH:
+		return "crash";
+	default:
+		return "unknown";
+	}
+}
+
 struct RewriterStats {
 	int validation_ok = 0, validation_fail = 0;
 	int mv_creation_ok = 0, mv_creation_fail = 0;
 	int incremental = 0, full_refresh = 0;
 	int refresh_ok = 0, refresh_fail = 0;
 	int correct = 0, incorrect = 0;
-	int crashed = 0;
+	int crashed = 0, timeout = 0;
 	double total_mv_ms = 0, total_refresh_ms = 0, total_verify_ms = 0;
 	std::map<string, int> error_counts;
 	std::map<string, vector<string>> error_queries;
@@ -591,8 +623,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				con.Query(native_use);
 			}
 
-			uint8_t phase_reached =
-			    0; // 1=duckdb_fail, 2=mv_fail, 3=delta_fail, 4=refresh_fail, 5=verify_fail, 6=ok, 99=crash
+			uint8_t phase_reached = 0;
 			uint8_t is_incremental = 0;
 			uint8_t is_correct = 0;
 			double time_select_ms = 0, time_mv_ms = 0, time_refresh_ms = 0, time_verify_ms = 0;
@@ -605,21 +636,21 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				auto test_result = con.Query(test_query);
 				if (test_result && test_result->HasError()) {
 					error = test_result->GetError();
-					phase_reached = IsFatalError(error) ? 99 : 1;
+					phase_reached = IsFatalError(error) ? PHASE_CRASH : PHASE_DUCKDB_VALIDATION_FAILED;
 				} else {
 					auto end = std::chrono::steady_clock::now();
 					time_select_ms = std::chrono::duration<double, std::milli>(end - start).count();
-					phase_reached = 2;
+					phase_reached = PHASE_MV_CREATION_FAILED;
 				}
 			} catch (std::exception &e) {
 				error = e.what();
-				phase_reached = IsFatalError(error) ? 99 : 1;
+				phase_reached = IsFatalError(error) ? PHASE_CRASH : PHASE_DUCKDB_VALIDATION_FAILED;
 			} catch (...) {
 				error = "unknown exception";
-				phase_reached = 1;
+				phase_reached = PHASE_DUCKDB_VALIDATION_FAILED;
 			}
 
-			if (phase_reached == 2) {
+			if (phase_reached == PHASE_MV_CREATION_FAILED) {
 				// Phase 2: MV creation
 				start = std::chrono::steady_clock::now();
 				try {
@@ -628,17 +659,17 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					if (mv_result && mv_result->HasError()) {
 						error = mv_result->GetError();
 						if (IsFatalError(error)) {
-							phase_reached = 99;
+							phase_reached = PHASE_CRASH;
 						} else {
-							phase_reached = 2;
+							phase_reached = PHASE_MV_CREATION_FAILED;
 						}
 					} else {
 						auto end = std::chrono::steady_clock::now();
 						time_mv_ms = std::chrono::duration<double, std::milli>(end - start).count();
-						phase_reached = 3;
+						phase_reached = PHASE_DELTA_FAILED;
 					}
 
-					if (phase_reached == 3) {
+					if (phase_reached == PHASE_DELTA_FAILED) {
 						// Phase 2b: Check incrementability (type=3 is FULL_REFRESH, rest are incremental).
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
@@ -656,7 +687,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						}
 						if ((size_t)delta_idx >= deltas.size())
 							delta_idx = 0;
-						phase_reached = 4;
+						phase_reached = PHASE_REFRESH_FAILED;
 
 						// Phase 4: PRAGMA refresh()
 						start = std::chrono::steady_clock::now();
@@ -664,14 +695,14 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						if (refresh_result && refresh_result->HasError()) {
 							error = refresh_result->GetError();
 							if (IsFatalError(error)) {
-								phase_reached = 99;
+								phase_reached = PHASE_CRASH;
 							} else {
-								phase_reached = 4;
+								phase_reached = PHASE_REFRESH_FAILED;
 							}
 						} else {
 							auto end_refresh = std::chrono::steady_clock::now();
 							time_refresh_ms = std::chrono::duration<double, std::milli>(end_refresh - start).count();
-							phase_reached = 5;
+							phase_reached = PHASE_VERIFY_FAILED;
 
 							// Phase 5: EXCEPT ALL verification (wrap in subqueries to handle ORDER BY/CTEs).
 							// Rename both sides to synthetic column names (c0, c1, ...) so EXCEPT ALL
@@ -820,7 +851,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							}
 							auto end_verify = std::chrono::steady_clock::now();
 							time_verify_ms = std::chrono::duration<double, std::milli>(end_verify - start).count();
-							phase_reached = (is_correct ? 6 : 5);
+							phase_reached = (is_correct ? PHASE_OK : PHASE_VERIFY_FAILED);
 						}
 					}
 
@@ -831,13 +862,13 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				} catch (std::exception &e) {
 					error = e.what();
 					if (IsFatalError(error)) {
-						phase_reached = 99;
-					} else if (phase_reached < 2) {
-						phase_reached = 2;
+						phase_reached = PHASE_CRASH;
+					} else if (phase_reached < PHASE_MV_CREATION_FAILED) {
+						phase_reached = PHASE_MV_CREATION_FAILED;
 					}
 				} catch (...) {
 					error = "mv creation failed";
-					phase_reached = 2;
+					phase_reached = PHASE_MV_CREATION_FAILED;
 				}
 			}
 
@@ -857,7 +888,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			if (err_len > 0)
 				WriteAllBytes(write_fd, error.data(), err_len);
 
-			if (phase_reached == 99) {
+			if (phase_reached == PHASE_CRASH) {
 				_exit(1);
 			}
 		}
@@ -962,7 +993,7 @@ struct ForkWorker {
 			int status;
 			waitpid(child_pid, &status, 0);
 			child_pid = -1;
-			result_phase = 99;
+			result_phase = PHASE_CRASH;
 			return;
 		}
 
@@ -976,7 +1007,7 @@ struct ForkWorker {
 				kill(child_pid, SIGKILL);
 				waitpid(child_pid, nullptr, 0);
 				child_pid = -1;
-				result_phase = 2; // timeout
+				result_phase = PHASE_TIMEOUT;
 				result_error = "timeout";
 				return;
 			}
@@ -1003,7 +1034,7 @@ struct ForkWorker {
 					int status;
 					waitpid(child_pid, &status, 0);
 					child_pid = -1;
-					result_phase = 99;
+					result_phase = PHASE_CRASH;
 					return;
 				}
 				uint32_t err_len = 0;
@@ -1011,7 +1042,7 @@ struct ForkWorker {
 					int status;
 					waitpid(child_pid, &status, 0);
 					child_pid = -1;
-					result_phase = 99;
+					result_phase = PHASE_CRASH;
 					return;
 				}
 				if (err_len > 0) {
@@ -1020,12 +1051,12 @@ struct ForkWorker {
 						int status;
 						waitpid(child_pid, &status, 0);
 						child_pid = -1;
-						result_phase = 99;
+						result_phase = PHASE_CRASH;
 						return;
 					}
 				}
 
-				if (result_phase == 99) {
+				if (result_phase == PHASE_CRASH) {
 					int status;
 					waitpid(child_pid, &status, 0);
 					child_pid = -1;
@@ -1037,7 +1068,7 @@ struct ForkWorker {
 				int status;
 				waitpid(child_pid, &status, 0);
 				child_pid = -1;
-				result_phase = 99;
+				result_phase = PHASE_CRASH;
 				if (WIFEXITED(status)) {
 					result_error = "child exited with code " + std::to_string(WEXITSTATUS(status));
 				} else if (WIFSIGNALED(status)) {
@@ -1052,7 +1083,7 @@ struct ForkWorker {
 			int w = waitpid(child_pid, &status, WNOHANG);
 			if (w > 0) {
 				child_pid = -1;
-				result_phase = 99;
+				result_phase = PHASE_CRASH;
 				if (WIFEXITED(status)) {
 					result_error = "child exited with code " + std::to_string(WEXITSTATUS(status));
 				} else if (WIFSIGNALED(status)) {
@@ -1118,33 +1149,52 @@ static void PrintIncrementalityMatrix(const RewriterStats &stats) {
 }
 
 static void PrintStats(const string &label, const RewriterStats &stats, int total) {
+	int validation_denominator = std::max(1, total);
+	int mv_denominator = std::max(1, stats.validation_ok);
+	int classification_denominator = std::max(1, stats.mv_creation_ok);
+	int refresh_denominator = std::max(1, stats.mv_creation_ok);
+	int correct_denominator = std::max(1, stats.refresh_ok);
+
 	Log("--- " + label + " ---");
-	Log("  Total:   " + std::to_string(total));
-	Log("  Validation OK:   " + std::to_string(stats.validation_ok) + " (" +
-	    FormatNumber(100.0 * stats.validation_ok / total) + "%)");
-	Log("  MV Creation OK:   " + std::to_string(stats.mv_creation_ok) + " (" +
-	    FormatNumber(100.0 * stats.mv_creation_ok / total) + "%)");
+	Log("  Total attempted:              " + std::to_string(total));
+	Log("  DuckDB validation OK:         " + std::to_string(stats.validation_ok) + " (" +
+	    FormatNumber(100.0 * stats.validation_ok / validation_denominator) + "% of attempted)");
+	Log("  DuckDB validation failed:     " + std::to_string(stats.validation_fail) + " (" +
+	    FormatNumber(100.0 * stats.validation_fail / validation_denominator) + "% of attempted)");
+	Log("  MV creation denominator:      " + std::to_string(stats.validation_ok) + " DuckDB-valid queries");
+	Log("  MV creation OK:               " + std::to_string(stats.mv_creation_ok) + " (" +
+	    FormatNumber(100.0 * stats.mv_creation_ok / mv_denominator) + "% of DuckDB-valid)");
+	Log("  MV creation failed:           " + std::to_string(stats.mv_creation_fail) + " (" +
+	    FormatNumber(100.0 * stats.mv_creation_fail / mv_denominator) + "% of DuckDB-valid)");
+	Log("  Classification denominator:   " + std::to_string(stats.mv_creation_ok) + " MV-created queries");
 	Log("  Incremental:  " + std::to_string(stats.incremental) + " (" +
-	    FormatNumber(100.0 * stats.incremental / std::max(1, stats.mv_creation_ok)) + "% of created)");
+	    FormatNumber(100.0 * stats.incremental / classification_denominator) + "% of created)");
 	Log("  Full refresh: " + std::to_string(stats.full_refresh) + " (" +
-	    FormatNumber(100.0 * stats.full_refresh / std::max(1, stats.mv_creation_ok)) + "% of created)");
-	Log("  Refresh OK:   " + std::to_string(stats.refresh_ok) + " (" + FormatNumber(100.0 * stats.refresh_ok / total) +
-	    "%)");
+	    FormatNumber(100.0 * stats.full_refresh / classification_denominator) + "% of created)");
+	Log("  Refresh OK:   " + std::to_string(stats.refresh_ok) + " (" +
+	    FormatNumber(100.0 * stats.refresh_ok / refresh_denominator) + "% of created)");
+	Log("  Refresh failed: " + std::to_string(stats.refresh_fail) + " (" +
+	    FormatNumber(100.0 * stats.refresh_fail / refresh_denominator) + "% of created)");
 	Log("  Correct:      " + std::to_string(stats.correct) + " (" +
-	    FormatNumber(100.0 * stats.correct / std::max(1, stats.refresh_ok)) + "% of refreshed)");
-	Log("  Crashed:      " + std::to_string(stats.crashed) + " (" + FormatNumber(100.0 * stats.crashed / total) + "%)");
+	    FormatNumber(100.0 * stats.correct / correct_denominator) + "% of refreshed)");
+	Log("  Timeout:      " + std::to_string(stats.timeout) + " (" +
+	    FormatNumber(100.0 * stats.timeout / validation_denominator) + "% of attempted)");
+	Log("  Crashed:      " + std::to_string(stats.crashed) + " (" +
+	    FormatNumber(100.0 * stats.crashed / validation_denominator) + "% of attempted)");
 	if (stats.mv_creation_ok > 0) {
 		Log("  Avg MV time:      " + FormatNumber(stats.total_mv_ms / stats.mv_creation_ok) + " ms");
-		Log("  Avg refresh time: " + FormatNumber(stats.total_refresh_ms / stats.refresh_ok) + " ms");
-		Log("  Avg verify time:  " + FormatNumber(stats.total_verify_ms / stats.refresh_ok) + " ms");
+		if (stats.refresh_ok > 0) {
+			Log("  Avg refresh time: " + FormatNumber(stats.total_refresh_ms / stats.refresh_ok) + " ms");
+			Log("  Avg verify time:  " + FormatNumber(stats.total_verify_ms / stats.refresh_ok) + " ms");
+		}
 	}
 }
 
 static vector<string> RunBenchmark(const string &queries_dir, const string &db_path, int scale_factor, double timeout_s,
                                    const string &workload = "tpcc") {
 	vector<string> csv_lines;
-	csv_lines.push_back("query_name,phase_reached,meta_is_incremental,actual_is_incremental,is_correct,time_select_ms,"
-	                    "time_mv_ms,time_refresh_ms,time_verify_ms,error");
+	csv_lines.push_back("query_name,phase_reached,phase_name,meta_is_incremental,actual_is_incremental,is_correct,"
+	                    "time_select_ms,time_mv_ms,time_refresh_ms,time_verify_ms,error");
 
 	if (!FileExists(db_path)) {
 		Log("Creating " + workload + " database: " + db_path);
@@ -1212,7 +1262,8 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 		if (query_sql.empty()) {
 			stats.validation_fail++;
-			csv_lines.push_back(query_name + ",1,0,0,0,0,0,0,,,empty file");
+			csv_lines.push_back(query_name + "," + std::to_string(PHASE_DUCKDB_VALIDATION_FAILED) + "," +
+			                    PhaseName(PHASE_DUCKDB_VALIDATION_FAILED) + ",0,,0,0,0,0,0,\"empty file\"");
 			continue;
 		}
 
@@ -1228,9 +1279,8 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		// next child opens the DB. A SIGKILL'd child never flushes its WAL, and
 		// DuckDB's WAL replay can then fail with "Calling DatabaseManager::
 		// GetDefaultDatabase with no default database set", killing every subsequent
-		// query. Timeouts surface as phase=2 with error=="timeout"; actual crashes
-		// as phase=99.
-		bool child_died = (phase == 99) || (phase == 2 && error_msg == "timeout");
+		// query.
+		bool child_died = (phase == PHASE_CRASH) || (phase == PHASE_TIMEOUT);
 		if (child_died) {
 			string wal_path = db_path + ".wal";
 			if (FileExists(wal_path)) {
@@ -1239,7 +1289,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		}
 
 		// Handle crash: attribute to root-cause query if INTERNAL error preceded it
-		if (phase == 99) {
+		if (phase == PHASE_CRASH) {
 			worker.Stop();
 
 			if (!last_internal_error_query.empty()) {
@@ -1260,12 +1310,17 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 			string err = error_msg.empty() ? "child died unexpectedly" : error_msg;
 			stats.error_counts[err]++;
 			stats.error_queries[err].push_back(query_name);
-		} else if (phase == 1) {
+		} else if (phase == PHASE_TIMEOUT) {
+			stats.timeout++;
+			stats.error_counts[error_msg]++;
+			stats.error_queries[error_msg].push_back(query_name);
+			last_internal_error_query.clear();
+		} else if (phase == PHASE_DUCKDB_VALIDATION_FAILED) {
 			stats.validation_fail++;
 			stats.error_counts[error_msg]++;
 			stats.error_queries[error_msg].push_back(query_name);
 			last_internal_error_query.clear();
-		} else if (phase == 2) {
+		} else if (phase == PHASE_MV_CREATION_FAILED) {
 			stats.validation_ok++;
 			stats.mv_creation_fail++;
 			stats.error_counts[error_msg]++;
@@ -1276,7 +1331,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 			} else {
 				last_internal_error_query.clear();
 			}
-		} else if (phase == 3 || phase == 4) {
+		} else if (phase == PHASE_DELTA_FAILED || phase == PHASE_REFRESH_FAILED) {
 			stats.validation_ok++;
 			stats.mv_creation_ok++;
 			if (worker.result_incremental)
@@ -1291,7 +1346,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 			} else {
 				last_internal_error_query.clear();
 			}
-		} else if (phase == 5) {
+		} else if (phase == PHASE_VERIFY_FAILED) {
 			stats.validation_ok++;
 			stats.mv_creation_ok++;
 			if (worker.result_incremental)
@@ -1309,7 +1364,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 			} else {
 				last_internal_error_query.clear();
 			}
-		} else if (phase == 6) {
+		} else if (phase == PHASE_OK) {
 			stats.validation_ok++;
 			stats.mv_creation_ok++;
 			if (worker.result_incremental)
@@ -1326,7 +1381,8 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 		// Metadata-vs-OpenIVM confusion matrix: only count queries where MV creation succeeded
 		// (so we have a real refresh_type to compare against).
-		bool has_actual_classification = phase == 3 || phase == 4 || phase == 5 || phase == 6;
+		bool has_actual_classification = phase == PHASE_DELTA_FAILED || phase == PHASE_REFRESH_FAILED ||
+		                                 phase == PHASE_VERIFY_FAILED || phase == PHASE_OK;
 		if (has_actual_classification) {
 			bool actual_incr = (worker.result_incremental != 0);
 			if (meta_incremental < 0) {
@@ -1348,7 +1404,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		string meta_str = (meta_incremental < 0) ? "" : std::to_string(meta_incremental);
 		string actual_str = has_actual_classification ? std::to_string(worker.result_incremental) : "";
 		std::ostringstream csv_line;
-		csv_line << query_name << "," << std::to_string(phase) << "," << meta_str << ","
+		csv_line << query_name << "," << std::to_string(phase) << "," << PhaseName(phase) << "," << meta_str << ","
 		         << actual_str << "," << std::to_string(worker.result_correct) << ","
 		         << FormatNumber(worker.result_time_select_ms) << "," << FormatNumber(worker.result_time_mv_ms) << ","
 		         << FormatNumber(worker.result_time_refresh_ms) << "," << FormatNumber(worker.result_time_verify_ms)
