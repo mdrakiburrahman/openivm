@@ -115,6 +115,10 @@ static DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
 		return DeltaModelNodeKind::TOP_K;
 	case LogicalOperatorType::LOGICAL_UNNEST:
 		return DeltaModelNodeKind::UNNEST;
+	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+	case LogicalOperatorType::LOGICAL_CHUNK_GET:
+		return DeltaModelNodeKind::CONSTANT;
 	case LogicalOperatorType::LOGICAL_CTE_REF:
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 		return DeltaModelNodeKind::CTE;
@@ -148,6 +152,7 @@ static DeltaRuleKind RuleKindForNode(DeltaModelNodeKind kind, LogicalOperator &o
 	case DeltaModelNodeKind::UNION:
 	case DeltaModelNodeKind::UNNEST:
 	case DeltaModelNodeKind::CTE:
+	case DeltaModelNodeKind::CONSTANT:
 		return DeltaRuleKind::LINEAR;
 	case DeltaModelNodeKind::JOIN: {
 		auto *join = dynamic_cast<LogicalJoin *>(&op);
@@ -270,6 +275,7 @@ static DeltaNodeMaintenance BuildNodeMaintenance(const DeltaModelNode &node, con
 	case DeltaModelNodeKind::UNION:
 	case DeltaModelNodeKind::UNNEST:
 	case DeltaModelNodeKind::CTE:
+	case DeltaModelNodeKind::CONSTANT:
 		maintenance.mode = DeltaMaintenanceMode::DELTA_ONLY;
 		break;
 	case DeltaModelNodeKind::JOIN:

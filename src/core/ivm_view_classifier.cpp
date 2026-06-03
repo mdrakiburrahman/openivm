@@ -455,6 +455,8 @@ const char *DeltaModelNodeKindName(DeltaModelNodeKind kind) {
 		return "UNNEST";
 	case DeltaModelNodeKind::CTE:
 		return "CTE";
+	case DeltaModelNodeKind::CONSTANT:
+		return "CONSTANT";
 	default:
 		return "OTHER";
 	}

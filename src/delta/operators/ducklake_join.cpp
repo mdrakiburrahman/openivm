@@ -1,5 +1,6 @@
 #include "delta/operators/ducklake_join.hpp"
 #include "delta/operators/join.hpp"
+#include "delta/operators/join_key_probe.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
@@ -10,79 +11,16 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
 
-static uint64_t DuckLakeJoinBindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
-}
-
 struct DuckLakeJoinColumnRef {
 	size_t leaf_index;
 	string column_name;
 };
-
-struct DuckLakeKeyProbe {
-	size_t other_leaf;
-	string delta_column;
-	string other_column;
-};
-
-static bool TryGetColumnRef(Expression &expr, ColumnBinding &binding) {
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		return TryGetColumnRef(*cast.child, binding);
-	}
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &col = expr.Cast<BoundColumnRefExpression>();
-	binding = col.binding;
-	return true;
-}
-
-static void CollectDuckLakeKeyProbes(LogicalOperator *node,
-                                     const unordered_map<uint64_t, DuckLakeJoinColumnRef> &column_refs,
-                                     vector<vector<DuckLakeKeyProbe>> &probes) {
-	if (!node) {
-		return;
-	}
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (join && join->join_type == JoinType::INNER) {
-			for (auto &cond : join->conditions) {
-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-					continue;
-				}
-				ColumnBinding left_binding, right_binding;
-				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
-					continue;
-				}
-				auto left_entry = column_refs.find(DuckLakeJoinBindingKey(left_binding));
-				auto right_entry = column_refs.find(DuckLakeJoinBindingKey(right_binding));
-				if (left_entry == column_refs.end() || right_entry == column_refs.end()) {
-					continue;
-				}
-				auto &left = left_entry->second;
-				auto &right = right_entry->second;
-				if (left.leaf_index == right.leaf_index) {
-					continue;
-				}
-				probes[left.leaf_index].push_back({right.leaf_index, left.column_name, right.column_name});
-				probes[right.leaf_index].push_back({left.leaf_index, right.column_name, left.column_name});
-			}
-		}
-	}
-	for (auto &child : node->children) {
-		CollectDuckLakeKeyProbes(child.get(), column_refs, probes);
-	}
-}
 
 static string DuckLakeQualifiedTable(const string &catalog, const string &schema, const string &table_name,
                                      int64_t snapshot_id) {
@@ -239,7 +177,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		}
 	}
 
-	vector<vector<DuckLakeKeyProbe>> key_probes(N);
+	vector<vector<DeltaJoinKeyProbe>> key_probes(N);
 	if (skip_empty_enabled && !has_left_join) {
 		unordered_map<uint64_t, DuckLakeJoinColumnRef> column_refs;
 		for (size_t i = 0; i < N; i++) {
@@ -254,7 +192,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				if (column_ids[col_idx].IsVirtualColumn()) {
 					continue;
 				}
-				column_refs[DuckLakeJoinBindingKey(bindings[col_idx])] = {i, get->GetColumnName(column_ids[col_idx])};
+				column_refs[DeltaJoinBindingKey(bindings[col_idx])] = {i, get->GetColumnName(column_ids[col_idx])};
 			}
 			auto leaf_bindings = leaves[i].node->GetColumnBindings();
 			idx_t leaf_count = std::min<idx_t>(leaf_bindings.size(), count);
@@ -262,11 +200,10 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				if (column_ids[col_idx].IsVirtualColumn()) {
 					continue;
 				}
-				column_refs[DuckLakeJoinBindingKey(leaf_bindings[col_idx])] = {i,
-				                                                               get->GetColumnName(column_ids[col_idx])};
+				column_refs[DeltaJoinBindingKey(leaf_bindings[col_idx])] = {i, get->GetColumnName(column_ids[col_idx])};
 			}
 		}
-		CollectDuckLakeKeyProbes(input.plan.get(), column_refs, key_probes);
+		CollectDeltaJoinKeyProbes(input.plan.get(), column_refs, key_probes);
 	}
 
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves)\n", N);

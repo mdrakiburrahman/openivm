@@ -1,5 +1,6 @@
 #include "delta/operators/join.hpp"
 #include "delta/operators/ducklake_join.hpp"
+#include "delta/operators/join_key_probe.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
@@ -10,7 +11,6 @@
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/function/function_binder.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -22,10 +22,6 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
-
-static uint64_t BindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
-}
 
 static idx_t CountBits(uint64_t value) {
 	idx_t count = 0;
@@ -44,63 +40,6 @@ struct JoinColumnRef {
 	string column_name;
 	string last_update;
 };
-
-struct JoinKeyProbe {
-	size_t other_leaf;
-	string delta_column;
-	string other_column;
-};
-
-static bool TryGetColumnRef(Expression &expr, ColumnBinding &binding) {
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		return TryGetColumnRef(*cast.child, binding);
-	}
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &col = expr.Cast<BoundColumnRefExpression>();
-	binding = col.binding;
-	return true;
-}
-
-static void CollectJoinKeyProbes(LogicalOperator *node, const unordered_map<uint64_t, JoinColumnRef> &column_refs,
-                                 vector<vector<JoinKeyProbe>> &probes) {
-	if (!node) {
-		return;
-	}
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (join && join->join_type == JoinType::INNER) {
-			for (auto &cond : join->conditions) {
-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-					continue;
-				}
-				ColumnBinding left_binding, right_binding;
-				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
-					continue;
-				}
-				OPENIVM_DEBUG_PRINT("[DeltaJoin] Join key bindings: %s = %s\n", left_binding.ToString().c_str(),
-				                    right_binding.ToString().c_str());
-				auto left_entry = column_refs.find(BindingKey(left_binding));
-				auto right_entry = column_refs.find(BindingKey(right_binding));
-				if (left_entry == column_refs.end() || right_entry == column_refs.end()) {
-					continue;
-				}
-				auto &left = left_entry->second;
-				auto &right = right_entry->second;
-				if (left.leaf_index == right.leaf_index) {
-					continue;
-				}
-				probes[left.leaf_index].push_back({right.leaf_index, left.column_name, right.column_name});
-				probes[right.leaf_index].push_back({left.leaf_index, right.column_name, left.column_name});
-			}
-		}
-	}
-	for (auto &child : node->children) {
-		CollectJoinKeyProbes(child.get(), column_refs, probes);
-	}
-}
 
 static string QualifyColumn(const string &alias, const string &column_name) {
 	return alias + "." + SqlUtils::QuoteIdentifier(column_name);
@@ -179,7 +118,7 @@ static void CollectExistingMultiplicityBindings(LogicalOperator *node, unordered
 		if (!ref.bound_columns.empty() && ref.bound_columns.back() == openivm::MULTIPLICITY_COL) {
 			auto bindings = node->GetColumnBindings();
 			if (!bindings.empty()) {
-				mul_set.insert(BindingKey(bindings.back()));
+				mul_set.insert(DeltaJoinBindingKey(bindings.back()));
 			}
 		}
 	}
@@ -193,7 +132,7 @@ static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindi
                                               vector<ColumnBinding> &filtered_bindings,
                                               vector<LogicalType> &filtered_types) {
 	for (idx_t i = 0; i < bindings.size(); i++) {
-		if (mul_set.count(BindingKey(bindings[i]))) {
+		if (mul_set.count(DeltaJoinBindingKey(bindings[i]))) {
 			continue;
 		}
 		filtered_bindings.push_back(bindings[i]);
@@ -262,7 +201,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto &column_ids = get->GetColumnIds();
 		idx_t count = bindings.size();
 		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
-			if (BindingKey(bindings[col_idx]) != BindingKey(binding)) {
+			if (DeltaJoinBindingKey(bindings[col_idx]) != DeltaJoinBindingKey(binding)) {
 				continue;
 			}
 			idx_t column_id_idx = col_idx;
@@ -286,11 +225,11 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
 		for (idx_t expr_idx = 0; expr_idx < count; expr_idx++) {
-			if (BindingKey(bindings[expr_idx]) != BindingKey(binding)) {
+			if (DeltaJoinBindingKey(bindings[expr_idx]) != DeltaJoinBindingKey(binding)) {
 				continue;
 			}
 			ColumnBinding child_binding;
-			if (!TryGetColumnRef(*projection.expressions[expr_idx], child_binding)) {
+			if (!TryGetDeltaJoinColumnRef(*projection.expressions[expr_idx], child_binding)) {
 				return false;
 			}
 			return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_binding, table_name, column_name);
@@ -302,7 +241,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto child_bindings = node->children[0]->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
 		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
-			if (BindingKey(bindings[col_idx]) == BindingKey(binding)) {
+			if (DeltaJoinBindingKey(bindings[col_idx]) == DeltaJoinBindingKey(binding)) {
 				return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_bindings[col_idx], table_name,
 				                                      column_name);
 			}
@@ -697,7 +636,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 
 	Connection key_probe_con(*context.db);
 	vector<JoinColumnRef> leaf_refs(N);
-	vector<vector<JoinKeyProbe>> key_probes(N);
+	vector<vector<DeltaJoinKeyProbe>> key_probes(N);
 	// Key-domain pruning can erase the last remaining term when exactly one input
 	// changed and its delta keys cannot match the unchanged side. That is the
 	// important performance case covered by mv_inner_join. When multiple leaves
@@ -744,11 +683,11 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 				leaf_refs[i].column_name = resolved_column;
 				OPENIVM_DEBUG_PRINT("[DeltaJoin] Column ref leaf=%zu binding=%s -> %s.%s\n", i,
 				                    binding.ToString().c_str(), resolved_table.c_str(), resolved_column.c_str());
-				column_refs[BindingKey(binding)] = {
+				column_refs[DeltaJoinBindingKey(binding)] = {
 				    i, get, table_name, delta_name, resolved_column, leaf_refs[i].last_update};
 			}
 		}
-		CollectJoinKeyProbes(input.plan.get(), column_refs, key_probes);
+		CollectDeltaJoinKeyProbes(input.plan.get(), column_refs, key_probes, "DeltaJoin");
 	}
 
 	uint64_t pruned_count = 0;
@@ -853,10 +792,10 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 		unordered_set<uint64_t> mul_set;
 		CollectExistingMultiplicityBindings(term.get(), mul_set);
 		for (auto &mb : mul_bindings) {
-			mul_set.insert(BindingKey(mb));
+			mul_set.insert(DeltaJoinBindingKey(mb));
 		}
 		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			if (!mul_set.count(BindingKey(term_bindings[i]))) {
+			if (!mul_set.count(DeltaJoinBindingKey(term_bindings[i]))) {
 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
 			}
 		}

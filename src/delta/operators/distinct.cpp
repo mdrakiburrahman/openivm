@@ -11,17 +11,16 @@
 namespace duckdb {
 
 DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
-	auto *distinct_node = dynamic_cast<LogicalDistinct *>(input.plan.get());
+	auto &distinct_node = input.plan->Cast<LogicalDistinct>();
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::DISTINCT_COUNT_AGGREGATE);
 	OPENIVM_DEBUG_PRINT("[DeltaDistinct] Rewriting DISTINCT node, %zu targets\n",
-	                    distinct_node->distinct_targets.size());
+	                    distinct_node.distinct_targets.size());
 
 	// Save the DISTINCT's output bindings before rewrite — these are what parent operators
 	// currently reference via BoundColumnRefExpression. After we replace DISTINCT with
 	// AGGREGATE, the aggregate uses fresh group_index/aggregate_index, so we must remap.
 	const vector<ColumnBinding> original_bindings = input.plan->GetColumnBindings();
 
-	// 1. Recurse into child first (gets delta with multiplicity)
 	auto child_mul = input.CompileChild(input.plan->children[0], input.root);
 	auto rewritten_child = std::move(child_mul.op);
 	ColumnBinding input_mul_binding = child_mul.mul_binding;
@@ -30,14 +29,12 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	auto child_bindings = rewritten_child->GetColumnBindings();
 	auto child_types = rewritten_child->types;
 
-	// 2. Build a LOGICAL_AGGREGATE_AND_GROUP_BY that replaces the DISTINCT node.
 	// Group-by keys = all child columns EXCEPT multiplicity
 	// Aggregate = COUNT(*) as openivm_distinct_count
 	// Multiplicity is added as a group-by key (same pattern as aggregate delta)
 	idx_t group_index = binder.GenerateTableIndex();
 	idx_t aggregate_index = binder.GenerateTableIndex();
 
-	// Create COUNT(*) aggregate expression
 	auto count_star_func = CountStarFun::GetFunction();
 	vector<unique_ptr<Expression>> count_args;
 	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
@@ -49,7 +46,6 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 
 	auto agg_node = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
 
-	// Add all child columns as group-by keys (except multiplicity)
 	GroupingSet grouping_set;
 	const idx_t child_output_count = MinValue<idx_t>(child_bindings.size(), child_types.size());
 	for (idx_t i = 0; i < child_output_count; i++) {
@@ -62,7 +58,6 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
 	}
 
-	// Add multiplicity as the last group-by key (same pattern as aggregate delta)
 	ColumnBinding mod_mul_binding;
 	mod_mul_binding.column_index = agg_node->groups.size();
 	mod_mul_binding.table_index = group_index;

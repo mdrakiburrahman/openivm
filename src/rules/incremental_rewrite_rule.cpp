@@ -28,7 +28,8 @@ static idx_t FindMaxTableIndex(LogicalOperator *node) {
 }
 
 void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                                           string &view_name, string &view_catalog_name, string &view_schema_name) {
+                                           const string &view_name, const string &view_catalog_name,
+                                           const string &view_schema_name) {
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("\nAdd the insert node to the plan...\n");
 	OPENIVM_DEBUG_PRINT("Plan:\n%s\nParameters:", plan->ToString().c_str());

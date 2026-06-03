@@ -17,20 +17,20 @@ struct DeltaCompileAssumptions {
 };
 
 struct DeltaCompileContext {
-	DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, string &view,
+	DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
 	                    const DeltaViewModel &model, DeltaCompileAssumptions assumptions);
 
 	OptimizerExtensionInput &input;
 	Connection &metadata_con;
-	string &view;
+	const string &view;
 	const DeltaViewModel &model;
 	DeltaCompileAssumptions assumptions;
 };
 
 class DeltaCompiler {
 public:
-	DeltaCompiler(OptimizerExtensionInput &input, Connection &metadata_con, string &view, const DeltaViewModel &model,
-	              DeltaCompileAssumptions assumptions = {});
+	DeltaCompiler(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
+	              const DeltaViewModel &model, DeltaCompileAssumptions assumptions = {});
 	explicit DeltaCompiler(DeltaCompileContext context);
 
 	DeltaPlanFragment Compile(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root);

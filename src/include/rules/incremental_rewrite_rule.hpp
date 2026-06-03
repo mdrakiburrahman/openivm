@@ -14,7 +14,7 @@ public:
 	}
 
 	static void AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-	                          string &view_name, string &view_catalog_name, string &view_schema_name);
+	                          const string &view_name, const string &view_catalog_name, const string &view_schema_name);
 
 	static void IncrementalRewriteRuleFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
 };

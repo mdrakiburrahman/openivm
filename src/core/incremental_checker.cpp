@@ -115,6 +115,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNNEST:
+		if (HasVolatileExpression(node->expressions)) {
+			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
+		}
 		break;
 
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:

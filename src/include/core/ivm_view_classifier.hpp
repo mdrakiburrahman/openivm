@@ -47,6 +47,7 @@ enum class DeltaModelNodeKind {
 	TOP_K,
 	UNNEST,
 	CTE,
+	CONSTANT,
 	OTHER
 };
 

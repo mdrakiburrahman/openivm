@@ -26,7 +26,6 @@ DeltaPlanFragment CompileFilterDelta(DeltaOperatorInput input) {
 
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::FILTER_LINEAR);
 
-	// Recurse into child first
 	auto child_mul = input.CompileChild(input.plan->children[0], input.root);
 	input.plan->children[0] = std::move(child_mul.op);
 	ColumnBinding child_mul_binding = child_mul.mul_binding;

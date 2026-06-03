@@ -32,12 +32,12 @@ static bool AllSourcesAreDuckLake(const CreateMVPlanFacts &facts) {
 
 } // namespace
 
-DeltaCompileContext::DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, string &view,
+DeltaCompileContext::DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
                                          const DeltaViewModel &model, DeltaCompileAssumptions assumptions)
     : input(input), metadata_con(metadata_con), view(view), model(model), assumptions(assumptions) {
 }
 
-DeltaCompiler::DeltaCompiler(OptimizerExtensionInput &input, Connection &metadata_con, string &view,
+DeltaCompiler::DeltaCompiler(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
                              const DeltaViewModel &model, DeltaCompileAssumptions assumptions)
     : DeltaCompiler(DeltaCompileContext(input, metadata_con, view, model, assumptions)) {
 }
@@ -64,20 +64,14 @@ const DeltaModelNode *DeltaCompiler::FindNode(LogicalOperator *op) const {
 DeltaPlanFragment DeltaCompiler::CompileInternal(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root,
                                                  bool copied_subtree) {
 	if (copied_subtree) {
-		OPENIVM_DEBUG_PRINT("[Delta Compiler] copied subtree %s; using operator-shape compile\n",
+		OPENIVM_DEBUG_PRINT("[Delta Compiler] copied subtree %s; using copied-subtree compile\n",
 		                    LogicalOperatorToString(plan->type).c_str());
-		return CompileDeltaOperatorByShape(DeltaOperatorInput(context, plan, root, this, true));
+		return CompileCopiedDeltaSubtree(DeltaOperatorInput(context, plan, root, this, true));
 	}
 
 	auto *node = FindNode(plan.get());
 	if (!node) {
-		if (IsAllowedNonModelFallbackShape(plan->type)) {
-			OPENIVM_DEBUG_PRINT("[Delta Compiler] non-model constant leaf %s; using operator-shape compile\n",
-			                    LogicalOperatorToString(plan->type).c_str());
-			return CompileDeltaOperatorByShape(DeltaOperatorInput(context, plan, root, this, false));
-		}
-		throw InternalException("Delta compiler missing IR node for operator %s",
-		                        LogicalOperatorToString(plan->type).c_str());
+		return CompileNonModelLeaf(DeltaOperatorInput(context, plan, root, this, false));
 	}
 
 	OPENIVM_DEBUG_PRINT("[Delta Compiler] Visiting node %llu (%s) for operator %s\n", (unsigned long long)node->id,

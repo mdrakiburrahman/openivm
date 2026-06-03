@@ -63,8 +63,12 @@ const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy) {
 		return "CTE_MATERIALIZED";
 	case DeltaOperatorStrategy::CTE_REF:
 		return "CTE_REF";
-	case DeltaOperatorStrategy::CONSTANT_LEAF:
-		return "CONSTANT_LEAF";
+	case DeltaOperatorStrategy::UNNEST_LINEAR:
+		return "UNNEST_LINEAR";
+	case DeltaOperatorStrategy::CONSTANT_ZERO_DELTA:
+		return "CONSTANT_ZERO_DELTA";
+	case DeltaOperatorStrategy::CONSTANT_STATIC:
+		return "CONSTANT_STATIC";
 	default:
 		return "UNKNOWN";
 	}
@@ -81,17 +85,6 @@ void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStra
 	}
 	OPENIVM_DEBUG_PRINT("[Delta Operator] strategy=%s shape=%s\n", DeltaOperatorStrategyName(strategy),
 	                    LogicalOperatorToString(input.plan->type).c_str());
-}
-
-bool IsAllowedNonModelFallbackShape(LogicalOperatorType type) {
-	switch (type) {
-	case LogicalOperatorType::LOGICAL_CHUNK_GET:
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-		return true;
-	default:
-		return false;
-	}
 }
 
 DeltaPlanFragment CompileDeltaOperatorWithModel(DeltaOperatorInput input, const DeltaModelNode &node) {
@@ -121,16 +114,20 @@ DeltaPlanFragment CompileDeltaOperatorWithModel(DeltaOperatorInput input, const 
 	case DeltaModelNodeKind::CTE:
 		return CompileCteDelta(node_input);
 	case DeltaModelNodeKind::UNNEST:
+		return CompileUnnestDelta(node_input);
+	case DeltaModelNodeKind::CONSTANT:
+		return CompileConstantZeroDelta(node_input);
 	case DeltaModelNodeKind::OTHER:
-		return CompileDeltaOperatorByShape(node_input);
+		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
 	default:
 		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
 	}
 }
 
-DeltaPlanFragment CompileDeltaOperatorByShape(DeltaOperatorInput input) {
-	OPENIVM_DEBUG_PRINT("[Shape Rewrite] Visiting node: %s\n", LogicalOperatorToString(input.plan->type).c_str());
-	OPENIVM_DEBUG_PRINT("[Shape Rewrite] Node detail: %s\n", input.plan->ToString().c_str());
+DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input) {
+	OPENIVM_DEBUG_PRINT("[Copied Delta Subtree] Visiting node: %s\n",
+	                    LogicalOperatorToString(input.plan->type).c_str());
+	OPENIVM_DEBUG_PRINT("[Copied Delta Subtree] Node detail: %s\n", input.plan->ToString().c_str());
 
 	switch (input.plan->type) {
 	case LogicalOperatorType::LOGICAL_GET:
@@ -161,12 +158,29 @@ DeltaPlanFragment CompileDeltaOperatorByShape(DeltaOperatorInput input) {
 		return CompileTopKDelta(input);
 	case LogicalOperatorType::LOGICAL_CTE_REF:
 		return CompileCteDelta(input);
+	case LogicalOperatorType::LOGICAL_UNNEST:
+		return CompileUnnestDelta(input);
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-		return CompileConstantLeafDelta(input);
+		return CompileStaticConstantLeaf(input);
 	default:
-		throw NotImplementedException("Operator type %s not supported", LogicalOperatorToString(input.plan->type));
+		throw NotImplementedException("Copied subtree operator type %s not supported",
+		                              LogicalOperatorToString(input.plan->type));
+	}
+}
+
+DeltaPlanFragment CompileNonModelLeaf(DeltaOperatorInput input) {
+	switch (input.plan->type) {
+	case LogicalOperatorType::LOGICAL_CHUNK_GET:
+	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+		OPENIVM_DEBUG_PRINT("[Delta Compiler] non-model constant leaf %s\n",
+		                    LogicalOperatorToString(input.plan->type).c_str());
+		return CompileConstantZeroDelta(input);
+	default:
+		throw InternalException("Delta compiler missing IR node for operator %s",
+		                        LogicalOperatorToString(input.plan->type).c_str());
 	}
 }
 

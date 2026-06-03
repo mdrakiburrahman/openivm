@@ -22,7 +22,9 @@ enum class DeltaOperatorStrategy {
 	TOPK_STRIP,
 	CTE_MATERIALIZED,
 	CTE_REF,
-	CONSTANT_LEAF
+	UNNEST_LINEAR,
+	CONSTANT_ZERO_DELTA,
+	CONSTANT_STATIC
 };
 
 struct DeltaOperatorInput {
@@ -53,10 +55,9 @@ struct DeltaOperatorInput {
 const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy);
 void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStrategy strategy);
 
-bool IsAllowedNonModelFallbackShape(LogicalOperatorType type);
-
 DeltaPlanFragment CompileDeltaOperatorWithModel(DeltaOperatorInput input, const DeltaModelNode &node);
-DeltaPlanFragment CompileDeltaOperatorByShape(DeltaOperatorInput input);
+DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input);
+DeltaPlanFragment CompileNonModelLeaf(DeltaOperatorInput input);
 
 DeltaPlanFragment CompileScanDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileFilterDelta(DeltaOperatorInput input);
@@ -69,7 +70,9 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileWindowDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileTopKDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileCteDelta(DeltaOperatorInput input);
-DeltaPlanFragment CompileConstantLeafDelta(DeltaOperatorInput input);
+DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input);
+DeltaPlanFragment CompileConstantZeroDelta(DeltaOperatorInput input);
+DeltaPlanFragment CompileStaticConstantLeaf(DeltaOperatorInput input);
 
 } // namespace duckdb
 

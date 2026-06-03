@@ -41,6 +41,7 @@ set(EXTENSION_SOURCES
     src/delta/operators/scan.cpp
     src/delta/operators/topk.cpp
     src/delta/operators/union.cpp
+    src/delta/operators/unnest.cpp
     src/delta/operators/window.cpp
     src/upsert/refresh.cpp
     src/upsert/refresh_delta_fast_paths.cpp
