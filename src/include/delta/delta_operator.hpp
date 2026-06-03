@@ -55,7 +55,7 @@ struct DeltaOperatorInput {
 const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy);
 void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStrategy strategy);
 
-DeltaPlanFragment CompileDeltaOperatorWithModel(DeltaOperatorInput input, const DeltaModelNode &node);
+DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input, const DeltaModelNode &node);
 DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input);
 DeltaPlanFragment CompileNonModelLeaf(DeltaOperatorInput input);
 

@@ -87,7 +87,7 @@ void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStra
 	                    LogicalOperatorToString(input.plan->type).c_str());
 }
 
-DeltaPlanFragment CompileDeltaOperatorWithModel(DeltaOperatorInput input, const DeltaModelNode &node) {
+DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input, const DeltaModelNode &node) {
 	ValidateCompileNode(node, input.plan.get());
 	auto node_input = input.WithNode(node);
 	switch (node.kind) {

@@ -89,7 +89,7 @@ static void CollectBoundColumnNames(LogicalOperator &op, BoundColumnNameMap &col
 			if (binding.column_index >= column_ids.size()) {
 				continue;
 			}
-			auto column_name = get.GetColumnName(column_ids[binding.column_index]);
+			const auto &column_name = get.GetColumnName(column_ids[binding.column_index]);
 			column_names[{binding.table_index, binding.column_index}] =
 			    KeywordHelper::WriteOptionallyQuoted(column_name);
 		}
