@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_plan_helpers.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
 #include "delta/delta_compiler.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -84,7 +85,6 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
 
 	Connection con(*input.context.db);
-	con.Query("SET disabled_optimizers='" + string(openivm::DISABLED_OPTIMIZERS) + "';");
 
 	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
 	                   SqlUtils::EscapeValue(view) + "';");
@@ -112,11 +112,9 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
 #endif
+	ScopedDisabledOptimizers disabled_optimizers(input.context, openivm::DISABLED_OPTIMIZERS);
 	Optimizer optimizer(*planner.binder, input.context);
 	auto optimized_plan = optimizer.Optimize(std::move(planner.plan));
-
-	// Reset disabled_optimizers to avoid polluting the session
-	con.Query("RESET disabled_optimizers;");
 
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Optimized plan: \n%s\n", optimized_plan->ToString().c_str());

@@ -1150,7 +1150,9 @@ static void PrintIncrementalityMatrix(const RewriterStats &stats) {
 
 static void PrintStats(const string &label, const RewriterStats &stats, int total) {
 	int validation_denominator = std::max(1, total);
-	int mv_denominator = std::max(1, stats.validation_ok);
+	int mv_attempted_or_unknown = std::max(0, total - stats.validation_fail);
+	int mv_unknown = std::max(0, mv_attempted_or_unknown - stats.mv_creation_ok - stats.mv_creation_fail);
+	int mv_denominator = std::max(1, mv_attempted_or_unknown);
 	int classification_denominator = std::max(1, stats.mv_creation_ok);
 	int refresh_denominator = std::max(1, stats.mv_creation_ok);
 	int correct_denominator = std::max(1, stats.refresh_ok);
@@ -1161,11 +1163,16 @@ static void PrintStats(const string &label, const RewriterStats &stats, int tota
 	    FormatNumber(100.0 * stats.validation_ok / validation_denominator) + "% of attempted)");
 	Log("  DuckDB validation failed:     " + std::to_string(stats.validation_fail) + " (" +
 	    FormatNumber(100.0 * stats.validation_fail / validation_denominator) + "% of attempted)");
-	Log("  MV creation denominator:      " + std::to_string(stats.validation_ok) + " DuckDB-valid queries");
+	Log("  MV creation denominator:      " + std::to_string(mv_attempted_or_unknown) +
+	    " non-validation-failed attempts");
 	Log("  MV creation OK:               " + std::to_string(stats.mv_creation_ok) + " (" +
-	    FormatNumber(100.0 * stats.mv_creation_ok / mv_denominator) + "% of DuckDB-valid)");
+	    FormatNumber(100.0 * stats.mv_creation_ok / mv_denominator) + "% of MV denominator)");
 	Log("  MV creation failed:           " + std::to_string(stats.mv_creation_fail) + " (" +
-	    FormatNumber(100.0 * stats.mv_creation_fail / mv_denominator) + "% of DuckDB-valid)");
+	    FormatNumber(100.0 * stats.mv_creation_fail / mv_denominator) + "% of MV denominator)");
+	if (mv_unknown > 0) {
+		Log("  MV creation unknown:          " + std::to_string(mv_unknown) +
+		    " (crash/timeout before a normal phase result)");
+	}
 	Log("  Classification denominator:   " + std::to_string(stats.mv_creation_ok) + " MV-created queries");
 	Log("  Incremental:  " + std::to_string(stats.incremental) + " (" +
 	    FormatNumber(100.0 * stats.incremental / classification_denominator) + "% of created)");

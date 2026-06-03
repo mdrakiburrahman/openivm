@@ -308,6 +308,10 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis,
                               bool has_unsupported_incremental_construct) {
+	auto has_nonlinear_aggregate =
+	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(), [](const string &agg_type) {
+		    return agg_type == "min" || agg_type == "max" || agg_type == "arg_min" || agg_type == "arg_max";
+	    });
 	if (has_unsupported_incremental_construct) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_window) {
@@ -335,10 +339,13 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;
-	} else if (analysis.found_having && analysis.found_aggregation && !model.group_columns.empty()) {
-		model.type = RefreshType::AGGREGATE_HAVING;
 	} else if (!model.strategy_reasons.empty() && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
+	} else if (analysis.found_having && analysis.found_aggregation && has_nonlinear_aggregate &&
+	           !model.group_columns.empty()) {
+		model.type = RefreshType::GROUP_RECOMPUTE;
+	} else if (analysis.found_having && analysis.found_aggregation && !model.group_columns.empty()) {
+		model.type = RefreshType::AGGREGATE_HAVING;
 	} else if (analysis.found_aggregation && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;
 	} else if (analysis.found_aggregation && model.group_columns.empty()) {

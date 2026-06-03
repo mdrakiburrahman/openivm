@@ -8,15 +8,21 @@ DeltaPlanFragment CompileUnionDelta(DeltaOperatorInput input) {
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::UNION_ALL_LINEAR);
 	OPENIVM_DEBUG_PRINT("[DeltaUnion] Rewriting UNION ALL node, %zu children\n", input.plan->children.size());
 
-	auto left_mul = input.CompileChild(input.plan->children[0], input.root);
-	input.plan->children[0] = std::move(left_mul.op);
+	auto &set_op = input.plan->Cast<LogicalSetOperation>();
+	if (!set_op.setop_all) {
+		throw NotImplementedException("UNION without ALL is not supported for delta compilation");
+	}
+	if (input.plan->children.empty()) {
+		throw InternalException("UNION delta compilation requires at least one child");
+	}
 
-	auto right_mul = input.CompileChild(input.plan->children[1], input.root);
-	input.plan->children[1] = std::move(right_mul.op);
+	for (auto &child : input.plan->children) {
+		auto child_delta = input.CompileChild(child, input.root);
+		child = std::move(child_delta.op);
+	}
 
 	// Update the UNION's column count to match the rewritten children (which now include multiplicity).
-	// Use GetColumnBindings().size() to ensure consistency with what LPTS reads.
-	auto &set_op = input.plan->Cast<LogicalSetOperation>();
+	// Use GetColumnBindings().size() to preserve the UNION's own output bindings for parent operators.
 	set_op.column_count = input.plan->children[0]->GetColumnBindings().size();
 	input.plan->ResolveOperatorTypes();
 

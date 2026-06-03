@@ -66,8 +66,16 @@ set(EXTENSION_SOURCES
     src/match/view_catalog_index.cpp
     ${LPTS_DIR}/src/cte_nodes.cpp
     ${LPTS_DIR}/src/lpts_helpers.cpp
+    ${LPTS_DIR}/src/sql_dialect.cpp
+    ${LPTS_DIR}/src/lpts_parser.cpp
+    ${LPTS_DIR}/src/lpts_sql_scanner.cpp
+    ${LPTS_DIR}/src/lpts_date_format.cpp
+    ${LPTS_DIR}/src/lpts_expression_renderer.cpp
     ${LPTS_DIR}/src/lpts_ast.cpp
-    ${LPTS_DIR}/src/lpts_pipeline.cpp)
+    ${LPTS_DIR}/src/lpts_ast_renderer.cpp
+    ${LPTS_DIR}/src/lpts_ast_builder.cpp
+    ${LPTS_DIR}/src/lpts_ast_flattener.cpp
+    ${LPTS_DIR}/src/dialect_function_map.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

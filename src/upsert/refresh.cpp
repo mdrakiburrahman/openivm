@@ -175,8 +175,12 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		                     ", meta_post_bytes=" + to_string(meta_post_sql.size()));
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
-		// expression-depth limit so the binder doesn't reject legitimate plans.
+		// expression-depth limit so the binder doesn't reject legitimate generated plans.
 		exec_con.Query("SET max_expression_depth = 10000");
+		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
+		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
+		// overflow in the optimizer before the refresh query runs.
+		exec_con.Query("SET disabled_optimizers='" + string(openivm::DISABLED_OPTIMIZERS) + ", deliminator'");
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.

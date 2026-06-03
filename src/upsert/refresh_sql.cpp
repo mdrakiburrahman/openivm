@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_compiler.hpp"
@@ -274,6 +275,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto context_start = profile_now();
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
+	con.Query("SET max_expression_depth = 10000");
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	string default_db;
 	string default_schema = "main";
@@ -837,6 +839,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		planner.CreatePlan(std::move(p.statements[0]));
 		auto plan = std::move(planner.plan);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
+		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::DISABLED_OPTIMIZERS) + ", deliminator");
 		Optimizer optimizer(*planner.binder, con_ctx);
 		plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
