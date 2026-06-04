@@ -56,8 +56,8 @@ constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;
 
-// Optimizer settings disabled during IVM rewrite (these interfere with the delta plan)
-constexpr const char *DISABLED_OPTIMIZERS = "compressed_materialization, column_lifetime, statistics_propagation";
+// Optimizer settings that are still sensitive during IVM rewrite/planning.
+constexpr const char *DISABLED_OPTIMIZERS = "column_lifetime, statistics_propagation";
 
 } // namespace openivm
 
