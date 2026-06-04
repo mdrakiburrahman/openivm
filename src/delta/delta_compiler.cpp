@@ -98,10 +98,9 @@ DeltaViewModel BuildRefreshDeltaViewModel(OptimizerExtensionInput &input, Connec
 
 	DeltaCompileAssumptions assumptions;
 	assumptions.all_sources_are_ducklake = AllSourcesAreDuckLake(facts);
-	bool single_source_window_join =
-	    analysis.found_window && analysis.found_join && facts.source_occurrences.size() == 1;
-	assumptions.keep_window_join_partitions = !analysis.found_window || !analysis.found_join ||
-	                                          single_source_window_join || assumptions.all_sources_are_ducklake;
+	// Keep joined-window partition metadata. Downstream refresh planning validates whether lineage covers every source
+	// before using a partial affected-partition program.
+	assumptions.keep_window_join_partitions = true;
 	assumptions.has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
 	if (out_assumptions) {
 		*out_assumptions = assumptions;

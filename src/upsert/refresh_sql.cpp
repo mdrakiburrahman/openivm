@@ -683,8 +683,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
-			    /*use_current_diff_affected_keys=*/false,
-			    aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
+			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
 			    &aggregate_recompute_emits_cascade_delta);
 		}
@@ -843,9 +842,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
 		string lpts_table_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
-		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs,
-		                                     internal_catalog_prefix, lpts_table_prefix,
-		                                     emit_cascade_delta_for_recompute, affected_mode);
+		upsert_query =
+		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,
+		                          lpts_table_prefix, emit_cascade_delta_for_recompute, affected_mode);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
 		                    group_columns.size(), delta_specs.size(), GroupRecomputeAffectedModeName(affected_mode));
@@ -994,9 +993,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	};
 
 	if (refresh_plan.SkipsDeltaProduction() || aggregate_recompute_emits_cascade_delta) {
-		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping ComputeDelta for %s\n",
-		                    aggregate_recompute_emits_cascade_delta ? "AGGREGATE_GROUP_RECOMPUTE_CASCADE"
-		                                                           : refresh_plan.DeltaProductionSkipReason());
+		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping ComputeDelta for %s\n", aggregate_recompute_emits_cascade_delta
+		                                                                   ? "AGGREGATE_GROUP_RECOMPUTE_CASCADE"
+		                                                                   : refresh_plan.DeltaProductionSkipReason());
 		delta_query = "";
 		if (has_downstream && !recompute_handles_own_cascade_delta) {
 			build_snapshot_companion();

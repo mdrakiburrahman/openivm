@@ -415,27 +415,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		                    view_query.c_str());
 	}
 	auto classification_start = create_profile_now();
-	// Non-DuckLake window joins need all changed sources to expose partition keys.
-	bool all_sources_are_ducklake = !table_names.empty();
-	if (all_sources_are_ducklake) {
-		for (const auto &table_name : table_names) {
-			string table_lc = StringUtil::Lower(table_name);
-			bool is_ducklake_scan = facts.ducklake_table_info.find(table_lc) != facts.ducklake_table_info.end();
-			// DuckLake views created by OpenIVM expose a DuckLake catalog view over an
-			// internal physical openivm_data_* table. When DuckDB expands such a view while
-			// planning a chained MV, the scan is physical even though the source's change
-			// tracking is still DuckLake-backed.
-			bool is_ducklake_mv_backing =
-			    !view_catalog_prefix.empty() && StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX);
-			if (!is_ducklake_scan && !is_ducklake_mv_backing) {
-				all_sources_are_ducklake = false;
-				break;
-			}
-		}
-	}
-	bool single_source_window_join = analysis.found_window && analysis.found_join && table_names.size() == 1;
-	bool keep_window_join_partitions =
-	    !analysis.found_window || !analysis.found_join || single_source_window_join || all_sources_are_ducklake;
+	// Keep partition metadata for joined windows. The refresh compiler uses plan-walk lineage when it can cover all
+	// changed sources and otherwise falls back to full recompute, so dropping the metadata here only prevents safe
+	// partial/cascade plans from being compiled.
+	bool keep_window_join_partitions = true;
 	bool has_full_outer_aggregate = analysis.found_full_outer && analysis.found_aggregation;
 	bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
 	bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
