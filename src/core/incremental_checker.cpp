@@ -312,6 +312,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_WINDOW: {
 		result.found_window = true;
 		auto &window = node->Cast<LogicalWindow>();
+		if (HasVolatileExpression(window.expressions)) {
+			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
+		}
 		// Extract PARTITION BY column names from ALL window expressions.
 		// Different window functions may use different PARTITION BY clauses —
 		// collect the union of all partition columns so any change triggers recompute.

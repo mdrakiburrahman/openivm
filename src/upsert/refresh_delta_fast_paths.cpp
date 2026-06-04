@@ -269,8 +269,14 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const string &attached_db_schema_name, bool cross_system,
                                              const DeltaActivityResult *precomputed_delta_activity,
                                              const openivm::CompileFacts *facts) {
-	(void)facts;
 	(void)cross_system;
+	if (facts && facts->compile_only) {
+		DeltaFastPathFlags flags;
+		flags.active_delta_table_names = delta_table_names;
+		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: disabling local delta fast paths, active_sources=%zu\n",
+		                    flags.active_delta_table_names.size());
+		return flags;
+	}
 	DeltaActivityResult summary;
 	if (precomputed_delta_activity) {
 		summary = *precomputed_delta_activity;

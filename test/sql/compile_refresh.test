@@ -104,7 +104,99 @@ SELECT count(*) FROM openivm_compile_with_facts(
 );
 
 # ==========================================
-# Test 5: openivm_compile_with_facts on a non-existent view fails cleanly
+# Test 5: compile-only does not specialize to local insert-only deltas
+# ==========================================
+
+statement ok
+CREATE TABLE compile_only_proj_src(id INT, val VARCHAR);
+
+statement ok
+INSERT INTO compile_only_proj_src VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_proj AS
+    SELECT id, val FROM compile_only_proj_src;
+
+statement ok
+INSERT INTO compile_only_proj_src VALUES (3, 'three');
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%delete from %openivm_data_mv_compile_only_proj%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_proj',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+CREATE TABLE compile_only_agg_src(k INT, amount INT);
+
+statement ok
+INSERT INTO compile_only_agg_src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_agg AS
+    SELECT k, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM compile_only_agg_src
+    GROUP BY k;
+
+statement ok
+INSERT INTO compile_only_agg_src VALUES (1, 5);
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%delete from %openivm_data_mv_compile_only_agg%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_agg',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+CREATE TABLE compile_only_left(id INT, k INT);
+
+statement ok
+CREATE TABLE compile_only_right(k INT, item INT);
+
+statement ok
+INSERT INTO compile_only_left VALUES (1, 10);
+
+statement ok
+INSERT INTO compile_only_right VALUES (10, 100), (10, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_join_gr AS
+    SELECT l.k, COUNT(DISTINCT r.item) AS item_count
+    FROM compile_only_left l
+    JOIN compile_only_right r ON l.k = r.k
+    GROUP BY l.k;
+
+statement ok
+INSERT INTO compile_only_left VALUES (2, 20);
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%openivm_delta_compile_only_left%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%openivm_delta_compile_only_right%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_join_gr',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Test 6: openivm_compile_with_facts on a non-existent view fails cleanly
 # ==========================================
 
 statement error

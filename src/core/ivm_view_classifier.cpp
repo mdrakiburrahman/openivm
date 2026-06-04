@@ -321,6 +321,9 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	                [](const string &agg_type) { return agg_type == "arg_min" || agg_type == "arg_max"; });
 	if (input.has_unsupported_incremental_construct) {
 		model.type = RefreshType::FULL_REFRESH;
+	} else if (!analysis.incremental_compatible) {
+		model.type = RefreshType::FULL_REFRESH;
+		model.warn_unsupported_incremental = true;
 	} else if (analysis.found_window) {
 		model.type = RefreshType::WINDOW_PARTITION;
 	} else if (analysis.found_grouping_sets) {
@@ -330,9 +333,6 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 		model.type = model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL) ? RefreshType::SEMI_ANTI_RECOMPUTE
 		                                                                     : RefreshType::FULL_REFRESH;
-	} else if (!analysis.incremental_compatible) {
-		model.type = RefreshType::FULL_REFRESH;
-		model.warn_unsupported_incremental = true;
 	} else if (analysis.found_filtered_list && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_filtered_list) {

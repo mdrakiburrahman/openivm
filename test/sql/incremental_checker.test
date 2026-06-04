@@ -348,6 +348,16 @@ SELECT type, group_columns FROM openivm_views WHERE view_name = 'mv_window_rank'
 5	dept=dept
 
 statement ok
+CREATE MATERIALIZED VIEW mv_window_volatile AS
+    SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY random()) AS rn
+    FROM w_src;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_window_volatile';
+----
+3
+
+statement ok
 INSERT INTO w_src VALUES (4, 'eng', 25), (5, 'ops', 1);
 
 statement ok
