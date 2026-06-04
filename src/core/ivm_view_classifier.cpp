@@ -214,10 +214,19 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	const auto group_count = analysis.group_count;
 	const auto group_index = analysis.group_index;
 	const bool has_union_over_agg = analysis.found_aggregation && facts.has_union_before_aggregate;
-	model.union_distinct_over_agg = analysis.found_distinct && model.distinct_at_top && has_union_over_agg;
+	model.union_distinct_over_agg =
+	    has_union_over_agg && (analysis.found_union_distinct || (analysis.found_distinct && model.distinct_at_top));
 
 	if (model.union_distinct_over_agg) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
+	} else if (analysis.found_union_distinct && !analysis.found_aggregation) {
+		AddVisibleGroupNames(model.group_columns, output_names);
+		if (!model.group_columns.empty()) {
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] UNION DISTINCT: using %zu visible output columns for "
+			                    "GROUP_RECOMPUTE\n",
+			                    model.group_columns.size());
+		}
 	} else if (model.distinct_at_top) {
 		model.group_columns = analysis.aggregate_columns;
 	} else if (analysis.found_distinct && analysis.aggregate_columns.empty()) {
@@ -337,6 +346,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		                                                                    : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
+	} else if (analysis.found_union_distinct && !analysis.found_aggregation && !model.group_columns.empty()) {
+		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;
 	} else if (!model.strategy_reasons.empty() && !model.group_columns.empty()) {
@@ -378,6 +389,8 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 	switch (reason) {
 	case DeltaStrategyReason::UNION_OVER_AGGREGATE:
 		return "UNION_OVER_AGGREGATE";
+	case DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE:
+		return "UNION_DISTINCT_GROUP_RECOMPUTE";
 	case DeltaStrategyReason::JOIN_KEY_GROUP_FALLBACK:
 		return "JOIN_KEY_GROUP_FALLBACK";
 	case DeltaStrategyReason::DELIM_AGGREGATE_GROUP_FALLBACK:

@@ -1,2 +1,2 @@
 -- {"operators": "AGGREGATE,FILTER,LIMIT,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE", "refresh_type": "RECOMPUTE"}
-SELECT W_ID, COUNT(W_TAX) FROM WAREHOUSE WHERE W_TAX > 0 GROUP BY W_ID HAVING COUNT(W_TAX) < 5 LIMIT 1;
+SELECT W_ID, COUNT(W_TAX) FROM WAREHOUSE WHERE W_TAX > 0 GROUP BY W_ID HAVING COUNT(W_TAX) < 5 ORDER BY W_ID LIMIT 1;

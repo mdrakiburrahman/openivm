@@ -468,7 +468,7 @@ stock_final AS (
 
 ),
 new_order_seed AS (
-	SELECT
+	SELECT DISTINCT
 		no.NO_W_ID AS warehouse_id,
 		no.NO_D_ID AS district_id,
 		no.NO_O_ID AS order_id,

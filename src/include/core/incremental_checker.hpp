@@ -13,6 +13,7 @@ struct PlanAnalysis {
 	bool found_projection = false;
 	bool found_having = false;
 	bool found_distinct = false;
+	bool found_union_distinct = false;
 	bool found_minmax = false;
 	bool found_list = false;
 	bool found_filtered_list = false; // LIST(...) FILTER needs group-recompute with original SQL

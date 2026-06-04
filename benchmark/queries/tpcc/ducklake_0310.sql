@@ -91,7 +91,8 @@ district_seed AS (
 		CASE WHEN d.D_NEXT_O_ID > 5 THEN 'busy' ELSE 'quiet' END AS district_flag,
 		((d.D_W_ID * 10) + d.D_ID) AS district_key
 	FROM dl.DISTRICT d
-	WHERE d.D_ID BETWEEN 1 AND 10
+	WHERE d.D_W_ID = 1
+		AND d.D_ID = 1
 
 ),
 district_layer_01 AS (
@@ -152,7 +153,9 @@ customer_seed AS (
 		CASE WHEN CAST(c.C_BALANCE AS DOUBLE) < 0 THEN 'debt' WHEN CAST(c.C_BALANCE AS DOUBLE) > 20000 THEN 'surplus' ELSE 'steady' END AS customer_flag,
 		((c.C_W_ID * 100000) + (c.C_D_ID * 1000) + c.C_ID) AS customer_key
 	FROM dl.CUSTOMER c
-	WHERE c.C_ID > 0
+	WHERE c.C_W_ID = 1
+		AND c.C_D_ID = 1
+		AND c.C_ID > 0
 
 ),
 customer_layer_01 AS (
@@ -244,7 +247,9 @@ order_seed AS (
 		CASE WHEN o.O_CARRIER_ID IS NULL THEN 'open' ELSE 'closed' END AS order_flag,
 		((o.O_W_ID * 100000) + (o.O_D_ID * 1000) + o.O_ID) AS order_key
 	FROM dl.OORDER o
-	WHERE o.O_ID IS NOT NULL
+	WHERE o.O_W_ID = 1
+		AND o.O_D_ID = 1
+		AND o.O_ID IS NOT NULL
 
 ),
 order_layer_01 AS (
@@ -309,7 +314,9 @@ order_line_seed AS (
 		CASE WHEN ol.OL_DELIVERY_D IS NULL THEN 'undelivered' ELSE 'delivered' END AS line_flag,
 		((ol.OL_W_ID * 1000000) + (ol.OL_D_ID * 10000) + (ol.OL_O_ID * 100) + ol.OL_NUMBER) AS line_key
 	FROM dl.ORDER_LINE ol
-	WHERE ol.OL_NUMBER > 0
+	WHERE ol.OL_W_ID = 1
+		AND ol.OL_D_ID = 1
+		AND ol.OL_NUMBER = 1
 
 ),
 order_line_layer_01 AS (
@@ -422,7 +429,8 @@ stock_seed AS (
 		CASE WHEN s.S_QUANTITY >= 75 THEN 'deep' WHEN s.S_QUANTITY >= 50 THEN 'normal' ELSE 'thin' END AS stock_flag,
 		((s.S_W_ID * 1000) + s.S_I_ID) AS stock_key
 	FROM dl.STOCK s
-	WHERE s.S_I_ID > 0
+	WHERE s.S_W_ID = 1
+		AND s.S_I_ID > 0
 
 ),
 stock_layer_01 AS (
@@ -475,6 +483,8 @@ new_order_seed AS (
 		'new' AS new_order_flag,
 		((no.NO_W_ID * 100000) + (no.NO_D_ID * 1000) + no.NO_O_ID) AS new_order_key
 	FROM dl.NEW_ORDER no
+	WHERE no.NO_W_ID = 1
+		AND no.NO_D_ID = 1
 
 ),
 new_order_layer_01 AS (
@@ -512,7 +522,9 @@ history_seed AS (
 		CASE WHEN LOWER(COALESCE(h.H_DATA, '')) LIKE '%payment%' THEN 'payment' ELSE 'other' END AS history_flag,
 		((h.H_C_W_ID * 100000) + (h.H_C_D_ID * 1000) + h.H_C_ID) AS history_customer_key
 	FROM dl.HISTORY h
-	WHERE h.H_C_ID IS NOT NULL
+	WHERE h.H_C_W_ID = 1
+		AND h.H_C_D_ID = 1
+		AND h.H_C_ID IS NOT NULL
 
 ),
 history_layer_01 AS (
@@ -1116,7 +1128,9 @@ wide_projection_input AS (
 		ff.stock_order_count AS repeated_stock_order_count,
 		ff.line_key AS repeated_new_order_key
 	FROM fact_stage_01 ff
-	WHERE ff.line_number <= 2
+	WHERE ff.warehouse_id = 1
+		AND ff.district_id <= 2
+		AND ff.line_number = 1
 
 ),
 wide_projection_filtered AS (

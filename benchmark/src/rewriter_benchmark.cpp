@@ -7,6 +7,7 @@
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
+#include "core/openivm_extension.hpp"
 #include "tpcc_helpers.hpp"
 #include "tpcdi_helpers.hpp"
 
@@ -471,15 +472,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
                             const string &workload) {
 	try {
 		duckdb::DuckDB db(db_path);
+		db.LoadStaticExtension<duckdb::OpenivmExtension>();
 		duckdb::Connection con(db);
 		con.Query("PRAGMA threads=4");
-
-		auto load_result = con.Query("LOAD openivm");
-		if (load_result && load_result->HasError()) {
-			string err = "LOAD openivm failed: " + load_result->GetError();
-			fprintf(stderr, "%s\n", err.c_str());
-			_exit(2);
-		}
 
 		// Figure out the default (native) catalog name so we can switch back
 		// after a ducklake query. When `db_path` is a file like

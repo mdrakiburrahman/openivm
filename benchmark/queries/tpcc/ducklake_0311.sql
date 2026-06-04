@@ -468,7 +468,7 @@ stock_final AS (
 
 ),
 new_order_seed AS (
-	SELECT
+	SELECT DISTINCT
 		no.NO_W_ID AS warehouse_id,
 		no.NO_D_ID AS district_id,
 		no.NO_O_ID AS order_id,
@@ -1133,7 +1133,18 @@ grouping_windowed AS (
 		gs.order_line_count,
 		ROW_NUMBER() OVER (
 			PARTITION BY gs.warehouse_id, gs.district_id, gs.credit_code
-			ORDER BY gs.extended_amount DESC, gs.customer_balance DESC
+			ORDER BY
+				gs.extended_amount DESC,
+				gs.customer_balance DESC,
+				gs.fulfillment_state ASC,
+				gs.account_state ASC,
+				gs.item_bucket ASC,
+				gs.item_flag ASC,
+				gs.stock_quantity ASC,
+				gs.history_rows ASC,
+				gs.payment_history_rows ASC,
+				gs.total_history_amount ASC,
+				gs.order_line_count ASC
 		) AS grouping_rank,
 		SUM(gs.extended_amount) OVER (
 			PARTITION BY gs.warehouse_id, gs.fulfillment_state

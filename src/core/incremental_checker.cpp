@@ -15,6 +15,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 
 #include <unordered_set>
@@ -160,6 +161,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNION:
+		if (!node->Cast<LogicalSetOperation>().setop_all) {
+			result.found_distinct = true;
+			result.found_union_distinct = true;
+		}
 		if (HasVolatileExpression(node->expressions)) {
 			result.incremental_compatible = false;
 			result.found_volatile_expression = true;

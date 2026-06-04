@@ -6,6 +6,8 @@
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_internal.hpp"
 
+#include <cctype>
+
 namespace duckdb {
 
 // Zero-initialized 64-element float list, used as COALESCE default for NULL list aggregates.
@@ -27,6 +29,57 @@ static bool ShouldUseCurrentDiffGroupRecompute(const string &view_query_sql,
 	idx_t variants = EstimateGroupRecomputeAffectedVariants(view_query_sql, delta_table_specs);
 	return variants >= GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD ||
 	       variants * view_query_sql.size() >= GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD;
+}
+
+static bool IsSqlIdentifierChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool ContainsKeywordToken(const string &sql, const string &keyword) {
+	auto lower = StringUtil::Lower(sql);
+	bool in_single_quote = false;
+	bool in_double_quote = false;
+	for (idx_t i = 0; i + keyword.size() <= lower.size(); i++) {
+		char c = lower[i];
+		if (c == '\'' && !in_double_quote) {
+			if (in_single_quote && i + 1 < lower.size() && lower[i + 1] == '\'') {
+				i++;
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (c == '"' && !in_single_quote) {
+			in_double_quote = !in_double_quote;
+			continue;
+		}
+		if (in_single_quote || in_double_quote || lower.compare(i, keyword.size(), keyword) != 0) {
+			continue;
+		}
+		bool left_boundary = i == 0 || !IsSqlIdentifierChar(lower[i - 1]);
+		bool right_boundary = i + keyword.size() == lower.size() || !IsSqlIdentifierChar(lower[i + keyword.size()]);
+		if (left_boundary && right_boundary) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ContainsAggregateFilterCte(const string &sql) {
+	auto lower = StringUtil::Lower(sql);
+	size_t pos = 0;
+	while ((pos = lower.find("filter_", pos)) != string::npos) {
+		size_t cte_end = lower.find("),", pos);
+		if (cte_end == string::npos) {
+			cte_end = lower.size();
+		}
+		auto filter_body = lower.substr(pos, cte_end - pos);
+		if (filter_body.find(" from aggregate_") != string::npos && filter_body.find(" where ") != string::npos) {
+			return true;
+		}
+		pos += string("filter_").size();
+	}
+	return false;
 }
 
 static string BuildCurrentDiffGroupRecomputeSQL(const string &view_name, const string &data_table,
@@ -863,8 +916,9 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
-	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
-		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large plan\n");
+	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs) ||
+	    ContainsKeywordToken(view_query_sql, "having") || ContainsAggregateFilterCte(view_query_sql)) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
 	}
 
