@@ -15,6 +15,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 
 #include <unordered_set>
@@ -115,6 +116,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNNEST:
+		if (HasVolatileExpression(node->expressions)) {
+			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
+		}
 		break;
 
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
@@ -135,6 +140,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		// Check for volatile functions
 		if (HasVolatileExpression(node->expressions)) {
 			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
 		}
 		// Detect HAVING: a FILTER above an AGGREGATE
 		if (!node->children.empty() && node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -146,15 +152,22 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		result.found_projection = true;
 		if (HasVolatileExpression(node->expressions)) {
 			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
 		}
 		if (HasNonFoldableUnnestExpression(node->expressions)) {
 			result.incremental_compatible = false;
+			result.found_non_foldable_unnest = true;
 		}
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNION:
+		if (!node->Cast<LogicalSetOperation>().setop_all) {
+			result.found_distinct = true;
+			result.found_union_distinct = true;
+		}
 		if (HasVolatileExpression(node->expressions)) {
 			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
 		}
 		break;
 
@@ -162,6 +175,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		result.found_distinct = true;
 		if (HasVolatileExpression(node->expressions)) {
 			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
 		}
 		// DISTINCT columns become group-by keys after IVM rewrite
 		auto *distinct_node = dynamic_cast<LogicalDistinct *>(node);
@@ -196,6 +210,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			    join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI &&
 			    join->join_type != JoinType::MARK && join->join_type != JoinType::SINGLE) {
 				result.incremental_compatible = false;
+				result.found_unsupported_join_type = true;
 			}
 			if (join->join_type == JoinType::SINGLE) {
 				result.found_single_join = true;
@@ -232,6 +247,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					    bound_agg.function.name == "first" && result.group_index != DConstants::INVALID_INDEX;
 					if (supported.find(bound_agg.function.name) == supported.end() && !scalar_subquery_first) {
 						result.incremental_compatible = false;
+						result.found_unsupported_aggregate = true;
 					}
 					// COUNT(DISTINCT x) can't be summed from delta counts, but group-recompute
 					// (delete affected groups + re-insert from original query) is correct.
@@ -248,6 +264,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 							// Other FILTER aggregates should have been normalized before the
 							// checker runs. If one reaches here, use full refresh.
 							result.incremental_compatible = false;
+							result.found_unsupported_filtered_aggregate = true;
 						}
 					}
 					if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
@@ -274,6 +291,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			}
 			if (HasVolatileExpression(agg->groups)) {
 				result.incremental_compatible = false;
+				result.found_volatile_expression = true;
 			}
 			// Record group count and group_index for the outermost (first-found) aggregate only.
 			// In plans with nested aggregates the DFS visits the outer aggregate first; overwriting
@@ -337,6 +355,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		result.top_k_offset = top_n.offset;
 		if (!ExtractOrderBy(top_n.orders, result)) {
 			result.incremental_compatible = false; // non-column ORDER BY: fall through to FULL_REFRESH
+			result.found_unsupported_order_by = true;
 		}
 		if (!node->children.empty()) {
 			AnalyzeNode(node->children[0].get(), result);
@@ -346,7 +365,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {
 		// ORDER BY alone (without LIMIT) is meaningless on an MV (a table has no inherent
-		// order). The IncrementalTopKRule drops the node from the delta plan; we still capture
+		// order). Top-k delta compilation drops the node from the delta plan; we still capture
 		// the order columns so a sibling LIMIT below this node — see plan shapes where
 		// LPTS keeps them as separate ORDER_BY → LIMIT nodes — has them available for
 		// top-k suffix handling.
@@ -382,6 +401,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	default:
 		// Unsupported operator type
 		result.incremental_compatible = false;
+		result.found_unsupported_operator = true;
 		break;
 	}
 

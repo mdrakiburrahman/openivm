@@ -455,6 +455,11 @@ CREATE MATERIALIZED VIEW mv_union_distinct AS
     UNION
     SELECT id FROM u_dist_c;
 
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_union_distinct';
+----
+6
+
 # Batch: insert into all three + delete from one, single refresh.
 # id=1 gets deleted from a and simultaneously inserted into c — net
 # effect on the UNION is zero (c already carries it).
@@ -490,12 +495,40 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+statement ok
+DELETE FROM u_dist_b WHERE id = 2;
+
+statement ok
+PRAGMA refresh('mv_union_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_dist_a UNION SELECT id FROM u_dist_b UNION SELECT id FROM u_dist_c)
+    EXCEPT ALL SELECT * FROM mv_union_distinct
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_union_distinct
+    EXCEPT ALL
+    (SELECT id FROM u_dist_a UNION SELECT id FROM u_dist_b UNION SELECT id FROM u_dist_c)
+);
+----
+0
+
 # UNION with a literal column forcing a projection above the DISTINCT
 statement ok
 CREATE MATERIALIZED VIEW mv_union_labeled AS
     SELECT id, 'a' AS src FROM u_dist_a
     UNION
     SELECT id, 'b' FROM u_dist_b;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_union_labeled';
+----
+6
 
 statement ok
 INSERT INTO u_dist_a VALUES (100);
@@ -726,6 +759,59 @@ SELECT type FROM openivm_views WHERE view_name = 'idist_mv';
 # without touching parser/dispatch.
 statement ok
 SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE idist_token_src (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO idist_token_src VALUES
+    (1, 'm1', 8),
+    (1, 'm1', 8),
+    (1, 'm2', 16),
+    (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW idist_mv_token_literal AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (
+        SELECT ' select distinct is a literal' AS marker, grp, machine, cores
+        FROM (SELECT DISTINCT grp, machine, cores FROM idist_token_src WHERE machine IS NOT NULL) d0
+    ) d
+    GROUP BY grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'idist_mv_token_literal';
+----
+8
+
+statement ok
+INSERT INTO idist_token_src VALUES (2, 'm3', 4), (1, 'm4', 32);
+
+statement ok
+PRAGMA refresh('idist_mv_token_literal');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT ' select distinct is a literal' AS marker, grp, machine, cores
+        FROM (SELECT DISTINCT grp, machine, cores FROM idist_token_src WHERE machine IS NOT NULL) d0
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv_token_literal
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv_token_literal
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT ' select distinct is a literal' AS marker, grp, machine, cores
+        FROM (SELECT DISTINCT grp, machine, cores FROM idist_token_src WHERE machine IS NOT NULL) d0
+    ) d GROUP BY grp
+);
+----
+0
 
 statement ok
 CREATE TABLE idist_u2 (grp INT, machine VARCHAR, cores INT);

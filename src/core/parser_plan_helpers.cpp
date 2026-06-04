@@ -29,7 +29,7 @@ namespace duckdb {
 /// output_col_names is the sanitized output column list; BoundColumnRefs are resolved via
 /// their column_index into that list.
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
-                       const vector<string> &output_col_names) {
+                       const vector<string> &output_col_names, bool include_limit) {
 	string sql = "ORDER BY ";
 	for (size_t i = 0; i < orders.size(); i++) {
 		if (i > 0) {
@@ -55,7 +55,7 @@ string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, 
 		}
 		sql += " " + ord.GetOrderModifier();
 	}
-	if (limit_val > 0) {
+	if (include_limit && limit_val > 0) {
 		sql += " LIMIT " + to_string(limit_val);
 		if (offset_val > 0) {
 			sql += " OFFSET " + to_string(offset_val);
@@ -543,18 +543,18 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t grou
 	return group_names;
 }
 
+static void AddUniqueGroupName(vector<string> &group_names, const string &new_name) {
+	for (auto &existing : group_names) {
+		if (StringUtil::CIEquals(existing, new_name)) {
+			return;
+		}
+	}
+	group_names.push_back(new_name);
+}
+
 static void AddUniqueGroupNames(vector<string> &group_names, const vector<string> &new_names) {
 	for (auto &name : new_names) {
-		bool exists = false;
-		for (auto &existing : group_names) {
-			if (StringUtil::CIEquals(existing, name)) {
-				exists = true;
-				break;
-			}
-		}
-		if (!exists) {
-			group_names.push_back(name);
-		}
+		AddUniqueGroupName(group_names, name);
 	}
 }
 
@@ -572,7 +572,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, c
 				continue;
 			}
 			if (!output_names[expr_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_idx])) {
-				AddUniqueGroupNames(group_names, vector<string> {output_names[expr_idx]});
+				AddUniqueGroupName(group_names, output_names[expr_idx]);
 			}
 		}
 	}
@@ -755,8 +755,156 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 	return facts;
 }
 
+bool PlanContainsAggregateFilter(LogicalOperator *plan) {
+	if (!plan) {
+		return false;
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_FILTER && !plan->children.empty() &&
+	    plan->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return true;
+	}
+	for (auto &child : plan->children) {
+		if (PlanContainsAggregateFilter(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void CollectAggregatesByIndex(LogicalOperator *plan, unordered_map<idx_t, LogicalAggregate *> &aggregates) {
+	if (!plan) {
+		return;
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &aggregate = plan->Cast<LogicalAggregate>();
+		aggregates[aggregate.aggregate_index] = &aggregate;
+	}
+	for (auto &child : plan->children) {
+		CollectAggregatesByIndex(child.get(), aggregates);
+	}
+}
+
+static bool IsHiddenHavingColumn(const string &name) {
+	return StringUtil::StartsWith(name, "openivm_having_");
+}
+
+bool PlanHasHiddenMinMaxHavingColumn(LogicalOperator *plan) {
+	unordered_map<idx_t, LogicalAggregate *> aggregates;
+	CollectAggregatesByIndex(plan, aggregates);
+	if (aggregates.empty()) {
+		return false;
+	}
+
+	bool found = false;
+	std::function<void(LogicalOperator *)> find_hidden_minmax;
+	find_hidden_minmax = [&](LogicalOperator *node) {
+		if (!node || found) {
+			return;
+		}
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = node->Cast<LogicalProjection>();
+			for (auto &expr : projection.expressions) {
+				if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF || !IsHiddenHavingColumn(expr->alias)) {
+					continue;
+				}
+				auto &column_ref = expr->Cast<BoundColumnRefExpression>();
+				auto aggregate_it = aggregates.find(column_ref.binding.table_index);
+				if (aggregate_it == aggregates.end()) {
+					continue;
+				}
+				auto &aggregate = *aggregate_it->second;
+				if (column_ref.binding.column_index >= aggregate.expressions.size()) {
+					continue;
+				}
+				auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
+				if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+					continue;
+				}
+				auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
+				if (bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max") {
+					found = true;
+					return;
+				}
+			}
+		}
+		for (auto &child : node->children) {
+			find_hidden_minmax(child.get());
+		}
+	};
+	find_hidden_minmax(plan);
+	return found;
+}
+
+static bool IsMinMaxAggregateColumn(const BoundColumnRefExpression &column_ref,
+                                    const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
+	auto aggregate_it = aggregates.find(column_ref.binding.table_index);
+	if (aggregate_it == aggregates.end()) {
+		return false;
+	}
+	auto &aggregate = *aggregate_it->second;
+	if (column_ref.binding.column_index >= aggregate.expressions.size()) {
+		return false;
+	}
+	auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
+	if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		return false;
+	}
+	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
+	return bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max";
+}
+
+static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
+                                                const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
+	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
+		return IsMinMaxAggregateColumn(column_ref, aggregates);
+	}
+
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
+		if (!found && ExpressionReferencesMinMaxAggregate(child, aggregates)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+bool PlanHasComputedMinMaxAggregateProjection(LogicalOperator *plan) {
+	unordered_map<idx_t, LogicalAggregate *> aggregates;
+	CollectAggregatesByIndex(plan, aggregates);
+	if (aggregates.empty()) {
+		return false;
+	}
+
+	bool found = false;
+	std::function<void(LogicalOperator *)> find_computed_minmax;
+	find_computed_minmax = [&](LogicalOperator *node) {
+		if (!node || found) {
+			return;
+		}
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = node->Cast<LogicalProjection>();
+			for (auto &expr : projection.expressions) {
+				if (expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+					continue;
+				}
+				if (ExpressionReferencesMinMaxAggregate(*expr, aggregates)) {
+					found = true;
+					return;
+				}
+			}
+		}
+		for (auto &child : node->children) {
+			find_computed_minmax(child.get());
+		}
+	};
+	find_computed_minmax(plan);
+	return found;
+}
+
 static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,
-                               const vector<ProjectionLineageEdge> &edges, vector<ProjectionLineageEdge> &path) {
+                               const unordered_map<string, vector<ProjectionLineageEdge>> &adjacency,
+                               vector<ProjectionLineageEdge> &path) {
 	string source_key = OccurrenceKey(source.table, source.occurrence);
 	string target_key = OccurrenceKey(key_ref);
 	if (source_key == target_key) {
@@ -772,10 +920,11 @@ static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const O
 	seen[source_key] = true;
 	for (idx_t pos = 0; pos < queue.size(); pos++) {
 		string node = queue[pos];
-		for (auto &edge : edges) {
-			if (OccurrenceKey(edge.from) != node) {
-				continue;
-			}
+		auto adjacency_it = adjacency.find(node);
+		if (adjacency_it == adjacency.end()) {
+			continue;
+		}
+		for (auto &edge : adjacency_it->second) {
 			string next = OccurrenceKey(edge.to);
 			if (seen[next]) {
 				continue;
@@ -828,19 +977,25 @@ string BuildRefreshLineageJson(const vector<string> &entries) {
 	       StringUtil::Join(entries, entries.size(), ",", [](const string &entry) { return entry; }) + "]}";
 }
 
-string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                               RefreshMetadata::ProjectionKeyLineage &out) {
 	if (!facts.root) {
-		return "";
+		return false;
 	}
 	auto *top_projection = facts.first_projection;
 	if (!top_projection) {
-		return "";
+		return false;
 	}
 	if (facts.source_occurrences.size() < 3) {
-		return "";
+		return false;
 	}
 	if (facts.projection_lineage_edges.empty()) {
-		return "";
+		return false;
+	}
+
+	unordered_map<string, vector<ProjectionLineageEdge>> adjacency;
+	for (auto &edge : facts.projection_lineage_edges) {
+		adjacency[OccurrenceKey(edge.from)].push_back(edge);
 	}
 
 	for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
@@ -862,7 +1017,7 @@ string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const 
 		bool covered = true;
 		for (auto &occurrence : facts.source_occurrences) {
 			vector<ProjectionLineageEdge> path;
-			if (!FindProjectionPath(occurrence, key_ref, facts.projection_lineage_edges, path)) {
+			if (!FindProjectionPath(occurrence, key_ref, adjacency, path)) {
 				covered = false;
 				break;
 			}
@@ -883,9 +1038,10 @@ string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const 
 		lineage.key_occurrence = key_ref.occurrence;
 		lineage.key_col = key_ref.column;
 		lineage.arms = std::move(arms);
-		return RefreshMetadata::ProjectionKeyLineageToJson(lineage);
+		out = std::move(lineage);
+		return true;
 	}
-	return "";
+	return false;
 }
 
 struct WindowLineageOp {
@@ -1111,19 +1267,21 @@ static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const 
 	return false;
 }
 
-string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &partition_columns) {
+bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out) {
+	out.clear();
 	if (!facts.root || partition_columns.empty()) {
-		return "";
+		return false;
 	}
 	auto *plan = facts.root;
 	if (facts.source_occurrences.empty()) {
-		return "";
+		return false;
 	}
 
 	vector<WindowLineageOp> direct_ops;
 	CollectWindowPartitionRefs(plan, facts, partition_columns, direct_ops);
 	if (direct_ops.empty()) {
-		return "";
+		return false;
 	}
 
 	vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> edges;
@@ -1201,26 +1359,18 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 		}
 	}
 
-	string json = "{\"k\":\"window_partition\",\"ops\":[";
-	for (idx_t i = 0; i < ops.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		auto &op = ops[i];
-		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
-		        ",\"source\":" + SqlUtils::JsonQuote(op.source_table) +
-		        ",\"source_occ\":" + SqlUtils::JsonQuote(to_string(op.source_occurrence)) +
-		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
-		if (op.kind == "lookup") {
-			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup_table) +
-			        ",\"lookup_occ\":" + SqlUtils::JsonQuote(to_string(op.lookup_occurrence)) +
-			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
-			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_output_col);
-		}
-		json += "}";
+	for (auto &op : ops) {
+		RefreshMetadata::WindowPartitionLineageOp metadata_op;
+		metadata_op.kind = std::move(op.kind);
+		metadata_op.output_col = std::move(op.output_col);
+		metadata_op.source = std::move(op.source_table);
+		metadata_op.source_col = std::move(op.source_col);
+		metadata_op.lookup = std::move(op.lookup_table);
+		metadata_op.lookup_col = std::move(op.lookup_col);
+		metadata_op.lookup_out = std::move(op.lookup_output_col);
+		out.push_back(std::move(metadata_op));
 	}
-	json += "]}";
-	return json;
+	return !out.empty();
 }
 
 void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,

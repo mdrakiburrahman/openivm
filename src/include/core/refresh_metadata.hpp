@@ -69,9 +69,6 @@ public:
 	bool TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,
 	                       const vector<string> &expected);
 
-	// Update the last_update timestamp to now() for all delta tables of a view.
-	void UpdateTimestamp(const string &view_name);
-
 	// Get all upstream MV dependencies in topological order (ancestors first).
 	// For table→mv1→mv2→mv3, GetUpstreamViews("mv3") returns ["mv1", "mv2"].
 	vector<string> GetUpstreamViews(const string &view_name);
@@ -105,6 +102,19 @@ public:
 
 	// Get per-column aggregate function types (min, max, sum, count_star, etc.).
 	vector<string> GetAggregateTypes(const string &view_name);
+
+	// Get the HAVING predicate extracted into the user-facing view. Empty means no
+	// predicate was extracted, which can happen when HAVING is nested inside a CTE.
+	string GetHavingPredicate(const string &view_name);
+
+	struct GroupRecomputeSourceOccurrence {
+		string table_name;
+		idx_t count = 0;
+	};
+
+	GroupRecomputeAffectedMode GetGroupRecomputeAffectedMode(const string &view_name);
+	vector<GroupRecomputeSourceOccurrence> GetGroupRecomputeSourceOccurrences(const string &view_name);
+	static string GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecomputeSourceOccurrence> &occurrences);
 
 	// --- DuckLake support ---
 

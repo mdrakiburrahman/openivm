@@ -1,7 +1,6 @@
-#include "core/parser_plan_helpers.hpp"
+#include "core/parser_create_mv_helpers.hpp"
 
 #include "core/openivm_constants.hpp"
-#include "core/parser_ddl.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 
@@ -26,13 +25,6 @@ static void AddColumnIfNotExists(vector<string> &ddl, const string &table_name, 
 	ddl.push_back("alter table " + table_name + " add column if not exists " + column_definition);
 }
 
-void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result) {
-	result.function = TableFunction("openivm_ddl_executor", {}, DDLExecutorExecuteFunction, DDLExecutorBindFunction,
-	                                DDLExecutorFunction::DDLExecutorInit);
-	result.requires_valid_transaction = true;
-	result.return_type = StatementReturnType::QUERY_RESULT;
-}
-
 string BuildUpdateViewJsonSQL(const string &column_name, const string &json, const string &view_name) {
 	return "UPDATE " + string(openivm::VIEWS_TABLE) + " SET " + column_name + " = '" +
 	       SqlUtils::EscapeSingleQuotes(json) + "' WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'";
@@ -49,6 +41,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " group_columns varchar default null,"
 	              " aggregate_types varchar default null,"
 	              " having_predicate varchar default null,"
+	              " group_recompute_affected_mode varchar default null,"
+	              " group_recompute_source_occurrences_json varchar default null,"
 	              " has_full_outer boolean default false,"
 	              " full_outer_join_cols varchar default null,"
 	              " signature_hash ubigint default null,"
@@ -67,6 +61,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "distinct_aux_meta_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "semi_anti_aux_meta_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "lineage_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_affected_mode varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_source_occurrences_json varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));

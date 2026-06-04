@@ -61,6 +61,91 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Scalar subquery aggregate under grouped HAVING: a right-side update must
+# recompute affected groups even when the changed table only appears inside
+# the correlated scalar subquery.
+statement ok
+CREATE TABLE lat_scalar_order_max (w_id INT, d_id INT, o_id INT, i_id INT);
+
+statement ok
+CREATE TABLE lat_scalar_stock_max (w_id INT, i_id INT, s_qty INT);
+
+statement ok
+INSERT INTO lat_scalar_order_max VALUES
+    (1, 1, 1, 10), (1, 1, 2, 20), (1, 2, 3, 10),
+    (2, 1, 4, 10), (2, 2, 5, 30);
+
+statement ok
+INSERT INTO lat_scalar_stock_max VALUES
+    (1, 10, 50), (1, 20, 60), (2, 10, 70), (2, 30, 80);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_scalar_max_group AS
+    SELECT
+        o.w_id,
+        o.d_id,
+        COUNT(*) AS order_rows,
+        MAX((SELECT MAX(s.s_qty)
+             FROM lat_scalar_stock_max s
+             WHERE s.w_id = o.w_id AND s.i_id = o.i_id)) AS stock_ceiling
+    FROM lat_scalar_order_max o
+    GROUP BY o.w_id, o.d_id
+    HAVING COUNT(*) > 0;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_scalar_max_group';
+----
+6
+
+statement ok
+UPDATE lat_scalar_stock_max SET s_qty = 95 WHERE w_id = 1 AND i_id = 10;
+
+statement ok
+INSERT INTO lat_scalar_order_max VALUES (1, 2, 6, 20);
+
+statement ok
+DELETE FROM lat_scalar_order_max WHERE rowid = (
+    SELECT min(rowid) FROM lat_scalar_order_max WHERE w_id = 2 AND d_id = 2 AND o_id = 5
+);
+
+statement ok
+PRAGMA refresh('mv_lat_scalar_max_group');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT
+        o.w_id,
+        o.d_id,
+        COUNT(*) AS order_rows,
+        MAX((SELECT MAX(s.s_qty)
+             FROM lat_scalar_stock_max s
+             WHERE s.w_id = o.w_id AND s.i_id = o.i_id)) AS stock_ceiling
+     FROM lat_scalar_order_max o
+     GROUP BY o.w_id, o.d_id
+     HAVING COUNT(*) > 0)
+    EXCEPT ALL SELECT * FROM mv_lat_scalar_max_group
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_scalar_max_group
+    EXCEPT ALL
+    (SELECT
+        o.w_id,
+        o.d_id,
+        COUNT(*) AS order_rows,
+        MAX((SELECT MAX(s.s_qty)
+             FROM lat_scalar_stock_max s
+             WHERE s.w_id = o.w_id AND s.i_id = o.i_id)) AS stock_ceiling
+     FROM lat_scalar_order_max o
+     GROUP BY o.w_id, o.d_id
+     HAVING COUNT(*) > 0)
+);
+----
+0
+
 # Row-local UNNEST over base columns is a linear lateral expansion.
 statement ok
 CREATE TABLE lat_unnest_stock (

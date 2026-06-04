@@ -323,6 +323,25 @@ static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeWindowSourceSpec &
 	return "(" + current_lookup + " UNION ALL " + old_lookup + ")";
 }
 
+static string BuildAffectedPartitionFilter(const vector<string> &partition_cols, const string &affected_table) {
+	string key_cols;
+	string key_tuple;
+	for (size_t i = 0; i < partition_cols.size(); i++) {
+		if (i > 0) {
+			key_cols += ", ";
+			key_tuple += ", ";
+		}
+		auto parsed = SplitPartitionSpec(partition_cols[i]);
+		string output_col = KeywordHelper::WriteOptionallyQuoted(parsed.first);
+		key_cols += output_col;
+		key_tuple += output_col;
+	}
+	if (partition_cols.size() == 1) {
+		return key_tuple + " IN (SELECT " + key_cols + " FROM " + affected_table + ")";
+	}
+	return "(" + key_tuple + ") IN (SELECT " + key_cols + " FROM " + affected_table + ")";
+}
+
 static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                                 const vector<string> &delta_table_names,
                                                 const vector<string> &partition_cols, const string &view_catalog_name,
@@ -409,18 +428,15 @@ static string BuildSingleSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, 
 
 	string affected_cols;
 	string affected_select;
-	string affected_tuple;
 	for (size_t i = 0; i < partition_cols.size(); i++) {
 		if (i > 0) {
 			affected_cols += ", ";
 			affected_select += ", ";
-			affected_tuple += ", ";
 		}
 		auto parsed = SplitPartitionSpec(partition_cols[i]);
 		affected_cols += KeywordHelper::WriteOptionallyQuoted(parsed.first);
 		affected_select += KeywordHelper::WriteOptionallyQuoted(parsed.second) + " AS " +
 		                   KeywordHelper::WriteOptionallyQuoted(parsed.first);
-		affected_tuple += KeywordHelper::WriteOptionallyQuoted(parsed.first);
 	}
 	string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
 	string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
@@ -430,12 +446,7 @@ static string BuildSingleSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, 
 	string deletions = "SELECT " + affected_select + " FROM " +
 	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
 	                                                   loc.table_name, old_snap, current_snap);
-	string affected_filter;
-	if (partition_cols.size() == 1) {
-		affected_filter = affected_tuple + " IN (SELECT " + affected_cols + " FROM " + qtemp_affected + ")";
-	} else {
-		affected_filter = "(" + affected_tuple + ") IN (SELECT " + affected_cols + " FROM " + qtemp_affected + ")";
-	}
+	string affected_filter = BuildAffectedPartitionFilter(partition_cols, qtemp_affected);
 	string upsert_query = "CREATE TEMP TABLE " + qtemp_affected + " AS SELECT DISTINCT " + affected_cols + " FROM ((" +
 	                      insertions + ") UNION ALL (" + deletions + ")) openivm_changed_partitions;\n";
 	upsert_query +=
@@ -476,16 +487,13 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
 	}
 
 	key_cols.clear();
-	key_tuple.clear();
 	for (size_t i = 0; i < partition_cols.size(); i++) {
 		if (i > 0) {
 			key_cols += ", ";
-			key_tuple += ", ";
 		}
 		auto parsed = SplitPartitionSpec(partition_cols[i]);
 		string output_col = KeywordHelper::WriteOptionallyQuoted(parsed.first);
 		key_cols += output_col;
-		key_tuple += output_col;
 	}
 	string current_rows = "SELECT * FROM (" + view_query_sql + ") openivm_current_rows";
 	// At refresh start the MV data table is the last committed result. Diffing against it
@@ -496,12 +504,7 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
 	string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
 	string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
 	string fallback_affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") openivm_changed_rows";
-	string affected_filter;
-	if (partition_cols.size() == 1) {
-		affected_filter = key_tuple + " IN (SELECT " + key_cols + " FROM " + qtemp_affected + ")";
-	} else {
-		affected_filter = "(" + key_tuple + ") IN (SELECT " + key_cols + " FROM " + qtemp_affected + ")";
-	}
+	string affected_filter = BuildAffectedPartitionFilter(partition_cols, qtemp_affected);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 	                    "partition cols, %zu sources)\n",
 	                    partition_cols.size(), delta_table_names.size());

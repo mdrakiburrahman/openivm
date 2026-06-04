@@ -187,14 +187,6 @@ bool RefreshMetadata::TableColumnsMatch(const string &catalog_name, const string
 	return true;
 }
 
-void RefreshMetadata::UpdateTimestamp(const string &view_name) {
-	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-	                        " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "Cannot update IVM metadata timestamp: " + result->GetError());
-	}
-}
-
 vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 	// Walk upstream: for view V, find its delta tables. If a delta table is "delta_X"
 	// and X is a registered MV, then X is an upstream dependency. Recurse.
@@ -293,6 +285,32 @@ vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {
 		}
 	}
 	return types;
+}
+
+string RefreshMetadata::GetHavingPredicate(const string &view_name) {
+	auto result = con.Query("SELECT having_predicate FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "";
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
+GroupRecomputeAffectedMode RefreshMetadata::GetGroupRecomputeAffectedMode(const string &view_name) {
+	auto result = con.Query("SELECT group_recompute_affected_mode FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return GroupRecomputeAffectedMode::CURRENT_DIFF;
+	}
+	string mode = result->GetValue(0, 0).ToString();
+	if (StringUtil::CIEquals(mode, GroupRecomputeAffectedModeName(GroupRecomputeAffectedMode::SOURCE_DELTA))) {
+		return GroupRecomputeAffectedMode::SOURCE_DELTA;
+	}
+	if (StringUtil::CIEquals(
+	        mode, GroupRecomputeAffectedModeName(GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER))) {
+		return GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER;
+	}
+	return GroupRecomputeAffectedMode::CURRENT_DIFF;
 }
 
 int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
@@ -672,6 +690,44 @@ static bool ReadRefreshLineageEntry(Connection &con, const string &view_name, co
 }
 
 } // namespace
+
+vector<RefreshMetadata::GroupRecomputeSourceOccurrence>
+RefreshMetadata::GetGroupRecomputeSourceOccurrences(const string &view_name) {
+	vector<GroupRecomputeSourceOccurrence> occurrences;
+	auto result = con.Query("SELECT group_recompute_source_occurrences_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return occurrences;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return occurrences;
+	}
+	auto objects = ExtractJsonObjectsFromArray(json, "sources");
+	for (auto &object : objects) {
+		GroupRecomputeSourceOccurrence occurrence;
+		if (!ExtractJsonString(object, "table", occurrence.table_name) ||
+		    !ParseJsonIndex(object, "count", occurrence.count) || occurrence.table_name.empty()) {
+			continue;
+		}
+		occurrences.push_back(std::move(occurrence));
+	}
+	return occurrences;
+}
+
+string
+RefreshMetadata::GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecomputeSourceOccurrence> &occurrences) {
+	string json = "{\"sources\":[";
+	for (idx_t i = 0; i < occurrences.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		json += "{\"table\":" + SqlUtils::JsonQuote(occurrences[i].table_name) +
+		        ",\"count\":" + SqlUtils::JsonQuote(to_string(occurrences[i].count)) + "}";
+	}
+	json += "]}";
+	return json;
+}
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
 	auto result = con.Query("SELECT distinct_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +

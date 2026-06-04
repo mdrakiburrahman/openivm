@@ -63,6 +63,18 @@ CREATE MATERIALIZED VIEW mv_random AS SELECT x, RANDOM() AS r FROM t3;
 statement ok
 CREATE MATERIALIZED VIEW mv_now AS SELECT x, NOW() AS ts FROM t3;
 
+statement ok
+CREATE SEQUENCE volatile_unnest_seq START 1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_volatile_unnest AS
+    SELECT x, unnest([nextval('volatile_unnest_seq')]) AS seq_value FROM t3;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_volatile_unnest';
+----
+3
+
 # ==========================================
 # Supported constructs → incremental
 # ==========================================
@@ -84,6 +96,27 @@ CREATE MATERIALIZED VIEW mv_proj AS SELECT a, b FROM t1;
 
 statement ok
 CREATE MATERIALIZED VIEW mv_filter AS SELECT a, b FROM t1 WHERE b > 5;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_min_model AS SELECT a, MIN(b) AS min_b FROM t1 GROUP BY a;
+
+query TI
+SELECT view_name, type FROM openivm_views
+WHERE view_name IN ('mv_avg', 'mv_count', 'mv_filter', 'mv_inner', 'mv_min_model', 'mv_proj', 'mv_sum')
+ORDER BY view_name;
+----
+mv_avg	0
+mv_count	1
+mv_filter	2
+mv_inner	2
+mv_min_model	0
+mv_proj	2
+mv_sum	0
+
+query I
+SELECT has_minmax::INT FROM openivm_views WHERE view_name = 'mv_min_model';
+----
+1
 
 # ==========================================
 # Full refresh works for unsupported MVs
@@ -145,6 +178,15 @@ PRAGMA refresh('mv_now');
 
 query I
 SELECT COUNT(*) FROM mv_now;
+----
+4
+
+# Volatile UNNEST expression: full refresh, not linear UNNEST delta
+statement ok
+PRAGMA refresh('mv_volatile_unnest');
+
+query I
+SELECT COUNT(*) FROM mv_volatile_unnest;
 ----
 4
 
@@ -241,6 +283,93 @@ SELECT COUNT(*) FROM (
     SELECT id, val FROM mv_union
     EXCEPT ALL
     (SELECT id, val FROM u1 UNION ALL SELECT id, val FROM u2)
+);
+----
+0
+
+# ==========================================
+# DISTINCT — incremental classification
+# ==========================================
+
+statement ok
+CREATE TABLE d_src(id INT, region VARCHAR);
+
+statement ok
+INSERT INTO d_src VALUES (1, 'east'), (2, 'east'), (3, 'west');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_distinct_region AS SELECT DISTINCT region FROM d_src;
+
+statement ok
+INSERT INTO d_src VALUES (4, 'north'), (5, 'east');
+
+statement ok
+DELETE FROM d_src WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_distinct_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region FROM mv_distinct_region
+    EXCEPT ALL
+    SELECT DISTINCT region FROM d_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT region FROM d_src
+    EXCEPT ALL
+    SELECT region FROM mv_distinct_region
+);
+----
+0
+
+# ==========================================
+# WINDOW — partition recompute classification
+# ==========================================
+
+statement ok
+CREATE TABLE w_src(id INT, dept VARCHAR, score INT);
+
+statement ok
+INSERT INTO w_src VALUES (1, 'eng', 10), (2, 'eng', 30), (3, 'sales', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_window_rank AS
+    SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score, id) AS rn
+    FROM w_src;
+
+query IT
+SELECT type, group_columns FROM openivm_views WHERE view_name = 'mv_window_rank';
+----
+5	dept=dept
+
+statement ok
+INSERT INTO w_src VALUES (4, 'eng', 25), (5, 'ops', 1);
+
+statement ok
+UPDATE w_src SET score = 5 WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_window_rank');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dept, score, rn FROM mv_window_rank
+    EXCEPT ALL
+    SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score, id) AS rn FROM w_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score, id) AS rn FROM w_src
+    EXCEPT ALL
+    SELECT id, dept, score, rn FROM mv_window_rank
 );
 ----
 0

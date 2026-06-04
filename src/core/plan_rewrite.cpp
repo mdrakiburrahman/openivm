@@ -3,7 +3,6 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/plan_rewrite_internal.hpp"
-#include "rules/delim_join.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
@@ -529,7 +528,7 @@ static bool RewriteMarkJoinFilters(unique_ptr<LogicalOperator> &node) {
 /// Inline every `LOGICAL_CTE_REF` in the plan with a fresh deep copy of its CTE
 /// definition, then collapse `LOGICAL_MATERIALIZED_CTE` wrapper nodes. This makes
 /// IVM see N independent leaves for an N-way self-join through a CTE, instead of
-/// one materialized intermediate referenced N times — without it, `IncrementalJoinRule`'s
+/// one materialized intermediate referenced N times — without it, join delta compilation's
 /// inclusion-exclusion can't generate the cross-terms (Δt ⋈ t_now and t_now ⋈ Δt)
 /// needed to produce new pairs from a single base-table delta.
 ///
@@ -1299,6 +1298,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 			CollectFilterBindings(*expr, filter_bindings);
 		}
 		idx_t next_hidden = 0;
+		bool added_hidden_having_column = false;
 		for (auto &b : filter_bindings) {
 			uint64_t key = (uint64_t)b.first ^ ((uint64_t)b.second * 0x9e3779b97f4a7c15ULL);
 			if (binding_to_alias.find(key) != binding_to_alias.end()) {
@@ -1320,6 +1320,10 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 			proj_ptr->expressions.push_back(std::move(hidden_expr));
 			output_names.push_back(hidden_name);
 			binding_to_alias[key] = hidden_name;
+			added_hidden_having_column = true;
+		}
+		if (added_hidden_having_column) {
+			proj_ptr->ResolveOperatorTypes();
 		}
 	}
 
@@ -1342,6 +1346,9 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 		}
 	} else {
 		plan = std::move(filter_node->children[0]);
+	}
+	if (plan) {
+		plan->ResolveOperatorTypes();
 	}
 
 	OPENIVM_DEBUG_PRINT("[StripHavingFilter] Extracted HAVING predicate: %s\n", having_sql.c_str());

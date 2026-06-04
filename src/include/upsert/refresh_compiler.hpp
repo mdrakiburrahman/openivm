@@ -1,6 +1,7 @@
 #ifndef REFRESH_COMPILER_HPP
 #define REFRESH_COMPILER_HPP
 
+#include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -13,6 +14,7 @@ namespace duckdb {
 struct GroupRecomputeDeltaSpec {
 	string base_table;
 	string last_update;
+	idx_t source_occurrences = 1;
 	bool is_ducklake = false;
 	string ducklake_catalog;
 	string ducklake_schema;
@@ -33,6 +35,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const vector<string> &group_column_names = {}, const string &catalog_prefix = "",
                               bool insert_only = false, const vector<string> &aggregate_types = {},
                               const vector<LogicalType> &column_types = {},
+                              bool use_current_diff_affected_keys = false,
                               const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr,
                               const string &cascade_lpts_table_prefix = "", bool emit_cascade_delta = false,
                               bool *out_handled_cascade_delta = nullptr);
@@ -66,7 +69,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
                              const string &catalog_prefix = "", const string &lpts_table_prefix = "",
-                             bool emit_cascade_delta = false);
+                             bool emit_cascade_delta = false,
+                             GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF);
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM aggregate.
 /// Generates a multi-statement SQL batch:
