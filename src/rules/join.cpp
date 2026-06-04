@@ -1,4 +1,5 @@
 #include "rules/join.hpp"
+#include "compile_facts.hpp"
 #include "rules/ducklake_join.hpp"
 #include "rules/incremental_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
@@ -695,7 +696,11 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	// Empty-delta skipping: skip terms where any table in the mask has zero delta rows.
 	// A join with an empty input always produces zero rows.
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
-	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
+	bool compile_only = openivm::CompileFactsContextSlot::Get(context).compile_only;
+	uint64_t empty_mask = 0;
+	if (skip_empty_enabled) {
+		empty_mask = compile_only ? (delta_status.empty_mask & delta_status.constant_mask) : delta_status.empty_mask;
+	}
 
 	Connection key_probe_con(*context.db);
 	vector<JoinColumnRef> leaf_refs(N);

@@ -888,12 +888,156 @@ string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const 
 	return "";
 }
 
-using WindowLineageOp = RefreshMetadata::WindowPartitionLineageOp;
+struct WindowLineageOp {
+	string kind;
+	string output_col;
+	string source_table;
+	idx_t source_occurrence = 0;
+	string source_col;
+	string lookup_table;
+	idx_t lookup_occurrence = 0;
+	string lookup_col;
+	string lookup_output_col;
+};
 
-static void CollectWindowPartitionRefs(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
-                                       vector<WindowLineageOp> &direct_ops) {
-	for (auto *window_ptr : facts.windows) {
-		auto &window = *window_ptr;
+struct WindowLookupEdge {
+	OccurrenceColumnRef lookup_join;
+	OccurrenceColumnRef changed_join;
+};
+
+static void CollectLeafColumnBindings(Expression *expr, vector<ColumnBinding> &bindings) {
+	if (!expr) {
+		return;
+	}
+	if (auto *bcr = GetColumnRefThroughCasts(expr)) {
+		bindings.push_back(bcr->binding);
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(*expr,
+	                                      [&](Expression &child) { CollectLeafColumnBindings(&child, bindings); });
+}
+
+static void AddUniqueOccurrenceRef(vector<OccurrenceColumnRef> &refs, const OccurrenceColumnRef &ref) {
+	for (auto &existing : refs) {
+		if (StringUtil::CIEquals(existing.table, ref.table) && existing.occurrence == ref.occurrence &&
+		    StringUtil::CIEquals(existing.column, ref.column)) {
+			return;
+		}
+	}
+	refs.push_back(ref);
+}
+
+static bool ResolveBindingToOccurrenceRefsInternal(ColumnBinding binding, const CreateMVPlanFacts &facts,
+                                                   vector<OccurrenceColumnRef> &out, int depth) {
+	if (depth >= 16) {
+		return false;
+	}
+	OccurrenceColumnRef direct_ref;
+	if (ResolveBindingToOccurrenceRef(binding, facts, direct_ref)) {
+		AddUniqueOccurrenceRef(out, direct_ref);
+		return true;
+	}
+	auto proj_it = facts.projections_by_index.find(binding.table_index);
+	if (proj_it == facts.projections_by_index.end()) {
+		return false;
+	}
+	auto *proj = proj_it->second;
+	if (binding.column_index >= proj->expressions.size()) {
+		return false;
+	}
+	vector<ColumnBinding> child_bindings;
+	CollectLeafColumnBindings(proj->expressions[binding.column_index].get(), child_bindings);
+	bool found = false;
+	for (auto &child_binding : child_bindings) {
+		if (child_binding.table_index == binding.table_index && child_binding.column_index == binding.column_index) {
+			continue;
+		}
+		found |= ResolveBindingToOccurrenceRefsInternal(child_binding, facts, out, depth + 1);
+	}
+	return found;
+}
+
+static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMVPlanFacts &facts,
+                                           vector<OccurrenceColumnRef> &out) {
+	out.clear();
+	return ResolveBindingToOccurrenceRefsInternal(binding, facts, out, 0);
+}
+
+static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVPlanFacts &facts,
+                                            vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> &edges) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		if (join.join_type == JoinType::INNER) {
+			for (auto &cond : join.conditions) {
+				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+					continue;
+				}
+				auto *left = GetColumnRefThroughCasts(cond.left.get());
+				auto *right = GetColumnRefThroughCasts(cond.right.get());
+				if (!left || !right) {
+					continue;
+				}
+				OccurrenceColumnRef lref, rref;
+				if (ResolveBindingToOccurrenceRef(left->binding, facts, lref) &&
+				    ResolveBindingToOccurrenceRef(right->binding, facts, rref)) {
+					edges.emplace_back(std::move(lref), std::move(rref));
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectInnerJoinEdgesOccurrence(child.get(), facts, edges);
+	}
+}
+
+static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFacts &facts,
+                                     vector<WindowLookupEdge> &edges) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, OccurrenceColumnRef changed_ref) {
+			edges.push_back({std::move(lookup_ref), std::move(changed_ref)});
+		};
+		for (auto &cond : join.conditions) {
+			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+				continue;
+			}
+			auto *left = GetColumnRefThroughCasts(cond.left.get());
+			auto *right = GetColumnRefThroughCasts(cond.right.get());
+			if (!left || !right) {
+				continue;
+			}
+			OccurrenceColumnRef lref, rref;
+			if (!ResolveBindingToOccurrenceRef(left->binding, facts, lref) ||
+			    !ResolveBindingToOccurrenceRef(right->binding, facts, rref)) {
+				continue;
+			}
+			switch (join.join_type) {
+			case JoinType::INNER:
+				add_lookup_edge(lref, rref);
+				add_lookup_edge(rref, lref);
+				break;
+			case JoinType::LEFT:
+				add_lookup_edge(lref, rref);
+				add_lookup_edge(rref, lref);
+				break;
+			case JoinType::RIGHT:
+				add_lookup_edge(rref, lref);
+				add_lookup_edge(lref, rref);
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectWindowLookupEdges(child.get(), facts, edges);
+	}
+}
+
+static void CollectWindowPartitionRefs(LogicalOperator *op, const CreateMVPlanFacts &facts,
+                                       const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
+	if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
+		auto &window = op->Cast<LogicalWindow>();
 		for (auto &expr : window.expressions) {
 			if (expr->expression_class != ExpressionClass::BOUND_WINDOW) {
 				continue;
@@ -904,38 +1048,46 @@ static void CollectWindowPartitionRefs(const CreateMVPlanFacts &facts, const vec
 				if (!bcr) {
 					continue;
 				}
-				BaseColumnRef base;
-				if (!ResolveBindingToBaseRef(bcr->binding, facts, base)) {
+				vector<OccurrenceColumnRef> refs;
+				if (!ResolveBindingToOccurrenceRefs(bcr->binding, facts, refs)) {
 					continue;
 				}
-				for (auto &stored : partition_columns) {
-					auto pos = stored.find('=');
-					string output_col = pos == string::npos ? stored : stored.substr(0, pos);
-					string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
-					if (!StringUtil::CIEquals(source_col, base.column)) {
-						continue;
+				for (auto &ref : refs) {
+					for (auto &stored : partition_columns) {
+						auto pos = stored.find('=');
+						string output_col = pos == string::npos ? stored : stored.substr(0, pos);
+						string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
+						if (!StringUtil::CIEquals(source_col, ref.column)) {
+							continue;
+						}
+						WindowLineageOp op;
+						op.kind = "direct";
+						op.output_col = output_col;
+						op.source_table = ref.table;
+						op.source_occurrence = ref.occurrence;
+						op.source_col = ref.column;
+						direct_ops.push_back(std::move(op));
 					}
-					WindowLineageOp op;
-					op.kind = "direct";
-					op.output_col = output_col;
-					op.source = base.table;
-					op.source_col = base.column;
-					direct_ops.push_back(std::move(op));
 				}
 			}
 		}
 	}
+	for (auto &child : op->children) {
+		CollectWindowPartitionRefs(child.get(), facts, partition_columns, direct_ops);
+	}
 }
 
-static bool SameRef(const BaseColumnRef &a, const BaseColumnRef &b) {
-	return StringUtil::CIEquals(a.table, b.table) && StringUtil::CIEquals(a.column, b.column);
+static bool SameRef(const OccurrenceColumnRef &a, const OccurrenceColumnRef &b) {
+	return StringUtil::CIEquals(a.table, b.table) && a.occurrence == b.occurrence &&
+	       StringUtil::CIEquals(a.column, b.column);
 }
 
 static bool SameOp(const WindowLineageOp &a, const WindowLineageOp &b) {
 	return a.kind == b.kind && StringUtil::CIEquals(a.output_col, b.output_col) &&
-	       StringUtil::CIEquals(a.source, b.source) && StringUtil::CIEquals(a.source_col, b.source_col) &&
-	       StringUtil::CIEquals(a.lookup, b.lookup) && StringUtil::CIEquals(a.lookup_col, b.lookup_col) &&
-	       StringUtil::CIEquals(a.lookup_out, b.lookup_out);
+	       StringUtil::CIEquals(a.source_table, b.source_table) && a.source_occurrence == b.source_occurrence &&
+	       StringUtil::CIEquals(a.source_col, b.source_col) && StringUtil::CIEquals(a.lookup_table, b.lookup_table) &&
+	       a.lookup_occurrence == b.lookup_occurrence && StringUtil::CIEquals(a.lookup_col, b.lookup_col) &&
+	       StringUtil::CIEquals(a.lookup_output_col, b.lookup_output_col);
 }
 
 static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op) {
@@ -947,11 +1099,12 @@ static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op)
 	ops.push_back(std::move(op));
 }
 
-static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const BaseColumnRef &ref,
+static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const OccurrenceColumnRef &ref,
                                       const string &output_col) {
 	for (auto &op : ops) {
 		if (op.kind == "direct" && StringUtil::CIEquals(op.output_col, output_col) &&
-		    StringUtil::CIEquals(op.source, ref.table) && StringUtil::CIEquals(op.source_col, ref.column)) {
+		    StringUtil::CIEquals(op.source_table, ref.table) && op.source_occurrence == ref.occurrence &&
+		    StringUtil::CIEquals(op.source_col, ref.column)) {
 			return true;
 		}
 	}
@@ -962,11 +1115,21 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 	if (!facts.root || partition_columns.empty()) {
 		return "";
 	}
+	auto *plan = facts.root;
+	if (facts.source_occurrences.empty()) {
+		return "";
+	}
+
 	vector<WindowLineageOp> direct_ops;
-	CollectWindowPartitionRefs(facts, partition_columns, direct_ops);
+	CollectWindowPartitionRefs(plan, facts, partition_columns, direct_ops);
 	if (direct_ops.empty()) {
 		return "";
 	}
+
+	vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> edges;
+	CollectInnerJoinEdgesOccurrence(plan, facts, edges);
+	vector<WindowLookupEdge> lookup_edges;
+	CollectWindowLookupEdges(plan, facts, lookup_edges);
 
 	vector<WindowLineageOp> partition_ops;
 	for (auto &op : direct_ops) {
@@ -977,10 +1140,13 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 	while (changed) {
 		changed = false;
 		vector<WindowLineageOp> next_ops = partition_ops;
-		for (auto &edge : facts.inner_join_edges) {
+		for (auto &edge : edges) {
 			for (auto &direct : partition_ops) {
-				BaseColumnRef direct_ref {direct.source, direct.source_col};
-				BaseColumnRef other;
+				OccurrenceColumnRef direct_ref;
+				direct_ref.table = direct.source_table;
+				direct_ref.occurrence = direct.source_occurrence;
+				direct_ref.column = direct.source_col;
+				OccurrenceColumnRef other;
 				bool found = false;
 				if (SameRef(edge.first, direct_ref)) {
 					other = edge.second;
@@ -995,7 +1161,8 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 				WindowLineageOp equivalent;
 				equivalent.kind = "direct";
 				equivalent.output_col = direct.output_col;
-				equivalent.source = other.table;
+				equivalent.source_table = other.table;
+				equivalent.source_occurrence = other.occurrence;
 				equivalent.source_col = other.column;
 				AddUniqueLineageOp(next_ops, std::move(equivalent));
 				changed = true;
@@ -1009,37 +1176,51 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 		AddUniqueLineageOp(ops, op);
 	}
 
-	for (auto &edge : facts.inner_join_edges) {
+	for (auto &edge : lookup_edges) {
 		for (auto &direct : partition_ops) {
-			BaseColumnRef lookup_output {direct.source, direct.source_col};
-			BaseColumnRef lookup_join;
-			BaseColumnRef changed_join;
-			bool found = false;
-			if (StringUtil::CIEquals(edge.first.table, direct.source) && !SameRef(edge.first, lookup_output)) {
-				lookup_join = edge.first;
-				changed_join = edge.second;
-				found = true;
-			} else if (StringUtil::CIEquals(edge.second.table, direct.source) && !SameRef(edge.second, lookup_output)) {
-				lookup_join = edge.second;
-				changed_join = edge.first;
-				found = true;
+			if (!StringUtil::CIEquals(edge.lookup_join.table, direct.source_table) ||
+			    edge.lookup_join.occurrence != direct.source_occurrence) {
+				continue;
 			}
-			if (!found) {
+			if (StringUtil::CIEquals(edge.lookup_join.column, direct.source_col) &&
+			    StringUtil::CIEquals(edge.changed_join.table, direct.source_table) &&
+			    edge.changed_join.occurrence == direct.source_occurrence) {
 				continue;
 			}
 			WindowLineageOp lookup;
 			lookup.kind = "lookup";
 			lookup.output_col = direct.output_col;
-			lookup.source = changed_join.table;
-			lookup.source_col = changed_join.column;
-			lookup.lookup = direct.source;
-			lookup.lookup_col = lookup_join.column;
-			lookup.lookup_out = direct.source_col;
+			lookup.source_table = edge.changed_join.table;
+			lookup.source_occurrence = edge.changed_join.occurrence;
+			lookup.source_col = edge.changed_join.column;
+			lookup.lookup_table = direct.source_table;
+			lookup.lookup_occurrence = direct.source_occurrence;
+			lookup.lookup_col = edge.lookup_join.column;
+			lookup.lookup_output_col = direct.source_col;
 			AddUniqueLineageOp(ops, std::move(lookup));
 		}
 	}
 
-	return RefreshMetadata::WindowPartitionLineageToJson(ops);
+	string json = "{\"k\":\"window_partition\",\"ops\":[";
+	for (idx_t i = 0; i < ops.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		auto &op = ops[i];
+		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
+		        ",\"source\":" + SqlUtils::JsonQuote(op.source_table) +
+		        ",\"source_occ\":" + SqlUtils::JsonQuote(to_string(op.source_occurrence)) +
+		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
+		if (op.kind == "lookup") {
+			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup_table) +
+			        ",\"lookup_occ\":" + SqlUtils::JsonQuote(to_string(op.lookup_occurrence)) +
+			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
+			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_output_col);
+		}
+		json += "}";
+	}
+	json += "]}";
+	return json;
 }
 
 void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
@@ -1308,6 +1489,53 @@ vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<str
 	AppendHiddenOutputNames(select_plan, output_names);
 	DeduplicateOutputNames(output_names);
 	return output_names;
+}
+
+static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
+	return fn_name == "quantile_cont" || fn_name == "quantile_disc" || fn_name == "percentile_cont" ||
+	       fn_name == "percentile_disc" || fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
+	       fn_name == "mode" ||
+	       // Two-argument aggregates whose children LPTS re-aliases to internal
+	       // `tN_col` names; the serialized SQL refers to those names against the
+	       // original FROM clause and fails binding at CREATE-table time.
+	       fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" || fn_name == "regr_avgx" ||
+	       fn_name == "regr_avgy" || fn_name == "regr_count" || fn_name == "regr_intercept" || fn_name == "regr_r2" ||
+	       fn_name == "regr_slope" || fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy" ||
+	       fn_name == "arg_min" || fn_name == "arg_max";
+}
+
+bool QueryNeedsOriginalSqlForLpts(const string &query) {
+	string lower = StringUtil::Lower(query);
+	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
+}
+
+bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
+		return true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto *agg = dynamic_cast<LogicalAggregate *>(op);
+		if (agg) {
+			for (auto &expr : agg->expressions) {
+				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+					continue;
+				}
+				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+				if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
+					return true;
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		if (PlanNeedsOriginalSqlForLpts(child.get())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 LogicalAggregate *FindOuterAggregate(LogicalOperator *op) {

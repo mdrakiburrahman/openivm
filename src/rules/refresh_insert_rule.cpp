@@ -1,4 +1,5 @@
 #include "rules/refresh_insert_rule.hpp"
+#include "compile_facts.hpp"
 #include "rules/schema_evolution.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -19,6 +20,7 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -124,8 +126,9 @@ static string QuotedExpressionString(const unique_ptr<Expression> &expr, const B
 static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
                                        const string &full_delta_table_name, unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
-	auto ast = LogicalPlanToAst(context, source_plan);
-	auto cte_list = AstToCteList(*ast);
+	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
+	auto ast = LogicalPlanToAst(context, source_plan, dialect);
+	auto cte_list = AstToCteList(*ast, dialect);
 	string subquery_string = cte_list->ToQuery(false);
 	if (!subquery_string.empty() && subquery_string.back() == ';') {
 		subquery_string.pop_back();
@@ -138,8 +141,9 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
                                              unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 	string data_cols = BuildDeltaDataColumns(delta_entry);
-	auto ast = LogicalPlanToAst(context, source_plan);
-	auto cte_list = AstToCteList(*ast);
+	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
+	auto ast = LogicalPlanToAst(context, source_plan, dialect);
+	auto cte_list = AstToCteList(*ast, dialect);
 	string subquery_string = cte_list->ToQuery(false);
 	if (!subquery_string.empty() && subquery_string.back() == ';') {
 		subquery_string.pop_back();
@@ -148,6 +152,26 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	// columns back through that rowid set to materialize the negative delta tuple.
 	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM " + full_table_name +
 	       " WHERE rowid IN (SELECT rowid FROM (" + subquery_string + ") openivm_deleted_rows)";
+}
+
+static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
+	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &col_ref = expr->Cast<BoundColumnRefExpression>();
+	return StringUtil::CIEquals(col_ref.GetName(), "rowid") || StringUtil::CIEquals(col_ref.alias, "rowid");
+}
+
+static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
+	if (join.join_type != JoinType::SEMI) {
+		return false;
+	}
+	for (auto &condition : join.conditions) {
+		if (IsRowIdColumn(condition.left) || IsRowIdColumn(condition.right)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 RefreshInsertRule::RefreshInsertRule() {
@@ -489,18 +513,45 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 					return;
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-					try {
-						insert_string = BuildDeleteDeltaInsertFromPlan(
-						    *con.context, delta_entry_del, full_delta_table_name, full_table_name, plan->children[0]);
-					} catch (...) {
-						throw NotImplementedException(
-						    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
+					// DELETE FROM t WHERE rowid IN (subquery) compiles to a SEMI JOIN on
+					// rowid. LPTS cannot serialise the full SEMI JOIN because `rowid` is a
+					// virtual column whose binding is lost after the join. Serialise only
+					// the right child (the subquery returning rowids) and wrap it as
+					// WHERE rowid IN (...) against the base table.
+					auto *join = dynamic_cast<LogicalComparisonJoin *>(plan->children[0].get());
+					if (join && IsSemiJoinOnRowId(*join) && !join->children.empty()) {
+						try {
+							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
+							string data_cols = BuildDeltaDataColumns(delta_entry_del);
+							SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
+							auto ast = LogicalPlanToAst(*con.context, join->children[1], dialect);
+							auto cte_list = AstToCteList(*ast, dialect);
+							string rowid_sql = cte_list->ToQuery(false);
+							if (!rowid_sql.empty() && rowid_sql.back() == ';') {
+								rowid_sql.pop_back();
+							}
+							insert_string = prefix_del + " SELECT " + data_cols + ", -1, now()::timestamp FROM " +
+							                full_table_name + " WHERE rowid IN (" + rowid_sql + ")";
+						} catch (...) {
+							throw NotImplementedException(
+							    "DELETE with rowid IN (subquery) is not yet fully supported for IVM delta tracking");
+						}
+					} else {
+						try {
+							insert_string =
+							    BuildDeleteDeltaInsertFromPlan(*con.context, delta_entry_del, full_delta_table_name,
+							                                   full_table_name, plan->children[0]);
+						} catch (...) {
+							throw NotImplementedException(
+							    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
+						}
 					}
 				} else {
 					try {
 						string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-						auto ast = LogicalPlanToAst(*con.context, plan->children[0]);
-						auto cte_list = AstToCteList(*ast);
+						SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
+						auto ast = LogicalPlanToAst(*con.context, plan->children[0], dialect);
+						auto cte_list = AstToCteList(*ast, dialect);
 						string subquery_string = cte_list->ToQuery(false);
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();

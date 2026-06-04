@@ -292,8 +292,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 			auto lpts_start = create_profile_now();
 			try {
-				auto ast = LogicalPlanToAst(*con.context, select_plan);
-				auto cte_list = AstToCteList(*ast);
+				// CREATE MATERIALIZED VIEW always stores the view body in
+				// DuckDB's own dialect (the stored body is replayed via
+				// DuckDB's planner on every refresh). The refresh-time
+				// dialect is selected per call via `CompileFacts`.
+				SqlDialect dialect = SqlDialect::DUCKDB;
+				auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
+				auto cte_list = AstToCteList(*ast, dialect);
 				view_query = cte_list->ToQuery(true, output_names);
 				if (!view_query.empty() && view_query.back() == ';') {
 					view_query.pop_back();
@@ -301,6 +306,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				StringUtil::Trim(view_query);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
 			} catch (const std::exception &e) {
+				// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
+				// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
 				view_query = original_view_query;
 				lpts_fallback = true;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
@@ -309,6 +316,17 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				view_query = original_view_query;
 				lpts_fallback = true;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
+				                    view_query.c_str());
+			}
+			// For views that LPTS silently mis-serializes (GROUPING SETS / ROLLUP / CUBE
+			// → plain GROUP BY; STRUCT_PACK field names → tN_col aliases; etc.), detect
+			// structurally and prefer the original SQL. Those constructs never need the
+			// LPTS-rewritten form anyway — they're maintained by recompute-style paths
+			// using the original SQL, so the rewriter-rule path (which needs LPTS) isn't used.
+			if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
+				view_query = original_view_query;
+				lpts_fallback = true;
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
 				                    view_query.c_str());
 			}
 			add_create_profile_step("create_compile_lpts", lpts_start,
@@ -534,30 +552,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		// Non-DuckLake window joins need all changed sources to expose partition keys.
-		bool all_sources_are_ducklake = !table_names.empty();
-		if (all_sources_are_ducklake) {
-			for (const auto &table_name : table_names) {
-				string table_lc = StringUtil::Lower(table_name);
-				bool is_ducklake_scan = facts.ducklake_table_info.find(table_lc) != facts.ducklake_table_info.end();
-				// DuckLake views created by OpenIVM expose a DuckLake catalog view over an
-				// internal physical openivm_data_* table. When DuckDB expands such a view while
-				// planning a chained MV, the scan is physical even though the source's change
-				// tracking is still DuckLake-backed.
-				bool is_ducklake_mv_backing =
-				    !view_catalog_prefix.empty() && StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX);
-				if (!is_ducklake_scan && !is_ducklake_mv_backing) {
-					all_sources_are_ducklake = false;
-					break;
-				}
-			}
-		}
-		bool single_source_window_join =
-		    classification.found_window && classification.found_join && table_names.size() == 1;
-		if (classification.found_window && classification.found_join && !single_source_window_join &&
-		    !all_sources_are_ducklake) {
-			window_partition_columns.clear();
-		}
+		// Keep window partition metadata even for joined windows. Refresh-time lineage
+		// analysis decides whether a multi-source recompute can stay partition-scoped or
+		// must fall back to a wider refresh strategy.
 
 		// Computed outer-join aggregate arguments need group recompute for NULL semantics.
 		if ((classification.found_left_join || classification.found_full_outer) && classification.found_aggregation) {
@@ -572,6 +569,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		bool has_full_outer_aggregate = classification.found_full_outer && classification.found_aggregation;
 
 		bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
+		// PIVOT is unfolded into CASE-aggregate form during DuckDB's pre-bind step,
+		// so the bound plan handed to openivm is a regular aggregate that the
+		// standard incremental classifier handles correctly. Detection therefore
+		// relies on `facts.has_unsupported_set_operation` and `facts.has_pivot`
+		// from plan-level analysis. Don't add a string-level PIVOT gate here:
+		// that demotes valid incremental cases to FULL_REFRESH (see CLAUDE.md:
+		// "do not fix OpenIVM correctness bugs by avoiding incrementalization").
 		bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
 		if (has_unsupported_incremental_construct) {
 			// These views are maintained by full refresh, so store the user's query directly.

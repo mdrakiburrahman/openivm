@@ -11,6 +11,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/query_error_context.hpp"
@@ -173,6 +174,7 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		profiler.AddStep("generate_refresh_sql", generate_start,
 		                 "sql_bytes=" + to_string(sql.size()) + ", meta_pre_bytes=" + to_string(meta_pre_sql.size()) +
 		                     ", meta_post_bytes=" + to_string(meta_post_sql.size()));
+
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
@@ -446,40 +448,13 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		view_name = StringValue::Get(parameters.values[4]);
 		cross_system = true;
 	} else {
-		auto &search_path = ClientData::Get(context).catalog_search_path;
-		auto default_entry = search_path->GetDefault();
-		view_catalog_name = default_entry.catalog;
-		view_schema_name = default_entry.schema;
+		auto resolved = ResolveViewCatalogFromContext(context, con, StringValue::Get(parameters.values[0]));
+		view_catalog_name = resolved.view_catalog_name;
+		view_schema_name = resolved.view_schema_name;
 		view_name = StringValue::Get(parameters.values[0]);
-
-		OPENIVM_DEBUG_PRINT("[UPSERT] Default catalog=%s, schema=%s, view=%s\n", view_catalog_name.c_str(),
-		                    view_schema_name.c_str(), view_name.c_str());
-		// If the view doesn't exist in the default catalog, search attached catalogs.
-		// This handles DuckLake MVs created as "dl.mv_name" where the view lives in "dl".
-		{
-			QueryErrorContext err_ctx;
-			auto entry = Catalog::GetEntry(context, view_catalog_name, view_schema_name,
-			                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx),
-			                               OnEntryNotFound::RETURN_NULL);
-			OPENIVM_DEBUG_PRINT("[UPSERT] Default catalog entry: %s\n", entry ? "found" : "not found");
-			if (!entry) {
-				auto found_view =
-				    con.Query("SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_type = "
-				              "'VIEW' AND table_name = '" +
-				              SqlUtils::EscapeValue(view_name) + "' ORDER BY table_catalog, table_schema LIMIT 1");
-				if (!found_view->HasError() && found_view->RowCount() > 0) {
-					view_catalog_name = found_view->GetValue(0, 0).ToString();
-					view_schema_name = found_view->GetValue(1, 0).ToString();
-					if (view_catalog_name != "memory") {
-						cross_system = true;
-					}
-					OPENIVM_DEBUG_PRINT("[UPSERT] Found view via information_schema in '%s.%s'\n",
-					                    view_catalog_name.c_str(), view_schema_name.c_str());
-				}
-			}
-			OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s'\n", view_catalog_name.c_str(),
-			                    view_schema_name.c_str());
-		}
+		cross_system = resolved.cross_system;
+		OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s', cross_system=%d\n", view_catalog_name.c_str(),
+		                    view_schema_name.c_str(), cross_system ? 1 : 0);
 	}
 
 	// cross_system detection: the view's catalog differs from the fresh connection's physical

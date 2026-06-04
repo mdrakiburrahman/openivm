@@ -169,7 +169,10 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
                               const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types,
-                              const vector<LogicalType> &column_types) {
+                              const vector<LogicalType> &column_types,
+                              const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs,
+                              const string &cascade_lpts_table_prefix, bool emit_cascade_delta,
+                              bool *out_handled_cascade_delta) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 
@@ -389,6 +392,21 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 
 	if (needs_group_recompute || (has_minmax && !insert_only)) {
+		// Cascade-delta dispatch: when the caller (refresh_sql.cpp) requested cascade-delta
+		// emission AND we have the inputs CompileGroupRecompute needs (non-empty group_columns,
+		// non-empty delta_specs), route through the snapshot+signed-multiset path so the
+		// downstream cascade-delta is built from real old/new view-query rows instead of the
+		// LPTS sum-delta + NULL companion pair (which is wrong for MIN/MAX and breaks
+		// SIMPLE_PROJECTION-with-JOIN downstreams).
+		if (emit_cascade_delta && cascade_delta_specs && !cascade_delta_specs->empty() && !group_column_names.empty()) {
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] cascade-delta requested + recompute branch → dispatching "
+			                    "to CompileGroupRecompute(emit_cascade_delta=true)\n");
+			if (out_handled_cascade_delta) {
+				*out_handled_cascade_delta = true;
+			}
+			return CompileGroupRecompute(view_name, view_query_sql, group_column_names, *cascade_delta_specs,
+			                             catalog_prefix, cascade_lpts_table_prefix, /*emit_cascade_delta=*/true);
+		}
 		// Group-recompute strategy: delete affected groups, re-insert from original query.
 		// Always triggered by non-summable columns (LIST aggregates, VARCHAR literals,
 		// CASE results, etc.) — even in insert-only mode, the MERGE path emits
@@ -848,7 +866,7 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
-                             const string &lpts_table_prefix) {
+                             const string &lpts_table_prefix, bool emit_cascade_delta) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -858,7 +876,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
-	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
+	if (!emit_cascade_delta && ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large plan\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
 	}
@@ -926,10 +944,34 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	string match_clause = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
 	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 
-	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas\n", group_columns.size(),
-	                    delta_table_specs.size());
-	return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt", "AS openivm_tgt",
-	                                  "openivm_aff", match_clause, match_clause, affected_temp_table);
+	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas, cascade delta: %s\n",
+	                    group_columns.size(), delta_table_specs.size(), emit_cascade_delta ? "enabled" : "disabled");
+	if (!emit_cascade_delta) {
+		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt",
+		                                  "AS openivm_tgt", "openivm_aff", match_clause, match_clause,
+		                                  affected_temp_table);
+	}
+
+	string delete_where =
+	    "EXISTS (\n  SELECT 1 FROM " + affected_temp_table + " AS openivm_aff WHERE " + match_clause + "\n)";
+	string insert_where =
+	    "EXISTS (\n  SELECT 1 FROM " + affected_temp_table + " AS openivm_aff WHERE " + match_clause + "\n)";
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
+	       " AS openivm_tgt\nWHERE " + delete_where + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+	       ") AS openivm_tgt\nWHERE " + insert_where + ";\n\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE " + delete_where + ";\n\n";
+	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
+	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	sql += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	return sql;
 }
 
 } // namespace duckdb

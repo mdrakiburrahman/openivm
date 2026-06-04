@@ -1,0 +1,116 @@
+# name: test/sql/compile_refresh.test
+# description: openivm_compile_with_facts — compile-only refresh path (openivm-spark integration).
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Setup: a simple SUM/GROUP BY materialized view
+# ==========================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES ('east', 100), ('west', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_region AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region;
+
+# Snapshot the MV state before the compile call so we can prove it is
+# untouched by `openivm_compile_with_facts` afterwards.
+statement ok
+CREATE TABLE mv_region_before AS SELECT * FROM mv_region;
+
+# Mutate the base table — the deltas are now non-empty.
+statement ok
+INSERT INTO sales VALUES ('east', 50), ('north', 75);
+
+statement ok
+DELETE FROM sales WHERE region = 'west';
+
+# ==========================================
+# Test 1: openivm_compile_with_facts succeeds and emits at least one
+# data-bucket row carrying the upsert SQL for the AGGREGATE_GROUP view.
+# ==========================================
+
+query ITT
+SELECT refresh_type, refresh_type_name, sql
+FROM openivm_compile_with_facts(
+    'mv_region',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data' AND sql LIKE '%openivm_delta_mv_region%'
+ORDER BY stmt_order
+LIMIT 1;
+----
+0	AGGREGATE_GROUP	<REGEX>:.*INSERT INTO.*openivm_delta_mv_region.*
+
+# ==========================================
+# Test 2: openivm_compile_with_facts did NOT mutate the materialized view
+# ==========================================
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT * FROM mv_region) EXCEPT ALL (SELECT * FROM mv_region_before))) = 0 AND
+       (SELECT count(*) FROM ((SELECT * FROM mv_region_before) EXCEPT ALL (SELECT * FROM mv_region))) = 0 AS unchanged;
+----
+true
+
+# Sanity: the deltas are still pending — a real refresh would commit them.
+query I
+SELECT total FROM mv_region WHERE region = 'east';
+----
+100
+
+# ==========================================
+# Test 3: PRAGMA refresh still works after the table-function compile call
+# (i.e. the per-call CompileFacts slot did not leak state into PRAGMA refresh)
+# ==========================================
+
+statement ok
+PRAGMA refresh('mv_region');
+
+query III
+SELECT region, total, cnt FROM mv_region ORDER BY region;
+----
+east	150	2
+north	75	1
+
+# ==========================================
+# Test 4: target_dialect='spark' — the facts.target_dialect override
+# is accepted and the compile path runs cleanly. Specific identifier-quoting /
+# function remap correctness is verified end-to-end in spark-ext integration tests
+# (the AGGREGATE_GROUP refresh assembly happens outside lpts for this view shape;
+# lpts is exercised on SIMPLE_PROJECTION / SEMI_ANTI / WINDOW shapes).
+# ==========================================
+
+statement ok
+INSERT INTO sales VALUES ('mid', 11);
+
+statement ok
+SELECT count(*) FROM openivm_compile_with_facts(
+    'mv_region',
+    '{"target_dialect":"spark","compile_only":true}'
+);
+
+statement ok
+SELECT count(*) FROM openivm_compile_with_facts(
+    'mv_region',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+
+# ==========================================
+# Test 5: openivm_compile_with_facts on a non-existent view fails cleanly
+# ==========================================
+
+statement error
+SELECT * FROM openivm_compile_with_facts(
+    'does_not_exist',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+----
+materialized view 'does_not_exist' not found

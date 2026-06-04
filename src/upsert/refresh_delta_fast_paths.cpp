@@ -217,7 +217,9 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name, bool cross_system,
-                                             const DeltaActivityResult *precomputed_delta_activity) {
+                                             const DeltaActivityResult *precomputed_delta_activity,
+                                             const openivm::CompileFacts *facts) {
+	(void)facts;
 	DeltaActivityResult summary;
 	if (precomputed_delta_activity) {
 		summary = *precomputed_delta_activity;

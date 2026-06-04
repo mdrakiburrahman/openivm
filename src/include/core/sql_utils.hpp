@@ -3,6 +3,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "lpts_pipeline.hpp"
 
 #include <string>
 #include <unordered_set>

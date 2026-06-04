@@ -32,7 +32,10 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               bool list_mode = false, const string &delta_ts_filter = "",
                               const vector<string> &group_column_names = {}, const string &catalog_prefix = "",
                               bool insert_only = false, const vector<string> &aggregate_types = {},
-                              const vector<LogicalType> &column_types = {});
+                              const vector<LogicalType> &column_types = {},
+                              const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr,
+                              const string &cascade_lpts_table_prefix = "", bool emit_cascade_delta = false,
+                              bool *out_handled_cascade_delta = nullptr);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false, bool list_mode = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
@@ -42,7 +45,9 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
                                  bool insert_only = false);
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
-                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {});
+                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
+                              bool emit_cascade_delta = false, const string &affected_keys_sql = "",
+                              const string &affected_key_cols = "", const string &affected_key_tuple = "");
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE` (inner-DISTINCT under
@@ -60,7 +65,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 /// when the catalog is default), so we can substitute the exact `cat.schema.tbl` pattern.
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
-                             const string &catalog_prefix = "", const string &lpts_table_prefix = "");
+                             const string &catalog_prefix = "", const string &lpts_table_prefix = "",
+                             bool emit_cascade_delta = false);
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM aggregate.
 /// Generates a multi-statement SQL batch:

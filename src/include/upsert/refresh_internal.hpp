@@ -1,6 +1,7 @@
 #ifndef OPENIVM_REFRESH_INTERNAL_HPP
 #define OPENIVM_REFRESH_INTERNAL_HPP
 
+#include "compile_facts.hpp"
 #include "core/refresh_metadata.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -96,6 +97,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table = "");
+string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
+                                         const string &statement_prefix = "");
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
 string BaseTableNameFromDeltaKey(const string &delta_key);
@@ -131,6 +134,21 @@ void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &
 
 ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const string &fallback_catalog,
                                  const string &fallback_schema);
+
+//! Resolves the (catalog, schema, cross_system) tuple for `view_name` by
+//! consulting the active ClientContext's default catalog/schema, falling
+//! back to information_schema if the entry isn't present in that default.
+//! Setting `throw_if_not_found = true` raises a CatalogException when no
+//! view of the given short name exists in any attached catalog — used by
+//! the `openivm_compile_with_facts` bind to fail fast with a useful
+//! message.
+struct ResolvedViewCatalog {
+	string view_catalog_name;
+	string view_schema_name;
+	bool cross_system = false;
+};
+ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name,
+                                                  bool throw_if_not_found = false);
 DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const string &view_name, const string &table_name,
                                                      const string &fallback_catalog, const string &fallback_schema,
                                                      const string &attached_catalog, const string &attached_schema);
@@ -153,7 +171,8 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const vector<string> &delta_table_names, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name, bool cross_system,
-                                             const DeltaActivityResult *precomputed_delta_activity = nullptr);
+                                             const DeltaActivityResult *precomputed_delta_activity = nullptr,
+                                             const openivm::CompileFacts *facts = nullptr);
 DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                              const string &view_query_sql, const vector<string> &delta_table_names,
                                              const string &view_catalog_name, const string &view_schema_name,
@@ -170,7 +189,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system);
+                                   bool cross_system, bool emit_cascade_delta = false);
 bool TryBuildGroupMeasureUpdateRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                        const string &view_query_sql, const vector<string> &active_delta_table_names,
                                        const vector<string> &column_names, const vector<LogicalType> &column_types,
@@ -182,7 +201,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,
                           string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
-                          RefreshCostEstimate *out_adaptive_estimate = nullptr);
+                          RefreshCostEstimate *out_adaptive_estimate = nullptr,
+                          const openivm::CompileFacts *facts = nullptr);
 
 } // namespace duckdb
 

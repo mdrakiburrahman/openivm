@@ -1,5 +1,6 @@
 #include "upsert/refresh_internal.hpp"
 
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
@@ -12,6 +13,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -106,6 +108,35 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 	input.delta_sql = metadata.ResolveDeltaQualifiedName(view_name, metadata_key, view_catalog_name, view_schema_name);
 	input.last_update = metadata.GetLastUpdate(view_name, metadata_key);
 	return input;
+}
+
+static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
+	auto &db_config = DBConfig::GetConfig(to);
+	ExtensionOption option;
+	if (!db_config.TryGetExtensionOption(name, option) || !option.setting_index.IsValid()) {
+		return;
+	}
+	Value value;
+	if (from.TryGetCurrentSetting(name, value) && !value.IsNull()) {
+		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
+	} else {
+		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
+	}
+}
+
+static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
+	// Per-call compile context (target dialect, compile_only, cascade hints) is
+	// carried by CompileFacts — see compile_facts.hpp. Only the remaining
+	// session-scoped planning settings still need to be mirrored onto the fresh
+	// planning connection.
+	static const char *PLANNING_SETTINGS[] = {
+	    "openivm_skip_empty_deltas",
+	    "openivm_fk_pruning",
+	    "openivm_ducklake_nterm",
+	};
+	for (auto setting_name : PLANNING_SETTINGS) {
+		CopyOpenIvmSetting(from, to, setting_name);
+	}
 }
 
 static bool HasPendingDeltaRows(RefreshMetadata &metadata, const string &view_name, const string &delta_table,
@@ -220,7 +251,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
-                          RefreshCostEstimate *out_adaptive_estimate) {
+                          RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in) {
+	// Resolve the active CompileFacts. Three sources, in priority order:
+	//   1. Explicit `facts_in` (set by direct C++ callers that own a facts
+	//      instance — e.g. the openivm_compile_with_facts table function
+	//      passes its parsed JSON facts here in a future commit).
+	//   2. The ClientContext slot installed by CompileFactsContextSlot.
+	//   3. A default-constructed CompileFacts (compile_only=false,
+	//      target_dialect=DUCKDB). This preserves native PRAGMA refresh
+	//      behaviour for callers that never construct a slot.
+	openivm::CompileFacts active_facts = facts_in ? *facts_in : openivm::CompileFactsContextSlot::Get(context);
 	auto profile_now = []() {
 		return std::chrono::steady_clock::now();
 	};
@@ -233,6 +273,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto context_start = profile_now();
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
+	PropagateRefreshPlanningSettings(context, *con.context);
+	// Mirror the active CompileFacts onto the inner connection's ClientContext
+	// so the optimizer rules invoked via `Optimizer(*con.context)` below
+	// (cost estimator + main IVM rewriter) see the same facts as the outer
+	// caller. Without this, ClientContext::registered_state lookups in
+	// `join.cpp` / `refresh_insert_rule.cpp` would silently fall back to
+	// `CompileFacts::Default()` and lose `compile_only` semantics, producing
+	// `SELECT NULL ... WHERE false` placeholders for views compiled with
+	// no pending deltas.
+	auto inner_facts_slot_facts = make_shared_ptr<openivm::CompileFacts>(active_facts);
+	openivm::CompileFactsContextSlot inner_facts_slot(*con.context, inner_facts_slot_facts);
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	string default_db;
 	string default_schema = "main";
@@ -288,6 +339,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
 	RefreshType view_query_type = metadata.GetViewType(view_name);
+	bool emit_cascade_delta_for_recompute =
+	    active_facts.force_view_delta_cascade &&
+	    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
@@ -433,9 +487,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d has_full_outer=%d\n", has_left_join, has_full_outer);
 
 	auto fast_path_start = profile_now();
-	auto fast_paths = ResolveDeltaFastPathFlags(context, metadata, con, view_name, view_query_sql, delta_table_names,
-	                                            view_catalog_name, view_schema_name, attached_db_catalog_name,
-	                                            attached_db_schema_name, cross_system, precomputed_delta_activity);
+	auto fast_paths = ResolveDeltaFastPathFlags(
+	    context, metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name, view_schema_name,
+	    attached_db_catalog_name, attached_db_schema_name, cross_system, precomputed_delta_activity, &active_facts);
 	add_profile_step("generate_refresh_sql.delta_fast_paths", fast_path_start,
 	                 "insert_only=" + string(fast_paths.insert_only ? "true" : "false") +
 	                     "; skip_agg_delete=" + string(fast_paths.skip_agg_delete ? "true" : "false") +
@@ -449,6 +503,68 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto agg_types = metadata.GetAggregateTypes(view_name);
 	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
 	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
+
+	// AGGREGATE_GROUP cascade-delta dispatch.
+	//
+	// When force_view_delta_cascade=true, CompileAggregateGroups's recompute
+	// branch emits the cascade-delta via the LPTS ComputeDelta query plus a
+	// NULL-padded retract/add-back companion. For MIN/MAX (and other
+	// recompute-driving aggregates) the LPTS sum-delta produces rows with
+	// stale non-key values, and the NULL companion cancels out when a
+	// downstream SIMPLE_PROJECTION aggregates by (key, non-key) — so
+	// downstream INNER JOINs on the non-key columns evaluate to UNKNOWN and
+	// the stale row is never deleted from the downstream MV.
+	//
+	// Route through CompileGroupRecompute with emit_cascade_delta=true so the
+	// cascade-delta is built from real openivm_old_<view> / openivm_new_<view>
+	// snapshots + signed-multiset insert.
+	//
+	// Excluded:
+	//   - source_has_full_outer — handled by BuildFullOuterAffectedGroupRefresh
+	//     with its own semantics.
+	//   - AGGREGATE_HAVING — CompileGroupRecompute substitutes delta-only
+	//     scans into the view query and applies HAVING to partial aggregates
+	//     (e.g. filters SUM(delta) > 100 instead of SUM(base + delta) > 100),
+	//     missing groups whose full sum crosses the threshold via the delta.
+	//     AGGREGATE_HAVING also stores hidden helper columns (openivm_count_star)
+	//     in <mv>__ivm_data that the bare view_query_sql does not project.
+	bool aggregate_recompute_emits_cascade_delta = false;
+	vector<GroupRecomputeDeltaSpec> aggregate_recompute_delta_specs;
+	string aggregate_recompute_lpts_prefix;
+	const vector<GroupRecomputeDeltaSpec> *aggregate_cascade_specs_ptr = nullptr;
+	{
+		bool force_view_delta_cascade = active_facts.force_view_delta_cascade;
+		bool eligible_refresh_type = (view_query_type == RefreshType::AGGREGATE_GROUP);
+		if (force_view_delta_cascade && eligible_refresh_type && !source_has_full_outer && !group_cols.empty()) {
+			auto active_delta_table_names = fast_paths.active_delta_table_names;
+			if (active_delta_table_names.empty() && active_facts.compile_only) {
+				active_delta_table_names = delta_table_names;
+			}
+			if (!active_delta_table_names.empty()) {
+				bool has_ducklake_source = false;
+				for (auto &dt : active_delta_table_names) {
+					if (metadata.IsDuckLakeTable(view_name, dt)) {
+						has_ducklake_source = true;
+						break;
+					}
+				}
+				string dl_cat;
+				if (has_ducklake_source) {
+					dl_cat = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
+				}
+				string dl_sch = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
+				aggregate_recompute_delta_specs =
+				    BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, active_delta_table_names, dl_cat, dl_sch);
+				string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
+				string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
+				aggregate_recompute_lpts_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
+				if (!aggregate_recompute_delta_specs.empty()) {
+					aggregate_cascade_specs_ptr = &aggregate_recompute_delta_specs;
+				}
+			}
+		}
+	}
+
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(view_query_type));
 	auto dispatch_start = profile_now();
 	switch (view_query_type) {
@@ -485,7 +601,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
-			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);
+			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
+			    aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
+			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
+			    &aggregate_recompute_emits_cascade_delta);
 		}
 		break;
 	}
@@ -507,10 +626,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		bool sa_insert_only = has_argminmax ? false : insert_only;
 		RefreshMetadata::FilteredGroupCountAuxMeta aux_meta;
 		if (metadata.GetFilteredGroupCountAuxMeta(view_name, aux_meta)) {
-			EnsureFilteredGroupCountAuxState(metadata, con, view_name, aux_meta, delta_table_names,
-			                                 internal_catalog_name, internal_schema_name, internal_catalog_prefix,
-			                                 view_catalog_name, view_schema_name, attached_db_catalog_name,
-			                                 attached_db_schema_name);
+			if (!active_facts.compile_only) {
+				EnsureFilteredGroupCountAuxState(metadata, con, view_name, aux_meta, delta_table_names,
+				                                 internal_catalog_name, internal_schema_name, internal_catalog_prefix,
+				                                 view_catalog_name, view_schema_name, attached_db_catalog_name,
+				                                 attached_db_schema_name);
+			}
 			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
 			string delta_source_sql =
 			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
@@ -535,18 +656,20 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		break;
 	}
 	case RefreshType::WINDOW_PARTITION: {
-		upsert_query = BuildWindowPartitionRefresh(metadata, con, view_name, view_query_sql, delta_table_names,
-		                                           column_names, data_table, delta_ts_filter, internal_catalog_prefix,
-		                                           view_catalog_name, view_schema_name, attached_db_catalog_name,
-		                                           attached_db_schema_name, cross_system);
+		upsert_query = BuildWindowPartitionRefresh(
+		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
+		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
+		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute);
 		break;
 	}
 	case RefreshType::DISTINCT_INCREMENTAL: {
 		RefreshMetadata::DistinctAuxMeta aux_meta;
 		if (metadata.GetDistinctAuxMeta(view_name, aux_meta)) {
-			EnsureDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
-			                       internal_schema_name, internal_catalog_prefix, view_catalog_name, view_schema_name,
-			                       attached_db_catalog_name, attached_db_schema_name);
+			if (!active_facts.compile_only) {
+				EnsureDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
+				                       internal_schema_name, internal_catalog_prefix, view_catalog_name,
+				                       view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			}
 			auto group_columns = metadata.GetGroupColumns(view_name);
 			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
 			string delta_source_sql =
@@ -569,9 +692,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::SEMI_ANTI_RECOMPUTE: {
 		RefreshMetadata::SemiAntiAuxMeta aux_meta;
 		if (metadata.GetSemiAntiAuxMeta(view_name, aux_meta)) {
-			EnsureSemiAntiAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
-			                       internal_schema_name, internal_catalog_prefix, view_catalog_name, view_schema_name,
-			                       attached_db_catalog_name, attached_db_schema_name);
+			if (!active_facts.compile_only) {
+				EnsureSemiAntiAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
+				                       internal_schema_name, internal_catalog_prefix, view_catalog_name,
+				                       view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			}
 			auto left_input = ResolveSemiAntiSourceInput(metadata, con, view_name, aux_meta.left_table,
 			                                             delta_table_names, view_catalog_name, view_schema_name,
 			                                             attached_db_catalog_name, attached_db_schema_name);
@@ -599,10 +724,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::GROUP_RECOMPUTE: {
 		auto group_columns = metadata.GetGroupColumns(view_name);
 		auto active_delta_table_names = fast_paths.active_delta_table_names;
+		bool compile_only_active = active_facts.compile_only;
 		if (active_delta_table_names.empty()) {
-			upsert_query = "";
-			OPENIVM_DEBUG_PRINT("[UPSERT] GROUP_RECOMPUTE has no active deltas after filtering\n");
-			break;
+			if (!compile_only_active) {
+				upsert_query = "";
+				OPENIVM_DEBUG_PRINT("[UPSERT] GROUP_RECOMPUTE has no active deltas after filtering\n");
+				break;
+			}
+			// Compile-only callers receive the refresh SQL template and
+			// re-run it against their own deltas downstream, so the
+			// empty-active-deltas short-circuit (which only applies when
+			// openivm itself executes the refresh) is bypassed here.
+			active_delta_table_names = delta_table_names;
 		}
 		if (TryBuildGroupMeasureUpdateRefresh(metadata, con, view_name, view_query_sql, active_delta_table_names,
 		                                      column_names, column_types, data_table, view_catalog_name,
@@ -626,8 +759,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
 		string lpts_table_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
-		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs,
-		                                     internal_catalog_prefix, lpts_table_prefix);
+		upsert_query =
+		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,
+		                          lpts_table_prefix, emit_cascade_delta_for_recompute);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources)\n",
 		                    group_columns.size(), delta_specs.size());
 		break;
@@ -654,6 +788,32 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                                  " WHERE table_name = '" + SqlUtils::EscapeValue(delta_view_name_bare) + "'");
 	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
+	// force_view_delta_cascade biases has_downstream=true for AGGREGATE_GROUP
+	// and AGGREGATE_HAVING so the per-key retract companion is emitted even
+	// when no downstream MV is currently registered in openivm_delta_tables.
+	//
+	// Scope: AGGREGATE_GROUP and AGGREGATE_HAVING only. The SIMPLE_AGGREGATE
+	// snapshot companion relies on CREATE TEMP TABLE / DROP TABLE pre/post
+	// pairs that not all dialects can carry across statement boundaries.
+	// WINDOW_PARTITION and GROUP_RECOMPUTE go through the
+	// emit_cascade_delta_for_recompute path below.
+	{
+		if (active_facts.force_view_delta_cascade &&
+		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
+			has_downstream = true;
+		}
+	}
+	// emit_cascade_delta_for_recompute: WINDOW_PARTITION / GROUP_RECOMPUTE
+	// compile their own signed-multiset view-delta into openivm_delta_<view>.
+	// Treat the MV as cascade-capable so cleanup retains the emitted rows even
+	// in compile-for-cascade sessions with no registered downstream metadata.
+	if (emit_cascade_delta_for_recompute) {
+		has_downstream = true;
+	}
+	bool recompute_handles_own_cascade_delta =
+	    aggregate_recompute_emits_cascade_delta ||
+	    (emit_cascade_delta_for_recompute &&
+	     (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE));
 	auto build_snapshot_companion = [&]() {
 		string col_list;
 		for (auto &col : column_names) {
@@ -750,15 +910,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	if (skip_compute_delta_for_refresh || view_query_type == RefreshType::WINDOW_PARTITION ||
 	    view_query_type == RefreshType::GROUP_RECOMPUTE || view_query_type == RefreshType::DISTINCT_INCREMENTAL ||
-	    view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
+	    view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE || aggregate_recompute_emits_cascade_delta) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping ComputeDelta for %s\n",
 		                    skip_compute_delta_for_refresh                         ? "SIMPLE_PROJECTION_KEY"
 		                    : view_query_type == RefreshType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
 		                    : view_query_type == RefreshType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
 		                    : view_query_type == RefreshType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
-		                                                                           : "WINDOW_PARTITION");
+		                    : view_query_type == RefreshType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
+		                                                                       : "AGGREGATE_GROUP_RECOMPUTE_CASCADE");
 		delta_query = "";
-		if (has_downstream) {
+		if (has_downstream && !recompute_handles_own_cascade_delta) {
 			build_snapshot_companion();
 		}
 	} else {
@@ -791,8 +952,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		} else {
 			try {
 				auto lpts_start = profile_now();
-				auto ast = LogicalPlanToAst(con_ctx, plan);
-				auto cte_list = AstToCteList(*ast);
+				SqlDialect dialect = active_facts.target_dialect;
+				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
+				auto cte_list = AstToCteList(*ast, dialect);
 				raw_refresh_sql = cte_list->ToQuery(false);
 				add_profile_step("generate_refresh_sql.lpts", lpts_start,
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));
@@ -825,16 +987,82 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 			auto key_ids = idx->column_ids;
 			vector<string> keys;
+			unordered_set<string> keys_set;
 			for (auto &kid : key_ids) {
 				keys.push_back(column_names[kid]);
+				keys_set.insert(column_names[kid]);
 			}
-			build_affected_snapshot_companion(keys);
+
+			// Dispatch on force_view_delta_cascade:
+			//   false (default): build_affected_snapshot_companion(keys)
+			//     uses TEMP TABLEs to snapshot the affected groups and
+			//     emits signed (-1 old, +1 new) rows. Correctness path for
+			//     downstream MVs that consume the cascade delta in the same
+			//     session.
+			//   true: emit inline per-key NULL retract/add-back rows. For
+			//     callers whose downstream executor splits the refresh
+			//     program statement-by-statement and recreates each delta
+			//     table fresh per refresh, so the TEMP TABLE scratch does
+			//     not survive across the split. NULLs in non-key columns
+			//     rely on SUM(NULL)=NULL preservation downstream.
+			bool inline_companion = active_facts.force_view_delta_cascade;
+
+			if (!inline_companion) {
+				build_affected_snapshot_companion(keys);
+			} else {
+				string col_list, val_list_neg, val_list_pos;
+				bool has_count_star_col = false;
+				for (auto &col : column_names) {
+					if (!col_list.empty()) {
+						col_list += ", ";
+						val_list_neg += ", ";
+						val_list_pos += ", ";
+					}
+					col_list += col;
+					if (col == string(openivm::COUNT_STAR_COL)) {
+						has_count_star_col = true;
+					}
+					if (keys_set.count(col)) {
+						val_list_neg += "d." + col;
+						val_list_pos += "d." + col;
+					} else if (col == openivm::MULTIPLICITY_COL) {
+						val_list_neg += "-1";
+						val_list_pos += "1";
+					} else {
+						val_list_neg += "NULL";
+						val_list_pos += "NULL";
+					}
+				}
+				string join_cond = SqlUtils::BuildNullSafeMatch(keys, "d", "m");
+
+				companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_neg +
+				                  " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) +
+				                  " > 0";
+				if (!delta_ts_filter.empty()) {
+					companion_query += " AND d." + delta_ts_filter;
+				}
+				companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
+
+				if (has_count_star_col) {
+					companion_query += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_pos +
+					                   " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) +
+					                   " < 0 AND d." + string(openivm::COUNT_STAR_COL) + " > 0";
+					if (!delta_ts_filter.empty()) {
+						companion_query += " AND d." + delta_ts_filter;
+					}
+					companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond +
+					                   " AND m." + string(openivm::COUNT_STAR_COL) + " + d." +
+					                   string(openivm::MULTIPLICITY_COL) + " * d." + string(openivm::COUNT_STAR_COL) +
+					                   " > 0);\n";
+				}
+				OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
+			}
 		}
 	}
 
 	auto assembly_start = profile_now();
 	if (has_downstream) {
-		if (skip_empty_enabled) {
+		if (skip_empty_enabled && !recompute_handles_own_cascade_delta) {
 			compact_delta_view_query =
 			    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());

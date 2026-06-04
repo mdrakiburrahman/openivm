@@ -138,6 +138,8 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 string BuildRefreshLineageJson(const vector<string> &entries);
 string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &partition_columns);
 string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &output_names);
+bool QueryNeedsOriginalSqlForLpts(const string &query);
+bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);

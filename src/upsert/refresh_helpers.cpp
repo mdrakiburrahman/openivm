@@ -4,7 +4,11 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
@@ -225,6 +229,13 @@ string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_
 	return statement_prefix + "DELETE FROM " + data_table + " WHERE " + delete_where + ";\n" + statement_prefix +
 	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
 	       insert_where + ";\n";
+}
+
+string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
+                                         const string &statement_prefix) {
+	return statement_prefix + "INSERT INTO " + delta_table +
+	       "\nSELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM " + old_source +
+	       "\nUNION ALL\nSELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + new_source + ";\n";
 }
 
 static string BuildDeleteUsingInsertRefreshSQL(const string &data_table, const string &view_query_sql,
@@ -765,6 +776,44 @@ static string CurrentDatabase(Connection &con) {
 		return res->GetValue(0, 0).ToString();
 	}
 	return "";
+}
+
+ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name,
+                                                  bool throw_if_not_found) {
+	ResolvedViewCatalog resolved;
+	auto &search_path = ClientData::Get(context).catalog_search_path;
+	auto default_entry = search_path->GetDefault();
+	resolved.view_catalog_name = default_entry.catalog;
+	resolved.view_schema_name = default_entry.schema;
+
+	QueryErrorContext err_ctx;
+	auto entry =
+	    Catalog::GetEntry(context, resolved.view_catalog_name, resolved.view_schema_name,
+	                      EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx), OnEntryNotFound::RETURN_NULL);
+	if (!entry) {
+		auto found_view =
+		    con.Query("SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_type = 'VIEW' "
+		              "AND table_name = '" +
+		              SqlUtils::EscapeValue(view_name) + "' ORDER BY CASE WHEN table_catalog = '" +
+		              SqlUtils::EscapeValue(resolved.view_catalog_name) + "' AND table_schema = '" +
+		              SqlUtils::EscapeValue(resolved.view_schema_name) +
+		              "' THEN 0 ELSE 1 END, table_catalog, table_schema LIMIT 1");
+		if (!found_view->HasError() && found_view->RowCount() > 0) {
+			resolved.view_catalog_name = found_view->GetValue(0, 0).ToString();
+			resolved.view_schema_name = found_view->GetValue(1, 0).ToString();
+		} else if (throw_if_not_found) {
+			throw CatalogException("openivm_compile_with_facts: materialized view '%s' not found in any attached "
+			                       "catalog (pass an unqualified short name only)",
+			                       view_name.c_str());
+		}
+	}
+
+	auto current_database = CurrentDatabase(con);
+	if (!resolved.view_catalog_name.empty() && !current_database.empty() &&
+	    resolved.view_catalog_name != current_database && resolved.view_catalog_name != "memory") {
+		resolved.cross_system = true;
+	}
+	return resolved;
 }
 
 ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const string &fallback_catalog,
