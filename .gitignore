@@ -16,3 +16,5 @@ __pycache__/
 /*.sql
 Thumbs.db
 rewriter_benchmark_results.csv
+rewriter_bench_run*.log
+rewriter_benchmark_*.db*

@@ -11,6 +11,13 @@ namespace duckdb {
 /// (for AnalyzePlan / find_group_cols) so the checker sees no FILTER aggregates.
 void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator> &plan);
 
+/// Fold uncorrelated constant scalar subqueries (e.g. `(SELECT k FROM constants_cte)`) to
+/// literals. Must be called on both the SELECT plan (so LPTS emits the folded query) and the
+/// full CREATE plan (so AnalyzePlan doesn't see the scalar-subquery guard's ungrouped `first()`
+/// aggregate and degrade the view to FULL_REFRESH). Requires CTEs already inlined. Only folds
+/// provably-constant single-row subtrees — never a subquery that scans base tables.
+void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOperator> &plan);
+
 /// Rewrite a materialized view's logical plan for IVM compatibility.
 /// Modifies the plan in place:
 /// - DISTINCT → AGGREGATE + COUNT(*) as openivm_distinct_count

@@ -263,6 +263,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 	bool stored_query_has_aggregate_filter = false;
+	bool pre_rewrite_has_aggregate_filter = false;
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	{
@@ -278,6 +279,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// before OpenIVM's structural rewrites.
 		auto select_rewrite_start = create_profile_now();
 		InlineCtesIfPresent(context, *select_planner.binder, select_plan);
+		pre_rewrite_has_aggregate_filter = PlanContainsBoundAggregateFilter(select_plan.get());
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
@@ -388,6 +390,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
 	auto analysis_start = create_profile_now();
 	RewriteAggregateFilters(context, plan);
+	// Fold uncorrelated constant scalar subqueries so the checker sees literals instead of the
+	// scalar-subquery guard's ungrouped first() aggregate. (PlanRewrite already did this for select_plan.)
+	FoldConstantScalarSubqueries(context, plan);
 
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (!facts.source_table_info.empty()) {
@@ -437,7 +442,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	model_input.output_names = &output_names;
 	model_input.has_unsupported_incremental_construct = has_unsupported_incremental_construct;
 	model_input.keep_window_join_partitions = keep_window_join_partitions;
-	model_input.stored_query_has_aggregate_filter = stored_query_has_aggregate_filter || stored_query_retains_having;
+	model_input.stored_query_has_aggregate_filter =
+	    stored_query_has_aggregate_filter || pre_rewrite_has_aggregate_filter || stored_query_retains_having;
 	model_input.stored_query_has_top_k = stored_query_retains_top_k;
 	model_input.has_hidden_minmax_having = has_hidden_minmax_having;
 	model_input.has_computed_minmax_aggregate_projection = has_computed_minmax_aggregate_projection;

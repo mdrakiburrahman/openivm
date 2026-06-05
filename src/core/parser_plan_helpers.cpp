@@ -776,6 +776,27 @@ bool PlanContainsAggregateFilter(LogicalOperator *plan) {
 	return false;
 }
 
+bool PlanContainsBoundAggregateFilter(LogicalOperator *plan) {
+	if (!plan) {
+		return false;
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &aggregate = plan->Cast<LogicalAggregate>();
+		for (auto &expr : aggregate.expressions) {
+			if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
+			    expr->Cast<BoundAggregateExpression>().filter) {
+				return true;
+			}
+		}
+	}
+	for (auto &child : plan->children) {
+		if (PlanContainsBoundAggregateFilter(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void CollectAggregatesByIndex(LogicalOperator *plan, unordered_map<idx_t, LogicalAggregate *> &aggregates) {
 	if (!plan) {
 		return;

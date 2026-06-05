@@ -1,0 +1,281 @@
+# name: test/sql/scalar_subquery_fold.test
+# description: Fold uncorrelated constant scalar subqueries so views incrementalize
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE ssf_t (id INT, code VARCHAR, amt INT, grp INT);
+
+statement ok
+INSERT INTO ssf_t VALUES
+    (1, 'GC', 10, 1),
+    (2, NULL, 20, 1),
+    (3, 'BC', 30, 2),
+    (4, NULL, 40, 2),
+    (5, 'GC', 50, 3);
+
+# ==========================================
+# Constant scalar subquery inside COALESCE in a projection: must fold and
+# incrementalize (SIMPLE_PROJECTION = 2), not degrade to FULL_REFRESH (3).
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ssf_proj AS
+    WITH params AS (SELECT 'NA' AS dflt)
+    SELECT id, COALESCE(code, (SELECT dflt FROM params)) AS code, amt
+    FROM ssf_t;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_ssf_proj';
+----
+2
+
+statement ok
+INSERT INTO ssf_t VALUES (6, NULL, 60, 3), (7, 'XX', 70, 1);
+
+statement ok
+DELETE FROM ssf_t WHERE id = 1;
+
+statement ok
+UPDATE ssf_t SET code = NULL WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_ssf_proj');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, COALESCE(code, 'NA') AS code, amt FROM ssf_t
+    EXCEPT ALL
+    SELECT id, code, amt FROM mv_ssf_proj
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, code, amt FROM mv_ssf_proj
+    EXCEPT ALL
+    SELECT id, COALESCE(code, 'NA') AS code, amt FROM ssf_t
+);
+----
+0
+
+# ==========================================
+# Stacked constant scalar subqueries inside CASE and an aggregate expression
+# over a GROUP BY: still folds and incrementalizes (AGGREGATE_GROUP = 0).
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ssf_agg AS
+    WITH params AS (SELECT 'GC' AS good, 100 AS bonus)
+    SELECT
+        CASE WHEN code = (SELECT good FROM params) THEN 'good' ELSE 'other' END AS bucket,
+        COUNT(*) AS cnt,
+        SUM(amt) + (SELECT bonus FROM params) AS total
+    FROM ssf_t
+    GROUP BY CASE WHEN code = (SELECT good FROM params) THEN 'good' ELSE 'other' END;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_ssf_agg';
+----
+0
+
+statement ok
+INSERT INTO ssf_t VALUES (8, 'GC', 80, 2), (9, NULL, 90, 1);
+
+statement ok
+DELETE FROM ssf_t WHERE id = 5;
+
+statement ok
+UPDATE ssf_t SET amt = 25 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('mv_ssf_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        CASE WHEN code = 'GC' THEN 'good' ELSE 'other' END AS bucket,
+        COUNT(*) AS cnt,
+        SUM(amt) + 100 AS total
+    FROM ssf_t
+    GROUP BY CASE WHEN code = 'GC' THEN 'good' ELSE 'other' END
+    EXCEPT ALL
+    SELECT bucket, cnt, total FROM mv_ssf_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT bucket, cnt, total FROM mv_ssf_agg
+    EXCEPT ALL
+    SELECT
+        CASE WHEN code = 'GC' THEN 'good' ELSE 'other' END AS bucket,
+        COUNT(*) AS cnt,
+        SUM(amt) + 100 AS total
+    FROM ssf_t
+    GROUP BY CASE WHEN code = 'GC' THEN 'good' ELSE 'other' END
+);
+----
+0
+
+# ==========================================
+# Constant scalar subqueries with their own FILTER aggregates must not be folded
+# by the scalar-subquery shortcut. COUNT(*) FILTER false is 0, and first(...)
+# FILTER false is NULL; folding the guard aggregate directly would materialize
+# the unfiltered one-row values instead.
+# ==========================================
+
+statement ok
+CREATE TABLE ssf_filter_t (id INT);
+
+statement ok
+INSERT INTO ssf_filter_t VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ssf_filtered_scalar AS
+    SELECT
+        id,
+        (SELECT COUNT(*) FILTER (WHERE false)) AS filtered_count,
+        (SELECT first(42) FILTER (WHERE false)) AS filtered_first
+    FROM ssf_filter_t;
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        id,
+        (SELECT COUNT(*) FILTER (WHERE false)) AS filtered_count,
+        (SELECT first(42) FILTER (WHERE false)) AS filtered_first
+    FROM ssf_filter_t
+    EXCEPT ALL
+    SELECT id, filtered_count, filtered_first FROM mv_ssf_filtered_scalar
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, filtered_count, filtered_first FROM mv_ssf_filtered_scalar
+    EXCEPT ALL
+    SELECT
+        id,
+        (SELECT COUNT(*) FILTER (WHERE false)) AS filtered_count,
+        (SELECT first(42) FILTER (WHERE false)) AS filtered_first
+    FROM ssf_filter_t
+);
+----
+0
+
+statement ok
+INSERT INTO ssf_filter_t VALUES (3);
+
+statement ok
+PRAGMA refresh('mv_ssf_filtered_scalar');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        id,
+        (SELECT COUNT(*) FILTER (WHERE false)) AS filtered_count,
+        (SELECT first(42) FILTER (WHERE false)) AS filtered_first
+    FROM ssf_filter_t
+    EXCEPT ALL
+    SELECT id, filtered_count, filtered_first FROM mv_ssf_filtered_scalar
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, filtered_count, filtered_first FROM mv_ssf_filtered_scalar
+    EXCEPT ALL
+    SELECT
+        id,
+        (SELECT COUNT(*) FILTER (WHERE false)) AS filtered_count,
+        (SELECT first(42) FILTER (WHERE false)) AS filtered_first
+    FROM ssf_filter_t
+);
+----
+0
+
+# ==========================================
+# Negative control: a NON-constant scalar subquery (scans the base table) must
+# NOT be folded to a stale literal. Whatever strategy it lands on, the result
+# must stay correct after deltas that change the subquery's value.
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ssf_nonconst AS
+    SELECT id, amt, (SELECT MAX(amt) FROM ssf_t) AS max_amt
+    FROM ssf_t;
+
+statement ok
+INSERT INTO ssf_t VALUES (10, 'GC', 9999, 2);
+
+statement ok
+DELETE FROM ssf_t WHERE id = 4;
+
+statement ok
+UPDATE ssf_t SET amt = 1 WHERE id = 6;
+
+statement ok
+PRAGMA refresh('mv_ssf_nonconst');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, amt, (SELECT MAX(amt) FROM ssf_t) AS max_amt FROM ssf_t
+    EXCEPT ALL
+    SELECT id, amt, max_amt FROM mv_ssf_nonconst
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, amt, max_amt FROM mv_ssf_nonconst
+    EXCEPT ALL
+    SELECT id, amt, (SELECT MAX(amt) FROM ssf_t) AS max_amt FROM ssf_t
+);
+----
+0
+
+# ==========================================
+# Correlated scalar subquery: not foldable, must be left untouched and correct.
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ssf_corr AS
+    SELECT id, grp, (SELECT COUNT(*) FROM ssf_t t2 WHERE t2.grp = t1.grp) AS grp_cnt
+    FROM ssf_t t1;
+
+statement ok
+INSERT INTO ssf_t VALUES (11, 'BC', 11, 3), (12, 'GC', 12, 2);
+
+statement ok
+DELETE FROM ssf_t WHERE id = 2;
+
+statement ok
+UPDATE ssf_t SET grp = 1 WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_ssf_corr');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, (SELECT COUNT(*) FROM ssf_t t2 WHERE t2.grp = t1.grp) AS grp_cnt FROM ssf_t t1
+    EXCEPT ALL
+    SELECT id, grp, grp_cnt FROM mv_ssf_corr
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, grp_cnt FROM mv_ssf_corr
+    EXCEPT ALL
+    SELECT id, grp, (SELECT COUNT(*) FROM ssf_t t2 WHERE t2.grp = t1.grp) AS grp_cnt FROM ssf_t t1
+);
+----
+0

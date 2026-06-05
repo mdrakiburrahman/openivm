@@ -91,6 +91,7 @@ string QualifyCreateSourceTable(const string &table_name, const string &current_
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
 bool PlanContainsAggregateFilter(LogicalOperator *plan);
+bool PlanContainsBoundAggregateFilter(LogicalOperator *plan);
 bool PlanHasHiddenMinMaxHavingColumn(LogicalOperator *plan);
 bool PlanHasComputedMinMaxAggregateProjection(LogicalOperator *plan);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);

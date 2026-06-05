@@ -5,8 +5,11 @@
 #include "core/plan_rewrite_internal.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -611,6 +614,246 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Collapsed MATERIALIZED_CTE wrapper (cte_index=%lu)\n", (unsigned long)cte_index);
 }
 
+// ===========================================================================
+// Constant scalar-subquery folding
+//
+// An uncorrelated scalar subquery in a projection (e.g. `(SELECT k FROM params)`
+// where `params` is a one-row constants CTE) plans, in the unoptimized logical
+// plan OpenIVM classifies, as a CROSS_PRODUCT whose subquery side is a single-row
+// guard: PROJECTION(CASE WHEN count>1 THEN error() ELSE value END) over an
+// ungrouped AGGREGATE(first(arg), count_star()) over a constant subtree. The
+// ungrouped `first()` aggregate is unsupported by the incremental checker, so the
+// whole view degrades to FULL_REFRESH. When the subquery resolves to a constant,
+// folding it to a literal is value-preserving and lets the view incrementalize.
+//
+// Hard restriction: only fold provably-constant single-row subtrees (PROJECTION /
+// ungrouped AGGREGATE(first|count_star) / DUMMY_SCAN, all expressions foldable and
+// non-volatile). A subquery that scans base tables changes with deltas and must
+// never be folded.
+// ===========================================================================
+
+// Replace every BoundColumnRef matching `target` in `expr` with a constant whose
+// foldable child references (those in `consts`) have been substituted first.
+static void SubstituteConstants(unique_ptr<Expression> &expr, const column_binding_map_t<Value> &consts) {
+	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+		auto it = consts.find(bcr.binding);
+		if (it != consts.end()) {
+			expr = make_uniq<BoundConstantExpression>(it->second.DefaultCastAs(bcr.return_type));
+		}
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(*expr,
+	                                      [&](unique_ptr<Expression> &child) { SubstituteConstants(child, consts); });
+}
+
+// Fold a (constant) expression to a Value. CASE is evaluated lazily: only the
+// taken branch is folded, so an untaken branch that is itself non-foldable — the
+// scalar-subquery guard's `error(...)` THEN branch — is never inspected.
+static bool TryFoldConstExpr(ClientContext &context, Expression &expr, Value &result) {
+	if (expr.type == ExpressionType::CASE_EXPR) {
+		auto &case_expr = expr.Cast<BoundCaseExpression>();
+		for (auto &check : case_expr.case_checks) {
+			Value cond;
+			if (!TryFoldConstExpr(context, *check.when_expr, cond)) {
+				return false;
+			}
+			if (!cond.IsNull() && BooleanValue::Get(cond)) {
+				return TryFoldConstExpr(context, *check.then_expr, result);
+			}
+		}
+		return TryFoldConstExpr(context, *case_expr.else_expr, result);
+	}
+	if (expr.IsVolatile() || !expr.IsFoldable()) {
+		return false;
+	}
+	return ExpressionExecutor::TryEvaluateScalar(context, expr, result);
+}
+
+// Fold `expr` to a Value after substituting any `consts` child column refs. Returns
+// false if the result is not a provably-constant, non-volatile scalar.
+static bool SubstituteAndFold(ClientContext &context, const Expression &expr, const column_binding_map_t<Value> &consts,
+                              Value &result) {
+	auto copy = expr.Copy();
+	SubstituteConstants(copy, consts);
+	return TryFoldConstExpr(context, *copy, result);
+}
+
+// Evaluate a constant-only single-row subtree, mapping each of `node`'s output
+// column bindings to its Value. Returns false (leaving the plan untouched) on
+// anything not provably constant.
+static bool TryEvalConstantSubtree(ClientContext &context, LogicalOperator &node, column_binding_map_t<Value> &out,
+                                   const unordered_map<idx_t, LogicalOperator *> &cte_defs) {
+	switch (node.type) {
+	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+		return true; // one row, no columns
+	case LogicalOperatorType::LOGICAL_CTE_REF: {
+		// The full CREATE plan still has materialized CTEs (DuckDB CTEInlining keeps
+		// multi-referenced ones). Resolve the ref against its constant definition.
+		auto &ref = node.Cast<LogicalCTERef>();
+		auto it = cte_defs.find(ref.cte_index);
+		if (it == cte_defs.end()) {
+			return false;
+		}
+		column_binding_map_t<Value> def_out;
+		if (!TryEvalConstantSubtree(context, *it->second, def_out, cte_defs)) {
+			return false;
+		}
+		it->second->ResolveOperatorTypes();
+		auto def_bindings = it->second->GetColumnBindings();
+		idx_t cols = std::min(ref.chunk_types.size(), def_bindings.size());
+		for (idx_t i = 0; i < cols; i++) {
+			auto vit = def_out.find(def_bindings[i]);
+			if (vit == def_out.end()) {
+				return false;
+			}
+			out[ColumnBinding(ref.table_index, i)] = vit->second;
+		}
+		return true;
+	}
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		if (node.children.size() != 1) {
+			return false;
+		}
+		column_binding_map_t<Value> child;
+		if (!TryEvalConstantSubtree(context, *node.children[0], child, cte_defs)) {
+			return false;
+		}
+		auto &proj = node.Cast<LogicalProjection>();
+		for (idx_t i = 0; i < proj.expressions.size(); i++) {
+			Value v;
+			if (!SubstituteAndFold(context, *proj.expressions[i], child, v)) {
+				return false;
+			}
+			out[ColumnBinding(proj.table_index, i)] = std::move(v);
+		}
+		return true;
+	}
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+		auto &agg = node.Cast<LogicalAggregate>();
+		// Only the ungrouped scalar-subquery guard (no GROUP BY, no grouping sets).
+		if (!agg.groups.empty() || agg.grouping_sets.size() > 1 || node.children.size() != 1) {
+			return false;
+		}
+		column_binding_map_t<Value> child;
+		if (!TryEvalConstantSubtree(context, *node.children[0], child, cte_defs)) {
+			return false;
+		}
+		for (idx_t i = 0; i < agg.expressions.size(); i++) {
+			if (agg.expressions[i]->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+				return false;
+			}
+			auto &bound_agg = agg.expressions[i]->Cast<BoundAggregateExpression>();
+			if (bound_agg.filter) {
+				return false;
+			}
+			Value v;
+			if (bound_agg.function.name == "count_star" && bound_agg.children.empty()) {
+				v = Value::BIGINT(1); // constant subtree is exactly one row
+			} else if (bound_agg.function.name == "first" && bound_agg.children.size() == 1) {
+				if (!SubstituteAndFold(context, *bound_agg.children[0], child, v)) {
+					return false;
+				}
+			} else {
+				return false; // any other aggregate: not a constant scalar guard
+			}
+			out[ColumnBinding(agg.aggregate_index, i)] = std::move(v);
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+// Replaces a single column binding with a constant everywhere in a plan.
+class ConstantBindingReplacer : public LogicalOperatorVisitor {
+public:
+	ConstantBindingReplacer(ColumnBinding target, Value value) : target(target), value(std::move(value)) {
+	}
+	using LogicalOperatorVisitor::VisitReplace;
+	unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *expr_ptr) override {
+		if (expr.binding == target) {
+			return make_uniq<BoundConstantExpression>(value.DefaultCastAs(expr.return_type));
+		}
+		return nullptr;
+	}
+
+private:
+	ColumnBinding target;
+	Value value;
+};
+
+// Find the first CROSS_PRODUCT (bottom-up) with a provably-constant single-row
+// side, fold that side's output columns to constants plan-wide, and drop the
+// cross product. Returns true if a fold was applied.
+static bool FoldConstantScalarSubqueriesOnce(ClientContext &context, unique_ptr<LogicalOperator> &root,
+                                             unique_ptr<LogicalOperator> &node,
+                                             const unordered_map<idx_t, LogicalOperator *> &cte_defs) {
+	for (auto &c : node->children) {
+		if (FoldConstantScalarSubqueriesOnce(context, root, c, cte_defs)) {
+			return true;
+		}
+	}
+	if (node->type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT || node->children.size() != 2) {
+		return false;
+	}
+	for (idx_t side = 0; side < 2; side++) {
+		column_binding_map_t<Value> values;
+		if (!TryEvalConstantSubtree(context, *node->children[side], values, cte_defs)) {
+			continue;
+		}
+		node->children[side]->ResolveOperatorTypes();
+		auto bindings = node->children[side]->GetColumnBindings();
+		if (bindings.empty()) {
+			continue; // nothing to project away (bare DUMMY_SCAN) — not a scalar value
+		}
+		bool all_constant = true;
+		for (auto &b : bindings) {
+			if (values.find(b) == values.end()) {
+				all_constant = false;
+				break;
+			}
+		}
+		if (!all_constant) {
+			continue;
+		}
+		for (auto &b : bindings) {
+			ConstantBindingReplacer replacer(b, values[b]);
+			replacer.VisitOperator(*root);
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Folded constant scalar subquery binding (%lu.%lu) = %s\n",
+			                    (unsigned long)b.table_index, (unsigned long)b.column_index,
+			                    values[b].ToString().c_str());
+		}
+		node = std::move(node->children[1 - side]); // keep the real input, drop the cross product
+		return true;
+	}
+	return false;
+}
+
+void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+	if (!plan) {
+		return;
+	}
+	// Map cte_index -> definition subtree so scalar subqueries that bottom out in a
+	// CTE_REF (the full CREATE plan keeps multi-referenced CTEs materialized) can still
+	// be resolved to a constant.
+	unordered_map<idx_t, LogicalOperator *> cte_defs;
+	std::function<void(LogicalOperator &)> collect = [&](LogicalOperator &n) {
+		if (n.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && n.children.size() == 2) {
+			cte_defs[n.Cast<LogicalMaterializedCTE>().table_index] = n.children[0].get();
+		}
+		for (auto &c : n.children) {
+			collect(*c);
+		}
+	};
+	collect(*plan);
+	// Loop to a fixpoint: stacked scalar subqueries appear as nested CROSS_PRODUCTs.
+	while (FoldConstantScalarSubqueriesOnce(context, plan, plan, cte_defs)) {
+	}
+	plan->ResolveOperatorTypes();
+}
+
 /// Inject a hidden COUNT(*) (alias `openivm_count_star`) into AGGREGATE_GROUP
 /// aggregates that don't already have a reliable total-row-count aggregate.
 ///
@@ -1071,6 +1314,10 @@ static void RewritePassInlineCteRefs(PlanRewriteContext &rewrite_context) {
 	InlineCteRefs(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
 }
 
+static void RewritePassFoldConstantScalarSubqueries(PlanRewriteContext &rewrite_context) {
+	FoldConstantScalarSubqueries(rewrite_context.context, rewrite_context.plan);
+}
+
 static void RewritePassAggregateFilters(PlanRewriteContext &rewrite_context) {
 	RewriteAggregateFilters(rewrite_context.context, rewrite_context.plan);
 }
@@ -1112,6 +1359,7 @@ static void RewritePassSemiAntiSubqueries(PlanRewriteContext &rewrite_context) {
 static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	const PlanRewritePassEntry passes[] = {
 	    {"inline_cte_refs", RewritePassInlineCteRefs},
+	    {"fold_constant_scalar_subqueries", RewritePassFoldConstantScalarSubqueries},
 	    {"aggregate_filters", RewritePassAggregateFilters},
 	    {"distinct", RewritePassDistinct},
 	    {"derived_aggregates", RewritePassDerivedAggregates},
@@ -1299,6 +1547,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 		}
 		idx_t next_hidden = 0;
 		bool added_hidden_having_column = false;
+		idx_t hidden_start_idx = proj_ptr->expressions.size();
 		for (auto &b : filter_bindings) {
 			uint64_t key = (uint64_t)b.first ^ ((uint64_t)b.second * 0x9e3779b97f4a7c15ULL);
 			if (binding_to_alias.find(key) != binding_to_alias.end()) {
@@ -1324,6 +1573,53 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 		}
 		if (added_hidden_having_column) {
 			proj_ptr->ResolveOperatorTypes();
+			// proj_ptr (the projection directly above the FILTER) is not necessarily the
+			// view's output projection: e.g. `rollup AS (... GROUP BY ... HAVING ...)
+			// SELECT ..., COALESCE(agg, 0) ... FROM rollup` plans as an outer projection
+			// on top of the HAVING aggregate. Propagate the new hidden columns up through
+			// every projection between proj_ptr and the root so they reach the data table
+			// the user view's HAVING WHERE clause reads from. Transparent operators
+			// (ORDER/LIMIT/DISTINCT/FILTER) pass column bindings through unchanged, so only
+			// projections need extending.
+			vector<LogicalProjection *> proj_chain;
+			for (LogicalOperator *n = plan.get(); n && n != filter_node;) {
+				if (n->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					proj_chain.push_back(&n->Cast<LogicalProjection>());
+				}
+				if (n->children.empty()) {
+					break;
+				}
+				n = (n->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && n->children.size() >= 2)
+				        ? n->children[1].get()
+				        : n->children[0].get();
+			}
+			// proj_chain.back() == proj_ptr (it carries the freshly added hidden columns).
+			// Walk upward (toward the root) re-exposing each hidden column at every layer.
+			if (!proj_chain.empty() && proj_chain.back() == proj_ptr) {
+				struct CarriedColumn {
+					ColumnBinding binding;
+					LogicalType type;
+					string name;
+				};
+				vector<CarriedColumn> carried;
+				for (idx_t i = hidden_start_idx; i < proj_ptr->expressions.size(); i++) {
+					carried.push_back({ColumnBinding(proj_ptr->table_index, i), proj_ptr->expressions[i]->return_type,
+					                   proj_ptr->expressions[i]->GetName()});
+				}
+				for (idx_t level = proj_chain.size() - 1; level-- > 0;) {
+					auto *upper = proj_chain[level];
+					vector<CarriedColumn> next_carried;
+					for (auto &c : carried) {
+						auto ref = make_uniq<BoundColumnRefExpression>(c.name, c.type, c.binding);
+						ref->alias = c.name;
+						next_carried.push_back(
+						    {ColumnBinding(upper->table_index, upper->expressions.size()), c.type, c.name});
+						upper->expressions.push_back(std::move(ref));
+					}
+					upper->ResolveOperatorTypes();
+					carried = std::move(next_carried);
+				}
+			}
 		}
 	}
 
