@@ -34,7 +34,7 @@ Base table schema changes (`ADD`, `DROP`, `RENAME COLUMN`) are propagated by Ope
 
 ## Data pipelines and DuckLake
 
-Materialized views can be stacked into pipelines, including over [DuckLake](https://ducklake.select/) tables. DuckLake's snapshot-based time travel replaces delta tables with native change tracking. See [DuckLake IVM integration](docs/ducklake.md). 
+Materialized views can be stacked into pipelines, including over [DuckLake](https://ducklake.select/) tables. DuckLake's snapshot-based time travel enables delta computation through native change tracking, avoiding storage duplication. See [DuckLake IVM integration](docs/ducklake.md). 
 ```sql
 INSTALL ducklake;
 LOAD ducklake;
