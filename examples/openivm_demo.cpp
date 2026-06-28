@@ -24,6 +24,7 @@
 #include "duckdb/main/connection.hpp"
 #include "core/openivm_extension.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -41,21 +42,59 @@ void Banner(const std::string &title) {
 	          << "=====================================================================\n";
 }
 
-// Run a statement and abort loudly on error — a failing setup step should never
-// be silently swallowed in a learning demo.
-std::unique_ptr<MaterializedQueryResult> Run(Connection &con, const std::string &sql) {
-	std::cout << "\nSQL> " << sql << "\n";
+// Auto-incrementing id stamped on every Run/Show so each query's debug trace is
+// easy to bracket and study.
+int g_run_seq = 0;
+
+constexpr int BANNER_WIDTH = 70;
+
+std::string PlainRule() {
+	return std::string(BANNER_WIDTH, '-');
+}
+
+std::string LabeledRule(const std::string &label) {
+	const std::string mid = " " + label + " ";
+	const int dashes = std::max(0, BANNER_WIDTH - static_cast<int>(mid.size()));
+	const int left = dashes / 2;
+	return std::string(left, '-') + mid + std::string(dashes - left, '-');
+}
+
+std::string Centered(const std::string &text) {
+	const int pad = std::max(0, (BANNER_WIDTH - static_cast<int>(text.size())) / 2);
+	return std::string(pad, ' ') + text;
+}
+
+std::unique_ptr<MaterializedQueryResult> RunInternal(Connection &con, const std::string &sql, bool show_result) {
+	const std::string tag = "#" + std::to_string(++g_run_seq);
+
+	std::cout << "\n"
+	          << LabeledRule("START " + tag) << "\n"
+	          << PlainRule() << "\n"
+	          << Centered(tag) << "\n"
+	          << PlainRule() << "\n\n"
+	          << sql << "\n\n"
+	          << PlainRule() << "\n"
+	          << std::flush; // flush stdout first so the stderr debug logs land after the SQL
+
 	auto result = con.Query(sql);
 	if (result->HasError()) {
 		std::cerr << "  !! ERROR: " << result->GetError() << "\n";
 		throw std::runtime_error("query failed: " + sql);
 	}
+
+	if (show_result) {
+		std::cout << "\n" << result->ToString();
+	}
+	std::cout << LabeledRule("END " + tag) << "\n" << std::flush;
 	return result;
 }
 
+std::unique_ptr<MaterializedQueryResult> Run(Connection &con, const std::string &sql) {
+	return RunInternal(con, sql, false);
+}
+
 void Show(Connection &con, const std::string &sql) {
-	auto result = Run(con, sql);
-	std::cout << result->ToString();
+	RunInternal(con, sql, true);
 }
 
 // Bag-equality check in BOTH directions (the OpenIVM correctness contract):
@@ -107,12 +146,7 @@ std::string EnsureCompiledDir() {
 idx_t ShowCompiledProgram(Connection &con, const std::string &view_name, const std::string &facts_json) {
 	const std::string sql = "SELECT stmt_order, stmt_kind, sql FROM openivm_compile_with_facts('" + view_name + "', '" +
 	                        facts_json + "') ORDER BY stmt_order";
-	std::cout << "\nSQL> " << sql << "\n";
-	auto result = con.Query(sql);
-	if (result->HasError()) {
-		std::cerr << "  !! ERROR: " << result->GetError() << "\n";
-		throw std::runtime_error("compile failed for " + view_name);
-	}
+	auto result = Run(con, sql);
 	const idx_t rows = result->RowCount();
 	std::cout << "  -> " << rows << " statement(s) emitted (compile-only — the MV is NOT modified):\n";
 	for (idx_t r = 0; r < rows; r++) {
