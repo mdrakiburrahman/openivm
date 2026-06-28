@@ -25,6 +25,89 @@ contrib/bootstrap-dev-env.sh
    launches under gdb, and stops at your breakpoint. **Step Into (F11)** to
    descend from the SQL call into OpenIVM's C++.
 
+## DuckDB ↔ OpenIVM interop — every entry & exit
+
+OpenIVM is a DuckDB **extension**: it never runs on its own. At `LOAD 'openivm'`
+time it registers four kinds of hooks, and from then on DuckDB calls _into_
+OpenIVM through them and OpenIVM hands control _back_ after each. This is why a
+breakpoint in one hook (e.g. the compile bind) stays quiet during `CREATE
+MATERIALIZED VIEW` — that statement crosses the boundary through a _different_
+hook.
+
+The boxes on the **left are DuckDB core**; the boxes on the **right are OpenIVM
+extension classes** (registered at `LOAD 'openivm'`). `(1)`–`(7)` mark where
+DuckDB calls **into** OpenIVM (`──>`, set a breakpoint) and where OpenIVM
+**returns** control (`<──`). The numbers match the table below.
+
+```
+                  DUCKDB CORE                   ┃              OPENIVM EXTENSION
+                                                ┃  (classes registered at LOAD 'openivm')
+════════════════════════════════════════════════╋══════════════════════════════════════════════
+                                                ┃
+  ┌──────────────────────────┐                  ┃    ┌────────────────────────────────────────┐
+  │                          │                  ┃    │                                        │
+  │  Parser                  │ (1) raw SQL text ┃    │  MaterializedViewParserExtension       │
+  │  (sees every statement)  │                  ┃    │                                        │
+  │                          │ ─────────────────╋──> │    ParseFunction()  parser_parse.cpp:12│
+  │                          │ (2) parse result ┃    │    PlanFunction()   parser.cpp:75      │
+  │                          │ <────────────────╋─── │    -> build delta_* + data table       │
+  │                          │                  ┃    │                                        │
+  └──────────────────────────┘                  ┃    └────────────────────────────────────────┘
+                                                ┃
+  ┌──────────────────────────┐                  ┃    ┌────────────────────────────────────────┐
+  │                          │                  ┃    │                                        │
+  │  Optimizer               │ (3) base DML     ┃    │  RefreshInsertRule                     │
+  │  (sees every plan)       │                  ┃    │                                        │
+  │                          │ ─────────────────╋──> │    RefreshInsertRuleFunction()         │
+  │                          │                  ┃    │    refresh_insert_rule.cpp:181         │
+  │                          │                  ┃    │    -> tee rows into delta_*            │
+  │                          │                  ┃    ├────────────────────────────────────────┤
+  │                          │ (7) delta plan   ┃    │  IncrementalRewriteRule                │
+  │                          │ ─────────────────╋──> │    IncrementalRewriteRuleFunction()    │
+  │                          │ <────────────────╋─── │    incremental_rewrite_rule.cpp:61     │
+  │                          │                  ┃    │    -> read delta_* not base            │
+  └──────────────────────────┘                  ┃    └────────────────────────────────────────┘
+                                                ┃
+  ┌──────────────────────────┐                  ┃    ┌────────────────────────────────────────┐
+  │                          │                  ┃    │                                        │
+  │  Binder                  │ (4) bind call    ┃    │  openivm_compile_with_facts()          │
+  │  SELECT ... FROM         │ ─────────────────╋──> │    OpenIvmCompileWithFactsBind         │
+  │  openivm_compile_with_   │                  ┃    │    compile_facts.cpp:288  <enter>      │
+  │  facts(...)              │                  ┃    │    -> GenerateRefreshSQL               │
+  │                          │                  ┃    │      refresh_sql.cpp:307 (emit SQL)    │
+  │                          │ (5) one row/stmt ┃    │    compile_facts.cpp:340  <exit>       │
+  │                          │ <────────────────╋─── │    (MV is never modified)              │
+  │                          │                  ┃    │                                        │
+  └──────────────────────────┘                  ┃    └────────────────────────────────────────┘
+                                                ┃
+  ┌──────────────────────────┐                  ┃    ┌────────────────────────────────────────┐
+  │                          │                  ┃    │                                        │
+  │  Pragma executor         │ (6) refresh      ┃    │  UpsertDeltaQueriesLocked              │
+  │  PRAGMA refresh('v')     │ ─────────────────╋──> │    refresh.cpp:427 ... 554             │
+  │  (Scenarios 2-4)         │ <────────────────╋─── │    drives (7), then upsert             │
+  │                          │                  ┃    │                                        │
+  └──────────────────────────┘                  ┃    └────────────────────────────────────────┘
+```
+
+| #   | DuckDB → OpenIVM (set breakpoint here) | File:line                                   | Fires when                                                                     | Releases control by                              |
+| --- | -------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------ |
+| (1) | `ParseFunction`                        | `src/core/parser_parse.cpp:12`              | **every** SQL statement (sniffs the text for MV DDL)                           | returning a parse result (`:53` / `:58` / `:88`) |
+| (2) | `PlanFunction`                         | `src/core/parser.cpp:75`                    | a `CREATE`/`ALTER`/`DROP`/`REFRESH MATERIALIZED VIEW` matched                  | returning the plan result                        |
+| (3) | `RefreshInsertRuleFunction`            | `src/rules/refresh_insert_rule.cpp:181`     | optimizing any `INSERT`/`UPDATE`/`DELETE`/`DROP` (acts only on tracked tables) | returning the augmented plan                     |
+| (4) | `OpenIvmCompileWithFactsBind` (enter)  | `src/compile_facts.cpp:288`                 | a query binds `openivm_compile_with_facts(…)` — **Scenario 1**                 | continues to (5)                                 |
+| (5) | `OpenIvmCompileWithFactsBind` (exit)   | `src/compile_facts.cpp:340`                 | the refresh program has been emitted                                           | returning the table-function result              |
+| (6) | `UpsertDeltaQueriesLocked`             | `src/upsert/refresh.cpp:427`                | `PRAGMA refresh('v')` — **Scenarios 2–4**                                      | returning at `src/upsert/refresh.cpp:554`        |
+| (7) | `IncrementalRewriteRuleFunction`       | `src/rules/incremental_rewrite_rule.cpp:61` | optimizing the `ComputeDelta` plan built inside (6)                            | returning the rewritten plan                     |
+
+> **Scenario 1 round trip** is just (4) → (5) (the `CREATE MATERIALIZED VIEW` you
+> run first crosses at (1) and (2), _not_ the compile bind — that's why the bind
+> breakpoint only hits later).
+>
+> **(3) and (7) are optimizer hooks** DuckDB calls for _every_ plan; they
+> early-out unless they recognize their shape (tracked-table DML for (3), a
+> `COMPUTEDELTA` marker for (7)). If such a breakpoint hits too often, make it
+> conditional.
+
 ## What the demo exercises
 
 Each scenario is an independent function — set a breakpoint in just one and run.
