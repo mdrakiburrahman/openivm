@@ -6,8 +6,12 @@
 
 #if OPENIVM_DEBUG
 #include <cstdio>
+// Basename of __FILE__ (the build compiles with absolute paths). The leading "/"
+// guarantees strrchr finds a slash, so the result is never null.
+#define OPENIVM_DEBUG_FILE (__builtin_strrchr("/" __FILE__, '/') + 1)
 #define OPENIVM_DEBUG_PRINT(...)                                                                                       \
 	do {                                                                                                               \
+		fprintf(stderr, "[%s:%d %s] ", OPENIVM_DEBUG_FILE, __LINE__, __func__);                                        \
 		fprintf(stderr, __VA_ARGS__);                                                                                  \
 		fflush(stderr);                                                                                                \
 	} while (0)
