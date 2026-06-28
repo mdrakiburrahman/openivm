@@ -1087,11 +1087,12 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	delete_candidate_columns.erase(delete_candidate_columns.size() - 2, 2);
 
 	if (insert_only) {
-		// Insert-only fast path: all deltas are inserts (w > 0), just INSERT directly.
-		// Each row replicated |w| times for bag-correct multiplicity.
+		// Insert-only fast path: append projected delta rows directly. Do not run the signed net
+		// consolidation/delete path here; byte-identical duplicates are distinct bag entries and
+		// must be appended once per positive multiplicity.
 		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " > 0" : ts_where + " AND " + mul + " > 0";
 		string insert_query = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + delta_view +
-		                      ", generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
+		                      "\nCROSS JOIN generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
 		return insert_query;
 	}
 
