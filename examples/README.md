@@ -14,22 +14,16 @@ extensions:
 contrib/bootstrap-dev-env.sh
 ```
 
-## Debug it
+## Debug it (3 steps)
 
-**Fastest start (no clicking):** open the repo in VS Code (`code .`), open the
-Run panel, pick **“Debug OpenIVM Demo (auto-stop at the compile path)”**, and
-press **F5**. It builds the debug binary and stops automatically at
-`OpenIvmCompileWithFactsBind` (Scenario 1). **Step Over (F10)** a few lines to
-see `view_name` / `facts_json`, then **Continue (F5)** to land in
-`ParseFactsJson` (watch the JSON become a `CompileFacts` struct) and
-`GenerateRefreshSQL` (the heart of compilation). These are debugger-side
-breakpoints, so they show **no red dot** in the gutter — execution still stops
-and the editor jumps to the source line with the call stack + locals.
-
-**Set your own breakpoints:** pick **“Debug OpenIVM Demo”** instead, click in the
-gutter of `examples/openivm_demo.cpp` or any `src/…` file (try a
-`Run(con, "PRAGMA refresh(...)")` line for Scenarios 2–4), then press **F5**.
-**Step Into (F11)** descends from a SQL call into OpenIVM's C++.
+1. Open this repo folder in VS Code (`code .`).
+2. Open `examples/openivm_demo.cpp` and click in the gutter to set a breakpoint.
+   For the **compile-only** tour (Scenario 1) the best first breakpoint is in
+   `src/compile_facts.cpp` at `OpenIvmCompileWithFactsBind`; for the refresh
+   scenarios (2–4), try the first `Run(con, "PRAGMA refresh(...)")` line.
+3. Press **F5** and pick **“Debug OpenIVM Demo”**. It builds the debug binary,
+   launches under gdb, and stops at your breakpoint. **Step Into (F11)** to
+   descend from the SQL call into OpenIVM's C++.
 
 ## What the demo exercises
 
