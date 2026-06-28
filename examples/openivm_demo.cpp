@@ -4,26 +4,33 @@
 // and step from a single SQL statement all the way into OpenIVM's C++ internals.
 //
 // The interesting code paths to step into:
-//   CREATE MATERIALIZED VIEW  -> src/core/parser.cpp        (parser extension)
+//   openivm_compile_with_facts(view, facts)  (Scenario 1 — the openivm-spark
+//                                "compile-only" path: emit refresh SQL, run nothing)
+//                             -> src/compile_facts.cpp        (OpenIvmCompileWithFactsBind)
+//                                src/upsert/refresh_sql.cpp   (GenerateRefreshSQL)
+//   CREATE MATERIALIZED VIEW  -> src/core/parser.cpp          (parser extension)
 //                                src/core/incremental_checker.cpp (RefreshType)
 //   INSERT / DELETE / UPDATE  -> src/rules/refresh_insert_rule.cpp (delta capture)
-//   PRAGMA refresh('...')     -> src/upsert/refresh.cpp     (refresh handler)
+//   PRAGMA refresh('...')     -> src/upsert/refresh.cpp       (refresh handler)
 //                                src/rules/incremental_rewrite_rule.cpp (dispatch)
-//                                src/rules/join.cpp          (inclusion-exclusion)
+//                                src/rules/join.cpp            (inclusion-exclusion)
 //                                src/upsert/refresh_compiler.cpp (upsert SQL)
 //
 // See examples/README.md for the recommended breakpoints per scenario.
 //
 
 #include "duckdb.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/main/connection.hpp"
 #include "core/openivm_extension.hpp"
 
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
 
 using duckdb::Connection;
+using duckdb::idx_t;
 using duckdb::MaterializedQueryResult;
 
 namespace {
@@ -75,11 +82,119 @@ void VerifyEquivalent(Connection &con, const std::string &mv_relation, const std
 	}
 }
 
-// ── Scenario 1: grouped aggregate ───────────────────────────────────────────
+// Ensures a writable directory for OpenIVM's compiled-SQL reference files and
+// returns its path (empty string if it could not be created — compile still
+// works, the files are just an optional artifact). openivm-spark sets
+// openivm_files_path the same way so it can read the program back from disk.
+std::string EnsureCompiledDir() {
+	const char *tmp = std::getenv("TMPDIR");
+	const std::string base = (tmp && *tmp) ? std::string(tmp) : std::string("/tmp");
+	const std::string dir = base + "/openivm_demo_compiled";
+	try {
+		auto fs = duckdb::FileSystem::CreateLocal();
+		if (!fs->DirectoryExists(dir)) {
+			fs->CreateDirectory(dir);
+		}
+		return dir;
+	} catch (...) {
+		return "";
+	}
+}
+
+// Calls openivm_compile_with_facts(view, facts) and prints each emitted statement
+// (the refresh program) on its own lines. Returns the statement count. This is
+// the compile-only entry point: it emits SQL but never mutates the MV.
+idx_t ShowCompiledProgram(Connection &con, const std::string &view_name, const std::string &facts_json) {
+	const std::string sql = "SELECT stmt_order, stmt_kind, sql FROM openivm_compile_with_facts('" + view_name + "', '" +
+	                        facts_json + "') ORDER BY stmt_order";
+	std::cout << "\nSQL> " << sql << "\n";
+	auto result = con.Query(sql);
+	if (result->HasError()) {
+		std::cerr << "  !! ERROR: " << result->GetError() << "\n";
+		throw std::runtime_error("compile failed for " + view_name);
+	}
+	const idx_t rows = result->RowCount();
+	std::cout << "  -> " << rows << " statement(s) emitted (compile-only — the MV is NOT modified):\n";
+	for (idx_t r = 0; r < rows; r++) {
+		std::cout << "\n  [" << result->GetValue(0, r).GetValue<int32_t>() << "] (" << result->GetValue(1, r).ToString()
+		          << ")\n"
+		          << result->GetValue(2, r).ToString() << "\n";
+	}
+	return rows;
+}
+
+// Asserts a query returns at least one row, throwing `message` otherwise.
+void ExpectAtLeastOneRow(Connection &con, const std::string &sql, const std::string &message) {
+	auto result = con.Query(sql);
+	if (result->HasError()) {
+		throw std::runtime_error("check query failed: " + result->GetError());
+	}
+	if (result->RowCount() == 0) {
+		throw std::runtime_error(message);
+	}
+}
+
+// ── Scenario 1: compile-only (openivm-spark's CompileFacts path) ─────────────
+// openivm-spark drives OpenIVM without ever running PRAGMA refresh: it calls
+// openivm_compile_with_facts('<view>', '<CompileFacts JSON>'), which returns the
+// refresh-SQL program (one row per statement) and leaves the MV untouched. This
+// is the single best place to learn how OpenIVM compiles a refresh — breakpoint
+// OpenIvmCompileWithFactsBind (src/compile_facts.cpp) and step into
+// GenerateRefreshSQL (src/upsert/refresh_sql.cpp).
+void ScenarioCompileWithFacts(Connection &con) {
+	Banner("Scenario 1: compile-only  (openivm_compile_with_facts -> emitted refresh SQL, nothing executed)");
+
+	const std::string compiled_dir = EnsureCompiledDir();
+	if (!compiled_dir.empty()) {
+		Run(con, "SET openivm_files_path='" + compiled_dir + "'");
+	}
+
+	Run(con, "CREATE TABLE compile_sales (region VARCHAR, amount INT)");
+	Run(con, "INSERT INTO compile_sales VALUES ('east', 100), ('west', 200)");
+	Run(con, "CREATE MATERIALIZED VIEW mv_compile_region AS "
+	         "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM compile_sales GROUP BY region");
+
+	// Snapshot the MV so we can prove the compile call is side-effect free.
+	Run(con, "CREATE TABLE mv_compile_region_before AS SELECT * FROM mv_compile_region");
+
+	// Mutate the base table: the pending deltas are now non-empty.
+	Run(con, "INSERT INTO compile_sales VALUES ('east', 50), ('north', 75)");
+	Run(con, "DELETE FROM compile_sales WHERE region = 'west'");
+
+	// (1) The exact call openivm-spark makes: Spark target dialect.
+	std::cout << "\n--- target_dialect=spark  (the exact openivm-spark CompileFacts payload) ---\n";
+	if (ShowCompiledProgram(con, "mv_compile_region",
+	                        R"({"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true})") == 0) {
+		throw std::runtime_error("spark compile emitted no statements");
+	}
+
+	// (2) Same view, DuckDB dialect — identical C++ path; only the final LPTS
+	// dialect translation differs.
+	std::cout << "\n--- target_dialect=duckdb  (same view, for contrast) ---\n";
+	if (ShowCompiledProgram(con, "mv_compile_region", R"({"target_dialect":"duckdb","compile_only":true})") == 0) {
+		throw std::runtime_error("duckdb compile emitted no statements");
+	}
+
+	// The emitted program must reference a delta table it would apply at refresh time.
+	ExpectAtLeastOneRow(
+	    con,
+	    R"(SELECT 1 FROM openivm_compile_with_facts('mv_compile_region', '{"target_dialect":"duckdb","compile_only":true}') WHERE stmt_kind = 'data' AND sql LIKE '%openivm_delta_%')",
+	    "compiled program references no delta table");
+
+	// compile-only is a pure function: the MV is byte-for-byte unchanged.
+	VerifyEquivalent(con, "mv_compile_region", "SELECT * FROM mv_compile_region_before");
+
+	if (!compiled_dir.empty()) {
+		std::cout << "\n[artifact] full compiled program also written under " << compiled_dir
+		          << "/openivm_upsert_queries_mv_compile_region.sql\n";
+	}
+}
+
+// ── Scenario 2: grouped aggregate ───────────────────────────────────────────
 // Exercises CompileAggregateGroups (CTE consolidates per-group delta, then
 // MERGE INTO updates/inserts the data table).
 void ScenarioAggregate(Connection &con) {
-	Banner("Scenario 1: grouped aggregate  (SUM / COUNT GROUP BY -> MERGE upsert)");
+	Banner("Scenario 2: grouped aggregate  (SUM / COUNT GROUP BY -> MERGE upsert)");
 
 	Run(con, "CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INT)");
 	Run(con, "INSERT INTO sales VALUES ('US','Widget',100), ('EU','Gadget',200), ('US','Bolt',50)");
@@ -101,11 +216,11 @@ void ScenarioAggregate(Connection &con) {
 	VerifyEquivalent(con, "regional_totals", base_query);
 }
 
-// ── Scenario 2: inner join ──────────────────────────────────────────────────
+// ── Scenario 3: inner join ──────────────────────────────────────────────────
 // Exercises IncrementalJoinRule: for N tables it builds 2^N-1 inclusion-exclusion
 // terms (delta-vs-current scans) combined with UNION ALL.
 void ScenarioInnerJoin(Connection &con) {
-	Banner("Scenario 2: inner join  (delta x current inclusion-exclusion terms)");
+	Banner("Scenario 3: inner join  (delta x current inclusion-exclusion terms)");
 
 	Run(con, "CREATE TABLE orders (order_id INT, product_id INT, qty INT)");
 	Run(con, "CREATE TABLE products (product_id INT, name VARCHAR, price INT)");
@@ -128,11 +243,11 @@ void ScenarioInnerJoin(Connection &con) {
 	VerifyEquivalent(con, "order_lines", base_query);
 }
 
-// ── Scenario 3: projection + filter ─────────────────────────────────────────
+// ── Scenario 4: projection + filter ─────────────────────────────────────────
 // Exercises CompileProjectionsFilters: counting-based consolidation (GROUP BY +
 // generate_series/rowid) to preserve bag semantics under inserts and deletes.
 void ScenarioProjectionFilter(Connection &con) {
-	Banner("Scenario 3: projection + filter  (counting-based bag consolidation)");
+	Banner("Scenario 4: projection + filter  (counting-based bag consolidation)");
 
 	Run(con, "CREATE TABLE events (id INT, kind VARCHAR, score INT)");
 	Run(con, "INSERT INTO events VALUES (1,'click',5), (2,'view',1), (3,'click',9), (4,'purchase',50)");
@@ -159,6 +274,7 @@ int main() {
 	Connection con(db);
 
 	try {
+		ScenarioCompileWithFacts(con);
 		ScenarioAggregate(con);
 		ScenarioInnerJoin(con);
 		ScenarioProjectionFilter(con);
