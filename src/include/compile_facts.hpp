@@ -18,12 +18,22 @@ namespace openivm {
 // `ParseFactsJson` deserialises the JSON object directly into these fields.
 class CompileFacts {
 public:
-	// Reserved for future schema evolution. Current valid value is 1.
-	static constexpr int CURRENT_SCHEMA_VERSION = 1;
+	// Schema evolution: 1 = original 3-field facts; 2 = WorkloadFacts (adds the
+	// classifier-derived workload shape, e.g. assume_insert_only). Unknown/extra
+	// fields are ignored by ParseFactsJson, so v1 writers keep working unchanged.
+	static constexpr int CURRENT_SCHEMA_VERSION = 2;
 	int schema_version = CURRENT_SCHEMA_VERSION;
 	SqlDialect target_dialect = SqlDialect::DUCKDB; // required when parsed from JSON
 	bool compile_only = false;                      // default false
 	bool force_view_delta_cascade = false;
+
+	// v2 WorkloadFacts: set true ONLY when an external classifier has PROVEN, from
+	// the actual change log, that this batch is append-only (every new commit a
+	// blind append / AddFile-only, no RemoveFile dataChange). When true under
+	// compile_only it re-enables the insert-only fast paths (skip aggregate/
+	// projection delete, MIN/MAX GREATEST/LEAST) that compile_only otherwise
+	// disables. Defaults false — conservative, identical to v1 behavior.
+	bool assume_insert_only = false;
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every
