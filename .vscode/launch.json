@@ -1,0 +1,72 @@
+{
+	// OpenIVM debug profiles. Press F5 (or pick a config in the Run panel).
+	// Both build the DEBUG binary first via the "build-debug" task, then launch
+	// under gdb so you can step from SQL into OpenIVM's C++ internals.
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Debug OpenIVM Demo",
+			"type": "cppdbg",
+			"request": "launch",
+			"program": "${workspaceFolder}/build/debug/extension/openivm/openivm_demo",
+			"args": [],
+			"stopAtEntry": false,
+			"cwd": "${workspaceFolder}",
+			"environment": [
+				{
+					// The debug build links AddressSanitizer (DuckDB ENABLE_SANITIZER).
+					// LeakSanitizer's end-of-run leak check aborts under a debugger
+					// (it can't run while the process is ptraced), so disable just
+					// the leak check — ASAN's use-after-free/overflow checks stay on.
+					"name": "ASAN_OPTIONS",
+					"value": "detect_leaks=0"
+				}
+			],
+			"externalConsole": false,
+			"MIMode": "gdb",
+			"miDebuggerPath": "/usr/bin/gdb",
+			"setupCommands": [
+				{
+					"description": "Enable pretty-printing for gdb",
+					"text": "-enable-pretty-printing",
+					"ignoreFailures": true
+				}
+			],
+			"preLaunchTask": "build-debug"
+		},
+		{
+			"name": "Debug a single SQL test (unittest)",
+			"type": "cppdbg",
+			"request": "launch",
+			"program": "${workspaceFolder}/build/debug/test/unittest",
+			"args": ["${input:testFile}"],
+			"stopAtEntry": false,
+			"cwd": "${workspaceFolder}",
+			"environment": [
+				{
+					"name": "ASAN_OPTIONS",
+					"value": "detect_leaks=0"
+				}
+			],
+			"externalConsole": false,
+			"MIMode": "gdb",
+			"miDebuggerPath": "/usr/bin/gdb",
+			"setupCommands": [
+				{
+					"description": "Enable pretty-printing for gdb",
+					"text": "-enable-pretty-printing",
+					"ignoreFailures": true
+				}
+			],
+			"preLaunchTask": "build-debug"
+		}
+	],
+	"inputs": [
+		{
+			"id": "testFile",
+			"type": "promptString",
+			"description": "Path to a .test file to debug",
+			"default": "test/sql/aggregate.test"
+		}
+	]
+}

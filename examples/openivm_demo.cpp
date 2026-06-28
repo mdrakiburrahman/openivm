@@ -1,0 +1,172 @@
+//
+// OpenIVM end-to-end demo — a debuggable tour of the incremental-view-maintenance
+// pipeline. Each scenario is self-contained so you can set a breakpoint, press F5,
+// and step from a single SQL statement all the way into OpenIVM's C++ internals.
+//
+// The interesting code paths to step into:
+//   CREATE MATERIALIZED VIEW  -> src/core/parser.cpp        (parser extension)
+//                                src/core/incremental_checker.cpp (RefreshType)
+//   INSERT / DELETE / UPDATE  -> src/rules/refresh_insert_rule.cpp (delta capture)
+//   PRAGMA refresh('...')     -> src/upsert/refresh.cpp     (refresh handler)
+//                                src/rules/incremental_rewrite_rule.cpp (dispatch)
+//                                src/rules/join.cpp          (inclusion-exclusion)
+//                                src/upsert/refresh_compiler.cpp (upsert SQL)
+//
+// See examples/README.md for the recommended breakpoints per scenario.
+//
+
+#include "duckdb.hpp"
+#include "duckdb/main/connection.hpp"
+#include "core/openivm_extension.hpp"
+
+#include <iostream>
+#include <memory>
+#include <string>
+
+using duckdb::Connection;
+using duckdb::MaterializedQueryResult;
+
+namespace {
+
+void Banner(const std::string &title) {
+	std::cout << "\n=====================================================================\n"
+	          << "  " << title << "\n"
+	          << "=====================================================================\n";
+}
+
+// Run a statement and abort loudly on error — a failing setup step should never
+// be silently swallowed in a learning demo.
+std::unique_ptr<MaterializedQueryResult> Run(Connection &con, const std::string &sql) {
+	std::cout << "\nSQL> " << sql << "\n";
+	auto result = con.Query(sql);
+	if (result->HasError()) {
+		std::cerr << "  !! ERROR: " << result->GetError() << "\n";
+		throw std::runtime_error("query failed: " + sql);
+	}
+	return result;
+}
+
+void Show(Connection &con, const std::string &sql) {
+	auto result = Run(con, sql);
+	std::cout << result->ToString();
+}
+
+// Bag-equality check in BOTH directions (the OpenIVM correctness contract):
+// the materialized view must contain exactly the rows a full recomputation would,
+// including duplicates. Any row returned by either EXCEPT ALL is a bug.
+void VerifyEquivalent(Connection &con, const std::string &mv_relation, const std::string &base_query) {
+	const std::string missing =
+	    "SELECT COUNT(*) FROM ((" + base_query + ") EXCEPT ALL (SELECT * FROM " + mv_relation + ")) _missing";
+	const std::string extra =
+	    "SELECT COUNT(*) FROM ((SELECT * FROM " + mv_relation + ") EXCEPT ALL (" + base_query + ")) _extra";
+
+	auto m = con.Query(missing);
+	auto e = con.Query(extra);
+	if (m->HasError() || e->HasError()) {
+		std::cerr << "  !! VERIFY query failed: " << (m->HasError() ? m->GetError() : e->GetError()) << "\n";
+		throw std::runtime_error("verify failed for " + mv_relation);
+	}
+	const auto missing_rows = m->GetValue(0, 0).GetValue<int64_t>();
+	const auto extra_rows = e->GetValue(0, 0).GetValue<int64_t>();
+	std::cout << "\n[verify] " << mv_relation << ": missing=" << missing_rows << " extra=" << extra_rows << "  -> "
+	          << ((missing_rows == 0 && extra_rows == 0) ? "PASS (MV == base query, bag-equal)" : "FAIL") << "\n";
+	if (missing_rows != 0 || extra_rows != 0) {
+		throw std::runtime_error("MV not bag-equal to base query: " + mv_relation);
+	}
+}
+
+// ── Scenario 1: grouped aggregate ───────────────────────────────────────────
+// Exercises CompileAggregateGroups (CTE consolidates per-group delta, then
+// MERGE INTO updates/inserts the data table).
+void ScenarioAggregate(Connection &con) {
+	Banner("Scenario 1: grouped aggregate  (SUM / COUNT GROUP BY -> MERGE upsert)");
+
+	Run(con, "CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INT)");
+	Run(con, "INSERT INTO sales VALUES ('US','Widget',100), ('EU','Gadget',200), ('US','Bolt',50)");
+
+	const std::string base_query = "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region";
+	Run(con, "CREATE MATERIALIZED VIEW regional_totals AS " + base_query);
+	Show(con, "SELECT * FROM regional_totals ORDER BY region");
+
+	// Batch conflicting DML before a single refresh so delta consolidation has
+	// real work: one insert into an existing group, one new group, one delete,
+	// one update (delete+insert under the hood).
+	Run(con, "INSERT INTO sales VALUES ('US','Gear',25)");
+	Run(con, "INSERT INTO sales VALUES ('JP','Gizmo',300)");
+	Run(con, "DELETE FROM sales WHERE product = 'Gadget'");
+	Run(con, "UPDATE sales SET amount = amount + 10 WHERE product = 'Widget'");
+
+	Run(con, "PRAGMA refresh('regional_totals')");
+	Show(con, "SELECT * FROM regional_totals ORDER BY region");
+	VerifyEquivalent(con, "regional_totals", base_query);
+}
+
+// ── Scenario 2: inner join ──────────────────────────────────────────────────
+// Exercises IncrementalJoinRule: for N tables it builds 2^N-1 inclusion-exclusion
+// terms (delta-vs-current scans) combined with UNION ALL.
+void ScenarioInnerJoin(Connection &con) {
+	Banner("Scenario 2: inner join  (delta x current inclusion-exclusion terms)");
+
+	Run(con, "CREATE TABLE orders (order_id INT, product_id INT, qty INT)");
+	Run(con, "CREATE TABLE products (product_id INT, name VARCHAR, price INT)");
+	Run(con, "INSERT INTO orders VALUES (1,10,2), (2,20,1), (3,10,5)");
+	Run(con, "INSERT INTO products VALUES (10,'Widget',100), (20,'Gadget',200)");
+
+	const std::string base_query = "SELECT o.order_id, p.name, o.qty * p.price AS line_total "
+	                               "FROM orders o JOIN products p ON o.product_id = p.product_id";
+	Run(con, "CREATE MATERIALIZED VIEW order_lines AS " + base_query);
+	Show(con, "SELECT * FROM order_lines ORDER BY order_id");
+
+	// Delta on BOTH sides before one refresh (exercises the cross terms).
+	Run(con, "INSERT INTO products VALUES (30,'Sprocket',75)");
+	Run(con, "INSERT INTO orders VALUES (4,30,4), (5,20,3)");
+	Run(con, "DELETE FROM orders WHERE order_id = 2");
+	Run(con, "UPDATE products SET price = 150 WHERE product_id = 10");
+
+	Run(con, "PRAGMA refresh('order_lines')");
+	Show(con, "SELECT * FROM order_lines ORDER BY order_id");
+	VerifyEquivalent(con, "order_lines", base_query);
+}
+
+// ── Scenario 3: projection + filter ─────────────────────────────────────────
+// Exercises CompileProjectionsFilters: counting-based consolidation (GROUP BY +
+// generate_series/rowid) to preserve bag semantics under inserts and deletes.
+void ScenarioProjectionFilter(Connection &con) {
+	Banner("Scenario 3: projection + filter  (counting-based bag consolidation)");
+
+	Run(con, "CREATE TABLE events (id INT, kind VARCHAR, score INT)");
+	Run(con, "INSERT INTO events VALUES (1,'click',5), (2,'view',1), (3,'click',9), (4,'purchase',50)");
+
+	const std::string base_query = "SELECT id, kind, score * 2 AS doubled FROM events WHERE score >= 5";
+	Run(con, "CREATE MATERIALIZED VIEW hot_events AS " + base_query);
+	Show(con, "SELECT * FROM hot_events ORDER BY id");
+
+	// Mix of rows that enter the filter, leave it, and stay out.
+	Run(con, "INSERT INTO events VALUES (5,'click',7), (6,'view',2)");
+	Run(con, "DELETE FROM events WHERE id = 3");
+	Run(con, "UPDATE events SET score = 100 WHERE id = 2"); // crosses the filter boundary
+
+	Run(con, "PRAGMA refresh('hot_events')");
+	Show(con, "SELECT * FROM hot_events ORDER BY id");
+	VerifyEquivalent(con, "hot_events", base_query);
+}
+
+} // namespace
+
+int main() {
+	duckdb::DuckDB db(":memory:");
+	db.LoadStaticExtension<duckdb::OpenivmExtension>();
+	Connection con(db);
+
+	try {
+		ScenarioAggregate(con);
+		ScenarioInnerJoin(con);
+		ScenarioProjectionFilter(con);
+	} catch (const std::exception &ex) {
+		std::cerr << "\nDEMO FAILED: " << ex.what() << "\n";
+		return 1;
+	}
+
+	std::cout << "\nAll scenarios passed (each MV is bag-equal to its base query).\n";
+	return 0;
+}

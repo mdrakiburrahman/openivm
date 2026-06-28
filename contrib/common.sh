@@ -213,3 +213,123 @@ cmn_ensure_passwordless_sudo() {
     fi
     cmn_log common "passwordless sudo configured at $target"
 }
+
+# ── openivm: c++ build toolchain ────────────────────────────────────────────
+
+# Pinned VS Code extensions for C++ debugging (id@version). Pins keep a blown-up
+# dev box reproducible — bump deliberately.
+CMN_VSCODE_EXTENSIONS=(
+    "ms-vscode.cpptools@1.32.2"
+    "ms-vscode.cpptools-extension-pack@1.5.1"
+    "ms-vscode.makefile-tools@0.12.17"
+)
+
+# cmn_ensure_local_bin_on_path — ensure ~/.local/bin (pip --user scripts such as
+# clang-format) is on PATH for this shell and future login shells.
+cmn_ensure_local_bin_on_path() {
+    local localbin="$HOME/.local/bin"
+    case ":$PATH:" in
+        *":$localbin:"*) ;;
+        *) export PATH="$localbin:$PATH" ;;
+    esac
+    if [[ -f "$HOME/.bashrc" ]] && ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+    fi
+}
+
+# cmn_ensure_build_toolchain — install everything needed to COMPILE the OpenIVM
+# DuckDB extension (same toolchain the PR build uses): a C++ compiler, CMake,
+# Ninja, gdb (debugging), ccache (faster rebuilds), git, and pip/venv.
+cmn_ensure_build_toolchain() {
+    local missing=()
+    cmn_has cmake      || missing+=(cmake)
+    cmn_has ninja      || missing+=(ninja-build)
+    cmn_has g++        || missing+=(build-essential)
+    cmn_has gdb        || missing+=(gdb)
+    cmn_has ccache     || missing+=(ccache)
+    cmn_has git        || missing+=(git)
+    cmn_has pkg-config || missing+=(pkg-config)
+    python3 -m pip --version >/dev/null 2>&1 || missing+=(python3-pip python3-venv)
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        cmn_log openivm "build toolchain already installed"
+        return 0
+    fi
+    cmn_log openivm "installing build toolchain: ${missing[*]}"
+    sudo apt-get update -qq
+    cmn_apt_install "${missing[@]}"
+    cmn_log openivm "build toolchain ready ($(cmake --version | head -1), $(g++ --version | head -1))"
+}
+
+# cmn_ensure_format_tools — install the exact formatter/linter the PR "code
+# quality" job uses: clang-format 11.0.1 via the pip wheel (Ubuntu 24.04 has no
+# clang-format-11 apt package), plus cmake-format/black and clang-tidy. Enables
+# `make format-fix` and clang-tidy parity. Best-effort: never fails bootstrap.
+cmn_ensure_format_tools() {
+    cmn_ensure_local_bin_on_path
+    if command -v clang-format >/dev/null 2>&1 && clang-format --version | grep -q ' 11\.'; then
+        cmn_log openivm "format tools already installed (clang-format 11)"
+    else
+        cmn_log openivm "installing format tools (clang-format 11.0.1, cmake-format, black)..."
+        python3 -m pip install --user --break-system-packages \
+            'clang_format==11.0.1' cmake-format 'black==24.*' cxxheaderparser pcpp 'pybind11[global]' >/dev/null \
+            || cmn_log openivm "  (pip format-tools install hit an issue; continuing)"
+    fi
+    cmn_has clang-tidy || { cmn_log openivm "installing clang-tidy..."; cmn_apt_install clang-tidy || true; }
+    cmn_log openivm "format tools ready"
+}
+
+# ── openivm: submodules + build ─────────────────────────────────────────────
+
+# cmn_ensure_submodules <repo_root> — check out the MINIMAL submodule set the
+# build needs: duckdb (v1.5.2), extension-ci-tools, and lpts (+ its ducklake
+# headers). Avoids lpts's heavy nested duckdb/sqlstorm clones. Idempotent.
+cmn_ensure_submodules() {
+    local root="$1"
+    cmn_log openivm "initializing submodules (duckdb, extension-ci-tools, lpts)..."
+    git -C "$root" submodule update --init duckdb extension-ci-tools third_party/lpts
+    git -C "$root/third_party/lpts" submodule update --init third_party/ducklake
+    cmn_log openivm "submodules ready"
+}
+
+# cmn_build_openivm <repo_root> — build BOTH configurations from a clean dev box:
+#   release -> CI parity, runs `make test`         build/release/...
+#   debug   -> symbols for line-by-line debugging  build/debug/...
+# Uses Ninja + ccache. Idempotent: make no-ops when nothing changed. The first
+# run compiles DuckDB from source and is slow (minutes); reruns are fast.
+cmn_build_openivm() {
+    local root="$1"
+    export PATH="/usr/lib/ccache:$PATH"
+    cmn_log openivm "building RELEASE (compiles DuckDB from source; first run is slow)..."
+    ( cd "$root" && GEN=ninja make )
+    cmn_log openivm "building DEBUG (symbols for the VS Code debugger)..."
+    ( cd "$root" && GEN=ninja make debug )
+    cmn_log openivm "build complete"
+    cmn_log openivm "  release demo: build/release/extension/openivm/openivm_demo"
+    cmn_log openivm "  debug demo:   build/debug/extension/openivm/openivm_demo"
+}
+
+# ── openivm: vs code extensions ─────────────────────────────────────────────
+
+# cmn_install_vscode_extensions — install pinned C++ debugging extensions into
+# VS Code. No-op when the `code` CLI is unavailable (headless / CI runners).
+# On WSL, `code` lives under a /mnt/c Windows path that bootstrap strips from
+# PATH, so fall back to CMN_ORIGINAL_PATH (captured before the strip) to find it.
+cmn_install_vscode_extensions() {
+    local code_bin=""
+    if cmn_has code; then
+        code_bin="code"
+    elif [[ -n "${CMN_ORIGINAL_PATH:-}" ]] && PATH="$CMN_ORIGINAL_PATH" command -v code >/dev/null 2>&1; then
+        code_bin="$(PATH="$CMN_ORIGINAL_PATH" command -v code)"
+    fi
+    if [[ -z "$code_bin" ]]; then
+        cmn_log openivm "VS Code 'code' CLI not found — skipping extension install"
+        return 0
+    fi
+    local ext
+    for ext in "${CMN_VSCODE_EXTENSIONS[@]}"; do
+        cmn_log openivm "installing VS Code extension ${ext}..."
+        "$code_bin" --install-extension "${ext}" --force >/dev/null 2>&1 \
+            || cmn_log openivm "  (could not install ${ext}; continuing)"
+    done
+    cmn_log openivm "VS Code extensions ready"
+}

@@ -13,6 +13,13 @@
 
 namespace duckdb {
 
+// C++11 requires out-of-line definitions for static constexpr members that are
+// ODR-used. These two are bound to a const& (by std::chrono::seconds and
+// std::min below), so the -O0 debug build needs real definitions to link; the
+// -O2 release build happens to constant-fold the uses and links without them.
+constexpr int64_t RefreshDaemon::WAKE_INTERVAL_SECONDS;
+constexpr int64_t RefreshDaemon::MAX_BACKOFF_SECONDS;
+
 void RefreshDaemon::Start(DatabaseInstance &db) {
 	bool expected = false;
 	if (!started_.compare_exchange_strong(expected, true)) {

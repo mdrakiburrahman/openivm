@@ -2,7 +2,11 @@
 .cache/
 .temp/
 .idea
-.vscode/
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
 cmake-build-debug
 duckdb_unittest_tempdir/
 .DS_Store

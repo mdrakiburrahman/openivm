@@ -1,0 +1,22 @@
+{
+	// IntelliSense for OpenIVM + DuckDB headers. Paths mirror CMakeLists.txt
+	// include_directories(...) so "Go to Definition" reaches into DuckDB and LPTS.
+	"C_Cpp.default.cppStandard": "c++14",
+	"C_Cpp.default.includePath": [
+		"${workspaceFolder}/src/include",
+		"${workspaceFolder}/duckdb/src/include",
+		"${workspaceFolder}/duckdb/third_party/**",
+		"${workspaceFolder}/third_party/lpts/src/include",
+		"${workspaceFolder}/third_party/lpts/third_party/ducklake/src/include",
+		"${workspaceFolder}/benchmark",
+		"${workspaceFolder}/benchmark/src"
+	],
+	"C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+	"files.associations": {
+		"*.hpp": "cpp",
+		"*.ipp": "cpp",
+		"duckdb.hpp": "cpp"
+	},
+	"cmake.ignoreCMakeListsMissing": true,
+	"cmake.configureOnOpen": false
+}

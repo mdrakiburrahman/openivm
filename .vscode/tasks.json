@@ -1,0 +1,42 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			// Builds the DEBUG configuration (build/debug/...) with symbols.
+			// Incremental after the first build — re-running on F5 is a fast no-op
+			// when nothing changed. Uses ninja + ccache from bootstrap-dev-env.sh.
+			"label": "build-debug",
+			"type": "shell",
+			"command": "GEN=ninja make debug",
+			"options": {
+				"env": {
+					"PATH": "${env:HOME}/.local/bin:/usr/lib/ccache:${env:PATH}"
+				}
+			},
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": ["$gcc"]
+		},
+		{
+			"label": "build-release",
+			"type": "shell",
+			"command": "GEN=ninja make",
+			"options": {
+				"env": {
+					"PATH": "${env:HOME}/.local/bin:/usr/lib/ccache:${env:PATH}"
+				}
+			},
+			"group": "build",
+			"problemMatcher": ["$gcc"]
+		},
+		{
+			"label": "run-tests",
+			"type": "shell",
+			"command": "make test",
+			"group": "test",
+			"problemMatcher": []
+		}
+	]
+}

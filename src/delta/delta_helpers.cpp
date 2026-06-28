@@ -333,7 +333,18 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	column_ids.push_back(ColumnIndex(mul_oid));
 	column_ids.push_back(ColumnIndex(ts_oid));
 
-	delta_get_node = make_uniq<LogicalGet>(old_get->table_index, scan_function, std::move(bind_data),
+	// In the compacted path, CompactDeltaNode wraps this scan in a remap projection
+	// that reuses old_get->table_index (so the plan above the delta node keeps
+	// binding to the original table index). The scan itself must therefore use a
+	// *fresh* index, otherwise the scan and the remap projection share a table
+	// index and DuckDB's debug-only ColumnBindingResolver::Verify rejects the plan
+	// ("Duplicate table index"). Everything between the scan and the remap reads
+	// the scan's bindings dynamically, so a fresh index flows through correctly.
+	// The non-compacted path returns the scan directly in place of old_get, so it
+	// must keep old_get->table_index.
+	bool compact_deltas = CompactDeltasEnabled(context);
+	idx_t delta_get_index = compact_deltas ? binder.GenerateTableIndex() : old_get->table_index;
+	delta_get_node = make_uniq<LogicalGet>(delta_get_index, scan_function, std::move(bind_data),
 	                                       std::move(return_types), std::move(return_names));
 	delta_get_node->SetColumnIds(std::move(column_ids));
 	for (auto &entry : old_get->table_filters.filters) {
@@ -380,7 +391,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
 	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index,
 	                    (unsigned long)new_mul_binding.column_index, delta_get_node->GetColumnIds().size());
-	if (CompactDeltasEnabled(context)) {
+	if (compact_deltas) {
 		return CompactDeltaNode(context, binder, std::move(delta_get_node), old_get->table_index, new_mul_binding);
 	}
 	return {std::move(delta_get_node), new_mul_binding};
