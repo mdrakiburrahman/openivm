@@ -40,7 +40,7 @@ Each scenario is an independent function — set a breakpoint in just one and ru
 `openivm_compile_with_facts('<view>', '<CompileFacts JSON>')`, which **emits the
 refresh-SQL program and executes nothing** — the materialized view is provably
 untouched (the demo asserts it is bag-equal to a pre-compile snapshot). It
-compiles the *same* view twice — `target_dialect` `spark` then `duckdb` — so you
+compiles the _same_ view twice — `target_dialect` `spark` then `duckdb` — so you
 can watch the one knob that changes the emitted SQL. The full program is also
 written to `$TMPDIR/openivm_demo_compiled/openivm_upsert_queries_mv_compile_region.sql`.
 
@@ -50,17 +50,26 @@ against a full recompute.
 
 ## Highest-value breakpoints
 
-### Scenario 1 — compile-only (start here)
+To watch OpenIVM run end to end — from the moment DuckDB calls into it until it
+hands control back — set these breakpoints in order. (More steps will be added
+between them.)
+
+| #   | Breakpoint                            | Location                    | What it marks                                                                                                                                                           |
+| --- | ------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `OpenIvmCompileWithFactsBind` (entry) | `src/compile_facts.cpp:288` | **DuckDB → OpenIVM.** DuckDB's binder invokes OpenIVM's table-function callback for `openivm_compile_with_facts(…)` — the first OpenIVM code to run for this statement. |
+| 2   | `OpenIvmCompileWithFactsBind` return  | `src/compile_facts.cpp:340` | **OpenIVM → DuckDB.** OpenIVM returns the compiled refresh program (the `FunctionData`) to the binder, releasing control back to DuckDB.                                |
+
+### Scenario 1 — compile-only
 
 Set these and **Step Into (F11)** to watch a SQL statement become a refresh
 program, without anything being executed:
 
-| File / line                      | Why                                                                       |
-| -------------------------------- | ------------------------------------------------------------------------- |
-| `src/compile_facts.cpp:302`      | `OpenIvmCompileWithFactsBind` — table-function entry; inspect `view_name` + `facts_json` |
+| File / line                      | Why                                                                                               |
+| -------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `src/compile_facts.cpp:302`      | `OpenIvmCompileWithFactsBind` — table-function entry; inspect `view_name` + `facts_json`          |
 | `src/compile_facts.cpp:159`      | `ParseFactsJson` — the JSON becomes a `CompileFacts` struct (`target_dialect`, `compile_only`, …) |
-| `src/upsert/refresh_sql.cpp:307` | `GenerateRefreshSQL` — **the heart of compilation**; everything below fans out from here |
-| `src/compile_facts.cpp:243`      | `PushBucket` — the program is split into one output row per statement      |
+| `src/upsert/refresh_sql.cpp:307` | `GenerateRefreshSQL` — **the heart of compilation**; everything below fans out from here          |
+| `src/compile_facts.cpp:243`      | `PushBucket` — the program is split into one output row per statement                             |
 
 ### Scenarios 2–4 — full incremental refresh
 
@@ -91,4 +100,3 @@ GEN=ninja make            # or: make debug
 > launch configs set `ASAN_OPTIONS=detect_leaks=0` so the end-of-run leak check
 > doesn't abort the session. If you run the debug binary by hand under gdb, set
 > the same env var: `ASAN_OPTIONS=detect_leaks=0 gdb ./build/debug/.../openivm_demo`.
-
