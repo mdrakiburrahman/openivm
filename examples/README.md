@@ -131,17 +131,6 @@ written to `$TMPDIR/openivm_demo_compiled/openivm_upsert_queries_mv_compile_regi
 `INSERT/DELETE/UPDATE` → `PRAGMA refresh` → `EXCEPT ALL` bag-equality check
 against a full recompute.
 
-## Highest-value breakpoints
-
-To watch OpenIVM run end to end — from the moment DuckDB calls into it until it
-hands control back — set these breakpoints in order. (More steps will be added
-between them.)
-
-| #   | Breakpoint                            | Location                    | What it marks                                                                                                                                                           |
-| --- | ------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | `OpenIvmCompileWithFactsBind` (entry) | `src/compile_facts.cpp:288` | **DuckDB → OpenIVM.** DuckDB's binder invokes OpenIVM's table-function callback for `openivm_compile_with_facts(…)` — the first OpenIVM code to run for this statement. |
-| 2   | `OpenIvmCompileWithFactsBind` return  | `src/compile_facts.cpp:340` | **OpenIVM → DuckDB.** OpenIVM returns the compiled refresh program (the `FunctionData`) to the binder, releasing control back to DuckDB.                                |
-
 ### Scenario 1 — compile-only
 
 Set these and **Step Into (F11)** to watch a SQL statement become a refresh
