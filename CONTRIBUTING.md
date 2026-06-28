@@ -38,13 +38,6 @@
    code .
    ```
 
-1. Run the bootstrapper script, that installs all tools idempotently:
-
-   ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
-   ```
-
 1. (Optional but recommended) Enable passwordless sudo so `dev.sh` helpers never block on a prompt:
 
    ```bash
@@ -56,4 +49,11 @@
    ```bash
    curl -fsSL https://gh.io/copilot-install | bash
    $HOME/.local/bin/copilot --yolo
+   ```
+
+1.. Run the bootstrapper script, that installs all tools idempotently:
+
+   ```bash
+   GIT_ROOT=$(git rev-parse --show-toplevel)
+   chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
    ```
