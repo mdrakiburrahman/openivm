@@ -35,6 +35,58 @@
 			"preLaunchTask": "build-debug"
 		},
 		{
+			// Same as above, but pre-seeds gdb breakpoints at the Scenario 1
+			// compile-only path so F5 stops there immediately — no need to know
+			// where to click first. NOTE: these are debugger-side breakpoints, so
+			// they do NOT show a red dot in the gutter; execution still stops and
+			// the editor jumps to the source line with the call stack + locals.
+			// You can add your own gutter breakpoints on top as usual.
+			"name": "Debug OpenIVM Demo (auto-stop at the compile path)",
+			"type": "cppdbg",
+			"request": "launch",
+			"program": "${workspaceFolder}/build/debug/extension/openivm/openivm_demo",
+			"args": [],
+			"stopAtEntry": false,
+			"cwd": "${workspaceFolder}",
+			"environment": [
+				{
+					"name": "ASAN_OPTIONS",
+					"value": "detect_leaks=0"
+				}
+			],
+			"externalConsole": false,
+			"MIMode": "gdb",
+			"miDebuggerPath": "/usr/bin/gdb",
+			"setupCommands": [
+				{
+					"description": "Enable pretty-printing for gdb",
+					"text": "-enable-pretty-printing",
+					"ignoreFailures": true
+				},
+				{
+					"description": "Let breakpoints resolve once symbols load",
+					"text": "-gdb-set breakpoint pending on",
+					"ignoreFailures": true
+				},
+				{
+					"description": "Scenario 1: table-function entry (src/compile_facts.cpp)",
+					"text": "-break-insert OpenIvmCompileWithFactsBind",
+					"ignoreFailures": true
+				},
+				{
+					"description": "Scenario 1: JSON -> CompileFacts struct (src/compile_facts.cpp)",
+					"text": "-break-insert ParseFactsJson",
+					"ignoreFailures": true
+				},
+				{
+					"description": "Scenario 1: the heart of compilation (src/upsert/refresh_sql.cpp)",
+					"text": "-break-insert GenerateRefreshSQL",
+					"ignoreFailures": true
+				}
+			],
+			"preLaunchTask": "build-debug"
+		},
+		{
 			"name": "Debug a single SQL test (unittest)",
 			"type": "cppdbg",
 			"request": "launch",
