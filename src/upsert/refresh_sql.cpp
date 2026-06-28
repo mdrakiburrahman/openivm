@@ -688,6 +688,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
 			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
+			    /*inline_cascade_delta=*/active_facts.force_view_delta_cascade,
 			    &aggregate_recompute_emits_cascade_delta);
 		}
 		break;
