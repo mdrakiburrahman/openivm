@@ -59,19 +59,11 @@ std::string LabeledRule(const std::string &label) {
 	return std::string(left, '-') + mid + std::string(dashes - left, '-');
 }
 
-std::string Centered(const std::string &text) {
-	const int pad = std::max(0, (BANNER_WIDTH - static_cast<int>(text.size())) / 2);
-	return std::string(pad, ' ') + text;
-}
-
 std::unique_ptr<MaterializedQueryResult> RunInternal(Connection &con, const std::string &sql, bool show_result) {
 	const std::string tag = "#" + std::to_string(++g_run_seq);
 
 	std::cout << "\n"
-	          << LabeledRule("START " + tag) << "\n"
-	          << PlainRule() << "\n"
-	          << Centered(tag) << "\n"
-	          << PlainRule() << "\n\n"
+	          << LabeledRule("START " + tag) << "\n\n"
 	          << sql << "\n\n"
 	          << PlainRule() << "\n"
 	          << std::flush; // flush stdout first so the stderr debug logs land after the SQL
