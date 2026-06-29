@@ -524,23 +524,101 @@ struct FKRelation {
 	size_t pk_leaf; // leaf index of the referenced (PK) table
 };
 
-static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
-                                            LogicalOperator *join_root) {
-	vector<FKRelation> relations;
+static string ShortTableName(const string &name) {
+	auto dot = name.find_last_of('.');
+	return dot == string::npos ? name : name.substr(dot + 1);
+}
 
-	// Build map: table_name -> leaf index (for matching FK targets to leaves)
+static bool TableNameMatches(const string &fact_name, const string &leaf_name) {
+	return StringUtil::CIEquals(fact_name, leaf_name) ||
+	       StringUtil::CIEquals(ShortTableName(fact_name), ShortTableName(leaf_name));
+}
+
+static void InsertLeafAlias(unordered_map<string, size_t> &table_to_leaf, const string &alias, size_t leaf) {
+	auto key = StringUtil::Lower(alias);
+	auto it = table_to_leaf.find(key);
+	if (it != table_to_leaf.end() && it->second != leaf) {
+		it->second = size_t(-1);
+		return;
+	}
+	table_to_leaf[key] = leaf;
+}
+
+static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafInfo> &leaves) {
 	unordered_map<string, size_t> table_to_leaf;
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
-		if (!get) {
+		if (!get || get->GetTable().get() == nullptr) {
 			continue;
 		}
-		auto table_ref = get->GetTable();
-		if (table_ref.get() == nullptr) {
-			continue;
-		}
-		table_to_leaf[table_ref.get()->name] = i;
+		auto table_name = get->GetTable().get()->name;
+		InsertLeafAlias(table_to_leaf, table_name, i);
+		InsertLeafAlias(table_to_leaf, ShortTableName(table_name), i);
 	}
+	return table_to_leaf;
+}
+
+static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, const string &table_name, size_t &leaf) {
+	auto it = table_to_leaf.find(StringUtil::Lower(table_name));
+	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
+		leaf = it->second;
+		return true;
+	}
+	it = table_to_leaf.find(StringUtil::Lower(ShortTableName(table_name)));
+	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
+		leaf = it->second;
+		return true;
+	}
+	return false;
+}
+
+static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes, size_t child_leaf,
+                            const string &child_column, size_t parent_leaf, const string &parent_column) {
+	if (child_leaf >= key_probes.size()) {
+		return false;
+	}
+	for (auto &probe : key_probes[child_leaf]) {
+		if (probe.other_leaf == parent_leaf && StringUtil::CIEquals(probe.delta_column, child_column) &&
+		    StringUtil::CIEquals(probe.other_column, parent_column)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static vector<vector<DeltaJoinKeyProbe>> BuildJoinKeyProbes(LogicalOperator *join_root,
+                                                            const vector<JoinLeafInfo> &leaves) {
+	vector<vector<DeltaJoinKeyProbe>> key_probes(leaves.size());
+	unordered_map<uint64_t, JoinColumnRef> column_refs;
+	for (size_t i = 0; i < leaves.size(); i++) {
+		LogicalGet *get = GetLeafScan(leaves[i]);
+		if (!get || get->GetTable().get() == nullptr) {
+			continue;
+		}
+		auto table_name = get->GetTable().get()->name;
+		auto leaf_bindings = leaves[i].node->GetColumnBindings();
+		for (auto &binding : leaf_bindings) {
+			string resolved_table;
+			string resolved_column;
+			if (!ResolveLeafBindingToBaseColumn(leaves[i].node, binding, resolved_table, resolved_column) ||
+			    !TableNameMatches(resolved_table, table_name)) {
+				continue;
+			}
+			column_refs[DeltaJoinBindingKey(binding)] = {i, get, table_name, string(), resolved_column, string()};
+		}
+	}
+	CollectDeltaJoinKeyProbes(join_root, column_refs, key_probes, "DeltaJoinFK");
+	return key_probes;
+}
+
+static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
+                                            LogicalOperator *join_root) {
+	(void)context;
+	vector<FKRelation> relations;
+
+	// Build map: table_name -> leaf index (for matching FK targets to leaves)
+	auto table_to_leaf = BuildTableToLeafMap(leaves);
+	auto key_probes = BuildJoinKeyProbes(join_root, leaves);
 
 	// For each leaf, check its constraints for FK references to other leaves
 	for (size_t i = 0; i < leaves.size(); i++) {
@@ -564,15 +642,63 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 				continue;
 			}
 			// Check if the referenced table is also a leaf in this join
-			auto it = table_to_leaf.find(fk.info.table);
-			if (it == table_to_leaf.end()) {
+			size_t pk_leaf;
+			if (!TryFindLeaf(table_to_leaf, fk.info.table, pk_leaf)) {
 				continue;
 			}
-			size_t pk_leaf = it->second;
+			if (fk.fk_columns.size() != fk.pk_columns.size()) {
+				continue;
+			}
+			bool all_columns_joined = true;
+			for (idx_t col_idx = 0; col_idx < fk.fk_columns.size(); col_idx++) {
+				if (!HasJoinEquality(key_probes, i, fk.fk_columns[col_idx], pk_leaf, fk.pk_columns[col_idx])) {
+					all_columns_joined = false;
+					break;
+				}
+			}
+			if (!all_columns_joined) {
+				continue;
+			}
 			relations.push_back({i, pk_leaf});
 			OPENIVM_DEBUG_PRINT("[DeltaJoin] FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
 			                    table_ref.get()->name.c_str(), pk_leaf, fk.info.table.c_str());
 		}
+	}
+	return relations;
+}
+
+static vector<FKRelation> DetectCompileFactsFKRelations(const openivm::CompileFacts &facts,
+                                                        const vector<JoinLeafInfo> &leaves,
+                                                        LogicalOperator *join_root) {
+	vector<FKRelation> relations;
+	if (facts.fk_relations.empty()) {
+		return relations;
+	}
+	auto table_to_leaf = BuildTableToLeafMap(leaves);
+	auto key_probes = BuildJoinKeyProbes(join_root, leaves);
+	for (auto &fact_fk : facts.fk_relations) {
+		size_t child_leaf;
+		size_t parent_leaf;
+		if (!TryFindLeaf(table_to_leaf, fact_fk.child_table, child_leaf) ||
+		    !TryFindLeaf(table_to_leaf, fact_fk.parent_table, parent_leaf) || child_leaf == parent_leaf) {
+			continue;
+		}
+		bool all_columns_joined = true;
+		for (idx_t col_idx = 0; col_idx < fact_fk.child_columns.size(); col_idx++) {
+			if (!HasJoinEquality(key_probes, child_leaf, fact_fk.child_columns[col_idx], parent_leaf,
+			                     fact_fk.parent_columns[col_idx])) {
+				all_columns_joined = false;
+				break;
+			}
+		}
+		if (!all_columns_joined) {
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Ignoring compile FK %s -> %s; join keys do not match\n",
+			                    fact_fk.child_table.c_str(), fact_fk.parent_table.c_str());
+			continue;
+		}
+		relations.push_back({child_leaf, parent_leaf});
+		OPENIVM_DEBUG_PRINT("[DeltaJoin] Compile FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", child_leaf,
+		                    fact_fk.child_table.c_str(), parent_leaf, fact_fk.parent_table.c_str());
 	}
 	return relations;
 }
@@ -598,6 +724,32 @@ static uint64_t ComputeSkipBits(const vector<FKRelation> &fk_relations, uint64_t
 	return skip_bits;
 }
 
+static bool DeltaShapeIsInsertOnlyForPruning(const string &shape) {
+	return StringUtil::CIEquals(shape, "INSERT_ONLY") || StringUtil::CIEquals(shape, "UNCHANGED");
+}
+
+static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, const vector<JoinLeafInfo> &leaves) {
+	uint64_t mask = 0;
+	for (size_t i = 0; i < leaves.size(); i++) {
+		LogicalGet *get = GetLeafScan(leaves[i]);
+		if (!get || get->GetTable().get() == nullptr) {
+			continue;
+		}
+		auto table_name = get->GetTable().get()->name;
+		if (facts.assume_insert_only) {
+			mask |= (1ULL << i);
+			continue;
+		}
+		for (auto &entry : facts.delta_shape) {
+			if (TableNameMatches(entry.first, table_name) && DeltaShapeIsInsertOnlyForPruning(entry.second)) {
+				mask |= (1ULL << i);
+				break;
+			}
+		}
+	}
+	return mask;
+}
+
 // ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
@@ -618,22 +770,27 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	bool fk_pruning_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
 	uint64_t skip_bits = 0;
+	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
+	bool compile_only = compile_facts.compile_only;
 	// FK pruning pays for catalog constraint inspection. When every leaf changed
 	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and
 	// the flag benchmark shows the inspection cost can dominate. Keep it for the
 	// main win case: one-sided PK/dimension changes.
-	bool fk_pruning_worthwhile = non_empty_leaf_count == 1;
+	bool has_compile_fk_facts = compile_only && !compile_facts.fk_relations.empty();
+	bool fk_pruning_worthwhile = has_compile_fk_facts || non_empty_leaf_count == 1;
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
-		auto fk_relations = DetectFKRelations(context, leaves, input.plan.get());
+		auto fk_relations = has_compile_fk_facts ? DetectCompileFactsFKRelations(compile_facts, leaves, input.plan.get())
+		                                         : DetectFKRelations(context, leaves, input.plan.get());
 		if (!fk_relations.empty()) {
-			skip_bits = ComputeSkipBits(fk_relations, delta_status.insert_only_mask);
+			uint64_t insert_only_mask =
+			    has_compile_fk_facts ? ComputeFactsInsertOnlyMask(compile_facts, leaves) : delta_status.insert_only_mask;
+			skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
 		}
 	}
 
 	// Empty-delta skipping: skip terms where any table in the mask has zero delta rows.
 	// A join with an empty input always produces zero rows.
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
-	bool compile_only = openivm::CompileFactsContextSlot::Get(context).compile_only;
 	uint64_t empty_mask = 0;
 	if (skip_empty_enabled) {
 		empty_mask = compile_only ? (delta_status.empty_mask & delta_status.constant_mask) : delta_status.empty_mask;

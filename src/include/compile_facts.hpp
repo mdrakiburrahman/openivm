@@ -5,11 +5,20 @@
 
 #include "duckdb.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/common/unordered_map.hpp"
 
 #include <memory>
 
 namespace duckdb {
 namespace openivm {
+
+struct CompileFactsFkRelation {
+	string child_table;
+	vector<string> child_columns;
+	string parent_table;
+	vector<string> parent_columns;
+	bool rely = true;
+};
 
 // Per-call compile context for `openivm_compile_with_facts`. The JSON wire
 // schema intentionally exposes only fields consumed by planning today: schema
@@ -34,6 +43,12 @@ public:
 	// projection delete, MIN/MAX GREATEST/LEAST) that compile_only otherwise
 	// disables. Defaults false — conservative, identical to v1 behavior.
 	bool assume_insert_only = false;
+
+	// v2 WorkloadFacts: per-source delta shape and RELY FK declarations supplied
+	// by the caller. These are compile-time facts only; the compile path may not
+	// be able to see source catalog constraints (e.g. Spark/Delta tables).
+	unordered_map<string, string> delta_shape;
+	vector<CompileFactsFkRelation> fk_relations;
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every
