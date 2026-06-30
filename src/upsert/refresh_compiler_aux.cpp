@@ -112,6 +112,11 @@ struct RunningWindowExpr {
 	string output_column;
 };
 
+struct RunningDerivedExpr {
+	string output_column;
+	string expression;
+};
+
 struct RunningWindowPlan {
 	string source_table;
 	string partition_column;
@@ -119,6 +124,7 @@ struct RunningWindowPlan {
 	vector<string> output_columns;
 	vector<pair<string, string>> passthrough_columns;
 	vector<RunningWindowExpr> window_exprs;
+	vector<RunningDerivedExpr> derived_exprs;
 };
 
 static bool ParsePassthroughProjection(const string &item, pair<string, string> &out) {
@@ -260,6 +266,28 @@ static bool ParseRunningWindowExpression(const string &expr, RunningWindowExpr &
 	return true;
 }
 
+static string TranslateExpressionIdentifiers(const string &expr, const std::map<string, string> &alias_to_output) {
+	static const std::regex ident_regex(R"("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)");
+	string result;
+	idx_t pos = 0;
+	for (std::sregex_iterator it(expr.begin(), expr.end(), ident_regex), end; it != end; ++it) {
+		auto match = *it;
+		result += expr.substr(pos, match.position() - pos);
+		string token = match.str();
+		string key = StringUtil::Lower(StripIdentifierQuotes(token));
+		auto found = alias_to_output.find(key);
+		result += found == alias_to_output.end() ? token : SqlUtils::QuoteIdentifier(found->second);
+		pos = match.position() + match.length();
+	}
+	result += expr.substr(pos);
+	return result;
+}
+
+static bool LooksLikeLptsAlias(const string &expr) {
+	static const std::regex lpts_alias_regex(R"(\bt[0-9]+_[A-Za-z0-9_]+\b)");
+	return std::regex_search(expr, lpts_alias_regex);
+}
+
 static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector<string> &partition_columns,
                                       const vector<string> &column_names, RunningWindowPlan &plan) {
 	string query = TrimCopy(view_query_sql);
@@ -358,8 +386,12 @@ static bool TryParseLptsRunningWindowPlan(const string &view_query_sql, const ve
 		return false;
 	}
 	std::map<string, string> alias_to_source;
+	std::map<string, string> alias_to_output;
 	for (idx_t i = 0; i < scan_aliases.size(); i++) {
-		alias_to_source[StringUtil::Lower(StripIdentifierQuotes(scan_aliases[i]))] = StripIdentifierQuotes(source_cols[i]);
+		string alias = StringUtil::Lower(StripIdentifierQuotes(scan_aliases[i]));
+		string source = StripIdentifierQuotes(source_cols[i]);
+		alias_to_source[alias] = source;
+		alias_to_output[alias] = source;
 	}
 	plan.source_table = StripIdentifierQuotes(view_query_sql.substr(from_pos + 6, source_end - from_pos - 6));
 	vector<string> output_names = column_names;
@@ -408,17 +440,54 @@ static bool TryParseLptsRunningWindowPlan(const string &view_query_sql, const ve
 	string parsed_order;
 	idx_t cte_search = 0;
 	while (true) {
-		auto cte_select = lower.find(" as (select ", cte_search);
-		if (cte_select == string::npos) {
+		auto cte_as = lower.find(" as (select ", cte_search);
+		if (cte_as == string::npos) {
 			break;
 		}
-		cte_select += 12;
+		auto cte_alias_start = view_query_sql.rfind('(', cte_as);
+		auto cte_alias_end = view_query_sql.rfind(')', cte_as);
+		if (cte_alias_start == string::npos || cte_alias_end == string::npos || cte_alias_end < cte_alias_start) {
+			return false;
+		}
+		auto cte_aliases = SplitTopLevelComma(view_query_sql.substr(cte_alias_start + 1, cte_alias_end - cte_alias_start - 1));
+		auto cte_select = cte_as + 12;
 		auto cte_from = lower.find(" from ", cte_select);
 		if (cte_from == string::npos) {
 			break;
 		}
-		for (auto &item : SplitTopLevelComma(view_query_sql.substr(cte_select, cte_from - cte_select))) {
+		auto cte_items = SplitTopLevelComma(view_query_sql.substr(cte_select, cte_from - cte_select));
+		if (cte_aliases.size() != cte_items.size()) {
+			return false;
+		}
+		std::map<string, string> next_alias_to_output;
+		for (idx_t item_idx = 0; item_idx < cte_items.size(); item_idx++) {
+			auto &item = cte_items[item_idx];
+			string output_alias = StripIdentifierQuotes(cte_aliases[item_idx]);
+			string output_key = StringUtil::Lower(output_alias);
 			if (LowerCopy(item).find(" over ") == string::npos) {
+				string source_key = StringUtil::Lower(StripIdentifierQuotes(item));
+				auto passthrough = alias_to_output.find(source_key);
+				if (passthrough != alias_to_output.end()) {
+					next_alias_to_output[output_key] = passthrough->second;
+					continue;
+				}
+				auto scan_passthrough = alias_to_source.find(output_key);
+				if (scan_passthrough != alias_to_source.end()) {
+					next_alias_to_output[output_key] = scan_passthrough->second;
+					continue;
+				}
+				string item_lower = LowerCopy(TrimCopy(item));
+				if (StringUtil::StartsWith(item_lower, "case ")) {
+					RunningDerivedExpr derived;
+					derived.output_column = output_alias;
+					derived.expression = TranslateExpressionIdentifiers(item, alias_to_output);
+					if (LooksLikeLptsAlias(derived.expression)) {
+						return false;
+					}
+					plan.derived_exprs.push_back(derived);
+					next_alias_to_output[output_key] = derived.output_column;
+					continue;
+				}
 				continue;
 			}
 			if (window_idx >= non_base_outputs.size()) {
@@ -431,8 +500,8 @@ static bool TryParseLptsRunningWindowPlan(const string &view_query_sql, const ve
 				return false;
 			}
 			auto translate = [&](const string &alias) -> string {
-				auto found = alias_to_source.find(StringUtil::Lower(StripIdentifierQuotes(alias)));
-				return found == alias_to_source.end() ? "" : found->second;
+				auto found = alias_to_output.find(StringUtil::Lower(StripIdentifierQuotes(alias)));
+				return found == alias_to_output.end() ? "" : found->second;
 			};
 			if (expr.argument != "*") {
 				expr.argument = translate(expr.argument);
@@ -455,7 +524,9 @@ static bool TryParseLptsRunningWindowPlan(const string &view_query_sql, const ve
 			parsed_order = expr_order;
 			expr.output_column = non_base_outputs[window_idx++];
 			plan.window_exprs.push_back(expr);
+			next_alias_to_output[output_key] = expr.output_column;
 		}
+		alias_to_output = next_alias_to_output;
 		cte_search = cte_from + 6;
 	}
 	plan.partition_column = parsed_partition;
@@ -471,6 +542,26 @@ static string RunningLocalExpr(const RunningWindowExpr &expr, const RunningWindo
 	string arg = expr.argument == "*" ? "*" : QualifiedColumn("d", expr.argument);
 	string over = " OVER (PARTITION BY " + QualifiedColumn("d", plan.partition_column) + " ORDER BY " +
 	              QualifiedColumn("d", plan.order_column) + ")";
+	return StringUtil::Upper(expr.function_name) + "(" + arg + ")" + over;
+}
+
+static bool IsRunningDerivedArgument(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
+	for (auto &derived : plan.derived_exprs) {
+		if (StringUtil::CIEquals(expr.argument, derived.output_column)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string RunningSeedColumn(const RunningWindowExpr &expr) {
+	return "openivm_seed_" + expr.output_column;
+}
+
+static string RunningLocalExprFromAlias(const RunningWindowExpr &expr, const RunningWindowPlan &plan, const string &alias) {
+	string arg = expr.argument == "*" ? "*" : QualifiedColumn(alias, expr.argument);
+	string over = " OVER (PARTITION BY " + QualifiedColumn(alias, plan.partition_column) + " ORDER BY " +
+	              QualifiedColumn(alias, plan.order_column) + ")";
 	return StringUtil::Upper(expr.function_name) + "(" + arg + ")" + over;
 }
 
@@ -506,6 +597,24 @@ static string RunningAdjustedExpr(const RunningWindowExpr &expr, const RunningWi
 		string prior_count = "COALESCE(" + prior_count_col + ", 0)";
 		return "((COALESCE(" + state_col + " * " + prior_count_col + ", 0)) + COALESCE(" + sum_local +
 		       ", 0)) / NULLIF(" + prior_count + " + " + count_local + ", 0)";
+	}
+	return "";
+}
+
+static string RunningAdjustedExprWithSeed(const RunningWindowExpr &expr, const string &local, const string &state_col) {
+	if (expr.function_name == "sum") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " ELSE " + state_col + " + " + local + " END";
+	}
+	if (expr.function_name == "count") {
+		return "COALESCE(" + state_col + ", 0) + " + local;
+	}
+	if (expr.function_name == "min") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
+		       " ELSE LEAST(" + state_col + ", " + local + ") END";
+	}
+	if (expr.function_name == "max") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
+		       " ELSE GREATEST(" + state_col + ", " + local + ") END";
 	}
 	return "";
 }
@@ -606,6 +715,97 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 
 	auto emit_column_names = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
 	string insert_cols = SqlUtils::JoinQuotedColumns(emit_column_names);
+	if (!plan.derived_exprs.empty()) {
+		vector<RunningWindowExpr> level1_exprs;
+		vector<RunningWindowExpr> level3_exprs;
+		for (auto &expr : plan.window_exprs) {
+			if (IsRunningDerivedArgument(expr, plan)) {
+				if (expr.function_name != "max") {
+					return "";
+				}
+				level3_exprs.push_back(expr);
+			} else {
+				level1_exprs.push_back(expr);
+			}
+		}
+		if (level1_exprs.empty() || level3_exprs.empty()) {
+			return "";
+		}
+		bool has_partition = false;
+		bool has_order = false;
+		for (auto &pass : plan.passthrough_columns) {
+			has_partition = has_partition || StringUtil::CIEquals(pass.second, plan.partition_column);
+			has_order = has_order || StringUtil::CIEquals(pass.second, plan.order_column);
+		}
+		if (!has_partition || !has_order) {
+			return "";
+		}
+		string l1_select;
+		auto append_l1 = [&](const string &expr_sql, const string &alias) {
+			if (!l1_select.empty()) {
+				l1_select += ", ";
+			}
+			l1_select += expr_sql + " AS " + SqlUtils::QuoteIdentifier(alias);
+		};
+		for (auto &pass : plan.passthrough_columns) {
+			append_l1(QualifiedColumn("d", pass.first), pass.second);
+		}
+		for (auto &expr : level1_exprs) {
+			append_l1(RunningAdjustedExpr(expr, plan), expr.output_column);
+		}
+		for (auto &expr : level3_exprs) {
+			append_l1(QualifiedColumn("s", expr.output_column), RunningSeedColumn(expr));
+		}
+		string lflags_select = "*";
+		for (auto &derived : plan.derived_exprs) {
+			lflags_select += ", " + derived.expression + " AS " + SqlUtils::QuoteIdentifier(derived.output_column);
+		}
+		string l3_select;
+		auto append_l3 = [&](const string &expr_sql, const string &alias) {
+			if (!l3_select.empty()) {
+				l3_select += ", ";
+			}
+			l3_select += expr_sql + " AS " + SqlUtils::QuoteIdentifier(alias);
+		};
+		for (auto &pass : plan.passthrough_columns) {
+			append_l3(QualifiedColumn("f", pass.second), pass.second);
+		}
+		for (auto &expr : level1_exprs) {
+			append_l3(QualifiedColumn("f", expr.output_column), expr.output_column);
+		}
+		for (auto &expr : level3_exprs) {
+			string local = RunningLocalExprFromAlias(expr, plan, "f");
+			string adjusted = RunningAdjustedExprWithSeed(expr, local, QualifiedColumn("f", RunningSeedColumn(expr)));
+			if (adjusted.empty()) {
+				return "";
+			}
+			append_l3(adjusted, expr.output_column);
+		}
+		string final_select;
+		for (idx_t i = 0; i < emit_column_names.size(); i++) {
+			if (i > 0) {
+				final_select += ", ";
+			}
+			final_select += QualifiedColumn("r", emit_column_names[i]);
+		}
+		string state_match = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "s");
+		sql += "INSERT INTO " + data_table + " (" + insert_cols + ")\nWITH openivm_l1 AS (\n  SELECT " + l1_select +
+		       "\n  FROM " + delta_q + " d\n  JOIN " + fast_table + " fk ON " + key_match_d_fk + "\n  LEFT JOIN " +
+		       state_table + " s ON " + state_match + "\n  WHERE " + delta_positive +
+		       "\n), openivm_flags AS (\n  SELECT " + lflags_select + "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " +
+		       l3_select + "\n  FROM openivm_flags f\n)\nSELECT " + final_select + "\nFROM openivm_l3 r;\n\n";
+		sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + bounds_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
+		OPENIVM_DEBUG_PRINT("[CompileWindowSuffixExtend] view=%s partition=%s order=%s window_exprs=%zu derived_exprs=%zu\n",
+		                    view_name.c_str(), plan.partition_column.c_str(), plan.order_column.c_str(),
+		                    plan.window_exprs.size(), plan.derived_exprs.size());
+		(void)key_match_df;
+		(void)key_match_b_m;
+		return sql;
+	}
 	string select_list;
 	for (idx_t i = 0; i < emit_column_names.size(); i++) {
 		if (i > 0) {
