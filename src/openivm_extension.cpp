@@ -146,6 +146,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_minmax_incremental",
 	                             "use GREATEST/LEAST for MIN/MAX when deltas are insert-only", LogicalType::BOOLEAN,
 	                             Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_running_window_incremental",
+	                             "extend cumulative running window aggregates for append-only suffix batches",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_having_merge",
 	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
 	                             "instead of group-recompute",

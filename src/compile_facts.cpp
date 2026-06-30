@@ -156,6 +156,7 @@ CompileFacts ParseFactsJson(const string &json) {
 	ExtractJsonBool(json, "compile_only", out.compile_only);
 	ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
 	ExtractJsonBool(json, "assume_insert_only", out.assume_insert_only);
+	ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
 
 	return out;
 }
