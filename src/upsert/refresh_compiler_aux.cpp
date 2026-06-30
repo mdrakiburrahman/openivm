@@ -672,7 +672,8 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + "\nFROM " + delta_q + " d\nWHERE " +
 	       delta_positive + ";\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH old_max AS (\n  SELECT " + part_q +
-	       ", MAX(" + order_q + ") AS openivm_old_max_order FROM " + data_table + " GROUP BY " + part_q +
+	       ", MAX(" + order_q + ") AS openivm_old_max_order FROM " + data_table + " WHERE " + part_q + " IN (SELECT " +
+	       part_q + " FROM " + affected_table + ") GROUP BY " + part_q +
 	       "\n), delta_min AS (\n  SELECT " + QualifiedColumn("d", plan.partition_column) + " AS " + part_q +
 	       ", MIN(" + QualifiedColumn("d", plan.order_column) + ") AS openivm_delta_min_order\n  FROM " + delta_q +
 	       " d\n  WHERE " + delta_positive + "\n  GROUP BY " + QualifiedColumn("d", plan.partition_column) +
