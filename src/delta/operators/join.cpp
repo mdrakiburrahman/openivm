@@ -5,6 +5,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "match/constraint_cache.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
@@ -527,6 +528,49 @@ struct FKRelation {
 static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
                                             LogicalOperator *join_root) {
 	vector<FKRelation> relations;
+	vector<vector<DeltaJoinKeyProbe>> join_key_probes(leaves.size());
+	{
+		unordered_map<uint64_t, JoinColumnRef> column_refs;
+		for (size_t i = 0; i < leaves.size(); i++) {
+			LogicalGet *get = GetLeafScan(leaves[i]);
+			if (!get || get->GetTable().get() == nullptr) {
+				continue;
+			}
+			string table_name = get->GetTable().get()->name;
+			auto leaf_bindings = leaves[i].node->GetColumnBindings();
+			for (auto &binding : leaf_bindings) {
+				string resolved_table;
+				string resolved_column;
+				if (!ResolveLeafBindingToBaseColumn(leaves[i].node, binding, resolved_table, resolved_column) ||
+				    !StringUtil::CIEquals(resolved_table, table_name)) {
+					continue;
+				}
+				column_refs[DeltaJoinBindingKey(binding)] = {i, get, table_name, "", resolved_column, ""};
+			}
+		}
+		CollectDeltaJoinKeyProbes(join_root, column_refs, join_key_probes, "DeltaJoin");
+	}
+
+	auto has_join_key_match = [&](size_t fk_leaf, const vector<string> &fk_columns, size_t pk_leaf,
+	                              const vector<string> &pk_columns) {
+		if (fk_columns.empty() || fk_columns.size() != pk_columns.size()) {
+			return false;
+		}
+		for (idx_t c = 0; c < fk_columns.size(); c++) {
+			bool found = false;
+			for (auto &probe : join_key_probes[fk_leaf]) {
+				if (probe.other_leaf == pk_leaf && StringUtil::CIEquals(probe.delta_column, fk_columns[c]) &&
+				    StringUtil::CIEquals(probe.other_column, pk_columns[c])) {
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				return false;
+			}
+		}
+		return true;
+	};
 
 	// Build map: table_name -> leaf index (for matching FK targets to leaves)
 	unordered_map<string, size_t> table_to_leaf;
@@ -572,6 +616,29 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 			relations.push_back({i, pk_leaf});
 			OPENIVM_DEBUG_PRINT("[DeltaJoin] FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
 			                    table_ref.get()->name.c_str(), pk_leaf, fk.info.table.c_str());
+		}
+
+		openivm::ConstraintCache constraint_cache;
+		for (auto &constraint : constraint_cache.GetConstraints(context, table_ref.get()->name)) {
+			if (!(StringUtil::CIEquals(constraint.kind, "FK") || StringUtil::CIEquals(constraint.kind, "RELY_FK")) ||
+			    !constraint.is_trusted) {
+				continue;
+			}
+			size_t pk_leaf = 0;
+			bool found_parent = false;
+			for (auto &entry : table_to_leaf) {
+				if (SqlUtils::IdentifierMatchesTable(constraint.referenced_table, entry.first)) {
+					pk_leaf = entry.second;
+					found_parent = true;
+					break;
+				}
+			}
+			if (!found_parent || !has_join_key_match(i, constraint.columns, pk_leaf, constraint.referenced_columns)) {
+				continue;
+			}
+			relations.push_back({i, pk_leaf});
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] RELY FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
+			                    table_ref.get()->name.c_str(), pk_leaf, constraint.referenced_table.c_str());
 		}
 	}
 	return relations;
