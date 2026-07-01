@@ -34,6 +34,7 @@ public:
 	// projection delete, MIN/MAX GREATEST/LEAST) that compile_only otherwise
 	// disables. Defaults false — conservative, identical to v1 behavior.
 	bool assume_insert_only = false;
+	bool scd2_range_join_accel = false;
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every
