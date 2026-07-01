@@ -997,6 +997,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		ddl.push_back("use " + current_catalog_schema);
 	}
 	ddl.push_back("create table " + qdt + " as " + view_query);
+	if (refresh_type == RefreshType::WINDOW_PARTITION &&
+	    SqlUtils::GetBoolSetting(context, "openivm_running_window_incremental", false)) {
+		string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted("openivm_aux_" + view_name);
+		string aux_create = BuildRunningWindowAuxStateCreateSQL(aux_target, qdt, view_query, window_partition_columns,
+		                                                        output_names, /*replace=*/false);
+		if (!aux_create.empty()) {
+			ddl.push_back(aux_create);
+			add_cleanup("DROP TABLE IF EXISTS " + aux_target);
+		}
+	}
 	if (!view_catalog_prefix.empty()) {
 		// Keep the same connection after a DuckLake CTAS. Reopening here can force
 		// connection teardown while DuckLake still owns the transaction used by the

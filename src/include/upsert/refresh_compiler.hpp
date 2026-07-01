@@ -97,6 +97,13 @@ string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<s
                                       const vector<string> &source_exprs, const string &source_relation,
                                       const string &filter_sql, bool replace);
 
+string BuildRunningWindowAuxStateCreateSQL(const string &target_table, const string &source_relation,
+                                           const string &view_query_sql, const vector<string> &partition_columns,
+                                           const vector<string> &column_names, bool replace);
+string BuildRunningWindowAuxStateBackfillSQL(const string &target_table, const string &source_relation,
+                                             const string &view_query_sql, const vector<string> &partition_columns,
+                                             const vector<string> &column_names);
+
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
