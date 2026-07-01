@@ -628,7 +628,7 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
                                                  const string &delta_ts_filter, const string &catalog_prefix,
                                                  const vector<string> &partition_columns,
                                                  const vector<WindowPartitionDeltaSpec> &partition_delta_specs,
-                                                 const vector<string> &column_names) {
+                                                 const vector<string> &column_names, bool emit_cascade_delta) {
 	if (partition_delta_specs.size() != 1) {
 		return "";
 	}
@@ -657,6 +657,9 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	string fast_table = SqlUtils::QuoteIdentifier("openivm_run_fast_" + view_name);
 	string fallback_table = SqlUtils::QuoteIdentifier("openivm_run_fallback_" + view_name);
 	string state_table = SqlUtils::QuoteIdentifier("openivm_run_state_" + view_name);
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
 	string portable_delta_ts_filter = SparkPortableTimestampCasts(delta_ts_filter);
 	string delta_filter = portable_delta_ts_filter.empty() ? "" : " AND " + portable_delta_ts_filter;
 	string delta_positive = QualifiedColumn("d", openivm::MULTIPLICITY_COL) + " > 0" + delta_filter;
@@ -711,8 +714,18 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	       " DESC) AS openivm_rn\n  FROM " + data_table + " dt\n  JOIN " + fast_table + " fk ON " + key_match_dt_fk +
 	       "\n) openivm_state_ranked\nWHERE openivm_rn = 1;\n\n";
 	string fallback_filter = part_q + " IN (SELECT " + part_q + " FROM " + fallback_table + ")";
-	sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", fallback_filter,
-	                                   fallback_filter);
+	if (emit_cascade_delta) {
+		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + "\nWHERE " +
+		       fallback_filter + ";\n\n";
+		sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+		       ") openivm_recompute\nWHERE " + fallback_filter + ";\n\n";
+		sql += "DELETE FROM " + data_table + " WHERE " + fallback_filter + ";\n";
+		sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
+		sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	} else {
+		sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", fallback_filter,
+		                                   fallback_filter);
+	}
 
 	auto emit_column_names = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
 	string insert_cols = SqlUtils::JoinQuotedColumns(emit_column_names);
@@ -795,6 +808,17 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 		       state_table + " s ON " + state_match + "\n  WHERE " + delta_positive +
 		       "\n), openivm_flags AS (\n  SELECT " + lflags_select + "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " +
 		       l3_select + "\n  FROM openivm_flags f\n)\nSELECT " + final_select + "\nFROM openivm_l3 r;\n\n";
+		if (emit_cascade_delta) {
+			sql += "INSERT INTO " + delta_table + "\nWITH openivm_l1 AS (\n  SELECT " + l1_select +
+			       "\n  FROM " + delta_q + " d\n  JOIN " + fast_table + " fk ON " + key_match_d_fk +
+			       "\n  LEFT JOIN " + state_table + " s ON " + state_match + "\n  WHERE " + delta_positive +
+			       "\n), openivm_flags AS (\n  SELECT " + lflags_select +
+			       "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " + l3_select +
+			       "\n  FROM openivm_flags f\n)\nSELECT " + final_select +
+			       ", CAST(1 AS INTEGER), CURRENT_TIMESTAMP\nFROM openivm_l3 r;\n\n";
+			sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+			sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+		}
 		sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
 		sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
 		sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
@@ -834,6 +858,14 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	sql += "INSERT INTO " + data_table + " (" + insert_cols + ")\nSELECT " + select_list + "\nFROM " + delta_q +
 	       " d\nJOIN " + fast_table + " fk ON " + key_match_d_fk + "\nLEFT JOIN " + state_table + " s ON " +
 	       state_match + "\nWHERE " + delta_positive + ";\n\n";
+	if (emit_cascade_delta) {
+		sql += "INSERT INTO " + delta_table + "\nSELECT " + select_list +
+		       ", CAST(1 AS INTEGER), CURRENT_TIMESTAMP\nFROM " + delta_q + " d\nJOIN " + fast_table + " fk ON " +
+		       key_match_d_fk + "\nLEFT JOIN " + state_table + " s ON " + state_match + "\nWHERE " + delta_positive +
+		       ";\n\n";
+		sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	}
 	sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
@@ -1178,9 +1210,10 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
 	}
-	if (running_window_incremental && !emit_cascade_delta) {
+	if (running_window_incremental) {
 		auto suffix_sql = BuildRunningWindowSuffixRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
-		                                                     partition_columns, partition_delta_specs, column_names);
+		                                                     partition_columns, partition_delta_specs, column_names,
+		                                                     emit_cascade_delta);
 		if (!suffix_sql.empty()) {
 			return suffix_sql;
 		}
