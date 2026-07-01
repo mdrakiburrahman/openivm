@@ -1,0 +1,167 @@
+# name: test/sql/cascade_delta_minimize.test
+# description: WINDOW_PARTITION cascade deltas can be minimized with EXCEPT ALL old/new diffs
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE cdm_src (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO cdm_src VALUES
+    (1, 'a', 10),
+    (2, 'a', 20),
+    (3, 'a', 30),
+    (4, 'a', 40),
+    (5, 'a', 50),
+    (6, 'b', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW cdm_win_mv AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM cdm_src;
+
+statement ok
+CREATE MATERIALIZED VIEW cdm_down_mv AS
+    SELECT grp, COUNT(*) AS cnt, SUM(rn) AS total_rn
+    FROM cdm_win_mv
+    GROUP BY grp;
+
+# Flag-off compile keeps the existing full old/new signed snapshot.
+statement ok
+SET openivm_cascade_delta_minimize=false;
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cdm_win_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%EXCEPT ALL SELECT * FROM openivm_new_cdm_win_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%EXCEPT ALL SELECT * FROM openivm_old_cdm_win_mv%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cdm_win_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true,"cascade_delta_minimize":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# Flag-on compile emits the minimal signed multiset difference.
+statement ok
+SET openivm_cascade_delta_minimize=true;
+
+query I
+SELECT CASE WHEN
+       contains(compiled_sql, 'INSERT INTO openivm_delta_cdm_win_mv')
+   AND contains(compiled_sql, 'SELECT * FROM openivm_old_cdm_win_mv EXCEPT ALL SELECT * FROM openivm_new_cdm_win_mv')
+   AND contains(compiled_sql, 'SELECT * FROM openivm_new_cdm_win_mv EXCEPT ALL SELECT * FROM openivm_old_cdm_win_mv')
+   THEN 1 ELSE 0 END
+FROM (
+    SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS compiled_sql
+    FROM openivm_compile_with_facts(
+        'cdm_win_mv',
+        '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true,"cascade_delta_minimize":true}'
+    )
+    WHERE stmt_kind = 'data'
+);
+----
+1
+
+statement ok
+DELETE FROM openivm_delta_cdm_win_mv;
+
+statement ok
+INSERT INTO cdm_src VALUES (7, 'a', 25);
+
+# Execute the same minimized old/new cascade shape that the compiler emits for the affected partition.
+statement ok
+CREATE OR REPLACE TEMP TABLE openivm_old_cdm_win_mv AS
+SELECT * FROM openivm_data_cdm_win_mv WHERE grp = 'a';
+
+statement ok
+CREATE OR REPLACE TEMP TABLE openivm_new_cdm_win_mv AS
+SELECT * FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM cdm_src
+) openivm_recompute
+WHERE grp = 'a';
+
+statement ok
+DELETE FROM openivm_data_cdm_win_mv WHERE grp = 'a';
+
+statement ok
+INSERT INTO openivm_data_cdm_win_mv
+SELECT * FROM openivm_new_cdm_win_mv;
+
+statement ok
+INSERT INTO openivm_delta_cdm_win_mv
+SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM (
+    SELECT * FROM openivm_old_cdm_win_mv
+    EXCEPT ALL
+    SELECT * FROM openivm_new_cdm_win_mv
+)
+UNION ALL
+SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM (
+    SELECT * FROM openivm_new_cdm_win_mv
+    EXCEPT ALL
+    SELECT * FROM openivm_old_cdm_win_mv
+);
+
+# Only truly changed rows are emitted: 3 retractions + 4 insertions = 7, less than 5+6 full snapshots.
+query III
+SELECT
+    COUNT(*) AS delta_rows,
+    SUM(CASE WHEN openivm_multiplicity = -1 THEN 1 ELSE 0 END) AS retract_rows,
+    SUM(CASE WHEN openivm_multiplicity = 1 THEN 1 ELSE 0 END) AS insert_rows
+FROM openivm_delta_cdm_win_mv;
+----
+7	3	4
+
+query I
+SELECT COUNT(*) FROM openivm_delta_cdm_win_mv;
+----
+7
+
+query I
+SELECT CASE WHEN COUNT(*) < 11 THEN 1 ELSE 0 END FROM openivm_delta_cdm_win_mv;
+----
+1
+
+statement ok
+PRAGMA refresh('cdm_down_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, cnt, total_rn FROM cdm_down_mv
+    EXCEPT ALL
+    SELECT grp, COUNT(*) AS cnt, SUM(rn) AS total_rn
+    FROM (
+        SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+        FROM cdm_src
+    ) expected
+    GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*) AS cnt, SUM(rn) AS total_rn
+    FROM (
+        SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+        FROM cdm_src
+    ) expected
+    GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, cnt, total_rn FROM cdm_down_mv
+);
+----
+0
+
+query III
+SELECT grp, cnt, total_rn FROM cdm_down_mv ORDER BY grp;
+----
+a	6	21
+b	1	1

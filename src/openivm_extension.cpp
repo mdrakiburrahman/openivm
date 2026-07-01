@@ -149,6 +149,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_running_window_incremental",
 	                             "extend cumulative running window aggregates for append-only suffix batches",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_cascade_delta_minimize",
+	                             "emit only EXCEPT ALL old/new differences for forced view-delta cascades",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_having_merge",
 	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
 	                             "instead of group-recompute",

@@ -628,7 +628,8 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
                                                  const string &delta_ts_filter, const string &catalog_prefix,
                                                  const vector<string> &partition_columns,
                                                  const vector<WindowPartitionDeltaSpec> &partition_delta_specs,
-                                                 const vector<string> &column_names, bool emit_cascade_delta) {
+                                                 const vector<string> &column_names, bool emit_cascade_delta,
+                                                 bool cascade_delta_minimize) {
 	if (partition_delta_specs.size() != 1) {
 		return "";
 	}
@@ -721,7 +722,10 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 		       ") openivm_recompute\nWHERE " + fallback_filter + ";\n\n";
 		sql += "DELETE FROM " + data_table + " WHERE " + fallback_filter + ";\n";
 		sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
-		sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+		sql += "\n" + (cascade_delta_minimize ? BuildMinimalSignedMultisetDeltaInsertSQL(delta_table, old_temp_table,
+		                                                                                new_temp_table)
+		                                      : BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table,
+		                                                                           new_temp_table));
 	} else {
 		sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", fallback_filter,
 		                                   fallback_filter);
@@ -1205,7 +1209,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const string &affected_key_cols,
                               const string &affected_key_tuple, const vector<string> &column_names,
-                              bool running_window_incremental) {
+                              bool running_window_incremental, bool cascade_delta_minimize) {
 	bool have_affected_keys = !affected_keys_sql.empty() && !affected_key_cols.empty() && !affected_key_tuple.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
@@ -1213,7 +1217,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	if (running_window_incremental) {
 		auto suffix_sql = BuildRunningWindowSuffixRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
 		                                                     partition_columns, partition_delta_specs, column_names,
-		                                                     emit_cascade_delta);
+		                                                     emit_cascade_delta, cascade_delta_minimize);
 		if (!suffix_sql.empty()) {
 			return suffix_sql;
 		}
@@ -1271,7 +1275,10 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	       ") openivm_recompute\nWHERE " + affected_filter + ";\n\n";
 	sql += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
 	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
-	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	sql += "\n" + (cascade_delta_minimize ? BuildMinimalSignedMultisetDeltaInsertSQL(delta_table, old_temp_table,
+	                                                                                new_temp_table)
+	                                      : BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table,
+	                                                                           new_temp_table));
 	if (have_affected_keys) {
 		sql += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
 	}

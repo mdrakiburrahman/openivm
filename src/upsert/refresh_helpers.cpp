@@ -238,6 +238,14 @@ string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string
 	       "\nUNION ALL\nSELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + new_source + ";\n";
 }
 
+string BuildMinimalSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source,
+                                               const string &new_source, const string &statement_prefix) {
+	return statement_prefix + "INSERT INTO " + delta_table + "\nSELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM "
+	       "(SELECT * FROM " + old_source + " EXCEPT ALL SELECT * FROM " + new_source + ")" +
+	       "\nUNION ALL\nSELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + "(SELECT * FROM " + new_source +
+	       " EXCEPT ALL SELECT * FROM " + old_source + ");\n";
+}
+
 static string BuildDeleteUsingInsertRefreshSQL(const string &data_table, const string &view_query_sql,
                                                const string &recompute_alias, const string &using_source,
                                                const string &using_alias, const string &delete_match,

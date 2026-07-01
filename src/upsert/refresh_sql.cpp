@@ -580,6 +580,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool running_window_incremental =
 	    (active_facts.running_window_incremental && active_facts.assume_insert_only) ||
 	    (insert_only && SqlUtils::GetBoolSetting(context, "openivm_running_window_incremental", false));
+	bool cascade_delta_minimize =
+	    active_facts.cascade_delta_minimize || SqlUtils::GetBoolSetting(context, "openivm_cascade_delta_minimize", false);
 	refresh_plan.delta_flags = fast_paths;
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	auto agg_types = metadata.GetAggregateTypes(view_name);
@@ -692,7 +694,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
 			    /*inline_cascade_delta=*/active_facts.force_view_delta_cascade,
-			    &aggregate_recompute_emits_cascade_delta);
+			    &aggregate_recompute_emits_cascade_delta, cascade_delta_minimize);
 		}
 		break;
 	}
@@ -747,7 +749,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		upsert_query = BuildWindowPartitionRefresh(
 		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental);
+		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental,
+		    cascade_delta_minimize);
 		break;
 	}
 	case RefreshType::DISTINCT_INCREMENTAL: {
@@ -851,7 +854,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string lpts_table_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
 		upsert_query =
 		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,
-		                          lpts_table_prefix, emit_cascade_delta_for_recompute, affected_mode);
+		                          lpts_table_prefix, emit_cascade_delta_for_recompute, affected_mode,
+		                          cascade_delta_minimize);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
 		                    group_columns.size(), delta_specs.size(), GroupRecomputeAffectedModeName(affected_mode));

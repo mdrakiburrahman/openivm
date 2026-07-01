@@ -130,6 +130,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_temp_table = "");
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
+string BuildMinimalSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source,
+                                               const string &new_source, const string &statement_prefix = "");
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
 string BaseTableNameFromDeltaKey(const string &delta_key);
@@ -221,7 +223,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                    bool cross_system, bool emit_cascade_delta = false,
-                                   bool running_window_incremental = false);
+                                   bool running_window_incremental = false, bool cascade_delta_minimize = false);
 bool TryBuildGroupMeasureUpdateRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                        const string &view_query_sql, const vector<string> &active_delta_table_names,
                                        const vector<string> &column_names, const vector<LogicalType> &column_types,
