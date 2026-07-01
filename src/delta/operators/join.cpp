@@ -685,11 +685,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	bool fk_pruning_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
 	uint64_t skip_bits = 0;
-	// FK pruning pays for catalog constraint inspection. When every leaf changed
-	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and
-	// the flag benchmark shows the inspection cost can dominate. Keep it for the
-	// main win case: one-sided PK/dimension changes.
-	bool fk_pruning_worthwhile = non_empty_leaf_count == 1;
+	bool fk_pruning_worthwhile = non_empty_leaf_count >= 1;
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = DetectFKRelations(context, leaves, input.plan.get());
 		if (!fk_relations.empty()) {
