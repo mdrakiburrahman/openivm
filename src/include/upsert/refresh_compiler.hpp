@@ -49,7 +49,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
-                              const string &affected_key_cols = "", const string &affected_key_tuple = "");
+                              const string &affected_key_cols = "", const string &affected_key_tuple = "",
+                              const vector<string> &column_names = {}, bool running_window_incremental = false);
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE` (inner-DISTINCT under
@@ -95,6 +96,13 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
                                       const vector<string> &source_exprs, const string &source_relation,
                                       const string &filter_sql, bool replace);
+
+string BuildRunningWindowAuxStateCreateSQL(const string &target_table, const string &source_relation,
+                                           const string &view_query_sql, const vector<string> &partition_columns,
+                                           const vector<string> &column_names, bool replace);
+string BuildRunningWindowAuxStateBackfillSQL(const string &target_table, const string &source_relation,
+                                             const string &view_query_sql, const vector<string> &partition_columns,
+                                             const vector<string> &column_names);
 
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,

@@ -43,6 +43,7 @@ public:
 	// projection delete, MIN/MAX GREATEST/LEAST) that compile_only otherwise
 	// disables. Defaults false — conservative, identical to v1 behavior.
 	bool assume_insert_only = false;
+	bool running_window_incremental = false;
 
 	// v2 WorkloadFacts: per-source delta shape and RELY FK declarations supplied
 	// by the caller. These are compile-time facts only; the compile path may not

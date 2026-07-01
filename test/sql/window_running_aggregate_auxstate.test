@@ -1,0 +1,258 @@
+# name: test/sql/window_running_aggregate_auxstate.test
+# description: Running-window suffix refresh persists per-partition aux state for seed/bounds.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_running_window_incremental=true;
+
+statement ok
+CREATE TABLE wraux_daily_market (
+    dm_date DATE,
+    dm_s_symb VARCHAR,
+    dm_high INT,
+    dm_low INT
+);
+
+statement ok
+INSERT INTO wraux_daily_market VALUES
+    (DATE '2024-01-01', 'AAA', 20, 10),
+    (DATE '2024-01-02', 'AAA', 22, 8),
+    (DATE '2024-01-01', 'BBB', 30, 15),
+    (DATE '2024-01-02', 'BBB', 29, 16);
+
+statement ok
+CREATE MATERIALIZED VIEW wraux_daily_mv AS
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market;
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wraux_daily_mv);
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_aux_wraux_daily_mv;
+----
+2
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-02', 8, 22),
+           ('BBB', DATE '2024-01-02', 15, 30)
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_aux_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-02', 8, 22),
+           ('BBB', DATE '2024-01-02', 15, 30)
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_aux_wraux_daily_mv);
+----
+0
+
+statement ok
+INSERT INTO wraux_daily_market VALUES
+    (DATE '2024-01-03', 'AAA', 24, 7),
+    (DATE '2024-01-03', 'BBB', 31, 14);
+
+query I
+WITH compiled AS (
+    SELECT stmt_order, sql
+    FROM openivm_compile_with_facts(
+        'wraux_daily_mv',
+        '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}'
+    )
+    WHERE stmt_kind = 'data'
+), bounds AS (
+    SELECT sql FROM compiled WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_bounds_wraux_daily_mv%'
+), state AS (
+    SELECT sql FROM compiled WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_state_wraux_daily_mv%'
+)
+SELECT CASE WHEN (SELECT sql FROM bounds) LIKE '%LEFT JOIN openivm_aux_wraux_daily_mv m%'
+         AND (SELECT sql FROM state) LIKE '%FROM openivm_aux_wraux_daily_mv a%'
+         AND (SELECT sql FROM bounds) NOT LIKE '%MAX(%openivm_old_max_order%'
+         AND (SELECT sql FROM state) NOT LIKE '%FROM openivm_data_wraux_daily_mv dt%'
+    THEN 1 ELSE 0 END;
+----
+1
+
+statement ok
+PRAGMA refresh('wraux_daily_mv');
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wraux_daily_mv);
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_aux_wraux_daily_mv;
+----
+2
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-03', 7, 24),
+           ('BBB', DATE '2024-01-03', 14, 31)
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_aux_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-03', 7, 24),
+           ('BBB', DATE '2024-01-03', 14, 31)
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_aux_wraux_daily_mv);
+----
+0
+
+statement ok
+INSERT INTO wraux_daily_market VALUES
+    (DATE '2023-12-31', 'AAA', 18, 5);
+
+statement ok
+PRAGMA refresh('wraux_daily_mv');
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wraux_daily_mv);
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_aux_wraux_daily_mv;
+----
+2
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-03', 5, 24),
+           ('BBB', DATE '2024-01-03', 14, 31)
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_aux_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-03', 5, 24),
+           ('BBB', DATE '2024-01-03', 14, 31)
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_aux_wraux_daily_mv);
+----
+0
+
+statement ok
+INSERT INTO wraux_daily_market VALUES
+    (DATE '2024-01-01', 'CCC', 40, 25);
+
+statement ok
+PRAGMA refresh('wraux_daily_mv');
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    SELECT dm_date, dm_s_symb,
+           MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low,
+           MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high
+    FROM wraux_daily_market
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wraux_daily_mv);
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_aux_wraux_daily_mv;
+----
+3
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-03', 5, 24),
+           ('BBB', DATE '2024-01-03', 14, 31),
+           ('CCC', DATE '2024-01-01', 25, 40)
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_aux_wraux_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected(dm_s_symb, openivm_aux_max_order, wk_low, wk_high) AS (
+    VALUES ('AAA', DATE '2024-01-03', 5, 24),
+           ('BBB', DATE '2024-01-03', 14, 31),
+           ('CCC', DATE '2024-01-01', 25, 40)
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_aux_wraux_daily_mv);
+----
+0
