@@ -117,7 +117,7 @@ struct RefreshCompileProfile {
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
 bool IsEmptyDeltaPlan(LogicalOperator *op);
 string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,
-                             const vector<LogicalType> &column_types);
+                             const vector<LogicalType> &column_types, SqlDialect dialect = SqlDialect::DUCKDB);
 string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
                                 const vector<string> &column_names, const string &delta_ts_filter);
 string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,

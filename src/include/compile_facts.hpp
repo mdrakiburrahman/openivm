@@ -35,6 +35,7 @@ public:
 	// disables. Defaults false — conservative, identical to v1 behavior.
 	bool assume_insert_only = false;
 	bool running_window_incremental = false;
+	bool emit_spark_hints = false;
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every
