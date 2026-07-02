@@ -6,6 +6,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "upsert/refresh_index_regen.hpp"
+#include "match/constraint_cache.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/constraint.hpp"
@@ -613,7 +614,6 @@ static vector<vector<DeltaJoinKeyProbe>> BuildJoinKeyProbes(LogicalOperator *joi
 
 static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
                                             LogicalOperator *join_root) {
-	(void)context;
 	vector<FKRelation> relations;
 
 	// Build map: table_name -> leaf index (for matching FK targets to leaves)
@@ -663,8 +663,61 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 			OPENIVM_DEBUG_PRINT("[DeltaJoin] FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
 			                    table_ref.get()->name.c_str(), pk_leaf, fk.info.table.c_str());
 		}
+
+		// Also consult the openivm_constraints_cache for declared RELY_FK / FK
+		// relationships (populated via PRAGMA openivm_declare_rely_fk). These are
+		// explicit, trusted user declarations the catalog may not carry (e.g.
+		// Spark/Delta base tables have no enforced FK constraints).
+		openivm::ConstraintCache constraint_cache;
+		for (auto &cached : constraint_cache.GetConstraints(context, table_ref.get()->name)) {
+			if (!cached.is_trusted ||
+			    !(StringUtil::CIEquals(cached.kind, "FK") || StringUtil::CIEquals(cached.kind, "RELY_FK"))) {
+				continue;
+			}
+			size_t pk_leaf;
+			if (!TryFindLeaf(table_to_leaf, cached.referenced_table, pk_leaf)) {
+				continue;
+			}
+			if (cached.columns.empty() || cached.columns.size() != cached.referenced_columns.size()) {
+				continue;
+			}
+			bool all_columns_joined = true;
+			for (idx_t col_idx = 0; col_idx < cached.columns.size(); col_idx++) {
+				if (!HasJoinEquality(key_probes, i, cached.columns[col_idx], pk_leaf,
+				                     cached.referenced_columns[col_idx])) {
+					all_columns_joined = false;
+					break;
+				}
+			}
+			if (!all_columns_joined) {
+				continue;
+			}
+			relations.push_back({i, pk_leaf});
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] RELY FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
+			                    table_ref.get()->name.c_str(), pk_leaf, cached.referenced_table.c_str());
+		}
 	}
 	return relations;
+}
+
+// Cheap pre-check for the FK-pruning gate: does any join leaf carry a trusted
+// FK / RELY_FK in the openivm_constraints_cache? A declared RELY_FK is an
+// explicit signal that pruning is worthwhile even when multiple leaves changed.
+static bool ConstraintCacheHasTrustedFk(ClientContext &context, const vector<JoinLeafInfo> &leaves) {
+	openivm::ConstraintCache constraint_cache;
+	for (auto &leaf : leaves) {
+		LogicalGet *get = GetLeafScan(leaf);
+		if (!get || get->GetTable().get() == nullptr) {
+			continue;
+		}
+		for (auto &cached : constraint_cache.GetConstraints(context, get->GetTable().get()->name)) {
+			if (cached.is_trusted &&
+			    (StringUtil::CIEquals(cached.kind, "FK") || StringUtil::CIEquals(cached.kind, "RELY_FK"))) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 static vector<FKRelation> DetectCompileFactsFKRelations(const openivm::CompileFacts &facts,
@@ -775,9 +828,11 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 	// FK pruning pays for catalog constraint inspection. When every leaf changed
 	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and
 	// the flag benchmark shows the inspection cost can dominate. Keep it for the
-	// main win case: one-sided PK/dimension changes.
+	// main win case: one-sided PK/dimension changes, OR when an explicit FK is
+	// declared (compile facts, or a trusted RELY_FK in the constraints cache).
 	bool has_compile_fk_facts = compile_only && !compile_facts.fk_relations.empty();
-	bool fk_pruning_worthwhile = has_compile_fk_facts || non_empty_leaf_count == 1;
+	bool has_cache_fk = !has_compile_fk_facts && ConstraintCacheHasTrustedFk(context, leaves);
+	bool fk_pruning_worthwhile = has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1;
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = has_compile_fk_facts ? DetectCompileFactsFKRelations(compile_facts, leaves, input.plan.get())
 		                                         : DetectFKRelations(context, leaves, input.plan.get());
