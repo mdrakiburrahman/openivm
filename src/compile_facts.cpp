@@ -300,6 +300,7 @@ CompileFacts ParseFactsJson(const string &json) {
 	ExtractDeltaShapeObject(json, out.delta_shape);
 	ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
 	ExtractJsonBool(json, "scd2_range_join_accel", out.scd2_range_join_accel);
+	ExtractJsonBool(json, "emit_spark_hints", out.emit_spark_hints);
 
 	for (auto &object : ExtractJsonObjectsFromArray(json, "fk_relations")) {
 		CompileFactsFkRelation fk;

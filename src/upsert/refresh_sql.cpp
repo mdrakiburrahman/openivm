@@ -22,12 +22,27 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/planner.hpp"
 
+#include <regex>
+
 namespace duckdb {
 
 namespace {
 
 constexpr const char *DUCKLAKE_SYNTHETIC_DELTA_TS = "1970-01-02 00:00:00";
 constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";
+
+static string SparkPortableRefreshSQL(string sql) {
+	static const std::regex quoted_cast_regex(R"(('[^']*(?:''[^']*)*')::(TIMESTAMP|DATE))",
+	                                          std::regex_constants::icase);
+	static const std::regex bigint_cast_regex(R"(([A-Za-z_][A-Za-z0-9_\.]*)::BIGINT)", std::regex_constants::icase);
+	static const std::regex now_regex(R"(\bnow\(\))", std::regex_constants::icase);
+	static const std::regex null_safe_regex(R"(\s+IS\s+NOT\s+DISTINCT\s+FROM\s+)", std::regex_constants::icase);
+	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
+	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
+	sql = std::regex_replace(sql, now_regex, "current_timestamp()");
+	sql = std::regex_replace(sql, null_safe_regex, " <=> ");
+	return sql;
+}
 
 struct SemiAntiSourceInput {
 	string table_sql;
@@ -1377,7 +1392,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		add_profile_step("generate_refresh_sql.compute_delta_plan", compute_delta_plan_start);
 		string raw_refresh_sql;
 		if (IsEmptyDeltaPlan(plan.get())) {
-			raw_refresh_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types);
+			raw_refresh_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types, active_facts.target_dialect);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Delta plan is empty; generated no-op delta insert for '%s'\n",
 			                    view_name.c_str());
 		} else {
@@ -1385,7 +1400,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				auto lpts_start = profile_now();
 				SqlDialect dialect = active_facts.target_dialect;
 				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
-				auto cte_list = AstToCteList(*ast, dialect);
+				bool emit_spark_hints = dialect == SqlDialect::SPARK &&
+				                        (active_facts.emit_spark_hints ||
+				                         SqlUtils::GetBoolSetting(con_ctx, "openivm_emit_spark_hints", false));
+				auto cte_list = AstToCteList(*ast, dialect, emit_spark_hints);
 				raw_refresh_sql = cte_list->ToQuery(false);
 				if (active_facts.scd2_range_join_accel ||
 				    SqlUtils::GetBoolSetting(context, "openivm_scd2_range_join_accel", false)) {
@@ -1559,6 +1577,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                  delete_from_delta_table_query;
 	const string &meta_pre_sql = set_in_progress;
 	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + clear_in_progress;
+	if (active_facts.target_dialect == SqlDialect::SPARK) {
+		data_sql = SparkPortableRefreshSQL(data_sql);
+		meta_post_sql = SparkPortableRefreshSQL(meta_post_sql);
+	}
 
 	string clean_query;
 	if (cross_system && out_pre_meta != nullptr && out_post_meta != nullptr) {

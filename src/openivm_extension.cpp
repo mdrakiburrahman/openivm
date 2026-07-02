@@ -186,6 +186,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_scd2_range_join_accel",
 	                             "add delta timestamp-domain filters for SCD-2 range joins", LogicalType::BOOLEAN,
 	                             Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_emit_spark_hints",
+	                             "emit Spark optimizer hints in target_dialect=spark compiled refresh SQL",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_skip_aggregate_delete",
 	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
