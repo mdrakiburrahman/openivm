@@ -299,6 +299,7 @@ CompileFacts ParseFactsJson(const string &json) {
 	ExtractJsonBool(json, "assume_insert_only", out.assume_insert_only);
 	ExtractDeltaShapeObject(json, out.delta_shape);
 	ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
+	ExtractJsonBool(json, "scd2_range_join_accel", out.scd2_range_join_accel);
 
 	for (auto &object : ExtractJsonObjectsFromArray(json, "fk_relations")) {
 		CompileFactsFkRelation fk;
