@@ -577,6 +577,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool skip_agg_delete = fast_paths.skip_agg_delete;
 	bool skip_proj_delete = fast_paths.skip_proj_delete;
 	bool minmax_incremental = fast_paths.minmax_incremental;
+	bool running_window_incremental =
+	    (active_facts.running_window_incremental && active_facts.assume_insert_only) ||
+	    (insert_only && SqlUtils::GetBoolSetting(context, "openivm_running_window_incremental", false));
 	refresh_plan.delta_flags = fast_paths;
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	auto agg_types = metadata.GetAggregateTypes(view_name);
@@ -744,7 +747,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		upsert_query = BuildWindowPartitionRefresh(
 		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute);
+		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental);
 		break;
 	}
 	case RefreshType::DISTINCT_INCREMENTAL: {
