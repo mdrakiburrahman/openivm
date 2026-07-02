@@ -54,6 +54,7 @@ struct RefreshPlan {
 	bool SkipsDeltaProduction() const {
 		return skip_projection_key_delta || refresh_type == RefreshType::WINDOW_PARTITION ||
 		       refresh_type == RefreshType::GROUP_RECOMPUTE || refresh_type == RefreshType::DISTINCT_INCREMENTAL ||
+		       refresh_type == RefreshType::COUNT_DISTINCT_INCREMENTAL ||
 		       refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE || refresh_type == RefreshType::CURRENT_DIFF_RECOMPUTE;
 	}
 
@@ -64,6 +65,8 @@ struct RefreshPlan {
 		switch (refresh_type) {
 		case RefreshType::DISTINCT_INCREMENTAL:
 			return "DISTINCT_INCREMENTAL";
+		case RefreshType::COUNT_DISTINCT_INCREMENTAL:
+			return "COUNT_DISTINCT_INCREMENTAL";
 		case RefreshType::SEMI_ANTI_RECOMPUTE:
 			return "SEMI_ANTI_RECOMPUTE";
 		case RefreshType::GROUP_RECOMPUTE:
@@ -534,6 +537,26 @@ static void EnsureDistinctAuxState(RefreshMetadata &metadata, Connection &con, c
 		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 		               return BuildDistinctAuxStateCreateSQL(aux_q, meta.cols, meta.source_exprs, source_table,
 		                                                     meta.filter, /*replace=*/true);
+	               });
+}
+
+static void EnsureCountDistinctAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                        const RefreshMetadata::CountDistinctAuxMeta &meta,
+                                        const vector<string> &delta_table_names, const string &internal_catalog_name,
+                                        const string &internal_schema_name, const string &catalog_prefix,
+                                        const string &view_catalog_name, const string &view_schema_name,
+                                        const string &attached_db_catalog_name, const string &attached_db_schema_name) {
+	string delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+	EnsureAuxState(metadata, con, view_name, meta.aux_table, RefreshMetadata::ExpectedCountDistinctAuxColumns(meta),
+	               internal_catalog_name, internal_schema_name, vector<string> {delta_source}, view_catalog_name,
+	               view_schema_name, [&]() {
+		               string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(meta.aux_table);
+		               string source_table =
+		                   ResolveSourceTableSQL(metadata, view_name, delta_source, meta.source, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		               return BuildCountDistinctAuxStateCreateSQL(aux_q, source_table, meta.group_cols,
+		                                                          meta.group_source_exprs, meta.distinct_col,
+		                                                          meta.distinct_expr, meta.filter, /*replace=*/true);
 	               });
 }
 
@@ -1030,6 +1053,36 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
 		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental);
 		break;
+	}
+	case RefreshType::COUNT_DISTINCT_INCREMENTAL: {
+		RefreshMetadata::CountDistinctAuxMeta aux_meta;
+		if (!metadata.GetCountDistinctAuxMeta(view_name, aux_meta)) {
+			throw InternalException("COUNT_DISTINCT_INCREMENTAL view '%s' has no aux metadata", view_name);
+		} else {
+			if (!active_facts.compile_only) {
+				EnsureCountDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names,
+				                            internal_catalog_name, internal_schema_name, internal_catalog_prefix,
+				                            view_catalog_name, view_schema_name, attached_db_catalog_name,
+				                            attached_db_schema_name);
+			}
+			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
+			string delta_source_sql =
+			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
+			string ts = metadata.GetLastUpdate(view_name, delta_source);
+			string count_star_col;
+			if (std::find(column_names.begin(), column_names.end(), string(openivm::COUNT_STAR_COL)) !=
+			    column_names.end()) {
+				count_star_col = string(openivm::COUNT_STAR_COL);
+			}
+			upsert_query = CompileCountDistinctIncremental(
+			    view_name, aux_meta.aux_table, delta_source_sql, ts, aux_meta.group_cols, aux_meta.group_source_exprs,
+			    aux_meta.distinct_col, aux_meta.distinct_expr, aux_meta.output_col, count_star_col, aux_meta.filter,
+			    internal_catalog_prefix);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: COUNT_DISTINCT_INCREMENTAL (%zu group cols, "
+			                    "distinct=%s, out=%s)\n",
+			                    aux_meta.group_cols.size(), aux_meta.distinct_expr.c_str(), aux_meta.output_col.c_str());
+			break;
+		}
 	}
 	case RefreshType::DISTINCT_INCREMENTAL: {
 		RefreshMetadata::DistinctAuxMeta aux_meta;

@@ -217,6 +217,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "instead of GROUP_RECOMPUTE. Single-source views only in v0; multi-source "
 	                             "views fall back to GROUP_RECOMPUTE.",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_stateful_auxstate",
+	                             "use persisted auxiliary state for stateful operators such as "
+	                             "COUNT(DISTINCT) instead of GROUP_RECOMPUTE",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Learned cost model
 	db_config.AddExtensionOption("openivm_cost_decay",
@@ -319,6 +323,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " ADD COLUMN IF NOT EXISTS nullified_columns_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS distinct_aux_meta_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS count_distinct_aux_meta_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +

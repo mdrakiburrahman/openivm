@@ -993,6 +993,126 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	return sql;
 }
 
+string BuildCountDistinctAuxStateCreateSQL(const string &target_table, const string &source_relation,
+                                           const vector<string> &group_cols,
+                                           const vector<string> &group_source_exprs, const string &distinct_col,
+                                           const string &distinct_expr, const string &filter_sql, bool replace) {
+	if (group_cols.empty() || group_cols.size() != group_source_exprs.size() || distinct_col.empty() ||
+	    distinct_expr.empty()) {
+		throw InternalException("BuildCountDistinctAuxStateCreateSQL called with incomplete metadata");
+	}
+	string select_list;
+	string group_list;
+	for (idx_t i = 0; i < group_cols.size(); i++) {
+		if (i > 0) {
+			select_list += ", ";
+			group_list += ", ";
+		}
+		select_list += group_source_exprs[i] + " AS " + SqlUtils::QuoteIdentifier(group_cols[i]);
+		group_list += group_source_exprs[i];
+	}
+	select_list += ", " + distinct_expr + " AS " + SqlUtils::QuoteIdentifier(distinct_col);
+	group_list += ", " + distinct_expr;
+	string filter = filter_sql.empty() ? "" : "(" + filter_sql + ") AND ";
+	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + select_list +
+	       ", count(*)::BIGINT AS _count FROM " + source_relation + " WHERE " + filter + distinct_expr +
+	       " IS NOT NULL GROUP BY " + group_list;
+}
+
+string CompileCountDistinctIncremental(const string &view_name, const string &aux_table, const string &delta_source,
+                                       const string &last_update, const vector<string> &group_cols,
+                                       const vector<string> &group_source_exprs, const string &distinct_col,
+                                       const string &distinct_expr, const string &output_col,
+                                       const string &count_star_col, const string &filter_sql,
+                                       const string &catalog_prefix) {
+	if (group_cols.empty() || group_cols.size() != group_source_exprs.size() || aux_table.empty() ||
+	    delta_source.empty() || last_update.empty() || distinct_col.empty() || distinct_expr.empty() ||
+	    output_col.empty()) {
+		throw InternalException("CompileCountDistinctIncremental called with incomplete metadata for view '%s'",
+		                        view_name);
+	}
+	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
+	string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(aux_table);
+	string delta_q = DeltaSourceRef(delta_source, catalog_prefix);
+	string dinput_table = SqlUtils::QuoteIdentifier("openivm_cd_dinput_" + view_name);
+	string dgroups_table = SqlUtils::QuoteIdentifier("openivm_cd_dgroups_" + view_name);
+	string dagg_table = SqlUtils::QuoteIdentifier("openivm_cd_dagg_" + view_name);
+	string mul = string(openivm::MULTIPLICITY_COL);
+	string ts_filter = string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP";
+	string base_filter = filter_sql.empty() ? ts_filter : ts_filter + " AND (" + filter_sql + ")";
+
+	string group_select;
+	string group_by;
+	string group_csv = SqlUtils::JoinQuotedColumns(group_cols);
+	string group_csv_i = SqlUtils::JoinQualifiedQuotedColumns(group_cols, "i");
+	for (idx_t i = 0; i < group_cols.size(); i++) {
+		if (i > 0) {
+			group_select += ", ";
+			group_by += ", ";
+		}
+		group_select += group_source_exprs[i] + " AS " + SqlUtils::QuoteIdentifier(group_cols[i]);
+		group_by += group_source_exprs[i];
+	}
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + dinput_table + " AS\n  SELECT " + group_select + ", " + distinct_expr +
+	       " AS " + SqlUtils::QuoteIdentifier(distinct_col) + ", SUM(" + mul + ")::BIGINT AS dmult\n  FROM " +
+	       delta_q + "\n  WHERE " + base_filter + " AND " + distinct_expr + " IS NOT NULL\n  GROUP BY " + group_by +
+	       ", " + distinct_expr + "\n  HAVING SUM(" + mul + ") <> 0;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + dgroups_table + " AS\n  SELECT " + group_select + ", SUM(" + mul +
+	       ")::BIGINT AS d_count_star\n  FROM " + delta_q + "\n  WHERE " + base_filter + "\n  GROUP BY " + group_by +
+	       "\n  HAVING SUM(" + mul + ") <> 0;\n\n";
+
+	vector<string> aux_match_cols = group_cols;
+	aux_match_cols.push_back(distinct_col);
+	string aux_match = SqlUtils::BuildNullSafeMatch(aux_match_cols, "_aux", "i");
+	sql += "CREATE OR REPLACE TEMP TABLE " + dagg_table + " AS\nWITH ddist AS (\n  SELECT " + group_csv_i +
+	       ", CASE WHEN COALESCE(_aux._count, 0) = 0 AND i.dmult > 0 THEN 1 "
+	       "WHEN COALESCE(_aux._count, 0) > 0 AND COALESCE(_aux._count, 0) + i.dmult <= 0 THEN -1 ELSE 0 END AS dd\n"
+	       "  FROM " +
+	       dinput_table + " i LEFT JOIN " + aux_q + " _aux ON " + aux_match +
+	       "\n), dcount AS (\n  SELECT " + group_csv +
+	       ", SUM(dd)::BIGINT AS d_count_distinct, 0::BIGINT AS d_count_star\n  FROM ddist WHERE dd <> 0 GROUP BY " +
+	       group_csv + "\n  UNION ALL\n  SELECT " + group_csv +
+	       ", 0::BIGINT AS d_count_distinct, d_count_star FROM " + dgroups_table +
+	       "\n)\nSELECT " + group_csv +
+	       ", SUM(d_count_distinct)::BIGINT AS d_count_distinct, SUM(d_count_star)::BIGINT AS d_count_star\nFROM "
+	       "dcount GROUP BY " +
+	       group_csv + " HAVING SUM(d_count_distinct) <> 0 OR SUM(d_count_star) <> 0;\n\n";
+
+	string output_q = SqlUtils::QuoteIdentifier(output_col);
+	string mv_match = SqlUtils::BuildNullSafeMatch(group_cols, "v", "d");
+	string insert_cols = group_csv + ", " + output_q;
+	string insert_vals = SqlUtils::JoinQualifiedQuotedColumns(group_cols, "d") + ", d.d_count_distinct";
+	string update_set = output_q + " = COALESCE(v." + output_q + ", 0) + d.d_count_distinct";
+	if (!count_star_col.empty()) {
+		string count_q = SqlUtils::QuoteIdentifier(count_star_col);
+		insert_cols += ", " + count_q;
+		insert_vals += ", d.d_count_star";
+		update_set += ", " + count_q + " = COALESCE(v." + count_q + ", 0) + d.d_count_star";
+	}
+	sql += "MERGE INTO " + data_table + " v USING " + dagg_table + " d ON " + mv_match +
+	       "\nWHEN MATCHED THEN UPDATE SET " + update_set + "\nWHEN NOT MATCHED THEN INSERT (" + insert_cols +
+	       ") VALUES (" + insert_vals + ");\n\n";
+	if (!count_star_col.empty()) {
+		sql += "DELETE FROM " + data_table + " WHERE " + SqlUtils::QuoteIdentifier(count_star_col) + " <= 0;\n\n";
+	} else {
+		sql += "DELETE FROM " + data_table + " WHERE " + output_q + " <= 0;\n\n";
+	}
+	sql += "MERGE INTO " + aux_q + " _aux USING " + dinput_table + " i ON " + aux_match +
+	       "\nWHEN MATCHED THEN UPDATE SET _count = _aux._count + i.dmult\nWHEN NOT MATCHED AND i.dmult > 0 "
+	       "THEN INSERT (" +
+	       group_csv + ", " + SqlUtils::QuoteIdentifier(distinct_col) + ", _count) VALUES (" + group_csv_i + ", i." +
+	       SqlUtils::QuoteIdentifier(distinct_col) + ", i.dmult);\n\n";
+	sql += "DELETE FROM " + aux_q + " WHERE _count <= 0;\n\n";
+	sql += "DROP TABLE IF EXISTS " + dinput_table + ";\nDROP TABLE IF EXISTS " + dgroups_table +
+	       ";\nDROP TABLE IF EXISTS " + dagg_table + ";\n";
+
+	OPENIVM_DEBUG_PRINT("[CompileCountDistinctIncremental] %zu group cols, distinct=%s, out=%s, aux=%s\n",
+	                    group_cols.size(), distinct_expr.c_str(), output_col.c_str(), aux_table.c_str());
+	return sql;
+}
+
 string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &left_source, const string &left_alias,
                                       const string &right_source, const string &right_alias, const string &predicate,
                                       const string &post_filter, const vector<string> &left_cols,
