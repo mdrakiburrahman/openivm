@@ -755,13 +755,16 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const vector<string> &delta_table_names, const string &data_table,
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete) {
+                                bool skip_proj_delete, bool scd2_projection_delta) {
 	if (has_full_outer) {
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
 	}
-	if (has_left_join) {
+	if (has_left_join && !scd2_projection_delta) {
 		return BuildLeftJoinProjectionRefresh(view_name, data_table, view_query_sql, delta_ts_filter, catalog_prefix);
+	}
+	if (has_left_join && scd2_projection_delta) {
+		OPENIVM_DEBUG_PRINT("[UPSERT] SIMPLE_PROJECTION signed-delta path enabled for %s\n", view_name.c_str());
 	}
 	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
 }

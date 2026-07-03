@@ -201,6 +201,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_running_window_incremental",
 	                             "extend cumulative running window aggregates for append-only suffix batches",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_scd2_projection_delta",
+	                             "apply SIMPLE_PROJECTION signed deltas directly instead of key-group recompute",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_having_merge",
 	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
 	                             "instead of group-recompute",

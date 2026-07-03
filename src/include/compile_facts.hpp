@@ -45,6 +45,7 @@ public:
 	bool assume_insert_only = false;
 	bool running_window_incremental = false;
 	bool scd2_range_join_accel = false;
+	bool scd2_projection_delta = false;
 	bool emit_spark_hints = false;
 
 	// v2 WorkloadFacts: per-source delta shape and RELY FK declarations supplied
