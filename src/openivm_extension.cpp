@@ -2,6 +2,7 @@
 
 #include "core/openivm_extension.hpp"
 #include "compile_facts.hpp"
+#include "functions/spark_scalar_functions.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"
@@ -157,6 +158,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// after the extension is loaded. Entry points also set the current ClientContext
 	// explicitly because pre-existing local settings override global defaults.
 	db_config.SetOption(PreserveInsertionOrderSetting::SettingIndex, Value::BOOLEAN(false));
+
+	RegisterSparkScalarFunctions(loader);
 
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
