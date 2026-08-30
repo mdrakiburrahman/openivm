@@ -895,18 +895,118 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 ----
 3
 
-# 7 profiled statements per refresh for an AGGREGATE_GROUP MERGE view:
-#   1. SET refresh_in_progress = true
-#   2. INSERT INTO openivm_delta_<view> (delta computation)
-#   3. MERGE INTO openivm_data_<view> (applies delta via CTE from the delta view)
-#   4. DELETE FROM openivm_delta_<view> (view delta cleanup)
-#   5. DELETE FROM openivm_delta_<source> (source delta cleanup)
-#   6. UPDATE openivm_delta_tables SET last_update (metadata timestamp)
-#   7. SET refresh_in_progress = false
+# The learned timings may select either incremental MERGE or full recompute.
+# Pair that exact refresh's decision with its ordered statement signature so
+# missing, extra, unexpected, or duplicate operations all fail.
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
+WITH refresh_decision AS (
+    SELECT refresh_id,
+           max(CASE WHEN step_name = 'generate_refresh_sql.adaptive_cost' THEN detail END) AS adaptive_strategy,
+           max(CASE WHEN step_name = 'record_refresh_history' THEN detail END) AS recorded_method
+    FROM openivm_refresh_profile
+    WHERE view_name = 'mv_lt'
+    GROUP BY refresh_id
+),
+classified_statements AS (
+    SELECT refresh_id,
+           step_order,
+           CASE
+               WHEN detail LIKE 'statement=1/7,%'
+                    AND contains(detail, 'openivm_views')
+                    AND contains(detail, 'refresh_in_progress = true')
+                   THEN 'mark_started'
+               WHEN detail LIKE 'statement=2/7,%'
+                    AND contains(detail, 'INSERT INTO')
+                    AND contains(detail, 'openivm_delta_mv_lt')
+                   THEN 'compute_delta'
+               WHEN detail LIKE 'statement=3/7,%'
+                    AND contains(detail, 'MERGE INTO')
+                    AND contains(detail, 'openivm_data_mv_lt')
+                   THEN 'merge_delta'
+               WHEN detail LIKE 'statement=4/7,%'
+                    AND contains(detail, 'DELETE FROM')
+                    AND contains(detail, 'openivm_delta_mv_lt')
+                   THEN 'cleanup_view_delta'
+               WHEN detail LIKE 'statement=5/7,%'
+                    AND contains(detail, 'DELETE FROM')
+                    AND contains(detail, 'openivm_delta_lt')
+                   THEN 'cleanup_source_delta'
+               WHEN detail LIKE 'statement=6/7,%'
+                    AND contains(detail, 'openivm_delta_tables')
+                    AND contains(detail, 'last_update')
+                   THEN 'advance_watermark'
+               WHEN detail LIKE 'statement=7/7,%'
+                    AND contains(detail, 'openivm_views')
+                    AND contains(detail, 'refresh_in_progress = false')
+                   THEN 'mark_finished'
+               WHEN detail LIKE 'statement=1/6,%'
+                    AND contains(detail, 'CREATE OR REPLACE TEMP TABLE')
+                    AND contains(detail, 'openivm_full_recompute_mv_lt')
+                   THEN 'stage_full_result'
+               WHEN detail LIKE 'statement=2/6,%'
+                    AND contains(detail, 'DELETE FROM')
+                    AND contains(detail, 'openivm_data_mv_lt')
+                   THEN 'delete_stale_groups'
+               WHEN detail LIKE 'statement=3/6,%'
+                    AND contains(detail, 'INSERT OR REPLACE INTO')
+                    AND contains(detail, 'openivm_data_mv_lt')
+                   THEN 'upsert_full_result'
+               WHEN detail LIKE 'statement=4/6,%'
+                    AND contains(detail, 'DROP TABLE IF EXISTS')
+                    AND contains(detail, 'openivm_full_recompute_mv_lt')
+                   THEN 'drop_full_stage'
+               WHEN detail LIKE 'statement=5/6,%'
+                    AND contains(detail, 'openivm_delta_tables')
+                    AND contains(detail, 'last_update')
+                   THEN 'advance_watermark'
+               WHEN detail LIKE 'statement=6/6,%'
+                    AND contains(detail, 'DELETE FROM')
+                    AND contains(detail, 'openivm_delta_lt')
+                   THEN 'cleanup_source_delta'
+           END AS statement_kind
+    FROM openivm_refresh_profile
+    WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt'
+),
+statement_set AS (
+    SELECT refresh_id,
+           count(*) AS statement_count,
+           count(DISTINCT statement_kind) AS distinct_statement_count,
+           count(*) FILTER (WHERE statement_kind IS NULL) AS unexpected_statement_count,
+           string_agg(statement_kind, ',' ORDER BY step_order) AS statement_signature
+    FROM classified_statements
+    GROUP BY refresh_id
+),
+latest_history AS (
+    SELECT method
+    FROM openivm_refresh_history
+    WHERE view_name = 'mv_lt'
+    ORDER BY refresh_timestamp DESC
+    LIMIT 1
+)
+SELECT count(*)
+FROM refresh_decision d
+JOIN statement_set s USING (refresh_id)
+CROSS JOIN latest_history h
+WHERE d.recorded_method = h.method
+  AND (
+      (d.adaptive_strategy = 'strategy=incremental'
+       AND d.recorded_method = 'incremental'
+       AND s.statement_count = 7
+       AND s.distinct_statement_count = 7
+       AND s.unexpected_statement_count = 0
+       AND s.statement_signature =
+           'mark_started,compute_delta,merge_delta,cleanup_view_delta,cleanup_source_delta,advance_watermark,mark_finished')
+      OR
+      (d.adaptive_strategy = 'strategy=full'
+       AND d.recorded_method = 'full'
+       AND s.statement_count = 6
+       AND s.distinct_statement_count = 6
+       AND s.unexpected_statement_count = 0
+       AND s.statement_signature =
+           'stage_full_result,delete_stale_groups,upsert_full_result,drop_full_stage,advance_watermark,cleanup_source_delta')
+  );
 ----
-7
+1
 
 query I
 SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
