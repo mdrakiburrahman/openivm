@@ -894,16 +894,32 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 		// A collected join path contains only child 0 or 1; <= would admit the invalid size() index.
 		if (join && child_side < join->children.size()) { // mull-ignore: cxx_lt_to_le
 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
+			bool immediate_parent = depth + 1 == leaf_path.size();
+			// A binary join's sibling is 1-child_side. Addition is either the same index for side 0 or the invalid
+			// index 2 for side 1; it cannot describe another valid planner shape.
+			bool preserve_full_child =
+			    preserve_constant_sibling_child_outputs && immediate_parent && ancestors[depth]->children.size() == 2 &&
+			    IsConstantLeafSubtree(
+			        ancestors[depth]->children[1 - child_side].get()); // mull-ignore: cxx_sub_to_add
+			auto child_bindings = ancestors[depth]->children[child_side]->GetColumnBindings();
+			auto shift_parent_projection = [&](idx_t insertion_idx, idx_t added) {
+				if (added == 0 || depth == 0) {
+					return;
+				}
+				size_t parent_side = leaf_path[depth - 1];
+				auto *parent_join = dynamic_cast<LogicalJoin *>(ancestors[depth - 1]);
+				if (!parent_join || parent_side >= parent_join->children.size()) {
+					return;
+				}
+				auto &parent_map =
+				    (parent_side == 0) ? parent_join->left_projection_map : parent_join->right_projection_map;
+				for (auto &parent_idx : parent_map) {
+					if (parent_idx >= insertion_idx) {
+						parent_idx += added;
+					}
+				}
+			};
 			if (!proj_map.empty()) {
-				bool immediate_parent = depth + 1 == leaf_path.size();
-				// A binary join's sibling is 1-child_side. Addition is either the same index for side 0 or the invalid
-				// index 2 for side 1; it cannot describe another valid planner shape.
-				bool preserve_full_child =
-				    preserve_constant_sibling_child_outputs && immediate_parent &&
-				    ancestors[depth]->children.size() == 2 &&
-				    IsConstantLeafSubtree(
-				        ancestors[depth]->children[1 - child_side].get()); // mull-ignore: cxx_sub_to_add
-				auto child_bindings = ancestors[depth]->children[child_side]->GetColumnBindings();
 				for (auto projected_idx : proj_map) {
 					// Equality is the first invalid binding index and is handled by this exception.
 					// mull-ignore-next: cxx_ge_to_gt
@@ -933,6 +949,13 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
 				}
+				idx_t old_width = proj_map.size();
+				idx_t insertion_idx = old_width;
+				if (child_side == 1) {
+					auto left_bindings = join->children[0]->GetColumnBindings();
+					insertion_idx +=
+					    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
+				}
 				// Appending to this join's own left_projection_map grows its LEFT
 				// contribution width, which shifts the absolute position where its RIGHT
 				// contribution starts within its own combined GetColumnBindings(). A
@@ -943,24 +966,6 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				// select. Appending to right_projection_map never has this effect: right
 				// contributions are always placed last, so a new entry there only ever
 				// extends the combined output with a brand-new highest index.
-				idx_t old_width = proj_map.size();
-				auto shift_stale_parent_indexes = [&](idx_t added) {
-					if (child_side != 0 || added == 0 || depth == 0) {
-						return;
-					}
-					size_t parent_side = leaf_path[depth - 1];
-					auto *parent_join = dynamic_cast<LogicalJoin *>(ancestors[depth - 1]);
-					if (!parent_join || parent_side >= parent_join->children.size()) {
-						return;
-					}
-					auto &parent_map =
-					    (parent_side == 0) ? parent_join->left_projection_map : parent_join->right_projection_map;
-					for (auto &parent_idx : parent_map) {
-						if (parent_idx >= old_width) {
-							parent_idx += added;
-						}
-					}
-				};
 				if (preserve_full_child) {
 					idx_t projectable_count = MinValue<idx_t>(mul_idx + 1, child_bindings.size());
 					idx_t added = 0;
@@ -973,7 +978,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 						OPENIVM_DEBUG_PRINT("[%s] Preserved child col %lu in immediate %s proj_map\n", context_label,
 						                    (unsigned long)binding_idx, child_side == 0 ? "left" : "right");
 					}
-					shift_stale_parent_indexes(added);
+					shift_parent_projection(insertion_idx, added);
 				} else {
 					// proj_map entries are positions into the child's *current* combined
 					// GetColumnBindings(). Testing raw index membership of mul_idx against
@@ -984,13 +989,29 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 					auto exposed = join->GetColumnBindings();
 					if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
 						proj_map.push_back(mul_idx);
-						shift_stale_parent_indexes(1);
+						shift_parent_projection(insertion_idx, 1);
 						OPENIVM_DEBUG_PRINT("[%s] Added mul col %lu to ancestor %s proj_map\n", context_label,
 						                    (unsigned long)mul_idx, child_side == 0 ? "left" : "right");
 					}
 				}
 				join->ResolveOperatorTypes();
+				continue;
 			}
+
+			auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
+			if (mul_binding_it == child_bindings.end()) {
+				continue;
+			}
+			idx_t insertion_idx = idx_t(mul_binding_it - child_bindings.begin());
+			if (child_side == 1) {
+				auto left_bindings = join->children[0]->GetColumnBindings();
+				insertion_idx +=
+				    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
+			}
+			// An empty map passes the child's bindings through unchanged, so the
+			// multiplicity is inserted in-place and shifts every later binding.
+			shift_parent_projection(insertion_idx, 1);
+			join->ResolveOperatorTypes();
 		}
 	}
 }
