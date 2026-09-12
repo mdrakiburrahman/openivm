@@ -933,8 +933,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 			// index 2 for side 1; it cannot describe another valid planner shape.
 			bool preserve_full_child =
 			    preserve_constant_sibling_child_outputs && immediate_parent && ancestors[depth]->children.size() == 2 &&
-			    IsConstantLeafSubtree(
-			        ancestors[depth]->children[1 - child_side].get()); // mull-ignore: cxx_sub_to_add
+			    IsConstantLeafSubtree(ancestors[depth]->children[1 - child_side].get()); // mull-ignore: cxx_sub_to_add
 			auto child_bindings = ancestors[depth]->children[child_side]->GetColumnBindings();
 			auto shift_parent_projection = [&](idx_t insertion_idx, idx_t added) {
 				if (added == 0 || depth == 0) {

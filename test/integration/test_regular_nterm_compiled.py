@@ -53,9 +53,7 @@ FROM openivm_compile_with_facts('{view_name}', '{facts_json}')
 WHERE stmt_kind = 'data';
 """
     compile_output = run_duckdb(binary, database, compile_sql)
-    classifications = [
-        line for line in compile_output.splitlines() if line.startswith("openivm_refresh_type=")
-    ]
+    classifications = [line for line in compile_output.splitlines() if line.startswith("openivm_refresh_type=")]
     if classifications != ["openivm_refresh_type=SIMPLE_PROJECTION"]:
         raise AssertionError(f"{name}: compiled join must stay incremental, got {classifications!r}")
 

@@ -39,8 +39,7 @@ static vector<string> ProjectedWindowPartitionColumns(const vector<string> &part
 	vector<string> projected;
 	for (auto &partition_column : partition_columns) {
 		auto output_column = WindowPartitionOutputColumn(partition_column);
-		if (!IncrementalTableNames::IsInternalColumn(output_column) &&
-		    ContainsStringCI(output_names, output_column)) {
+		if (!IncrementalTableNames::IsInternalColumn(output_column) && ContainsStringCI(output_names, output_column)) {
 			AddStringCI(projected, partition_column);
 		}
 	}
@@ -653,10 +652,9 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	if (model.type == RefreshType::WINDOW_PARTITION) {
 		const auto lineage_partition_columns = model.window_partition_columns;
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
-		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns,
-		                                                  model.window_lineage_ops, &direct_lineage_ops);
-		model.window_partition_columns =
-		    ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
+		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, model.window_lineage_ops,
+		                                                  &direct_lineage_ops);
+		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
 		for (auto &node : model.nodes) {
 			if (node.kind == DeltaModelNodeKind::WINDOW) {
 				node.affected_key_columns = model.window_partition_columns;
@@ -664,8 +662,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		}
 		if (model.window_partition_columns.empty()) {
 			model.features.erase(
-			    std::remove(model.features.begin(), model.features.end(),
-			                DeltaModelFeature::WINDOW_AFFECTED_PARTITION),
+			    std::remove(model.features.begin(), model.features.end(), DeltaModelFeature::WINDOW_AFFECTED_PARTITION),
 			    model.features.end());
 		}
 		if (analysis.found_asof_join &&
