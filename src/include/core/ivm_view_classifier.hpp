@@ -176,6 +176,7 @@ struct DeltaViewModel {
 	vector<DeltaStrategyReason> strategy_reasons;
 	vector<string> group_columns;
 	vector<string> window_partition_columns;
+	vector<string> window_order_columns;
 	vector<string> aggregate_types;
 	vector<DeltaModelFeature> features;
 	vector<DeltaUnsupportedReason> unsupported_reasons;
@@ -188,6 +189,7 @@ struct DeltaViewModel {
 	RefreshMetadata::LeftJoinKeySource left_join_key_source;
 	RefreshMetadata::LeftJoinNullableSources left_join_nullable_sources;
 	idx_t root_node = DConstants::INVALID_INDEX;
+	idx_t max_table_index = 0;
 	string full_outer_join_cols;
 	GroupRecomputeAffectedMode group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 	RefreshMetadata::DistinctAuxMeta distinct_aux;

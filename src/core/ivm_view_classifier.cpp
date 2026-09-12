@@ -209,7 +209,7 @@ static bool GroupColumnsAreVisibleOutputs(const vector<string> &group_columns, c
 static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                    vector<string> &aggregate_columns, vector<DeltaStrategyReason> &strategy_reasons) {
 	auto *top_proj_ptr = facts.first_projection;
-	auto *cjoin = facts.first_comparison_join;
+	auto *cjoin = facts.comparison_joins.empty() ? nullptr : facts.comparison_joins.front();
 	if (!top_proj_ptr || !cjoin) {
 		return;
 	}
@@ -932,8 +932,13 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	model.aggregate_types = analysis.aggregate_types;
 	model.window_partition_columns = analysis.window_partition_columns;
 	ResolveWindowPartitionOutputNames(facts, model.window_partition_columns, output_names);
+	if (analysis.window_row_key_compatible) {
+		model.window_order_columns = analysis.window_order_columns;
+		ResolveWindowPartitionOutputNames(facts, model.window_order_columns, output_names);
+	}
 	if (!input.keep_window_join_partitions) {
 		model.window_partition_columns.clear();
+		model.window_order_columns.clear();
 	}
 
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;

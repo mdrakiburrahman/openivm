@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/plan_rewrite.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
@@ -68,44 +69,65 @@ string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, 
 	return sql;
 }
 
-static bool PlanContainsCte(LogicalOperator *op) {
+static bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
+	const auto &name = aggregate.function.name;
+	return name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" || name == "variance" ||
+	       name == "var_samp" || name == "var_pop";
+}
+
+static bool PrepareCtesForInlining(LogicalOperator *op, PlanRewriteNeeds &needs) {
 	if (!op) {
 		return false;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_CTE_REF || op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (PlanContainsCte(child.get())) {
-			return true;
+	bool found_cte = op->type == LogicalOperatorType::LOGICAL_CTE_REF;
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		needs.has_aggregate = true;
+		auto &aggregate = op->Cast<LogicalAggregate>();
+		for (auto &expression : aggregate.expressions) {
+			if (expression->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+				continue;
+			}
+			auto &bound_aggregate = expression->Cast<BoundAggregateExpression>();
+			needs.aggregate_filters = needs.aggregate_filters || bound_aggregate.filter;
+			needs.derived_aggregates = needs.derived_aggregates || IsDerivedAggregate(bound_aggregate);
 		}
-	}
-	return false;
-}
-
-static void RelaxMaterializedCtes(LogicalOperator *op) {
-	if (!op) {
-		return;
+	} else if (op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		needs.distinct = true;
+	} else if (op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		needs.fold_constant_scalar_subqueries = true;
+	} else if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	           op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		needs.outer_join_support =
+		    needs.outer_join_support || (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+		                                 (join.join_type == JoinType::LEFT || join.join_type == JoinType::RIGHT ||
+		                                  join.join_type == JoinType::OUTER));
+		needs.semi_anti_subqueries = needs.semi_anti_subqueries || join.join_type == JoinType::MARK ||
+		                             join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI ||
+		                             join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		found_cte = true;
+		needs.inline_cte_refs = true;
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
 		if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
 			cte.materialize = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		}
 	}
 	for (auto &child : op->children) {
-		RelaxMaterializedCtes(child.get());
+		found_cte = PrepareCtesForInlining(child.get(), needs) || found_cte;
 	}
+	return found_cte;
 }
 
-void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	if (!PlanContainsCte(plan.get())) {
-		return;
+PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	PlanRewriteNeeds needs;
+	if (PrepareCtesForInlining(plan.get(), needs)) {
+		Optimizer cte_opt(binder, context);
+		CTEInlining cte_inlining(cte_opt);
+		plan = cte_inlining.Optimize(std::move(plan));
 	}
-	RelaxMaterializedCtes(plan.get());
-	Optimizer cte_opt(binder, context);
-	CTEInlining cte_inlining(cte_opt);
-	plan = cte_inlining.Optimize(std::move(plan));
+	return needs;
 }
 
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
@@ -232,16 +254,13 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t grou
 	return false;
 }
 
-static bool ContainsTableFunction(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET && !op.Cast<LogicalGet>().GetTable().get()) {
-		return true;
+static const CreateMVPlanNodeFacts *GetPlanNodeFacts(const CreateMVPlanFacts &facts, const LogicalOperator *node) {
+	auto entry = facts.plan_node_ids.find(node);
+	if (entry == facts.plan_node_ids.end()) {
+		return nullptr;
 	}
-	for (auto &child : op.children) {
-		if (ContainsTableFunction(*child)) {
-			return true;
-		}
-	}
-	return false;
+	D_ASSERT(entry->second < facts.plan_nodes_post_order.size());
+	return &facts.plan_nodes_post_order[entry->second];
 }
 
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts) {
@@ -254,7 +273,11 @@ bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts) {
 		} else {
 			continue;
 		}
-		if (join->children.size() > preserved_child && ContainsTableFunction(*join->children[preserved_child])) {
+		if (join->children.size() <= preserved_child) {
+			continue;
+		}
+		auto *subtree = GetPlanNodeFacts(facts, join->children[preserved_child].get());
+		if (subtree && subtree->contains_table_function) {
 			return true;
 		}
 	}
@@ -311,23 +334,43 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 	facts.ducklake_table_info[lc] = source_info;
 }
 
+static string NullableGetTableName(LogicalGet &get);
+static string NormalizeNullableTableName(const string &table_name);
+
+template <class T>
+static void AppendUniqueValues(vector<T> &target, const vector<T> &source) {
+	for (auto &value : source) {
+		if (std::find(target.begin(), target.end(), value) == target.end()) {
+			target.push_back(value);
+		}
+	}
+}
+
 static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
                                        unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
-                                       bool under_join) {
+                                       bool under_join, const LogicalOperator *redundant_distinct,
+                                       PlanAnalysis &analysis) {
 	if (!op) {
 		return "";
+	}
+	for (auto &binding : op->GetColumnBindings()) {
+		facts.max_table_index = std::max(facts.max_table_index, binding.table_index);
+	}
+	AnalyzePlanOperator(*op, analysis);
+	auto *logical_join = dynamic_cast<LogicalJoin *>(op);
+	if (logical_join && (logical_join->join_type == JoinType::LEFT || logical_join->join_type == JoinType::RIGHT ||
+	                     logical_join->join_type == JoinType::OUTER)) {
+		facts.outer_join_count++;
+		facts.outer_joins.push_back(logical_join);
+	}
+	if (redundant_distinct && op != redundant_distinct && op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		facts.has_descendant_distinct = true;
 	}
 	string first_table;
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		seen_agg_above = true;
 		auto &agg = op->Cast<LogicalAggregate>();
 		facts.aggregates.push_back(&agg);
-		for (auto &expr : agg.expressions) {
-			if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
-			    expr->Cast<BoundAggregateExpression>().filter) {
-				facts.has_bound_aggregate_filter = true;
-			}
-		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_UNION) {
 		if (!seen_agg_above) {
 			facts.has_union_before_aggregate = true;
@@ -339,14 +382,17 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	} else if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
 		facts.has_pivot = true;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_FILTER && !op->children.empty()) {
-		auto *filter_input = op->children[0].get();
-		while (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_PROJECTION &&
-		       filter_input->children.size() == 1) {
-			filter_input = filter_input->children[0].get();
-		}
-		if (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-			facts.has_filter_above_aggregate = true;
+	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+		facts.has_cardinality_changing_filter = true;
+		if (!op->children.empty()) {
+			auto *filter_input = op->children[0].get();
+			while (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_PROJECTION &&
+			       filter_input->children.size() == 1) {
+				filter_input = filter_input->children[0].get();
+			}
+			if (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+				facts.has_filter_above_aggregate = true;
+			}
 		}
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
@@ -365,11 +411,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	           op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN ||
 	           op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
-		if ((op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-		     op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) &&
-		    !facts.first_comparison_join) {
-			facts.first_comparison_join = &join;
-		}
 		if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 		    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 			facts.comparison_joins.push_back(&join);
@@ -403,6 +444,8 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
+		facts.has_cardinality_changing_filter =
+		    facts.has_cardinality_changing_filter || !get.table_filters.filters.empty();
 		AddGetFacts(get, current_catalog, facts, next_occurrence);
 		auto table_ref = get.GetTable();
 		if (table_ref.get()) {
@@ -422,20 +465,78 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
 		facts.windows.push_back(&op->Cast<LogicalWindow>());
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		facts.first_table_name[op] = first_table;
-		return first_table;
-	}
-	for (auto &child : op->children) {
-		string child_first =
-		    CollectCreateMVPlanFacts(child.get(), current_catalog, facts, next_occurrence, seen_agg_above, under_join);
+	vector<idx_t> child_ids;
+	child_ids.reserve(op->children.size());
+	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis) {
+		string child_first = CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above,
+		                                              under_join, redundant_distinct, child_analysis);
+		D_ASSERT(!facts.plan_nodes_post_order.empty());
+		child_ids.push_back(facts.plan_nodes_post_order.size() - 1);
 		if (first_table.empty()) {
 			first_table = std::move(child_first);
+		}
+	};
+	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		PlanAnalysis body_analysis;
+		if (!op->children.empty()) {
+			collect_child(op->children[0].get(), body_analysis);
+		}
+		if (op->children.size() >= 2) {
+			collect_child(op->children[1].get(), analysis);
+			MergeMaterializedCteBodyAnalysis(analysis, std::move(body_analysis));
+		}
+		for (idx_t i = 2; i < op->children.size(); i++) {
+			PlanAnalysis ignored_analysis;
+			collect_child(op->children[i].get(), ignored_analysis);
+		}
+	} else {
+		for (auto &child : op->children) {
+			collect_child(child.get(), analysis);
 		}
 	}
 	if (!first_table.empty()) {
 		facts.first_table_name[op] = first_table;
 	}
+	CreateMVPlanNodeFacts node_facts;
+	node_facts.plan_node = op;
+	node_facts.child_ids = std::move(child_ids);
+	const idx_t node_id = facts.plan_nodes_post_order.size();
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION || op->type == LogicalOperatorType::LOGICAL_UNION) {
+		node_facts.group_column_search_ids.push_back(node_id);
+	} else if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && node_facts.child_ids.size() >= 2) {
+		AppendUniqueValues(node_facts.group_column_search_ids,
+		                   facts.plan_nodes_post_order[node_facts.child_ids[1]].group_column_search_ids);
+		AppendUniqueValues(node_facts.group_column_search_ids,
+		                   facts.plan_nodes_post_order[node_facts.child_ids[0]].group_column_search_ids);
+	} else {
+		for (auto child_id : node_facts.child_ids) {
+			AppendUniqueValues(node_facts.group_column_search_ids,
+			                   facts.plan_nodes_post_order[child_id].group_column_search_ids);
+		}
+	}
+	for (auto child_id : node_facts.child_ids) {
+		auto &child_facts = facts.plan_nodes_post_order[child_id];
+		AppendUniqueValues(node_facts.subtree_table_indices, child_facts.subtree_table_indices);
+		AppendUniqueValues(node_facts.subtree_base_tables, child_facts.subtree_base_tables);
+		node_facts.subtree_base_tables_complete =
+		    node_facts.subtree_base_tables_complete && child_facts.subtree_base_tables_complete;
+		node_facts.contains_table_function = node_facts.contains_table_function || child_facts.contains_table_function;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		node_facts.subtree_table_indices.push_back(get.table_index);
+		string table_name = NullableGetTableName(get);
+		if (table_name.empty()) {
+			node_facts.subtree_base_tables_complete = false;
+		} else {
+			node_facts.subtree_base_tables.push_back(NormalizeNullableTableName(table_name));
+		}
+		node_facts.contains_table_function = !get.GetTable().get();
+	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		node_facts.subtree_base_tables_complete = false;
+	}
+	facts.plan_node_ids[op] = node_id;
+	facts.plan_nodes_post_order.push_back(std::move(node_facts));
 	return first_table;
 }
 
@@ -686,30 +787,25 @@ static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanF
 	return matched;
 }
 
-static bool FindGroupColumns(LogicalOperator *op, const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
+static bool FindGroupColumns(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
                              const vector<string> &output_names, vector<string> &group_names) {
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = op->Cast<LogicalProjection>();
-		return AddGroupColumnsFromProjection(proj, facts, group_index, group_count, output_names, group_names);
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_UNION) {
-		if (AddGroupColumnsFromBindings(*op, facts, group_index, group_count, output_names, group_names)) {
-			return true;
-		}
+	auto *root_facts = GetPlanNodeFacts(facts, facts.root);
+	if (!root_facts) {
 		return false;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-		if (op->children.size() >= 2) {
-			if (FindGroupColumns(op->children[1].get(), facts, group_index, group_count, output_names, group_names)) {
+	for (auto node_id : root_facts->group_column_search_ids) {
+		D_ASSERT(node_id < facts.plan_nodes_post_order.size());
+		auto *candidate = facts.plan_nodes_post_order[node_id].plan_node;
+		if (candidate->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			if (AddGroupColumnsFromProjection(candidate->Cast<LogicalProjection>(), facts, group_index, group_count,
+			                                  output_names, group_names)) {
 				return true;
 			}
-			return FindGroupColumns(op->children[0].get(), facts, group_index, group_count, output_names, group_names);
-		}
-		return false;
-	}
-	for (auto &child : op->children) {
-		if (FindGroupColumns(child.get(), facts, group_index, group_count, output_names, group_names)) {
-			return true;
+		} else {
+			D_ASSERT(candidate->type == LogicalOperatorType::LOGICAL_UNION);
+			if (AddGroupColumnsFromBindings(*candidate, facts, group_index, group_count, output_names, group_names)) {
+				return true;
+			}
 		}
 	}
 	return false;
@@ -721,7 +817,7 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t grou
 	if (AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
 		return group_names;
 	}
-	FindGroupColumns(facts.root, facts, group_index, group_count, output_names, group_names);
+	FindGroupColumns(facts, group_index, group_count, output_names, group_names);
 	return group_names;
 }
 
@@ -777,7 +873,7 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 		seen_aggregate = true;
 		if (include_this && !agg.groups.empty()) {
 			vector<string> nested_names;
-			if (FindGroupColumns(facts.root, facts, agg.group_index, agg.groups.size(), output_names, nested_names)) {
+			if (FindGroupColumns(facts, agg.group_index, agg.groups.size(), output_names, nested_names)) {
 				AddUniqueGroupNames(group_names, nested_names);
 			}
 		}
@@ -1079,22 +1175,9 @@ bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node) {
 	return true;
 }
 
-static bool HasDistinctOperator(const LogicalOperator &node) {
-	if (node.type == LogicalOperatorType::LOGICAL_DISTINCT) {
-		return true;
-	}
-	for (auto &child : node.children) {
-		if (HasDistinctOperator(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog) {
 	CreateMVPlanFacts facts;
 	facts.root = plan;
-	facts.analysis = AnalyzePlan(plan);
 	LogicalOperator *top = plan;
 	while (top && top->children.size() == 1 &&
 	       (top->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
@@ -1106,11 +1189,9 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 	facts.has_top_level_redundant_distinct =
 	    top && top->type == LogicalOperatorType::LOGICAL_DISTINCT && !top->children.empty() &&
 	    (ProducesAtMostOneRow(*top->children[0]) || IsRedundantDistinctOverGroupKeys(*top));
-	if (facts.has_top_level_redundant_distinct) {
-		facts.has_descendant_distinct = HasDistinctOperator(*top->children[0]);
-	}
 	unordered_map<string, idx_t> next_occurrence;
-	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false);
+	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false,
+	                         facts.has_top_level_redundant_distinct ? top : nullptr, facts.analysis);
 	FinalizeCreateMVPlanFacts(facts);
 	AddJoinEdgesFromFacts(facts);
 	return facts;
@@ -1274,6 +1355,8 @@ bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::Lef
 		out.table = source.table;
 		out.occurrence = source.occurrence;
 		out.column = source.column;
+		out.cardinality_transition_check_safe = facts.outer_join_count == 1 && join->conditions.size() == 1 &&
+		                                        join->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
 		return true;
 	}
 	return false;
@@ -1303,57 +1386,33 @@ static string NormalizeNullableTableName(const string &table_name) {
 	return StringUtil::Lower(last);
 }
 
-static void CollectNullableBaseTables(LogicalOperator *node, std::set<string> &out, bool &complete, int depth) {
-	if (!node || depth > 64) {
-		complete = false;
-		return;
-	}
-	if (node->type == LogicalOperatorType::LOGICAL_GET) {
-		string table_name = NullableGetTableName(node->Cast<LogicalGet>());
-		if (table_name.empty()) {
-			complete = false;
-			return;
-		}
-		out.insert(NormalizeNullableTableName(table_name));
-		return;
-	}
-	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
-		complete = false;
-		return;
-	}
-	for (auto &child : node->children) {
-		CollectNullableBaseTables(child.get(), out, complete, depth + 1);
-	}
-}
-
 bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out) {
 	out.tables.clear();
 	out.complete = true;
 	std::set<string> tables;
 	bool found_any = false;
-	vector<LogicalOperator *> stack;
-	if (facts.root) {
-		stack.push_back(facts.root);
-	}
-	while (!stack.empty()) {
-		auto *node = stack.back();
-		stack.pop_back();
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join && node->children.size() >= 2) {
-			if (join->join_type == JoinType::LEFT) {
-				found_any = true;
-				CollectNullableBaseTables(node->children[1].get(), tables, out.complete, 0);
-			} else if (join->join_type == JoinType::RIGHT) {
-				found_any = true;
-				CollectNullableBaseTables(node->children[0].get(), tables, out.complete, 0);
-			} else if (join->join_type == JoinType::OUTER) {
-				found_any = true;
-				CollectNullableBaseTables(node->children[0].get(), tables, out.complete, 0);
-				CollectNullableBaseTables(node->children[1].get(), tables, out.complete, 0);
-			}
+	for (auto *join : facts.outer_joins) {
+		if (!join || join->children.size() < 2) {
+			continue;
 		}
-		for (auto &child : node->children) {
-			stack.push_back(child.get());
+		auto add_nullable_child = [&](idx_t child_idx) {
+			auto *subtree = GetPlanNodeFacts(facts, join->children[child_idx].get());
+			if (!subtree) {
+				out.complete = false;
+				return;
+			}
+			tables.insert(subtree->subtree_base_tables.begin(), subtree->subtree_base_tables.end());
+			out.complete = out.complete && subtree->subtree_base_tables_complete;
+		};
+		found_any = true;
+		if (join->join_type == JoinType::LEFT) {
+			add_nullable_child(1);
+		} else if (join->join_type == JoinType::RIGHT) {
+			add_nullable_child(0);
+		} else {
+			D_ASSERT(join->join_type == JoinType::OUTER);
+			add_nullable_child(0);
+			add_nullable_child(1);
 		}
 	}
 	out.tables.assign(tables.begin(), tables.end());
@@ -1451,128 +1510,90 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 	return ResolveBindingToOccurrenceRefsInternal(binding, facts, out, 0);
 }
 
-static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVPlanFacts &facts,
-                                            vector<WindowEquivalenceEdge> &edges) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
+static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
+                                   vector<WindowEquivalenceEdge> &equivalence_edges,
+                                   vector<WindowLookupEdge> &lookup_edges) {
+	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    join.type != LogicalOperatorType::LOGICAL_ASOF_JOIN) {
+		return;
+	}
+	auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, string lookup_cast, OccurrenceColumnRef changed_ref,
+	                           string changed_cast) {
+		lookup_edges.push_back(
+		    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
+	};
+	for (auto &condition : join.conditions) {
+		if (condition.comparison != ExpressionType::COMPARE_EQUAL) {
+			continue;
+		}
+		string left_cast;
+		string right_cast;
+		auto *left = GetColumnRefThroughCasts(condition.left.get(), &left_cast);
+		auto *right = GetColumnRefThroughCasts(condition.right.get(), &right_cast);
+		if (!left || !right) {
+			continue;
+		}
+		OccurrenceColumnRef left_ref, right_ref;
+		if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, left_ref, left_cast, left->return_type) ||
+		    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, right_ref, right_cast, right->return_type)) {
+			continue;
+		}
+		switch (join.join_type) {
+		case JoinType::INNER:
+		case JoinType::LEFT:
+			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+			break;
+		case JoinType::RIGHT:
+			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+			break;
+		default:
+			break;
+		}
 		if (join.join_type == JoinType::INNER) {
-			for (auto &cond : join.conditions) {
-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-					continue;
-				}
-				string left_cast;
-				string right_cast;
-				auto *left = GetColumnRefThroughCasts(cond.left.get(), &left_cast);
-				auto *right = GetColumnRefThroughCasts(cond.right.get(), &right_cast);
-				if (!left || !right) {
-					continue;
-				}
-				OccurrenceColumnRef lref, rref;
-				if (ResolveBindingToOccurrenceRefWithCast(left->binding, facts, lref, left_cast, left->return_type) &&
-				    ResolveBindingToOccurrenceRefWithCast(right->binding, facts, rref, right_cast,
-				                                          right->return_type)) {
-					edges.push_back({std::move(lref), std::move(left_cast), std::move(rref), std::move(right_cast)});
-				}
-			}
+			equivalence_edges.push_back(
+			    {std::move(left_ref), std::move(left_cast), std::move(right_ref), std::move(right_cast)});
 		}
-	}
-	for (auto &child : op->children) {
-		CollectInnerJoinEdgesOccurrence(child.get(), facts, edges);
 	}
 }
 
-static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFacts &facts,
-                                     vector<WindowLookupEdge> &edges) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, string lookup_cast, OccurrenceColumnRef changed_ref,
-		                           string changed_cast) {
-			edges.push_back(
-			    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
-		};
-		for (auto &cond : join.conditions) {
-			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-				continue;
-			}
-			string left_cast;
-			string right_cast;
-			auto *left = GetColumnRefThroughCasts(cond.left.get(), &left_cast);
-			auto *right = GetColumnRefThroughCasts(cond.right.get(), &right_cast);
-			if (!left || !right) {
-				continue;
-			}
-			OccurrenceColumnRef lref, rref;
-			if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, lref, left_cast, left->return_type) ||
-			    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, rref, right_cast, right->return_type)) {
-				continue;
-			}
-			switch (join.join_type) {
-			case JoinType::INNER:
-				add_lookup_edge(lref, left_cast, rref, right_cast);
-				add_lookup_edge(rref, right_cast, lref, left_cast);
-				break;
-			case JoinType::LEFT:
-				add_lookup_edge(lref, left_cast, rref, right_cast);
-				add_lookup_edge(rref, right_cast, lref, left_cast);
-				break;
-			case JoinType::RIGHT:
-				add_lookup_edge(rref, right_cast, lref, left_cast);
-				add_lookup_edge(lref, left_cast, rref, right_cast);
-				break;
-			default:
-				break;
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectWindowLookupEdges(child.get(), facts, edges);
-	}
-}
-
-static void CollectWindowPartitionRefs(LogicalOperator *op, const CreateMVPlanFacts &facts,
+static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlanFacts &facts,
                                        const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
-	if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
-		auto &window = op->Cast<LogicalWindow>();
-		for (auto &expr : window.expressions) {
-			if (expr->expression_class != ExpressionClass::BOUND_WINDOW) {
+	for (auto &expression : window.expressions) {
+		if (expression->expression_class != ExpressionClass::BOUND_WINDOW) {
+			continue;
+		}
+		auto &window_expression = expression->Cast<BoundWindowExpression>();
+		for (auto &partition : window_expression.partitions) {
+			string partition_cast;
+			auto *column_ref = GetColumnRefThroughCasts(partition.get(), &partition_cast);
+			if (!column_ref) {
 				continue;
 			}
-			auto &win_expr = expr->Cast<BoundWindowExpression>();
-			for (auto &part : win_expr.partitions) {
-				string partition_cast;
-				auto *bcr = GetColumnRefThroughCasts(part.get(), &partition_cast);
-				if (!bcr) {
-					continue;
-				}
-				vector<OccurrenceColumnRef> refs;
-				if (!ResolveBindingToOccurrenceRefs(bcr->binding, facts, refs)) {
-					continue;
-				}
-				for (auto &ref : refs) {
-					for (auto &stored : partition_columns) {
-						auto pos = stored.find('=');
-						string output_col = pos == string::npos ? stored : stored.substr(0, pos);
-						string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
-						if (!StringUtil::CIEquals(source_col, ref.column)) {
-							continue;
-						}
-						WindowLineageOp op;
-						op.kind = "direct";
-						op.output_col = output_col;
-						op.source_table = ref.table;
-						op.source_occurrence = ref.occurrence;
-						op.source_col = ref.column;
-						op.source_cast = partition_cast;
-						direct_ops.push_back(std::move(op));
+			vector<OccurrenceColumnRef> refs;
+			if (!ResolveBindingToOccurrenceRefs(column_ref->binding, facts, refs)) {
+				continue;
+			}
+			for (auto &ref : refs) {
+				for (auto &stored : partition_columns) {
+					auto pos = stored.find('=');
+					string output_col = pos == string::npos ? stored : stored.substr(0, pos);
+					string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
+					if (!StringUtil::CIEquals(source_col, ref.column)) {
+						continue;
 					}
+					WindowLineageOp op;
+					op.kind = "direct";
+					op.output_col = output_col;
+					op.source_table = ref.table;
+					op.source_occurrence = ref.occurrence;
+					op.source_col = ref.column;
+					op.source_cast = partition_cast;
+					direct_ops.push_back(std::move(op));
 				}
 			}
 		}
-	}
-	for (auto &child : op->children) {
-		CollectWindowPartitionRefs(child.get(), facts, partition_columns, direct_ops);
 	}
 }
 
@@ -1637,13 +1658,14 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	if (!facts.root || partition_columns.empty()) {
 		return false;
 	}
-	auto *plan = facts.root;
 	if (facts.source_occurrences.empty()) {
 		return false;
 	}
 
 	vector<WindowLineageOp> direct_ops;
-	CollectWindowPartitionRefs(plan, facts, partition_columns, direct_ops);
+	for (auto *window : facts.windows) {
+		CollectWindowPartitionRefs(*window, facts, partition_columns, direct_ops);
+	}
 	if (direct_ops.empty()) {
 		return false;
 	}
@@ -1654,9 +1676,10 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	}
 
 	vector<WindowEquivalenceEdge> edges;
-	CollectInnerJoinEdgesOccurrence(plan, facts, edges);
 	vector<WindowLookupEdge> lookup_edges;
-	CollectWindowLookupEdges(plan, facts, lookup_edges);
+	for (auto *join : facts.comparison_joins) {
+		CollectWindowJoinEdges(*join, facts, edges, lookup_edges);
+	}
 
 	vector<WindowLineageOp> partition_ops;
 	for (auto &op : direct_ops) {
@@ -2022,54 +2045,22 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 	       fn_name == "arg_min" || fn_name == "arg_max";
 }
 
-bool QueryNeedsOriginalSqlForLpts(const string &query) {
-	string lower = StringUtil::Lower(query);
-	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
-}
-
-bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
+bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts) {
+	if (facts.has_pivot) {
 		return true;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto *agg = dynamic_cast<LogicalAggregate *>(op);
-		if (agg) {
-			for (auto &expr : agg->expressions) {
-				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
-					continue;
-				}
-				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-				if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
-					return true;
-				}
+	for (auto *aggregate : facts.aggregates) {
+		for (auto &expr : aggregate->expressions) {
+			if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+				continue;
+			}
+			auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+			if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
+				return true;
 			}
 		}
 	}
-	for (auto &child : op->children) {
-		if (PlanNeedsOriginalSqlForLpts(child.get())) {
-			return true;
-		}
-	}
 	return false;
-}
-
-LogicalAggregate *FindOuterAggregate(LogicalOperator *op) {
-	if (!op) {
-		return nullptr;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		return &op->Cast<LogicalAggregate>();
-	}
-	for (auto &child : op->children) {
-		auto *aggregate = FindOuterAggregate(child.get());
-		if (aggregate) {
-			return aggregate;
-		}
-	}
-	return nullptr;
 }
 
 bool IsPacLoaded(ClientContext &context) {
@@ -2090,33 +2081,7 @@ void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con) {
 	}
 }
 
-static bool SubtreeContainsComparisonJoin(LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (SubtreeContainsComparisonJoin(child.get())) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void CollectSubtreeTableIndices(LogicalOperator *op, std::set<idx_t> &out) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		out.insert(op->Cast<LogicalGet>().table_index);
-	}
-	for (auto &child : op->children) {
-		CollectSubtreeTableIndices(child.get(), out);
-	}
-}
+using LeftJoinInnerTableMap = unordered_map<const LogicalComparisonJoin *, std::set<idx_t>>;
 
 // Which base tables read as NULL in a null-padded row of join `oj`.
 //
@@ -2125,12 +2090,17 @@ static void CollectSubtreeTableIndices(LogicalOperator *op, std::set<idx_t> &out
 // So start from oj's inner subtree and close transitively over any join whose condition touches an
 // already-NULL table, adding that join's inner side. Aggregates over these tables contribute 0 to the
 // null-padded row; aggregates over the preserved side still contribute.
-static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts, LogicalComparisonJoin *oj) {
+static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts, LogicalComparisonJoin *oj,
+                                                 const LeftJoinInnerTableMap &inner_tables) {
 	std::set<idx_t> null_tables;
 	if (!oj || oj->children.size() != 2) {
 		return null_tables;
 	}
-	CollectSubtreeTableIndices(oj->children[1].get(), null_tables);
+	auto initial = inner_tables.find(oj);
+	if (initial == inner_tables.end()) {
+		return null_tables;
+	}
+	null_tables = initial->second;
 	bool changed = true;
 	while (changed) {
 		changed = false;
@@ -2138,8 +2108,9 @@ static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts,
 			if (other == oj || other->join_type != JoinType::LEFT || other->children.size() != 2) {
 				continue;
 			}
-			std::set<idx_t> other_inner;
-			CollectSubtreeTableIndices(other->children[1].get(), other_inner);
+			auto other_entry = inner_tables.find(other);
+			D_ASSERT(other_entry != inner_tables.end());
+			auto &other_inner = other_entry->second;
 			bool already_null = true;
 			for (auto idx : other_inner) {
 				if (!null_tables.count(idx)) {
@@ -2190,24 +2161,6 @@ static bool IsUnfilteredGetSubtree(LogicalOperator *op) {
 	return op && op->type == LogicalOperatorType::LOGICAL_GET && op->Cast<LogicalGet>().table_filters.filters.empty();
 }
 
-static bool ContainsCardinalityChangingFilter(LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
-		return true;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET && !op->Cast<LogicalGet>().table_filters.filters.empty()) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (ContainsCardinalityChangingFilter(child.get())) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static bool ColumnIsNotNull(LogicalGet &get, const string &column_name) {
 	auto table = get.GetTable();
 	if (!table.get() || !table.get()->ColumnExists(column_name)) {
@@ -2240,7 +2193,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// LogicalFilter above the join. Inspect the complete view plan as well as
 	// the local children; secondary transition counts are valid only when no
 	// additional cardinality predicate exists anywhere in this aggregate view.
-	if (ContainsCardinalityChangingFilter(facts.root)) {
+	if (facts.has_cardinality_changing_filter) {
 		return "";
 	}
 	// __newc below counts rows directly in the inner base table. A filter or any other
@@ -2505,6 +2458,18 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 	preserved_cols.clear();
 	string combined_sql;
 	vector<string> inner_tables, inner_keys, pres_tables, pres_keys;
+	LeftJoinInnerTableMap join_inner_tables;
+	for (auto *join : facts.comparison_joins) {
+		if (!join || join->join_type != JoinType::LEFT || join->children.size() != 2) {
+			continue;
+		}
+		auto *subtree = GetPlanNodeFacts(facts, join->children[1].get());
+		if (!subtree) {
+			return "";
+		}
+		join_inner_tables.emplace(
+		    join, std::set<idx_t>(subtree->subtree_table_indices.begin(), subtree->subtree_table_indices.end()));
+	}
 	size_t level = 0;
 	for (auto *oj : facts.comparison_joins) {
 		if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.empty() || oj->children.size() != 2) {
@@ -2513,7 +2478,7 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		// Every LEFT JOIN level gets a secondary, including the innermost one whose preserved side is a
 		// bare table -- see the note in BuildLeftJoinSecondaryForLevel for why the primary delta does
 		// NOT cover that case.
-		auto null_tables = ComputeNullTablesForLevel(facts, oj);
+		auto null_tables = ComputeNullTablesForLevel(facts, oj, join_inner_tables);
 		vector<string> level_preserved;
 		string it, ik, pt, pk;
 		string level_sql =

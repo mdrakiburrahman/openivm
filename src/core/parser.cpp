@@ -429,7 +429,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	add_create_profile_step("create_compile_full_plan", full_plan_start);
 
 	// Inline CTEs so create-MV facts see the folded structure.
-	InlineCtesIfPresent(context, *planner.binder, plan);
+	auto full_plan_rewrite_needs = InlineCtesIfPresent(context, *planner.binder, plan);
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
@@ -462,12 +462,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Inline CTEs without running the full optimizer, which can reshape plans
 		// before OpenIVM's structural rewrites.
 		auto select_rewrite_start = create_profile_now();
-		InlineCtesIfPresent(context, *select_planner.binder, select_plan);
-		auto pre_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
-		pre_rewrite_has_aggregate_filter = pre_rewrite_facts.has_bound_aggregate_filter;
+		auto select_rewrite_needs = InlineCtesIfPresent(context, *select_planner.binder, select_plan);
+		pre_rewrite_has_aggregate_filter = select_rewrite_needs.aggregate_filters;
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
-		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
+		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names, select_rewrite_needs);
 
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 		// Strip HAVING filter from plan — data table stores all groups.
@@ -477,13 +476,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// non-NULL state afterward so visible, wrapped, and HAVING-only SUMs all
 		// use the same output-index mapping during incremental maintenance.
 		InjectSumNonNullCounts(context, select_plan);
-		PropagateHiddenAggregateColumns(select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
-		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
-		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
-		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
-		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
-		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 
 		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 		{
@@ -536,8 +529,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			select_plan = std::move(select_plan->children[0]);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 		}
+		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
+		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
+		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
+		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
+		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 		if (select_plan) {
-			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, output_names);
+			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, post_rewrite_facts, output_names);
 		}
 		add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
 		                        "output_cols=" + to_string(output_names.size()));
@@ -567,7 +565,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			                    "original query: %s\n",
 			                    view_query.c_str());
 		}
-		if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
+		if (PlanNeedsOriginalSqlForLpts(post_rewrite_facts)) {
 			view_query = original_view_query;
 			lpts_fallback = true;
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — "
@@ -588,10 +586,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// sees CASE expressions instead of raw FILTER and doesn't set incremental_compatible=false.
 	// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
 	auto analysis_start = create_profile_now();
-	RewriteAggregateFilters(context, plan);
+	if (full_plan_rewrite_needs.aggregate_filters) {
+		RewriteAggregateFilters(context, plan);
+	}
 	// Fold uncorrelated constant scalar subqueries so the checker sees literals instead of the
 	// scalar-subquery guard's ungrouped first() aggregate. (PlanRewrite already did this for select_plan.)
-	FoldConstantScalarSubqueries(context, plan);
+	if (full_plan_rewrite_needs.fold_constant_scalar_subqueries) {
+		FoldConstantScalarSubqueries(context, plan);
+	}
 
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (!facts.source_table_info.empty()) {
@@ -823,12 +825,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				distinct_extracted_filter = std::move(d_filter);
 			}
 		}
-		// Walk the rewritten plan for the outer aggregate's expressions. v0 supports
+		// Inspect the outer aggregate collected by the existing plan-facts walk. v0 supports
 		// exactly one SUM(<arg>) — `openivm_count_star` (auto-injected by PlanRewrite)
 		// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
 		// demotes back to GROUP_RECOMPUTE.
 		if (!distinct_extracted_cols.empty()) {
-			LogicalAggregate *outer_agg = FindOuterAggregate(plan.get());
+			LogicalAggregate *outer_agg = facts.aggregates.empty() ? nullptr : facts.aggregates.front();
 			int sum_count = 0;
 			bool unsupported_agg = false;
 			if (outer_agg) {
@@ -985,6 +987,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	auto aggregate_columns = std::move(view_model.group_columns);
 	auto aggregate_types = std::move(view_model.aggregate_types);
 	auto window_partition_columns = std::move(view_model.window_partition_columns);
+	auto window_order_columns = std::move(view_model.window_order_columns);
 	bool has_minmax_metadata = view_model.has_minmax_metadata;
 	auto group_recompute_affected_mode = view_model.group_recompute_affected_mode;
 	auto group_recompute_source_occurrences = BuildGroupRecomputeSourceOccurrences(facts);
@@ -1115,6 +1118,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
 	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
+	string window_order_cols_val = SqlCsvLiteralOrNull(window_order_columns);
 	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)
 	                        ? "null"
@@ -1138,7 +1142,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	    "insert or replace into " + string(openivm::VIEWS_TABLE) +
 	    " (view_name, view_catalog, view_schema, sql_string, type, has_minmax, has_left_join, "
 	    "has_join, last_update, "
-	    "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
+	    "refresh_interval, refresh_in_progress, group_columns, window_order_columns, aggregate_types, "
 	    "having_predicate, group_recompute_affected_mode, "
 	    "group_recompute_source_occurrences_json, has_full_outer, "
 	    "full_outer_join_cols) values ('" +
@@ -1146,9 +1150,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	    SqlUtils::EscapeSingleQuotes(view_target_schema) + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 	    to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
 	    (analysis.found_left_join ? "true" : "false") + ", " + (analysis.found_join ? "true" : "false") + ", " +
-	    string(openivm::UTC_NOW_SQL) + ", " + refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " +
-	    having_val + ", " + group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
-	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
+	    string(openivm::UTC_NOW_SQL) + ", " + refresh_val + ", false, " + group_cols_val + ", " +
+	    window_order_cols_val + ", " + agg_types_val + ", " + having_val + ", " + group_recompute_mode_val + ", " +
+	    group_recompute_source_occurrences_val + ", " + (analysis.found_full_outer ? "true" : "false") + ", " +
+	    full_outer_join_cols_val + ")");
 
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));

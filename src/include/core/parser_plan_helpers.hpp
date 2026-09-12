@@ -17,6 +17,8 @@
 
 namespace duckdb {
 
+struct PlanRewriteNeeds;
+
 struct DuckLakeSourceTableInfo {
 	string table_name;
 	string catalog_name;
@@ -52,17 +54,30 @@ struct ProjectionLineageEdge {
 	OccurrenceColumnRef to;
 };
 
+struct CreateMVPlanNodeFacts {
+	LogicalOperator *plan_node = nullptr;
+	vector<idx_t> child_ids;
+	vector<idx_t> group_column_search_ids;
+	vector<idx_t> subtree_table_indices;
+	vector<string> subtree_base_tables;
+	bool subtree_base_tables_complete = true;
+	bool contains_table_function = false;
+};
+
 struct CreateMVPlanFacts {
 	LogicalOperator *root = nullptr;
+	vector<CreateMVPlanNodeFacts> plan_nodes_post_order;
+	idx_t max_table_index = 0;
 	PlanAnalysis analysis;
 	unordered_map<string, SourceTableInfo> source_table_info;
 	unordered_map<string, DuckLakeSourceTableInfo> ducklake_table_info;
 	LogicalProjection *first_projection = nullptr;
-	LogicalComparisonJoin *first_comparison_join = nullptr;
 	vector<LogicalProjection *> projections;
 	vector<LogicalAggregate *> aggregates;
 	vector<LogicalComparisonJoin *> comparison_joins;
+	vector<LogicalJoin *> outer_joins;
 	vector<LogicalWindow *> windows;
+	unordered_map<const LogicalOperator *, idx_t> plan_node_ids;
 	unordered_map<idx_t, LogicalProjection *> projections_by_index;
 	unordered_map<idx_t, LogicalGet *> gets_by_index;
 	unordered_map<idx_t, LogicalSetOperation *> setops_by_index;
@@ -82,7 +97,8 @@ struct CreateMVPlanFacts {
 	bool has_repeated_cte_ref_under_join = false;
 	bool has_pivot = false;
 	bool has_filter_above_aggregate = false;
-	bool has_bound_aggregate_filter = false;
+	bool has_cardinality_changing_filter = false;
+	idx_t outer_join_count = 0;
 	bool has_hidden_minmax_having_column = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	bool has_computed_sum_aggregate_projection = false;
@@ -92,7 +108,8 @@ struct CreateMVPlanFacts {
 
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
                        const vector<string> &output_col_names, bool include_limit = true);
-void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
+/// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
+PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
@@ -129,13 +146,11 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
                                RefreshMetadata::ProjectionKeyLineage &out);
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out);
 bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out);
-bool QueryNeedsOriginalSqlForLpts(const string &query);
-bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op);
+bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);
 vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names);
-LogicalAggregate *FindOuterAggregate(LogicalOperator *op);
 bool IsPacLoaded(ClientContext &context);
 void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con);
 
