@@ -676,9 +676,11 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 	// COALESCE is not a catalog scalar function -- it's a bound operator expression.
 	FunctionBinder fbinder(binder);
 	auto build_new_count = [&]() -> unique_ptr<Expression> {
-		auto coalesce_expr = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, count_type);
-		coalesce_expr->children.push_back(make_uniq<BoundColumnRefExpression>(count_type, base_count_binding));
-		coalesce_expr->children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
+		unique_ptr<Expression> coalesce_expr =
+		    make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, count_type);
+		auto &coalesce = coalesce_expr->Cast<BoundOperatorExpression>();
+		coalesce.children.push_back(make_uniq<BoundColumnRefExpression>(count_type, base_count_binding));
+		coalesce.children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
 		return coalesce_expr;
 	};
 	auto mul_as_count_type = BoundCastExpression::AddCastToType(
