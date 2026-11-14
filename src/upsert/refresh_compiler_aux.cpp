@@ -1121,7 +1121,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
                                 const string &left_delta_source, const string &right_delta_source,
                                 const string &left_last_update, const string &right_last_update,
                                 const string &catalog_prefix, bool null_aware, const string &null_aware_left_col,
-                                const string &null_aware_right_expr) {
+                                const string &null_aware_right_expr, bool emit_view_delta) {
 	if (left_cols.empty() || output_cols.empty() || aux_table.empty() || right_delta_source.empty() ||
 	    right_last_update.empty()) {
 		throw InternalException("CompileSemiAntiRecompute called with incomplete metadata for view '%s'", view_name);
@@ -1269,19 +1269,28 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	       "_old._visible IS DISTINCT FROM (" +
 	       cur_visible + ");\n\n";
 
-	sql += "WITH _old_rows AS (\n  SELECT " + output_old + " FROM " + SqlUtils::QuoteIdentifier(old_table) +
-	       " _old JOIN " + SqlUtils::QuoteIdentifier(aff_table) + " _aff ON " + aff_old_match +
-	       ", generate_series(1, _old._left_count::BIGINT)\n  WHERE _old._visible AND _old._left_count > 0" +
-	       "\n), "
+	string old_visible_rows =
+	    "SELECT " + output_old + " FROM " + SqlUtils::QuoteIdentifier(old_table) + " _old JOIN " +
+	    SqlUtils::QuoteIdentifier(aff_table) + " _aff ON " + aff_old_match +
+	    ", generate_series(1, _old._left_count::BIGINT)\n  WHERE _old._visible AND _old._left_count > 0";
+	string new_visible_rows =
+	    "SELECT " + output_cur + " FROM " + aux_q + " _cur JOIN " + SqlUtils::QuoteIdentifier(aff_table) +
+	    " _aff ON " + aff_cur_match + ", generate_series(1, _cur._left_count::BIGINT)\nWHERE " + cur_visible +
+	    " AND _cur._left_count > 0";
+	if (emit_view_delta) {
+		auto delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+		sql += BuildSignedMultisetDeltaInsertSQL(delta_table, "(" + old_visible_rows + ") openivm_old_visible",
+		                                        "(" + new_visible_rows + ") openivm_new_visible");
+	}
+
+	sql += "WITH _old_rows AS (\n  " + old_visible_rows + "\n), "
 	       "_net AS (\n  SELECT " +
 	       output_cols_csv + ", COUNT(*)::BIGINT AS _cnt FROM _old_rows GROUP BY " + output_cols_csv +
 	       "\n)\nDELETE FROM " + data_table + " WHERE rowid IN (\n  SELECT _v.rowid FROM (\n    SELECT rowid, " +
 	       output_cols_csv + ", ROW_NUMBER() OVER (PARTITION BY " + output_cols_csv + " ORDER BY rowid) AS _rn FROM " +
 	       data_table + "\n  ) _v JOIN _net _d ON " + data_match + " WHERE _v._rn <= _d._cnt\n);\n\n";
 
-	sql += "INSERT INTO " + data_table + " SELECT " + output_cur + "\nFROM " + aux_q + " _cur JOIN " +
-	       SqlUtils::QuoteIdentifier(aff_table) + " _aff ON " + aff_cur_match +
-	       ", generate_series(1, _cur._left_count::BIGINT)\nWHERE " + cur_visible + " AND _cur._left_count > 0;\n\n";
+	sql += "INSERT INTO " + data_table + " " + new_visible_rows + ";\n\n";
 
 	sql += "DELETE FROM " + aux_q + " WHERE _left_count <= 0;\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(old_table) + ";\nDROP TABLE IF EXISTS " +

@@ -141,7 +141,8 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
                                 const string &left_delta_source, const string &right_delta_source,
                                 const string &left_last_update, const string &right_last_update,
                                 const string &catalog_prefix = "", bool null_aware = false,
-                                const string &null_aware_left_col = "", const string &null_aware_right_expr = "");
+                                const string &null_aware_left_col = "", const string &null_aware_right_expr = "",
+                                bool emit_view_delta = false);
 string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &left_source, const string &left_alias,
                                       const string &right_source, const string &right_alias, const string &predicate,
                                       const string &post_filter, const string &right_filter,

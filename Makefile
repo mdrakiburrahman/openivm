@@ -14,6 +14,13 @@ test_release_internal: test_regular_nterm_compiled
 test_regular_nterm_compiled:
 	python3 test/integration/test_regular_nterm_compiled.py ./build/release/duckdb
 
+.PHONY: test_semi_anti_companion
+
+test_release_internal: test_semi_anti_companion
+
+test_semi_anti_companion:
+	python3 test/integration/test_semi_anti_companion.py ./build/release/duckdb
+
 .PHONY: test_scheduler_catalog
 
 test_release_internal: test_scheduler_catalog

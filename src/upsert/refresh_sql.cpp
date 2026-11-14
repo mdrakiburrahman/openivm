@@ -1236,7 +1236,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    right_input.table_sql, aux_meta.right_alias, aux_meta.predicate, aux_meta.post_filter,
 			    aux_meta.right_filter, aux_meta.left_cols, aux_meta.left_exprs, aux_meta.output_cols, left_delta,
 			    right_input.delta_sql, left_ts, right_input.last_update, internal_catalog_prefix, aux_meta.null_aware,
-			    aux_meta.null_aware_left_col, aux_meta.null_aware_right_expr);
+			    aux_meta.null_aware_left_col, aux_meta.null_aware_right_expr, active_facts.force_view_delta_cascade);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: SEMI_ANTI_RECOMPUTE (%s, %zu left cols)\n",
 			                    aux_meta.join_type.c_str(), aux_meta.left_cols.size());
 			break;
