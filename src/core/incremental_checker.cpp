@@ -1,4 +1,5 @@
 #include "core/incremental_checker.hpp"
+#include "core/spark_expression_marker.hpp"
 
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -74,7 +75,10 @@ static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
 				    func.function.name.rfind("__internal_decompress", 0) == 0 || func.function.name == "error") {
 					return;
 				}
-				if (func.function.GetStability() != FunctionStability::CONSISTENT) {
+				using ScalarCallback = void (*)(DataChunk &, ExpressionState &, Vector &);
+				const auto callback = func.function.GetFunctionCallback().target<ScalarCallback>();
+				if (func.function.GetStability() != FunctionStability::CONSISTENT &&
+				    (!callback || *callback != SparkExpressionMarker)) {
 					found_volatile = true;
 				}
 			}
