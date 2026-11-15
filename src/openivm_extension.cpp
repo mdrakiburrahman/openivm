@@ -128,8 +128,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterSparkScalarFunctions(loader);
 
-	db_config.AddExtensionOption("openivm_spark_expression_markers", "enable compiler-only opaque Spark expression markers",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_spark_expression_markers",
+	                             "enable compiler-only opaque Spark expression markers", LogicalType::BOOLEAN,
+	                             Value::BOOLEAN(false));
 	ScalarFunction marker("__openivm_spark_expression", {LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY,
 	                      SparkExpressionMarker, BindSparkExpressionMarker, nullptr, nullptr, LogicalType::ANY);
 	marker.SetStability(FunctionStability::VOLATILE);
