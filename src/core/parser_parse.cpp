@@ -52,19 +52,10 @@ static SqlDialect InputDialectFromInfo(ParserExtensionInfo *info) {
 static string PrepareMaterializedViewQuery(const string &query) {
 	auto tokens = Parser::Tokenize(query);
 	string prepared = query;
-	idx_t last_token = tokens.size();
-	for (idx_t i = 0; i < tokens.size(); i++) {
-		if (tokens[i].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
-			last_token = i;
-			continue;
-		}
-		auto end = i + 1 < tokens.size() ? tokens[i + 1].start : query.size();
-		prepared.replace(tokens[i].start, end - tokens[i].start, end - tokens[i].start, ' ');
-	}
 	// Only the final lexer-recognized terminator is syntax, not literal or identifier content.
-	if (last_token < tokens.size() && tokens[last_token].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR &&
-	    query[tokens[last_token].start] == ';') {
-		prepared.erase(tokens[last_token].start, 1);
+	if (!tokens.empty() && tokens.back().type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR &&
+	    query[tokens.back().start] == ';') {
+		prepared.erase(tokens.back().start, 1);
 	}
 	return prepared;
 }
@@ -109,6 +100,7 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
 	auto query_lower = SqlUtils::SQLToLowercase(PrepareMaterializedViewQuery(query));
 	StringUtil::Trim(query_lower);
+	SqlUtils::StripLineComments(query_lower);
 	SqlUtils::RemoveRedundantWhitespaces(query_lower);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL

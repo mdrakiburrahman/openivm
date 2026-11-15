@@ -564,16 +564,35 @@ void SqlUtils::RemoveRedundantWhitespaces(string &query) {
 void SqlUtils::StripLineComments(string &query) {
 	string out;
 	out.reserve(query.size());
-	bool in_string = false;
+	char quote = '\0';
+	idx_t block_depth = 0;
 	for (size_t i = 0; i < query.size(); ++i) {
 		char c = query[i];
-		if (c == '\'' && !in_string) {
-			in_string = true;
+		auto next = i + 1 < query.size() ? query[i + 1] : '\0';
+		if (quote != '\0') {
 			out += c;
-		} else if (c == '\'' && in_string) {
-			in_string = false;
+			if (c == quote && next == quote) {
+				out += query[++i];
+			} else if (c == quote) {
+				quote = '\0';
+			}
+		} else if (block_depth > 0) {
 			out += c;
-		} else if (!in_string && c == '-' && i + 1 < query.size() && query[i + 1] == '-') {
+			if (c == '/' && next == '*') {
+				block_depth++;
+				out += query[++i];
+			} else if (c == '*' && next == '/') {
+				block_depth--;
+				out += query[++i];
+			}
+		} else if (c == '\'' || c == '"' || c == '`') {
+			quote = c;
+			out += c;
+		} else if (c == '/' && next == '*') {
+			block_depth = 1;
+			out += c;
+			out += query[++i];
+		} else if (c == '-' && next == '-') {
 			// Skip to end of line, preserve the newline so downstream \s+ collapse still works
 			while (i < query.size() && query[i] != '\n') {
 				++i;
