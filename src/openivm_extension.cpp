@@ -134,6 +134,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction marker("__openivm_spark_expression", {LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY,
 	                      SparkExpressionMarker, BindSparkExpressionMarker, nullptr, nullptr, LogicalType::ANY);
 	marker.SetStability(FunctionStability::VOLATILE);
+	marker.SetFallible();
 	marker.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(marker);
 
