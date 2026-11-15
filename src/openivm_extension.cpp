@@ -133,7 +133,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             Value::BOOLEAN(false));
 	ScalarFunction marker("__openivm_spark_expression", {LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY,
 	                      SparkExpressionMarker, BindSparkExpressionMarker, nullptr, nullptr, LogicalType::ANY);
-	marker.SetStability(FunctionStability::VOLATILE);
+	// DuckDB rejects volatile window keys; a fallible marker cannot be folded into a value.
+	marker.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 	marker.SetFallible();
 	marker.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(marker);

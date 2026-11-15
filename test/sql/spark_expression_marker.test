@@ -61,7 +61,8 @@ WHERE refresh_type_name = 'AGGREGATE_HAVING' AND contains(sql, 'having_marker');
 statement ok
 CREATE MATERIALIZED VIEW marker_window AS
 SELECT id, ROW_NUMBER() OVER (
-  PARTITION BY __openivm_spark_expression('window_marker', NULL::VARCHAR, txt) ORDER BY id
+  PARTITION BY __openivm_spark_expression('window_marker', NULL::VARCHAR, txt)
+  ORDER BY __openivm_spark_expression('window_order_marker', NULL::INTEGER, id)
 ) rn FROM marker_source;
 
 query I
