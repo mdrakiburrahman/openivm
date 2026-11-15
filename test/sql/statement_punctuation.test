@@ -76,6 +76,7 @@ CREATE MATERIALIZED VIEW punct_invalid AS SELECT 1; SELECT FROM;
 Parser Error
 
 statement error
-CREATE MATERIALIZED VIEW punct_extra AS SELECT id FROM punct_source; SELECT 99;
+PRAGMA openivm_materialized_view_lifecycle(
+    'CREATE MATERIALIZED VIEW punct_extra AS SELECT id FROM punct_source; SELECT 99;');
 ----
 Expected exactly one materialized-view statement
