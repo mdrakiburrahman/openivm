@@ -49,6 +49,26 @@ static SqlDialect InputDialectFromInfo(ParserExtensionInfo *info) {
 	return materialized_view_info ? materialized_view_info->InputDialect() : SqlDialect::DUCKDB;
 }
 
+static string PrepareMaterializedViewQuery(const string &query) {
+	auto tokens = Parser::Tokenize(query);
+	string prepared = query;
+	idx_t last_token = tokens.size();
+	for (idx_t i = 0; i < tokens.size(); i++) {
+		if (tokens[i].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
+			last_token = i;
+			continue;
+		}
+		auto end = i + 1 < tokens.size() ? tokens[i + 1].start : query.size();
+		prepared.replace(tokens[i].start, end - tokens[i].start, end - tokens[i].start, ' ');
+	}
+	// Only the final lexer-recognized terminator is syntax, not literal or identifier content.
+	if (last_token < tokens.size() && tokens[last_token].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR &&
+	    query[tokens[last_token].start] == ';') {
+		prepared.erase(tokens[last_token].start, 1);
+	}
+	return prepared;
+}
+
 ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExtensionInfo *info, const string &query,
                                                                        ParserOptions &options) {
 	try {
@@ -87,12 +107,8 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 }
 
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
-	auto query_lower = SqlUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
+	auto query_lower = SqlUtils::SQLToLowercase(PrepareMaterializedViewQuery(query));
 	StringUtil::Trim(query_lower);
-	// Strip SQL line comments (-- to end of line) before whitespace normalization.
-	// RemoveRedundantWhitespaces collapses '\n' to ' ', which would turn
-	// "-- comment\n rest" into "-- comment rest" where the rest is eaten by the comment.
-	SqlUtils::StripLineComments(query_lower);
 	SqlUtils::RemoveRedundantWhitespaces(query_lower);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
@@ -167,6 +183,9 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 
 	Parser p;
 	p.ParseQuery(query_lower);
+	if (p.statements.size() != 1) {
+		throw ParserException("Expected exactly one materialized-view statement");
+	}
 
 	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
 	                                                                                      refresh_interval);

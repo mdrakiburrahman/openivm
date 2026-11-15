@@ -1,0 +1,81 @@
+# name: test/sql/statement_punctuation.test
+# description: Materialized-view parsing preserves punctuation in SQL tokens
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE punct_source (id INTEGER);
+
+statement ok
+INSERT INTO punct_source VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW punct_mv AS
+SELECT id, 'alpha; beta; gamma' AS coverage_scope,
+       'it''s;still;quoted' AS escaped_literal, 'left;middle;right' AS compact_literal
+FROM punct_source;
+
+query ITTT
+SELECT * FROM punct_mv ORDER BY id;
+----
+1	alpha; beta; gamma	it's;still;quoted	left;middle;right
+
+query II
+SELECT bool_and(refresh_type_name = 'SIMPLE_PROJECTION'),
+       bool_or(contains(sql, 'alpha; beta; gamma') AND contains(sql, 'left;middle;right'))
+FROM openivm_compile_with_facts('punct_mv', '{"target_dialect":"spark","compile_only":true}');
+----
+true	true
+
+statement ok
+INSERT INTO punct_source VALUES (2);
+
+statement ok
+PRAGMA refresh('punct_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM punct_mv EXCEPT ALL
+     SELECT id, 'alpha; beta; gamma', 'it''s;still;quoted', 'left;middle;right'
+     FROM punct_source)
+    UNION ALL
+    (SELECT id, 'alpha; beta; gamma', 'it''s;still;quoted', 'left;middle;right'
+     FROM punct_source EXCEPT ALL SELECT * FROM punct_mv)
+);
+----
+0
+
+statement ok
+CREATE TABLE "punct;source" ("id;value" INTEGER);
+
+statement ok
+INSERT INTO "punct;source" VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW "punct;comments" AS
+SELECT "id;value" AS id, '--;not a comment' AS "value;--quoted"
+/* outer ; ' -- /* nested ; */ still a comment ; */
+FROM "punct;source"; -- trailing ; '
+
+query IT
+SELECT * FROM "punct;comments" ORDER BY id;
+----
+1	--;not a comment
+2	--;not a comment
+
+statement ok
+ALTER MATERIALIZED VIEW "punct;comments" SET REFRESH MANUAL; -- ; '
+
+statement error
+CREATE MATERIALIZED VIEW punct_invalid AS SELECT 1; SELECT FROM;
+----
+Parser Error
+
+statement error
+CREATE MATERIALIZED VIEW punct_extra AS SELECT id FROM punct_source; SELECT 99;
+----
+Expected exactly one materialized-view statement
