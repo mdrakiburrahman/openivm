@@ -1245,10 +1245,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
 			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
 			                                              attached_db_schema_name);
-			upsert_query = CompileDistinctIncremental(
-			    view_name, aux_meta.aux_table, aux_meta.cols, aux_meta.source_exprs, source_input.delta_sql,
-			    source_input.last_update, aux_meta.filter, group_cols, aux_meta.sum_arg, aux_meta.sum_out,
-			    string(openivm::COUNT_STAR_COL), internal_catalog_prefix);
+			auto options = aggregate_options(false, insert_only);
+			// Tuple transitions already apply the source watermark and have no timestamp column.
+			options.delta_ts_filter.clear();
+			upsert_query = CompileDistinctIncremental(view_name, aux_meta.aux_table, aux_meta.cols,
+			                                          aux_meta.source_exprs, source_input.delta_sql,
+			                                          source_input.last_update, aux_meta.filter, aux_meta.sum_arg,
+			                                          aux_meta.sum_out, column_names, options, derived_output_info);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: "
 			                    "DISTINCT_INCREMENTAL (%zu distinct cols, "
 			                    "%zu group cols, sum_arg=%s, sum_out=%s)\n",

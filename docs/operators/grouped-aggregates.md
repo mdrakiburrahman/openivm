@@ -47,6 +47,10 @@ it does not rescan the source tables. Scalar aggregates update their raw state
 and then finalize the single output row. Plain AVG and variance outputs retain
 their existing specialized finalization.
 
+With `openivm_distinct_aux_state=true`, supported SUM outputs over an inner
+DISTINCT use the same finalization for grouped and scalar aggregates. The aux
+state emits signed tuple transitions before updating raw SUM/COUNT inputs.
+
 Recreate an affected MV created by an older compiler to initialize the hidden
 raw inputs required by this finalization.
 

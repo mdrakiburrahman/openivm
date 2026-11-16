@@ -129,15 +129,15 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 /// name), and `last_update` come from `openivm_views.distinct_aux_meta_json`.
 /// `filter_sql` is the WHERE predicate of the DISTINCT body (empty if none) —
 /// applied to both Δinput (filters delta rows that wouldn't have entered the
-/// DISTINCT) and the aux MERGE source. `group_columns` is the parent
-/// aggregate's GROUP BY; `sum_arg`/`sum_out` are the single-SUM argument and
-/// output column. `count_star_col` is the auto-injected `openivm_count_star`
-/// column name on the data table (almost always literal `openivm_count_star`).
+/// DISTINCT) and the aux MERGE source. Signed tuple transitions are projected
+/// onto raw SUM/COUNT inputs and integrated by the shared aggregate compilers.
+/// `sum_out` identifies the raw SUM output when metadata has no input lineage.
 string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
                                   const vector<string> &source_exprs, const string &delta_source,
-                                  const string &last_update, const string &filter_sql,
-                                  const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
-                                  const string &count_star_col, const string &catalog_prefix = "");
+                                  const string &last_update, const string &filter_sql, const string &sum_arg,
+                                  const string &sum_out, const vector<string> &column_names,
+                                  const AggregateGroupsOptions &options,
+                                  const DerivedAggregateOutputInfo &derived_outputs);
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
                                       const vector<string> &source_exprs, const string &source_relation,
                                       const string &filter_sql, bool replace);

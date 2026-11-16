@@ -1335,3 +1335,364 @@ SELECT COUNT(*) FROM ((SELECT * FROM distinct_switch_child EXCEPT ALL SELECT grp
 
 statement ok
 SET openivm_distinct_aux_state=false;
+
+# Computed outer SUM outputs must finalize after DISTINCT tuple transitions.
+# The aux path also preserves scalar empty-state and SUM's non-NULL counts.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE derived_distinct_source(id INT,k INT,v INT);
+
+statement ok
+INSERT INTO derived_distinct_source VALUES (1,1,10),(2,1,10),(3,2,NULL),(4,NULL,30),(5,2,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_add AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_add_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_mul AS SELECT k,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_mul_expected AS SELECT k,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_coalesce AS SELECT k,COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_coalesce_expected AS SELECT k,COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_mixed AS SELECT k,SUM(v) raw,SUM(v) duplicate,SUM(v)*2 a,COUNT(*)+1 n,
+struct_pack(total := SUM(v)) packed,'fixed' label
+FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_mixed_expected AS SELECT k,SUM(v) raw,SUM(v) duplicate,SUM(v)*2 a,COUNT(*)+1 n,
+struct_pack(total := SUM(v)) packed,'fixed' label
+FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_add AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_add_expected AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_mul AS SELECT SUM(v)*2 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_mul_expected AS SELECT SUM(v)*2 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_coalesce AS SELECT COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_coalesce_expected AS SELECT COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_mixed AS SELECT SUM(v) raw,SUM(v)*2 a,COUNT(*)+1 n,struct_pack(total := SUM(v)) packed
+FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_mixed_expected AS SELECT SUM(v) raw,SUM(v)*2 a,COUNT(*)+1 n,struct_pack(total := SUM(v)) packed
+FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_plain_group AS SELECT k,SUM(v) a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_plain_group_expected AS SELECT k,SUM(v) a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_plain_scalar AS SELECT SUM(v) a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_plain_scalar_expected AS SELECT SUM(v) a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+foreach variant group_mul scalar_coalesce
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_child_{variant} AS SELECT * FROM derived_distinct_{variant};
+
+endloop
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_distinct_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce
+
+query I
+SELECT CASE WHEN min(refresh_type)=8
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%WITH ddist AS (%'
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%struct_pack%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('derived_distinct_{variant}',
+    '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind='data';
+----
+1
+
+endloop
+
+# New groups and duplicate inserts exercise both MERGE branches.
+statement ok
+INSERT INTO derived_distinct_source VALUES (6,1,20),(7,3,40),(8,3,40),(9,4,NULL),(10,4,NULL);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# Consolidate conflicting operations and last-support deletions before one refresh.
+statement ok
+INSERT INTO derived_distinct_source VALUES (11,5,50),(12,1,10),(13,4,NULL);
+
+statement ok
+UPDATE derived_distinct_source SET v=20 WHERE id=1;
+
+statement ok
+UPDATE derived_distinct_source SET k=2,v=NULL WHERE id=4;
+
+statement ok
+DELETE FROM derived_distinct_source WHERE id IN (2,7,9,11,12);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# Full refresh rebuilds tuple support counts and raw aggregate state.
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+UPDATE derived_distinct_source SET v=50 WHERE id=8;
+
+statement ok
+INSERT INTO derived_distinct_source VALUES (14,6,60),(15,6,60);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM derived_distinct_source WHERE id IN (6,14);
+
+statement ok
+INSERT INTO derived_distinct_source VALUES (16,6,60),(17,1,NULL);
+
+statement ok
+UPDATE derived_distinct_source SET v=NULL WHERE id=15;
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM derived_distinct_source;
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# Scalar SUM remains one NULL row when empty, and can accept new tuples again.
+statement ok
+INSERT INTO derived_distinct_source VALUES (18,NULL,NULL),(19,1,7),(20,1,7);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_distinct_aux_state=false;
