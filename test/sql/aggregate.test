@@ -5558,7 +5558,35 @@ statement ok
 CREATE VIEW derived_expr_struct_update_expected AS
 SELECT k,struct_update(struct_pack(n := COUNT(*)),n := COUNT(*)+1) a FROM derived_expr_source GROUP BY k;
 
-foreach variant bit_group struct_group struct_nested struct_update
+# Keyword function names use ordinary function-call syntax when quoted.
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_position_group AS
+SELECT k,POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_position_group_expected AS
+SELECT k,POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_position_scalar AS
+SELECT POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source;
+
+statement ok
+CREATE VIEW derived_expr_position_scalar_expected AS
+SELECT POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source;
+
+# A type-field name is not a column reference, even when both are "select".
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_struct_cast AS
+SELECT k,COUNT(*) AS "select",CAST(struct_pack("select" := COUNT(*)) AS STRUCT("select" INTEGER)) a
+FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_struct_cast_expected AS
+SELECT k,COUNT(*) AS "select",CAST(struct_pack("select" := COUNT(*)) AS STRUCT("select" INTEGER)) a
+FROM derived_expr_source GROUP BY k;
+
+foreach variant bit_group struct_group struct_nested struct_update position_group struct_cast
 
 query I
 SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_{variant}';
@@ -5567,7 +5595,7 @@ SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_{variant}';
 
 endloop
 
-foreach variant bit_scalar struct_scalar
+foreach variant bit_scalar struct_scalar position_scalar
 
 query I
 SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_{variant}';
@@ -5591,7 +5619,7 @@ SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_sum';
 ----
 0
 
-foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
 
 query I
 SELECT count(*) FROM (
@@ -5609,7 +5637,7 @@ endloop
 statement ok
 INSERT INTO derived_expr_source VALUES(10,1,20,30,1),(11,2,5,6,NULL),(12,4,1,NULL,1),(13,4,2,NULL,2),(14,4,3,NULL,3);
 
-foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
 
 statement ok
 PRAGMA refresh('derived_expr_{variant}');
@@ -5642,7 +5670,7 @@ UPDATE derived_expr_source SET y=NULL,x=8 WHERE id=4;
 statement ok
 DELETE FROM derived_expr_source WHERE id IN(15,19) OR k=4;
 
-foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
 
 statement ok
 PRAGMA refresh('derived_expr_{variant}');
@@ -5669,7 +5697,7 @@ INSERT INTO derived_expr_source VALUES(20,1,25,50,NULL),(21,5,4,6,4);
 statement ok
 UPDATE derived_expr_source SET v=26 WHERE id=20;
 
-foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
 
 statement ok
 PRAGMA refresh('derived_expr_{variant}');
@@ -5694,7 +5722,7 @@ DELETE FROM derived_expr_source WHERE id=21;
 statement ok
 UPDATE derived_expr_source SET y=1 WHERE id=20;
 
-foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
 
 statement ok
 PRAGMA refresh('derived_expr_{variant}');
@@ -5713,7 +5741,7 @@ endloop
 statement ok
 DELETE FROM derived_expr_source;
 
-foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
 
 statement ok
 PRAGMA refresh('derived_expr_{variant}');

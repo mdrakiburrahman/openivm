@@ -2108,7 +2108,7 @@ struct OutputExpressionRenderer {
 						    SQLQuotedIdentifier::ToString(named_arguments[i - positional_count]) + " := " + children[i];
 					}
 				}
-				sql = name + "(" + StringUtil::Join(children, ", ") + ")";
+				sql = SQLIdentifier::ToString(name) + "(" + StringUtil::Join(children, ", ") + ")";
 			}
 			return true;
 		}

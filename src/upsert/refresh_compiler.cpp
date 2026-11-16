@@ -6,6 +6,7 @@
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_internal.hpp"
 
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -15,6 +16,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <limits>
 
@@ -179,62 +181,32 @@ static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
 
 static string SubstituteDerivedOutputColumns(const string &expression_sql,
                                              const unordered_map<string, string> &replacements) {
-	string result;
-	result.reserve(expression_sql.size());
-	for (idx_t i = 0; i < expression_sql.size();) {
-		if (expression_sql[i] == '\'') {
-			idx_t start = i++;
-			while (i < expression_sql.size()) {
-				if (expression_sql[i++] != '\'') {
-					continue;
-				}
-				if (i < expression_sql.size() && expression_sql[i] == '\'') {
-					i++;
-					continue;
-				}
-				break;
-			}
-			result.append(expression_sql, start, i - start);
-			continue;
-		}
-		if (expression_sql[i] != '"') {
-			result += expression_sql[i++];
-			continue;
-		}
-
-		idx_t start = i++;
-		string identifier;
-		bool closed = false;
-		while (i < expression_sql.size()) {
-			if (expression_sql[i] != '"') {
-				identifier += expression_sql[i++];
-				continue;
-			}
-			if (i + 1 < expression_sql.size() && expression_sql[i + 1] == '"') {
-				identifier += '"';
-				i += 2;
-				continue;
-			}
-			i++;
-			closed = true;
-			break;
-		}
-		if (!closed) {
-			result.append(expression_sql, start, expression_sql.size() - start);
-			break;
-		}
-		// Named argument labels are identifiers, but are not column references.
-		auto next_token = expression_sql.find_first_not_of(" \t\r\n", i);
-		if (next_token != string::npos && expression_sql.compare(next_token, 2, ":=") == 0) {
-			result.append(expression_sql, start, i - start);
-			continue;
-		}
-		auto replacement = replacements.find(identifier);
-		if (replacement != replacements.end()) {
-			result += replacement->second;
-		} else {
-			result.append(expression_sql, start, i - start);
-		}
+	const string prefix = "SELECT ";
+	auto parser = Parser::GetBuiltinParser();
+	parser.ParseQuery(prefix + expression_sql);
+	D_ASSERT(parser.statements.size() == 1);
+	auto &select = parser.statements[0]->Cast<SelectStatement>().node->Cast<SelectNode>();
+	D_ASSERT(select.select_list.size() == 1);
+	vector<pair<QueryLocation, const string *>> edits;
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(
+	    *select.select_list[0], [&](ColumnRefExpression &column) {
+		    if (column.IsQualified()) {
+			    return;
+		    }
+		    auto replacement = replacements.find(column.GetColumnName().GetIdentifierName());
+		    if (replacement != replacements.end()) {
+			    auto location = column.GetQueryLocation();
+			    D_ASSERT(location.IsValid() && location.length > 0 && location.Start() >= prefix.size());
+			    edits.emplace_back(location, &replacement->second);
+		    }
+	    });
+	// Only column-reference spans are replaced. Preserve named argument labels,
+	// type-field names, literals, and function syntax verbatim.
+	std::sort(edits.begin(), edits.end(),
+	          [](const auto &left, const auto &right) { return left.first.Start() > right.first.Start(); });
+	string result = expression_sql;
+	for (auto &edit : edits) {
+		result.replace(edit.first.Start() - prefix.size(), edit.first.length, "(" + *edit.second + ")");
 	}
 	return result;
 }
