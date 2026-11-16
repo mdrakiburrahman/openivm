@@ -197,6 +197,33 @@ void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
 
 namespace {
 
+static string RenderStoredExpressionForDialect(Connection &con, const string &expression_sql,
+                                               const string &source_table, const vector<string> &source_columns,
+                                               SqlDialect dialect, const unordered_map<string, string> &replacements) {
+	string rendered;
+	con.context->RunFunctionInTransaction([&]() {
+		Parser parser(*con.context);
+		// The explicit subquery preserves column order and types for the binding resolver.
+		parser.ParseQuery("SELECT " + expression_sql + " FROM (SELECT " + SqlUtils::JoinQuotedColumns(source_columns) +
+		                  " FROM " + source_table + ") openivm_state");
+		Planner planner(*con.context);
+		planner.CreatePlan(std::move(parser.statements[0]));
+		auto &projection = planner.plan->Cast<LogicalProjection>();
+		auto bindings = projection.children[0]->GetColumnBindings();
+		D_ASSERT(bindings.size() == source_columns.size());
+		LptsExpressionRenderer renderer(*con.context, dialect, [&](const ColumnBinding &binding, const char *) {
+			auto match = std::find(bindings.begin(), bindings.end(), binding);
+			D_ASSERT(match != bindings.end());
+			auto &column = source_columns[match - bindings.begin()];
+			auto replacement = replacements.find(column);
+			return replacement == replacements.end() ? DialectQuoteIdent(column, dialect)
+			                                         : "(" + replacement->second + ")";
+		});
+		rendered = renderer.ExpressionToAliasedString(*projection.expressions[0]);
+	});
+	return rendered;
+}
+
 static string RenderStoredViewQueryForDialect(Connection &con, const string &view_query_sql,
                                               const vector<string> &output_names, SqlDialect dialect,
                                               const openivm::TimeTravelPins &time_travel_pins) {
@@ -893,32 +920,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Rendering %zu derived aggregate outputs in the target dialect\n",
 		                    derived_output_info.outputs.size());
 		render_derived_output = [&](const string &expression_sql, const unordered_map<string, string> &replacements) {
-			auto state_columns = SqlUtils::WithoutMultiplicity(column_names);
-			string rendered;
-			con.context->RunFunctionInTransaction([&]() {
-				Parser parser(*con.context);
-				// The explicit subquery preserves column order and types for the binding resolver.
-				parser.ParseQuery("SELECT " + expression_sql + " FROM (SELECT " +
-				                  SqlUtils::JoinQuotedColumns(state_columns) + " FROM " + data_table +
-				                  ") openivm_state");
-				Planner planner(*con.context);
-				planner.CreatePlan(std::move(parser.statements[0]));
-				auto &projection = planner.plan->Cast<LogicalProjection>();
-				auto bindings = projection.children[0]->GetColumnBindings();
-				D_ASSERT(bindings.size() == state_columns.size());
-				LptsExpressionRenderer renderer(*con.context, active_facts.target_dialect,
-				                                [&](const ColumnBinding &binding, const char *) {
-					                                auto match = std::find(bindings.begin(), bindings.end(), binding);
-					                                D_ASSERT(match != bindings.end());
-					                                auto &column = state_columns[match - bindings.begin()];
-					                                auto replacement = replacements.find(column);
-					                                return replacement == replacements.end()
-					                                           ? DialectQuoteIdent(column, active_facts.target_dialect)
-					                                           : "(" + replacement->second + ")";
-				                                });
-				rendered = renderer.ExpressionToAliasedString(*projection.expressions[0]);
-			});
-			return rendered;
+			return RenderStoredExpressionForDialect(con, expression_sql, data_table,
+			                                        SqlUtils::WithoutMultiplicity(column_names),
+			                                        active_facts.target_dialect, replacements);
 		};
 	}
 	unordered_map<string, string> derived_output_expressions;
@@ -1248,10 +1252,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto options = aggregate_options(false, insert_only);
 			// Tuple transitions already apply the source watermark and have no timestamp column.
 			options.delta_ts_filter.clear();
-			upsert_query = CompileDistinctIncremental(view_name, aux_meta.aux_table, aux_meta.cols,
-			                                          aux_meta.source_exprs, source_input.delta_sql,
-			                                          source_input.last_update, aux_meta.filter, aux_meta.sum_arg,
-			                                          aux_meta.sum_out, column_names, options, derived_output_info);
+			std::function<string(const string &)> render_input_expression;
+			if (active_facts.target_dialect != SqlDialect::DUCKDB) {
+				render_input_expression = [&](const string &expression) {
+					return RenderStoredExpressionForDialect(con, expression, aux_table_sql(aux_meta.aux_table),
+					                                        aux_meta.cols, active_facts.target_dialect, {});
+				};
+			}
+			upsert_query =
+			    CompileDistinctIncremental(view_name, aux_meta, source_input.delta_sql, source_input.last_update,
+			                               column_names, options, derived_output_info, render_input_expression);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: "
 			                    "DISTINCT_INCREMENTAL (%zu distinct cols, "
 			                    "%zu group cols, sum_arg=%s, sum_out=%s)\n",

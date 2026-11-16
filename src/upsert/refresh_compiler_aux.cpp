@@ -848,12 +848,17 @@ string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<s
 	       ", count(*)::BIGINT AS _count FROM " + source_relation + filter + " GROUP BY " + group_list;
 }
 
-string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
-                                  const vector<string> &source_exprs, const string &delta_source,
-                                  const string &last_update, const string &filter_sql, const string &sum_arg,
-                                  const string &sum_out, const vector<string> &column_names,
-                                  const AggregateGroupsOptions &options,
-                                  const DerivedAggregateOutputInfo &derived_outputs) {
+string CompileDistinctIncremental(const string &view_name, const RefreshMetadata::DistinctAuxMeta &meta,
+                                  const string &delta_source, const string &last_update,
+                                  const vector<string> &column_names, const AggregateGroupsOptions &options,
+                                  const DerivedAggregateOutputInfo &derived_outputs,
+                                  const std::function<string(const string &)> &render_input_expression) {
+	auto &aux_table = meta.aux_table;
+	auto &distinct_cols = meta.cols;
+	auto &source_exprs = meta.source_exprs;
+	auto &filter_sql = meta.filter;
+	auto &sum_arg = meta.sum_arg;
+	auto &sum_out = meta.sum_out;
 	if (distinct_cols.empty() || sum_arg.empty() || sum_out.empty()) {
 		throw InternalException("CompileDistinctIncremental called with incomplete metadata for view '%s'", view_name);
 	}
@@ -894,15 +899,24 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	for (auto &input : derived_outputs.inputs) {
 		input_types[input.output_column] = input.aggregate_type;
 	}
+	unordered_map<string, string> group_expressions;
+	for (auto &group : meta.group_inputs) {
+		group_expressions[group.output_column] = group.expression_sql;
+	}
 	vector<string> projections;
-	for (auto &column : column_names) {
+	for (idx_t i = 0; i < column_names.size(); i++) {
+		auto &column = column_names[i];
 		if (options.derived_output_expressions.count(column)) {
 			continue;
 		}
 		string expression;
 		auto input = input_types.find(column);
 		if (std::find(group_columns.begin(), group_columns.end(), column) != group_columns.end()) {
-			expression = SqlUtils::QuoteIdentifier(column);
+			auto group = group_expressions.find(column);
+			expression = group == group_expressions.end() ? SqlUtils::QuoteIdentifier(column) : group->second;
+			if (render_input_expression) {
+				expression = render_input_expression(expression);
+			}
 		} else if (column == openivm::MULTIPLICITY_COL) {
 			expression = "dd";
 		} else if ((input != input_types.end() && input->second == "count_star") || column == openivm::COUNT_STAR_COL) {
@@ -911,7 +925,12 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 		           StringUtil::StartsWith(column, openivm::SUM_COUNT_COL_PREFIX)) {
 			expression = "CASE WHEN " + sum_arg_q + " IS NULL THEN 0 ELSE 1 END";
 		} else if ((input != input_types.end() && input->second == "sum") || column == sum_out) {
-			expression = sum_arg_q;
+			expression = meta.sum_input_expr.empty()
+			                 ? "CAST(" + sum_arg_q + " AS " + options.column_types.at(i).ToString() + ")"
+			                 : meta.sum_input_expr;
+			if (render_input_expression) {
+				expression = render_input_expression(expression);
+			}
 		} else {
 			throw InternalException("Unrecognized DISTINCT aggregate state column '%s'", column);
 		}

@@ -1416,6 +1416,34 @@ CREATE MATERIALIZED VIEW derived_distinct_plain_scalar AS SELECT SUM(v) a FROM (
 statement ok
 CREATE VIEW derived_distinct_plain_scalar_expected AS SELECT SUM(v) a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
 
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_renamed AS SELECT k AS renamed,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_renamed_expected AS SELECT k AS renamed,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_computed AS SELECT k+1 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k+1;
+
+statement ok
+CREATE VIEW derived_distinct_group_computed_expected AS SELECT k+1 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k+1;
+
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_projected AS SELECT k%2 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_projected_expected AS SELECT k%2 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_permuted AS SELECT SUM(v)*2 a,k AS renamed FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_permuted_expected AS SELECT SUM(v)*2 a,k AS renamed FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
 foreach variant group_mul scalar_coalesce
 
 statement ok
@@ -1423,7 +1451,7 @@ CREATE MATERIALIZED VIEW derived_distinct_child_{variant} AS SELECT * FROM deriv
 
 endloop
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
 
 query I
 SELECT type FROM openivm_views WHERE view_sql_name='derived_distinct_{variant}';
@@ -1441,7 +1469,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce
+foreach variant group_mul scalar_coalesce group_renamed group_computed group_projected group_permuted
 
 query I
 SELECT CASE WHEN min(refresh_type)=8
@@ -1460,7 +1488,7 @@ endloop
 statement ok
 INSERT INTO derived_distinct_source VALUES (6,1,20),(7,3,40),(8,3,40),(9,4,NULL),(10,4,NULL);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1505,7 +1533,7 @@ UPDATE derived_distinct_source SET k=2,v=NULL WHERE id=4;
 statement ok
 DELETE FROM derived_distinct_source WHERE id IN (2,7,9,11,12);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1547,7 +1575,7 @@ UPDATE derived_distinct_source SET v=50 WHERE id=8;
 statement ok
 INSERT INTO derived_distinct_source VALUES (14,6,60),(15,6,60);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1591,7 +1619,7 @@ INSERT INTO derived_distinct_source VALUES (16,6,60),(17,1,NULL);
 statement ok
 UPDATE derived_distinct_source SET v=NULL WHERE id=15;
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1626,7 +1654,7 @@ endloop
 statement ok
 DELETE FROM derived_distinct_source;
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1662,7 +1690,7 @@ endloop
 statement ok
 INSERT INTO derived_distinct_source VALUES (18,NULL,NULL),(19,1,7),(20,1,7);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1688,6 +1716,199 @@ SELECT count(*) FROM (
   (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
   UNION ALL
   (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# SUM inputs must be signed and widened before multiplying by tuple weights.
+statement ok
+CREATE TABLE distinct_typed_source(id INT,k INT,v INT,b BOOLEAN);
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (1,1,-2147483648,true),(2,1,1,true),(3,2,NULL,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_int_group AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_typed_int_group_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_int_scalar AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM distinct_typed_source) d;
+
+statement ok
+CREATE VIEW distinct_typed_int_scalar_expected AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM distinct_typed_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_bool_group AS SELECT k,SUM(b)+1 a FROM (SELECT DISTINCT k,b FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_typed_bool_group_expected AS SELECT k,SUM(b)+1 a FROM (SELECT DISTINCT k,b FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_bool_scalar AS SELECT SUM(b)+1 a FROM (SELECT DISTINCT b FROM distinct_typed_source) d;
+
+statement ok
+CREATE VIEW distinct_typed_bool_scalar_expected AS SELECT SUM(b)+1 a FROM (SELECT DISTINCT b FROM distinct_typed_source) d;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_typed_{variant}';
+----
+8
+
+query I
+SELECT CASE WHEN min(refresh_type)=8
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%HUGEINT%'
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST(%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('distinct_typed_{variant}',
+    '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind='data';
+----
+1
+
+endloop
+
+# Retracting INT_MIN must negate the widened SUM input, not an INT32 value.
+statement ok
+INSERT INTO distinct_typed_source VALUES (4,2,20,false),(5,3,30,false);
+
+statement ok
+UPDATE distinct_typed_source SET k=3,v=21 WHERE id=4;
+
+statement ok
+DELETE FROM distinct_typed_source WHERE id IN (1,5);
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (6,1,-2147483648,true),(7,1,-2147483648,true),(8,4,NULL,NULL);
+
+statement ok
+UPDATE distinct_typed_source SET v=22,b=false WHERE id=2;
+
+statement ok
+DELETE FROM distinct_typed_source WHERE id=6;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (9,1,-2147483648,true);
+
+statement ok
+UPDATE distinct_typed_source SET b=NULL WHERE id=4;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (10,5,2147483647,false);
+
+statement ok
+UPDATE distinct_typed_source SET k=1 WHERE id=10;
+
+statement ok
+DELETE FROM distinct_typed_source WHERE id IN (7,9);
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_typed_source;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (11,NULL,-2147483648,true),(12,NULL,NULL,NULL);
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
 );
 ----
 0

@@ -142,6 +142,8 @@ RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientCont
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names);
+void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanFacts &facts,
+                                     const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta);
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                                bool include_first_aggregate);

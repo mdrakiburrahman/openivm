@@ -2093,6 +2093,7 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Str("filter", m.filter, Presence::OPTIONAL); // empty without a WHERE clause
 	io.Str("sum_arg", m.sum_arg);
 	io.Str("sum_out", m.sum_out);
+	io.Str("sum_input_expr", m.sum_input_expr, Presence::OPTIONAL);
 }
 
 template <class IO>
@@ -2292,11 +2293,25 @@ string RefreshMetadata::DerivedAggregateOutputsToJson(const DerivedAggregateOutp
 }
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
-	return MetadataJson::Read(ReadViewString(view_name, "distinct_aux_meta_json"), out);
+	auto json = ReadViewString(view_name, "distinct_aux_meta_json");
+	if (!MetadataJson::Read(json, out)) {
+		return false;
+	}
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "group_inputs")) {
+		DerivedAggregateOutput input;
+		if (!MetadataJson::Read(object, input)) {
+			return false;
+		}
+		out.group_inputs.push_back(std::move(input));
+	}
+	return true;
 }
 
 string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
-	return MetadataJson::Write(meta);
+	MetadataJson::Writer writer;
+	Fields(writer, meta);
+	writer.Objects("group_inputs", WriteEach(meta.group_inputs));
+	return writer.Finish();
 }
 
 bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {

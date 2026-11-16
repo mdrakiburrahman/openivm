@@ -7,6 +7,7 @@
 #include "core/plan_rewrite_internal.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include "lpts_expression_renderer.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -1533,6 +1534,55 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex
 		}
 	}
 	return group_names;
+}
+
+void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanFacts &facts,
+                                     const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta) {
+	auto &aggregate = *facts.aggregates.front();
+	for (auto &expression : aggregate.expressions) {
+		auto &input = expression->Cast<BoundAggregateExpression>();
+		if (input.Function().GetName().GetIdentifierName() != "sum") {
+			continue;
+		}
+		// Boolean SUM counts true values. Use a signed numeric input before weighting;
+		// the other SUM inputs use their accumulator type to make negation safe.
+		auto type = input.GetChildren()[0]->GetReturnType().id() == LogicalTypeId::BOOLEAN ? LogicalType::BIGINT
+		                                                                                   : input.GetReturnType();
+		meta.sum_input_expr = "CAST(" + SqlUtils::QuoteIdentifier(meta.sum_arg) + " AS " + type.ToString() + ")";
+	}
+	auto group_cols = DeriveGroupColumnNames(facts, aggregate.group_index, aggregate.groups.size(), output_names);
+	if (group_cols.empty()) {
+		return;
+	}
+	LogicalDistinct *distinct = nullptr;
+	for (auto &node : facts.plan_nodes_post_order) {
+		if (node.plan_node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+			distinct = &node.plan_node->Cast<LogicalDistinct>();
+			break;
+		}
+	}
+	D_ASSERT(distinct);
+	auto bindings = distinct->GetColumnBindings();
+	D_ASSERT(bindings.size() == meta.cols.size());
+	LptsExpressionRenderer renderer(context, SqlDialect::DUCKDB, [&](const ColumnBinding &binding, const char *) {
+		auto match = std::find(bindings.begin(), bindings.end(), binding);
+		if (match != bindings.end()) {
+			return SqlUtils::QuoteIdentifier(meta.cols[match - bindings.begin()]);
+		}
+		if (binding.table_index == aggregate.group_index) {
+			return renderer.ExpressionToAliasedString(*aggregate.groups[binding.column_index]);
+		}
+		auto projection = facts.projections_by_index.find(binding.table_index);
+		D_ASSERT(projection != facts.projections_by_index.end());
+		return renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
+	});
+	for (auto &column : group_cols) {
+		auto name = std::find(output_names.begin(), output_names.end(), column);
+		D_ASSERT(name != output_names.end());
+		meta.group_inputs.push_back({column, renderer.ExpressionToAliasedString(
+		                                         *facts.first_projection->expressions[name - output_names.begin()])});
+	}
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu DISTINCT aggregate group expressions\n", meta.group_inputs.size());
 }
 
 static void AddUniqueGroupName(vector<string> &group_names, const string &new_name) {

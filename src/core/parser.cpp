@@ -923,6 +923,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                          distinct_extracted_filter,
 		                          distinct_sum_arg,
 		                          distinct_sum_out};
+		PopulateDistinctAggregateInputs(context, facts, output_names, distinct_aux_candidate);
 		model_input.distinct_aux_candidate = &distinct_aux_candidate;
 	}
 	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux_candidate;

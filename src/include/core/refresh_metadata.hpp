@@ -338,6 +338,8 @@ public:
 		string filter;
 		string sum_arg;
 		string sum_out;
+		vector<DerivedAggregateOutput> group_inputs;
+		string sum_input_expr;
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL

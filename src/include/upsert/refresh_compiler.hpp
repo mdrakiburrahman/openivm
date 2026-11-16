@@ -2,6 +2,7 @@
 #define REFRESH_COMPILER_HPP
 
 #include "core/derived_aggregate_output.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 #include "duckdb/execution/index/art/art.hpp"
@@ -132,12 +133,11 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 /// DISTINCT) and the aux MERGE source. Signed tuple transitions are projected
 /// onto raw SUM/COUNT inputs and integrated by the shared aggregate compilers.
 /// `sum_out` identifies the raw SUM output when metadata has no input lineage.
-string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
-                                  const vector<string> &source_exprs, const string &delta_source,
-                                  const string &last_update, const string &filter_sql, const string &sum_arg,
-                                  const string &sum_out, const vector<string> &column_names,
-                                  const AggregateGroupsOptions &options,
-                                  const DerivedAggregateOutputInfo &derived_outputs);
+string CompileDistinctIncremental(const string &view_name, const RefreshMetadata::DistinctAuxMeta &meta,
+                                  const string &delta_source, const string &last_update,
+                                  const vector<string> &column_names, const AggregateGroupsOptions &options,
+                                  const DerivedAggregateOutputInfo &derived_outputs,
+                                  const std::function<string(const string &)> &render_input_expression = {});
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
                                       const vector<string> &source_exprs, const string &source_relation,
                                       const string &filter_sql, bool replace);
