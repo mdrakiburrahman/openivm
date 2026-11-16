@@ -223,6 +223,12 @@ static string SubstituteDerivedOutputColumns(const string &expression_sql,
 			result.append(expression_sql, start, expression_sql.size() - start);
 			break;
 		}
+		// Named argument labels are identifiers, but are not column references.
+		auto next_token = expression_sql.find_first_not_of(" \t\r\n", i);
+		if (next_token != string::npos && expression_sql.compare(next_token, 2, ":=") == 0) {
+			result.append(expression_sql, start, i - start);
+			continue;
+		}
 		auto replacement = replacements.find(identifier);
 		if (replacement != replacements.end()) {
 			result += replacement->second;
@@ -801,6 +807,15 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 
 	string merge_source = "refresh_cte";
 	if (!quoted_derived_output_expressions.empty()) {
+		// SUM(delta) can widen COUNT's BIGINT state to HUGEINT. Finalize with
+		// the stored input types so type-sensitive functions keep their semantics.
+		for (idx_t i = 0; i < column_names.size() && i < options.column_types.size(); i++) {
+			auto input = updated_column_expressions.find(column_names[i]);
+			if (input != updated_column_expressions.end() && !keys_set.count(column_names[i]) &&
+			    options.column_types[i].id() == LogicalTypeId::BIGINT) {
+				input->second = "CAST(" + input->second + " AS BIGINT)";
+			}
+		}
 		string group_count;
 		for (auto &input : col_agg_type) {
 			if (input.second == "count_star") {

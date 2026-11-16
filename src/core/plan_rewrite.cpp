@@ -2092,6 +2092,22 @@ struct OutputExpressionRenderer {
 			} else if (is_operator && children.size() == 1) {
 				sql = "(" + name + " " + children[0] + ")";
 			} else {
+				// As in LPTS, named STRUCT fields come from the return type.
+				bool named_struct = (name == "struct_pack" || name == "row") &&
+				                    function.GetReturnType().id() == LogicalTypeId::STRUCT &&
+				                    !StructType::IsUnnamed(function.GetReturnType());
+				const auto &named_arguments = function.Function().GetNamedArguments();
+				auto positional_count = function.Function().GetPositionalArgumentCount();
+				for (idx_t i = 0; i < children.size(); i++) {
+					if (named_struct) {
+						children[i] =
+						    SQLQuotedIdentifier::ToString(StructType::GetChildName(function.GetReturnType(), i)) +
+						    " := " + children[i];
+					} else if (i >= positional_count && i - positional_count < named_arguments.size()) {
+						children[i] =
+						    SQLQuotedIdentifier::ToString(named_arguments[i - positional_count]) + " := " + children[i];
+					}
+				}
 				sql = name + "(" + StringUtil::Join(children, ", ") + ")";
 			}
 			return true;
