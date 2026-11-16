@@ -505,6 +505,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		auto select_rewrite_start = create_profile_now();
 		auto select_rewrite_needs = InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 		pre_rewrite_has_aggregate_filter = select_rewrite_needs.aggregate_filters;
+		auto decomposed_outputs = DirectDecomposedAggregateOutputs(*select_plan, select_output_names);
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_output_names, select_rewrite_needs);
@@ -514,6 +515,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
 		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
+		InjectDerivedAggregateInputs(select_plan);
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
@@ -525,7 +527,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
 		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 		if (select_plan) {
-			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, post_rewrite_facts, output_names);
+			derived_aggregate_outputs =
+			    ExtractDerivedAggregateOutputs(*select_plan, post_rewrite_facts, output_names, decomposed_outputs);
+			has_computed_sum_aggregate_projection &= !derived_aggregate_outputs.complete;
 		}
 		add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
 		                        "output_cols=" + to_string(output_names.size()));

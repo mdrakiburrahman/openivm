@@ -888,7 +888,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto derived_output_info = metadata.GetDerivedAggregateOutputs(view_name);
 	unordered_map<string, string> derived_output_expressions;
 	for (auto &output : derived_output_info.outputs) {
-		derived_output_expressions[output.output_column] = output.expression_sql;
+		if (std::find(group_cols.begin(), group_cols.end(), output.output_column) == group_cols.end()) {
+			derived_output_expressions[output.output_column] = output.expression_sql;
+		}
 	}
 	bool has_unstripped_having =
 	    view_query_type == RefreshType::AGGREGATE_HAVING && metadata.GetHavingPredicate(view_name).empty();
@@ -950,6 +952,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                                    dispatch_refresh_type == RefreshType::AGGREGATE_GROUP &&
 		                                    active_facts.target_dialect == SqlDialect::DUCKDB;
 		options.aggregate_types = agg_types;
+		options.aggregate_inputs = derived_output_info.inputs;
+		options.derived_output_expressions = derived_output_expressions;
+		options.derived_output_expressions_complete = derived_output_info.complete;
 		options.column_types = column_types;
 		return options;
 	};
@@ -1090,8 +1095,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				options.cascade_delta_specs = &aggregate_recompute_delta_specs;
 			}
 			options.inline_cascade_delta = inline_merge_cascade;
-			options.derived_output_expressions = std::move(derived_output_expressions);
-			options.derived_output_expressions_complete = derived_output_info.complete;
 			options.preserved_side_cols = std::move(ljsec.preserved_cols);
 			options.force_group_recompute = force_lj_group_recompute;
 			upsert_query = CompileAggregateGroups(view_name, column_names, options, &aggregate_outcome);
@@ -1154,7 +1157,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.threshold_sql.c_str());
 		} else {
 			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, delta_ts_filter,
-			                                       internal_catalog_prefix, column_types);
+			                                       internal_catalog_prefix, column_types, derived_output_info);
 		}
 		break;
 	}
@@ -1375,8 +1378,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Split-safe full-refresh post-companion: %s\n", post_companion.c_str());
 	};
 	auto build_affected_snapshot_companion = [&](const vector<string> &keys) {
-		auto signed_delta = BuildAffectedGroupSignedDelta(data_table, delta_view_name, keys, column_names,
-		                                                  delta_ts_filter, view_name, /*persistent_scratch=*/false);
+		auto signed_delta = BuildAffectedGroupSignedDelta(
+		    data_table, delta_view_name, keys, column_names, delta_ts_filter, view_name,
+		    active_facts.force_view_delta_cascade && !derived_output_expressions.empty() &&
+		        active_facts.target_dialect == SqlDialect::SPARK);
 		companion_query = std::move(signed_delta.snapshot);
 		post_companion = std::move(signed_delta.publish);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Affected companion query:\n%s\n", companion_query.c_str());
@@ -1484,7 +1489,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			//     table fresh per refresh, so the TEMP TABLE scratch does
 			//     not survive across the split. NULLs in non-key columns
 			//     rely on SUM(NULL)=NULL preservation downstream.
-			if (!active_facts.force_view_delta_cascade) {
+			if (!active_facts.force_view_delta_cascade || !derived_output_expressions.empty()) {
 				build_affected_snapshot_companion(group_cols);
 			} else {
 				unordered_set<string> keys_set(group_cols.begin(), group_cols.end());

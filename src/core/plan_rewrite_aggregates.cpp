@@ -397,7 +397,12 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 		if (d.kind == DecompKind::AVG) {
 			auto sum_ref = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
 			auto count_ref = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-			return opt.BindScalarFunction("/", std::move(sum_ref), std::move(count_ref));
+			auto formula = opt.BindScalarFunction("/", std::move(sum_ref), std::move(count_ref));
+			auto present = BoundComparisonExpression::Create(
+			    ExpressionType::COMPARE_GREATERTHAN, make_uniq<BoundColumnRefExpression>(count_type, count_binding),
+			    make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
+			auto empty = make_uniq<BoundConstantExpression>(Value(formula->GetReturnType()));
+			return make_uniq<BoundCaseExpression>(std::move(present), std::move(formula), std::move(empty));
 		}
 		ColumnBinding sum_sq_binding = agg_bindings[group_count + d.sum_sq_idx];
 		LogicalType sum_sq_type = agg_types[group_count + d.sum_sq_idx];
@@ -415,6 +420,8 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 			denom = opt.BindScalarFunction("-", std::move(n), make_uniq<BoundConstantExpression>(Value::BIGINT(1)));
 		}
 		auto var_expr = opt.BindScalarFunction("/", std::move(numerator), std::move(denom));
+		var_expr = opt.BindScalarFunction("greatest", std::move(var_expr),
+		                                  make_uniq<BoundConstantExpression>(Value::DOUBLE(0)));
 		auto formula =
 		    IsStddevVariant(d.func_name) ? opt.BindScalarFunction("sqrt", std::move(var_expr)) : std::move(var_expr);
 		int64_t threshold = IsPopulationVariant(d.func_name) ? 0 : 1;

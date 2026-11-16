@@ -333,7 +333,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Extracted publication modifiers: %s\n", suffix.c_str());
 }
 
-static bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
+bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
 	const auto &name = aggregate.Function().GetName().GetIdentifierName();
 	return name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" || name == "variance" ||
 	       name == "var_samp" || name == "var_pop";

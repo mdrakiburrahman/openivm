@@ -18,6 +18,8 @@
 namespace duckdb {
 
 struct PlanRewriteNeeds;
+class BoundAggregateExpression;
+bool IsDerivedAggregate(const BoundAggregateExpression &aggregate);
 class Planner;
 
 // Compiler-only source boundary; generated columns retain their logical identity.

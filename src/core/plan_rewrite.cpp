@@ -1136,6 +1136,63 @@ static bool IsHiddenAggregateAlias(const string &alias) {
 	       alias.find(openivm::SUM_COUNT_COL_PREFIX) == 0;
 }
 
+void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan) {
+	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
+	});
+	auto *aggregate = SpineAggregate(spine);
+	if (!aggregate || spine.projections.empty()) {
+		return;
+	}
+	unordered_map<TableIndex, LogicalProjection *> projections;
+	for (auto *projection : spine.projections) {
+		projections.emplace(projection->table_index, projection);
+	}
+	column_binding_set_t visited;
+	vector<ColumnBinding> inputs;
+	std::function<void(const Expression &)> collect = [&](const Expression &expression) {
+		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
+			if (!visited.insert(binding).second) {
+				return;
+			}
+			if (binding.table_index == aggregate->aggregate_index) {
+				inputs.push_back(binding);
+			} else {
+				auto projection = projections.find(binding.table_index);
+				if (projection != projections.end()) {
+					collect(*projection->second->expressions[binding.column_index]);
+				}
+			}
+			return;
+		}
+		ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) { collect(child); });
+	};
+	for (auto &expression : spine.projections.front()->expressions) {
+		collect(*expression);
+	}
+	bool changed = false;
+	for (auto binding : inputs) {
+		auto &expression = aggregate->expressions[binding.column_index]->Cast<BoundAggregateExpression>();
+		const auto &name = expression.Function().GetName().GetIdentifierName();
+		if (expression.IsDistinct() || (name != "count_star" && name != "count" && name != "sum")) {
+			continue;
+		}
+		// A projected expression is not additive, but its SUM/COUNT inputs are.
+		// Reuse published raw inputs; retain hidden state only when a projection consumes them.
+		string alias = name == "count_star" ? string(openivm::COUNT_STAR_COL)
+		                                    : "openivm_aggregate_input_" + to_string(binding.column_index.GetIndex());
+		changed |= PropagateHiddenBindingThroughProjectionPath(spine.projections, binding, expression.GetReturnType(),
+		                                                       alias, true);
+	}
+	if (changed) {
+		plan->ResolveOperatorTypes();
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Exposed raw SUM/COUNT inputs for derived aggregate outputs\n");
+	}
+}
+
 /// Propagate hidden aggregate columns (openivm_sum_*, openivm_count_*, …) added
 /// by DecomposeAvgStddev up through any chain of pass-through PROJECTIONs that
 /// sits between the decomposed projection and the plan root.
@@ -1944,14 +2001,12 @@ namespace {
 /// column references; other bindings are inlined through `projections`.
 struct OutputExpressionRenderer {
 	OutputExpressionRenderer(const column_binding_map_t<string> &binding_to_column,
-	                         const DerivedOutputProjectionMap &projections, bool allow_functions, bool having = false)
-	    : binding_to_column(binding_to_column), projections(projections), allow_functions(allow_functions),
-	      having(having) {
+	                         const DerivedOutputProjectionMap &projections, bool having = false)
+	    : binding_to_column(binding_to_column), projections(projections), having(having) {
 	}
 
 	const column_binding_map_t<string> &binding_to_column;
 	const DerivedOutputProjectionMap &projections;
-	bool allow_functions;
 	// HAVING predicates also render IN-lists and aggregate references, and fall back to the expression's own text for
 	// anything else that cannot be rendered.
 	bool having;
@@ -2026,12 +2081,16 @@ struct OutputExpressionRenderer {
 			}
 			auto &function = expr.Cast<BoundFunctionExpression>();
 			vector<string> children;
-			if (!allow_functions || !RenderAll(function.GetChildren(), 0, children)) {
+			const auto &name = function.Function().GetName().GetIdentifierName();
+			bool is_operator =
+			    function.IsOperator() || name == "+" || name == "-" || name == "*" || name == "/" || name == "%";
+			if (!RenderAll(function.GetChildren(), 0, children)) {
 				return false;
 			}
-			const auto &name = function.Function().GetName().GetIdentifierName();
-			if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
+			if (is_operator && children.size() == 2) {
 				sql = "(" + children[0] + " " + name + " " + children[1] + ")";
+			} else if (is_operator && children.size() == 1) {
+				sql = "(" + name + " " + children[0] + ")";
 			} else {
 				sql = name + "(" + StringUtil::Join(children, ", ") + ")";
 			}
@@ -2070,6 +2129,14 @@ struct OutputExpressionRenderer {
 		}
 		case ExpressionClass::BOUND_OPERATOR: {
 			auto &op = expr.Cast<BoundOperatorExpression>();
+			if (expr.GetExpressionType() == ExpressionType::OPERATOR_COALESCE) {
+				vector<string> children;
+				if (!RenderAll(op.GetChildren(), 0, children)) {
+					return false;
+				}
+				sql = "COALESCE(" + StringUtil::Join(children, ", ") + ")";
+				return true;
+			}
 			if (having &&
 			    (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
 			     expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) &&
@@ -2122,6 +2189,37 @@ struct OutputExpressionRenderer {
 
 } // namespace
 
+vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vector<string> &output_names) {
+	auto spine = FindOutputSpine(&plan, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
+	});
+	auto *aggregate = SpineAggregate(spine);
+	if (!aggregate) {
+		return {};
+	}
+	DerivedOutputProjectionMap projections;
+	for (auto *projection : spine.projections) {
+		projections.emplace(projection->table_index, projection);
+	}
+	vector<string> names;
+	auto bindings = plan.GetColumnBindings();
+	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
+		BoundColumnRefExpression output(LogicalType::SQLNULL, bindings[i]);
+		auto expression = ResolveDerivedOutputPassThrough(output, projections);
+		if (!expression || expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto binding = expression->Cast<BoundColumnRefExpression>().Binding();
+		if (binding.table_index == aggregate->aggregate_index &&
+		    IsDerivedAggregate(aggregate->expressions[binding.column_index]->Cast<BoundAggregateExpression>())) {
+			names.push_back(output_names[i]);
+		}
+	}
+	return names;
+}
+
 bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
                                 const vector<string> &output_names, string &sql) {
 	DerivedOutputProjectionMap projections;
@@ -2161,11 +2259,12 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 			}
 		}
 	}
-	return OutputExpressionRenderer(binding_to_column, projections, true).Render(expression, sql);
+	return OutputExpressionRenderer(binding_to_column, projections).Render(expression, sql);
 }
 
 DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,
-                                                          const vector<string> &output_names) {
+                                                          const vector<string> &output_names,
+                                                          const vector<string> &decomposed_outputs) {
 	DerivedAggregateOutputInfo info;
 	if (plan.type != LogicalOperatorType::LOGICAL_PROJECTION || plan.children.empty() || facts.aggregates.empty()) {
 		info.complete = true;
@@ -2192,13 +2291,24 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 			for (auto key : binding_path) {
 				binding_to_column[key] = output_names[i];
 			}
+			auto binding = resolved->Cast<BoundColumnRefExpression>().Binding();
+			for (auto *aggregate : facts.aggregates) {
+				if (binding.table_index == aggregate->aggregate_index &&
+				    binding.column_index < aggregate->expressions.size()) {
+					auto &input = aggregate->expressions[binding.column_index]->Cast<BoundAggregateExpression>();
+					info.inputs.push_back({output_names[i], input.Function().GetName().GetIdentifierName()});
+					break;
+				}
+			}
 		}
 	}
-	OutputExpressionRenderer renderer(binding_to_column, projections, false);
+	OutputExpressionRenderer renderer(binding_to_column, projections);
 	for (idx_t i = 0; i < resolved_expressions.size(); i++) {
 		auto &expression = *resolved_expressions[i];
 		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
-		    IncrementalTableNames::IsInternalColumn(output_names[i])) {
+		    IncrementalTableNames::IsInternalColumn(output_names[i]) ||
+		    std::find(decomposed_outputs.begin(), decomposed_outputs.end(), output_names[i]) !=
+		        decomposed_outputs.end()) {
 			continue;
 		}
 		string expression_sql;
@@ -2213,6 +2323,9 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 		}
 	}
 	info.complete = true;
+	if (info.outputs.empty()) {
+		info.inputs.clear();
+	}
 	return info;
 }
 
@@ -2344,7 +2457,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 
 	// Extract HAVING predicate as SQL.
 	DerivedOutputProjectionMap no_projections;
-	OutputExpressionRenderer renderer(binding_to_alias, no_projections, true, true);
+	OutputExpressionRenderer renderer(binding_to_alias, no_projections, true);
 	string having_sql;
 	for (idx_t i = 0; i < filter.expressions.size(); i++) {
 		string predicate_sql;

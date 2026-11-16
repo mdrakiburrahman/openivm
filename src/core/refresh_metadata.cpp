@@ -2072,6 +2072,12 @@ static void Fields(IO &io, typename IO::template Field<DerivedAggregateOutput> &
 }
 
 template <class IO>
+static void Fields(IO &io, typename IO::template Field<AggregateInput> &m) {
+	io.Str("column", m.output_column);
+	io.Str("aggregate", m.aggregate_type);
+}
+
+template <class IO>
 static void Fields(IO &io, typename IO::template Field<RefreshMetadata::GroupRecomputeSourceOccurrence> &m) {
 	io.Str("table", m.table_name);
 	io.Index("count", m.count);
@@ -2260,6 +2266,18 @@ DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const str
 			info.complete = false;
 		}
 	}
+	bool parsed_inputs = false;
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "inputs", parsed_inputs)) {
+		AggregateInput input;
+		if (MetadataJson::Read(object, input) && !input.output_column.empty() && !input.aggregate_type.empty()) {
+			info.inputs.push_back(std::move(input));
+		} else {
+			info.complete = false;
+		}
+	}
+	if (json.find("\"inputs\"") != string::npos && !parsed_inputs) {
+		info.complete = false;
+	}
 	return info;
 }
 
@@ -2267,6 +2285,9 @@ string RefreshMetadata::DerivedAggregateOutputsToJson(const DerivedAggregateOutp
 	MetadataJson::Writer writer;
 	writer.Raw("complete", info.complete ? "true" : "false");
 	writer.Objects("outputs", WriteEach(info.outputs));
+	if (!info.inputs.empty()) {
+		writer.Objects("inputs", WriteEach(info.inputs));
+	}
 	return writer.Finish();
 }
 

@@ -79,6 +79,7 @@ void InlineMaterializedCteRefs(ClientContext &context, Binder &binder, unique_pt
 
 bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
                                 const vector<string> &output_names, string &sql);
+vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vector<string> &output_names);
 
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
 
@@ -97,7 +98,8 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 /// any user-visible expression cannot be rendered solely in terms of stored
 /// output columns, so refresh compilation can fail closed.
 DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,
-                                                          const vector<string> &output_names);
+                                                          const vector<string> &output_names,
+                                                          const vector<string> &decomposed_outputs = {});
 
 } // namespace duckdb
 

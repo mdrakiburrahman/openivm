@@ -1,6 +1,7 @@
 #ifndef REFRESH_COMPILER_HPP
 #define REFRESH_COMPILER_HPP
 
+#include "core/derived_aggregate_output.hpp"
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 #include "duckdb/execution/index/art/art.hpp"
@@ -43,6 +44,7 @@ struct AggregateGroupsOptions {
 	bool insert_only = false;
 	bool use_ducklake_rowid_upsert = false;
 	vector<string> aggregate_types;
+	vector<AggregateInput> aggregate_inputs;
 	vector<LogicalType> column_types;
 	bool use_current_diff_affected_keys = false;
 	//! Non-null requests a cascade delta from the group-recompute fallback.
@@ -65,7 +67,8 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
-                               const vector<LogicalType> &column_types = {});
+                               const vector<LogicalType> &column_types = {},
+                               const DerivedAggregateOutputInfo &derived_outputs = {});
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
                                  const string &delta_ts_filter = "", const string &catalog_prefix = "",
                                  bool insert_only = false, string *appended_rows = nullptr);

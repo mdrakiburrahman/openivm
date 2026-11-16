@@ -33,6 +33,23 @@ Hidden helper columns keep this exact:
 
 The delta table is scanned, grouped by the same keys as the view, and consolidated into net changes per group. A `MERGE INTO` statement atomically updates existing groups and inserts new ones.
 
+### Expressions over aggregates
+
+Outputs such as `COUNT(*) + 1`, `SUM(amount) * 2`, and `COALESCE(SUM(amount), 0)`
+are evaluated over the updated raw aggregate state. Adding `COUNT(delta) + 1`
+would add the constant again on every refresh. OpenIVM retains hidden raw inputs
+when necessary and finalizes the output after combining the old state and delta.
+Group cardinality is tracked separately, so deleting a group still removes it
+even when its projected count contains a constant.
+
+Grouped finalization joins the affected deltas to stored MV state before MERGE;
+it does not rescan the source tables. Scalar aggregates update their raw state
+and then finalize the single output row. Plain AVG and variance outputs retain
+their existing specialized finalization.
+
+Recreate an affected MV created by an older compiler to initialize the hidden
+raw inputs required by this finalization.
+
 ## Compiled SQL
 
 ### IVM query (delta computation)

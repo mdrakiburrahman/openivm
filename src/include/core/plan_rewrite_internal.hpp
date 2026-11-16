@@ -25,6 +25,7 @@ bool PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &pr
 void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt,
                               bool is_top = true);
 void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> &plan);
+void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan);
 void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan);
 bool RewriteSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &plan);
 
