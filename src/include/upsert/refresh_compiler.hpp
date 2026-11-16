@@ -9,9 +9,12 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
+#include <functional>
 #include <unordered_map>
 
 namespace duckdb {
+
+using DerivedAggregateOutputRenderer = std::function<string(const string &, const unordered_map<string, string> &)>;
 
 struct GroupRecomputeDeltaSpec {
 	string base_table;
@@ -52,6 +55,7 @@ struct AggregateGroupsOptions {
 	//! Replace the compact inline companion with an exact affected-group multiset.
 	bool inline_cascade_delta = false;
 	unordered_map<string, string> derived_output_expressions;
+	DerivedAggregateOutputRenderer render_derived_output;
 	bool derived_output_expressions_complete = false;
 	vector<string> preserved_side_cols;
 	bool force_group_recompute = false;
@@ -68,7 +72,8 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
                                const string &view_query_sql = "", bool has_minmax = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
                                const vector<LogicalType> &column_types = {},
-                               const DerivedAggregateOutputInfo &derived_outputs = {});
+                               const DerivedAggregateOutputInfo &derived_outputs = {},
+                               const DerivedAggregateOutputRenderer &render_derived_output = {});
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
                                  const string &delta_ts_filter = "", const string &catalog_prefix = "",
                                  bool insert_only = false, string *appended_rows = nullptr);

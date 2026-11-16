@@ -520,3 +520,69 @@ FROM openivm_compile_with_facts('sph_scope_mv','{"target_dialect":"spark","compi
 WHERE stmt_kind='data';
 ----
 1
+
+# Computed complex outputs use bare NULL deltas and target-dialect finalizers.
+statement ok
+CREATE TABLE sph_derived_source(k INT,v INT);
+
+statement ok
+INSERT INTO sph_derived_source VALUES (1,5),(1,6),(2,7);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_derived_group AS
+SELECT k,COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source GROUP BY k;
+
+statement ok
+CREATE VIEW sph_derived_group_expected AS
+SELECT k,COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW sph_derived_scalar AS
+SELECT COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source;
+
+statement ok
+CREATE VIEW sph_derived_scalar_expected AS
+SELECT COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source;
+
+statement ok
+INSERT INTO sph_derived_source VALUES (1,10),(3,20);
+
+statement ok
+UPDATE sph_derived_source SET v=11 WHERE k=3;
+
+statement ok
+DELETE FROM sph_derived_source WHERE k=2;
+
+foreach variant group scalar
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%named_struct(''%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%''field"quote''%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%struct_pack%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%:=%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AS STRUCT%'
+             AND min(refresh_type)=CASE WHEN '{variant}'='group' THEN 0 ELSE 1 END
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('sph_derived_{variant}',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind='data';
+----
+1
+
+statement ok
+PRAGMA refresh('sph_derived_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM sph_derived_{variant} EXCEPT ALL SELECT * FROM sph_derived_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM sph_derived_{variant}_expected EXCEPT ALL SELECT * FROM sph_derived_{variant})
+);
+----
+0
+
+endloop

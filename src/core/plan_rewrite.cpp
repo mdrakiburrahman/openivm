@@ -2322,7 +2322,8 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 	for (idx_t i = 0; i < resolved_expressions.size(); i++) {
 		auto &expression = *resolved_expressions[i];
 		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
-		    IncrementalTableNames::IsInternalColumn(output_names[i]) ||
+		    (IncrementalTableNames::IsInternalColumn(output_names[i]) &&
+		     !StringUtil::StartsWith(output_names[i], openivm::SORT_VALUE_PREFIX)) ||
 		    std::find(decomposed_outputs.begin(), decomposed_outputs.end(), output_names[i]) !=
 		        decomposed_outputs.end()) {
 			continue;

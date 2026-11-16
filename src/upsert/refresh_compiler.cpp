@@ -801,7 +801,9 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			if (derived == quoted_derived_output_expressions.end()) {
 				continue;
 			}
-			string expression = SubstituteDerivedOutputColumns(derived->second, updated_column_expressions);
+			string expression = options.render_derived_output
+			                        ? options.render_derived_output(derived->second, updated_column_expressions)
+			                        : SubstituteDerivedOutputColumns(derived->second, updated_column_expressions);
 			if (!group_count.empty()) {
 				// Disappearing groups are removed below; their output expressions need not be defined at count zero.
 				expression = "CASE WHEN " + group_count + " > 0 THEN " + expression + " ELSE NULL END";
@@ -1014,7 +1016,8 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql, bool has_minmax, const string &delta_ts_filter,
                                const string &catalog_prefix, const vector<LogicalType> &column_types,
-                               const DerivedAggregateOutputInfo &derived_outputs) {
+                               const DerivedAggregateOutputInfo &derived_outputs,
+                               const DerivedAggregateOutputRenderer &render_derived_output) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	unordered_set<string> derived_columns;
 	if (derived_outputs.complete) {
@@ -1116,7 +1119,9 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	if (!derived_columns.empty()) {
 		vector<string> assignments;
 		for (auto &output : derived_outputs.outputs) {
-			assignments.push_back(SqlUtils::QuoteIdentifier(output.output_column) + " = " + output.expression_sql);
+			auto expression =
+			    render_derived_output ? render_derived_output(output.expression_sql, {}) : output.expression_sql;
+			assignments.push_back(SqlUtils::QuoteIdentifier(output.output_column) + " = " + expression);
 		}
 		result += "UPDATE " + data_table + " SET " + StringUtil::Join(assignments, ", ") + ";\n";
 		OPENIVM_DEBUG_PRINT("[CompileSimpleAggregates] Finalized %zu derived outputs from updated state\n",

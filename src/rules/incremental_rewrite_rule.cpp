@@ -1,5 +1,6 @@
 #include "rules/incremental_rewrite_rule.hpp"
 
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_ddl.hpp"
@@ -109,6 +110,9 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		// be invalid (e.g. an unsigned cast of COUNT(*) - 2 on a one-row delta).
 		// Keep raw aggregate inputs and let the optimizer prune consumed outputs.
 		planner.plan->ResolveOperatorTypes();
+		// Foreign INSERT SQL can use bare NULL, including for complex outputs
+		// whose target dialect has no verified cast type mapping.
+		bool native = openivm::CompileFactsContextSlot::Get(input.context).target_dialect == SqlDialect::DUCKDB;
 		auto bindings = planner.plan->GetColumnBindings();
 		vector<unique_ptr<Expression>> expressions;
 		for (idx_t i = 0; i < bindings.size(); i++) {
@@ -119,7 +123,8 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 				                                            output.output_column) == group_columns.end();
 			                           });
 			unique_ptr<Expression> expression =
-			    derived ? unique_ptr<Expression>(make_uniq<BoundConstantExpression>(Value(planner.plan->types[i])))
+			    derived ? unique_ptr<Expression>(
+			                  make_uniq<BoundConstantExpression>(native ? Value(planner.plan->types[i]) : Value()))
 			            : make_uniq<BoundColumnRefExpression>(planner.plan->types[i], bindings[i]);
 			expression->SetAlias(planner.names[i]);
 			expressions.push_back(std::move(expression));

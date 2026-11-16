@@ -11,6 +11,7 @@
 #include "upsert/refresh_compiler.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "lpts_pipeline.hpp"
+#include "lpts_expression_renderer.hpp"
 #include "sql_dialect.hpp"
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -26,6 +27,7 @@
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 #include <cctype>
 
@@ -886,6 +888,39 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	refresh_plan.delta_flags = fast_paths;
 	auto agg_types = metadata.GetAggregateTypes(view_name);
 	auto derived_output_info = metadata.GetDerivedAggregateOutputs(view_name);
+	DerivedAggregateOutputRenderer render_derived_output;
+	if (active_facts.target_dialect != SqlDialect::DUCKDB && !derived_output_info.outputs.empty()) {
+		OPENIVM_DEBUG_PRINT("[UPSERT] Rendering %zu derived aggregate outputs in the target dialect\n",
+		                    derived_output_info.outputs.size());
+		render_derived_output = [&](const string &expression_sql, const unordered_map<string, string> &replacements) {
+			auto state_columns = SqlUtils::WithoutMultiplicity(column_names);
+			string rendered;
+			con.context->RunFunctionInTransaction([&]() {
+				Parser parser(*con.context);
+				// The explicit subquery preserves column order and types for the binding resolver.
+				parser.ParseQuery("SELECT " + expression_sql + " FROM (SELECT " +
+				                  SqlUtils::JoinQuotedColumns(state_columns) + " FROM " + data_table +
+				                  ") openivm_state");
+				Planner planner(*con.context);
+				planner.CreatePlan(std::move(parser.statements[0]));
+				auto &projection = planner.plan->Cast<LogicalProjection>();
+				auto bindings = projection.children[0]->GetColumnBindings();
+				D_ASSERT(bindings.size() == state_columns.size());
+				LptsExpressionRenderer renderer(*con.context, active_facts.target_dialect,
+				                                [&](const ColumnBinding &binding, const char *) {
+					                                auto match = std::find(bindings.begin(), bindings.end(), binding);
+					                                D_ASSERT(match != bindings.end());
+					                                auto &column = state_columns[match - bindings.begin()];
+					                                auto replacement = replacements.find(column);
+					                                return replacement == replacements.end()
+					                                           ? DialectQuoteIdent(column, active_facts.target_dialect)
+					                                           : "(" + replacement->second + ")";
+				                                });
+				rendered = renderer.ExpressionToAliasedString(*projection.expressions[0]);
+			});
+			return rendered;
+		};
+	}
 	unordered_map<string, string> derived_output_expressions;
 	for (auto &output : derived_output_info.outputs) {
 		if (std::find(group_cols.begin(), group_cols.end(), output.output_column) == group_cols.end()) {
@@ -954,6 +989,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		options.aggregate_types = agg_types;
 		options.aggregate_inputs = derived_output_info.inputs;
 		options.derived_output_expressions = derived_output_expressions;
+		options.render_derived_output = render_derived_output;
 		options.derived_output_expressions_complete = derived_output_info.complete;
 		options.column_types = column_types;
 		return options;
@@ -1157,7 +1193,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.threshold_sql.c_str());
 		} else {
 			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, delta_ts_filter,
-			                                       internal_catalog_prefix, column_types, derived_output_info);
+			                                       internal_catalog_prefix, column_types, derived_output_info,
+			                                       render_derived_output);
 		}
 		break;
 	}
