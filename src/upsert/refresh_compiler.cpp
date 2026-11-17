@@ -959,13 +959,20 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 	}
 	string representative_update;
 	if (!representative_updates.empty()) {
-		// Updating an indexed key forces DuckDB's delete-and-insert UPDATE path.
-		// Restrict it to actual representation changes; ordinary groups keep the fast action.
+		// Supply a complete row for native delete-and-insert, including when
+		// there is no index to make the binder retain unchanged group keys.
+		for (auto &key : keys) {
+			auto quoted_key = SqlUtils::QuoteIdentifier(key);
+			if (!group_sign_counts.count(quoted_key)) {
+				representative_updates.push_back(quoted_key + " = v." + quoted_key);
+			}
+		}
+		// Only actual representation changes replace a row; ordinary groups keep the fast action.
 		representative_update = "WHEN MATCHED AND (" + StringUtil::Join(representative_changes, " OR ") +
 		                        ") THEN UPDATE SET " + update_set + ", " +
 		                        StringUtil::Join(representative_updates, ", ") + "\n";
 		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] Maintaining representatives for %zu floating keys\n",
-		                    representative_updates.size());
+		                    representative_changes.size());
 	}
 	string merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table + " v USING " +
 	                     merge_source + " d\nON " + on_clause + "\n" + representative_update +

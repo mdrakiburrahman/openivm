@@ -194,6 +194,35 @@ static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
 	return table;
 }
 
+static void PreserveGroupRepresentatives(LogicalMergeInto &merge) {
+	if (!merge.table.catalog.IsDuckCatalog() ||
+	    !StringUtil::StartsWith(merge.table.name.GetIdentifierName(), openivm::DATA_TABLE_PREFIX)) {
+		return;
+	}
+	for (auto &entry : merge.actions) {
+		for (auto &action : entry.second) {
+			if (action->action_type != MergeActionType::MERGE_UPDATE || action->update_is_del_and_insert) {
+				continue;
+			}
+			// Sign-count aliases encode the stored grouping column's position.
+			for (auto column : action->columns) {
+				auto sign_count = string(openivm::GROUP_SIGN_COUNT_COL_PREFIX) + to_string(column.index);
+				if (!merge.table.ColumnExists(Identifier(sign_count))) {
+					continue;
+				}
+				// In-place updates can discard SQL-equal -0.0/+0.0 assignments.
+				// The representative-change action supplies the complete replacement
+				// row, including unchanged keys, even when the table has no index.
+				D_ASSERT(action->columns.size() == merge.table.GetColumns().PhysicalColumnCount());
+				action->update_is_del_and_insert = true;
+				OPENIVM_DEBUG_PRINT("[INSERT RULE] replacing floating group representative in '%s'\n",
+				                    merge.table.name.GetIdentifierName().c_str());
+				break;
+			}
+		}
+	}
+}
+
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
 	if (insert.column_index_map.empty()) {
 		return;
@@ -517,6 +546,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		dml = dml_owner->get();
 	}
 
+	if (dml->type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		PreserveGroupRepresentatives(dml->Cast<LogicalMergeInto>());
+	}
 	auto table = GetNativeDMLTable(*dml);
 	if (!table) {
 		return;

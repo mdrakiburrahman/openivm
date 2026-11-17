@@ -125,10 +125,13 @@ Signed zero can affect numerical results: `1 / -0.0` and `1 / +0.0` produce
 opposite infinities. Floating GROUP BY keys retain a negative-zero support count. Refresh
 keeps the stored zero's sign while that sign still occurs in the group, and
 switches it when its last supporting row disappears. Only groups that change
-representation update their indexed key. This adds one `BIGINT` count per
-published floating group key, without rescanning source rows. When both zero
-signs coexist, the representative can differ from DuckDB's input-order-dependent
-choice; exact agreement with that choice is not guaranteed.
+representation replace their stored row, including native tables without an
+index; ordinary group updates keep the in-place path. The support state adds
+one `BIGINT` count per published floating group key, without rescanning source
+rows. DuckDB serializes MERGE actions when both row replacement and insertion
+can append to the target. When both zero signs coexist, the representative can
+differ from DuckDB's input-order-dependent choice; exact agreement with that
+choice is not guaranteed.
 
 DISTINCT aux tuples use the same zero-sign policy for floating columns. A
 sign-only replacement emits a retraction and an insertion even when its total
