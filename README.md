@@ -49,10 +49,11 @@ Base table schema changes (`ADD`, `DROP`, `RENAME COLUMN`) are propagated by Ope
 CREATE [OR REPLACE] MATERIALIZED VIEW [catalog.][schema.]name [REFRESH EVERY '<interval>'] AS <query>;
 ALTER MATERIALIZED VIEW [catalog.][schema.]name SET REFRESH EVERY '<interval>';
 ALTER MATERIALIZED VIEW [catalog.][schema.]name SET REFRESH MANUAL;
-DROP VIEW [catalog.][schema.]name;  -- removes the MV, its internal tables and metadata
+DROP MATERIALIZED VIEW [IF EXISTS] [catalog.][schema.]name [CASCADE];
 ```
 
-`CREATE MATERIALIZED VIEW IF NOT EXISTS` and `DROP MATERIALIZED VIEW` are not supported.
+`DROP MATERIALIZED VIEW` is an alias for `DROP VIEW`; both remove the MV, its internal
+tables and metadata. `CREATE MATERIALIZED VIEW IF NOT EXISTS` is not supported.
 See [parser](docs/internals/parser.md) and [limitations](docs/limitations.md).
 
 ## Data pipelines and DuckLake

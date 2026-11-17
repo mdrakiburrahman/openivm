@@ -2600,10 +2600,13 @@ static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo 
 	}
 
 	auto root_metadata_location = RefreshMetadata::CurrentLocation(con);
-	vector<TrackedDropView> drop_views = {{root_metadata_location, view_key}};
-	if (drop_info.cascade) {
-		drop_views = LeaseTrackedViewDropOrder(
-		    context, con, RefreshMetadata::MetadataLocations(context, openivm::VIEWS_TABLE), drop_views);
+	auto drop_views =
+	    LeaseTrackedViewDropOrder(context, con, RefreshMetadata::MetadataLocations(context, openivm::VIEWS_TABLE),
+	                              {{root_metadata_location, view_key}});
+	if (!drop_info.cascade && drop_views.size() > 1) {
+		throw CatalogException("Cannot drop materialized view '%s' because dependent materialized views exist. "
+		                       "Use CASCADE to drop them too.",
+		                       drop_info.GetQualifiedName().ToString());
 	}
 	TrackedDropProgram drop_program;
 	for (auto &view : drop_views) {
