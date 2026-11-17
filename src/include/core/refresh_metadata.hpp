@@ -98,9 +98,13 @@ public:
 	// Accept both legacy short keys and qualified keys for sources with colliding names.
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
+	// Interpret NULL source locations relative to the registry that stores the row.
+	static string SourcePredicate(const string &table, const string &catalog, const string &schema,
+	                              const string &legacy_catalog, const string &legacy_schema);
 	// Rows owned by a physical source table. DuckLake rows store the source name itself;
 	// native rows store the source's delta-table name.
-	static string SourceOwnerPredicate(const string &table, const string &catalog, const string &schema, bool ducklake);
+	static string SourceOwnerPredicate(const string &table, const string &catalog, const string &schema, bool ducklake,
+	                                   const string &legacy_catalog);
 
 	// A source's delta table lives beside the source unless openivm_internal_schema placed it in
 	// an internal schema of the same catalog; there its name encodes the source schema.
