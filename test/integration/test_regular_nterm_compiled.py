@@ -130,6 +130,29 @@ JOIN nterm_c c ON b.c_id = c.id""",
         run_scenario(
             binary,
             root,
+            "sparse_old_join_key",
+            """
+CREATE TABLE sparse_item(i_id INT, i_price INT, i_name VARCHAR);
+CREATE TABLE sparse_stock(s_w_id INT, s_i_id INT, s_quantity INT);
+INSERT INTO sparse_item VALUES (1, 60, 'a'), (2, 40, 'b');
+INSERT INTO sparse_stock VALUES (1, 1, 10), (1, 2, 20);
+CREATE MATERIALIZED VIEW sparse_mv AS
+SELECT s.s_w_id, s.s_i_id, s.s_quantity, i.i_name
+FROM sparse_stock s
+JOIN (SELECT i_id, i_name FROM sparse_item WHERE i_price > 50) i
+  ON s.s_i_id = i.i_id;
+UPDATE sparse_stock SET s_quantity = 11 WHERE s_w_id = 1 AND s_i_id = 1;
+""",
+            "sparse_mv",
+            {"target_dialect": "duckdb", "compile_only": True},
+            """SELECT s.s_w_id, s.s_i_id, s.s_quantity, i.i_name
+FROM sparse_stock s
+JOIN (SELECT i_id, i_name FROM sparse_item WHERE i_price > 50) i
+  ON s.s_i_id = i.i_id""",
+        )
+        run_scenario(
+            binary,
+            root,
             "unchanged_sources",
             """
 CREATE TABLE unchanged_a(id INTEGER, b_id INTEGER);

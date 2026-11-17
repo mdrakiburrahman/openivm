@@ -1110,6 +1110,29 @@ CREATE MATERIALIZED VIEW proj_join_mv AS
 statement ok
 UPDATE proj_join_stock SET s_quantity = 11 WHERE s_w_id = 1 AND s_i_id = 1;
 
+# Both portable compilers must keep i_id as the join key when rebuilding the
+# filtered item's old state; the source scan has a filter-only i_price column.
+query I
+WITH compiled AS (
+    SELECT 'spark' AS dialect, refresh_type, sql
+    FROM openivm_compile_with_facts('proj_join_mv', '{"target_dialect":"spark","compile_only":true}')
+    WHERE stmt_kind = 'data'
+    UNION ALL
+    SELECT 'duckdb' AS dialect, refresh_type, sql
+    FROM openivm_compile_with_facts('proj_join_mv', '{"target_dialect":"duckdb","compile_only":true}')
+    WHERE stmt_kind = 'data'
+)
+SELECT CASE WHEN min(refresh_type) = 2
+             AND bool_and(NOT regexp_matches(sql,
+                 't[0-9]+_s_i_id\) = \(t[0-9]+_i_name|t[0-9]+_i_name\) = \(t[0-9]+_s_i_id'))
+             AND bool_or(regexp_matches(sql,
+                 't[0-9]+_s_i_id\) = \(t[0-9]+_i_id|t[0-9]+_i_id\) = \(t[0-9]+_s_i_id'))
+            THEN 1 ELSE 0 END
+FROM compiled GROUP BY dialect ORDER BY dialect;
+----
+1
+1
+
 statement ok
 PRAGMA refresh('proj_join_mv');
 
