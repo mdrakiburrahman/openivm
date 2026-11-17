@@ -1249,14 +1249,36 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
 			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
 			                                              attached_db_schema_name);
-			auto options = aggregate_options(false, insert_only);
+			auto options = aggregate_options(false, insert_only && aux_meta.selected_input_sql.empty());
 			// Tuple transitions already apply the source watermark and have no timestamp column.
 			options.delta_ts_filter.clear();
+			string input_relation = aux_table_sql(aux_meta.aux_table);
+			auto input_columns = &aux_meta.cols;
+			if (!aux_meta.selected_input_sql.empty()) {
+				input_columns = &aux_meta.selected_input_columns;
+				vector<string> candidates;
+				for (idx_t i = 0; i < aux_meta.cols.size(); i++) {
+					candidates.push_back(SqlUtils::QuoteIdentifier(aux_meta.cols[i]) + " AS " +
+					                     SqlUtils::QuoteIdentifier(aux_meta.selected_source_columns[i]));
+				}
+				string candidate_bag = "(SELECT " + StringUtil::Join(candidates, ", ") + " FROM " +
+				                       aux_table_sql(aux_meta.aux_table) +
+				                       " openivm_candidates CROSS JOIN generate_series(1, openivm_candidates._count) "
+				                       "openivm_copies WHERE openivm_candidates._count > 0)";
+				aux_meta.selected_input_sql = SqlUtils::ReplaceTableReferences(
+				    aux_meta.selected_input_sql, "openivm_topk_candidates", candidate_bag);
+				input_relation = "(" + aux_meta.selected_input_sql + ")";
+				if (active_facts.target_dialect != SqlDialect::DUCKDB) {
+					aux_meta.selected_input_sql = RenderStoredViewQueryForDialect(con, aux_meta.selected_input_sql,
+					                                                              aux_meta.selected_input_columns,
+					                                                              active_facts.target_dialect, {});
+				}
+			}
 			std::function<string(const string &)> render_input_expression;
 			if (active_facts.target_dialect != SqlDialect::DUCKDB) {
 				render_input_expression = [&](const string &expression) {
-					return RenderStoredExpressionForDialect(con, expression, aux_table_sql(aux_meta.aux_table),
-					                                        aux_meta.cols, active_facts.target_dialect, {});
+					return RenderStoredExpressionForDialect(con, expression, input_relation, *input_columns,
+					                                        active_facts.target_dialect, {});
 				};
 			}
 			upsert_query =

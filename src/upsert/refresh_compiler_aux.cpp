@@ -893,6 +893,29 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 	    "  FROM " +
 	    SqlUtils::QuoteIdentifier(dinput_table) + " i LEFT JOIN " + aux_q + " _aux ON " + aux_match_aliased + "\n)\n";
 
+	string update_aux =
+	    "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dinput_table) + " i ON " +
+	    aux_match_aliased +
+	    "\nWHEN MATCHED THEN UPDATE SET _count = _aux._count + i.dmult\nWHEN NOT MATCHED AND i.dmult > 0 "
+	    "THEN INSERT (" +
+	    distinct_cols_csv + ", _count) VALUES (" + distinct_cols_csv_i + ", i.dmult);\n\n";
+	string selected_old = SqlUtils::QuoteIdentifier("openivm_selected_old_" + view_name);
+	string selected_new = SqlUtils::QuoteIdentifier("openivm_selected_new_" + view_name);
+	if (!meta.selected_input_sql.empty()) {
+		// Differentiate the bounded input after integrating source deltas into its candidate bag.
+		// Both eviction and refill rows reach the aggregate, even for an insert-only source batch.
+		sql += "CREATE OR REPLACE TEMP TABLE " + selected_old + " AS " + meta.selected_input_sql + ";\n";
+		sql += update_aux;
+		sql += "CREATE OR REPLACE TEMP TABLE " + selected_new + " AS " + meta.selected_input_sql + ";\n";
+		ddist_cte = "WITH ddist AS (SELECT *, -1::INTEGER AS dd FROM (SELECT * FROM " + selected_old +
+		            " EXCEPT ALL SELECT * FROM " + selected_new +
+		            ") openivm_lost UNION ALL SELECT *, 1::INTEGER AS dd "
+		            "FROM (SELECT * FROM " +
+		            selected_new + " EXCEPT ALL SELECT * FROM " + selected_old + ") openivm_gained)\n";
+		OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] Differentiating maintained limited input for %s\n",
+		                    view_name.c_str());
+	}
+
 	// DISTINCT emits signed tuple transitions. Feed their raw SUM/COUNT inputs to
 	// the shared aggregate compiler, which owns NULL handling and output finalization.
 	unordered_map<string, string> input_types;
@@ -923,7 +946,11 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 			expression = "1";
 		} else if ((input != input_types.end() && input->second == "count") ||
 		           StringUtil::StartsWith(column, openivm::SUM_COUNT_COL_PREFIX)) {
-			expression = "CASE WHEN " + sum_arg_q + " IS NULL THEN 0 ELSE 1 END";
+			auto sum_input = meta.sum_input_expr.empty() ? sum_arg_q : meta.sum_input_expr;
+			if (render_input_expression) {
+				sum_input = render_input_expression(sum_input);
+			}
+			expression = "CASE WHEN (" + sum_input + ") IS NULL THEN 0 ELSE 1 END";
 		} else if ((input != input_types.end() && input->second == "sum") || column == sum_out) {
 			expression = meta.sum_input_expr.empty()
 			                 ? "CAST(" + sum_arg_q + " AS " + options.column_types.at(i).ToString() + ")"
@@ -945,11 +972,11 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	sql += SqlUtils::ReplaceTableReferences(aggregate_sql, delta_view, raw_delta);
 
-	sql += "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dinput_table) + " i ON " +
-	       aux_match_aliased +
-	       "\nWHEN MATCHED THEN UPDATE SET _count = _aux._count + i.dmult\nWHEN NOT MATCHED AND i.dmult > 0 "
-	       "THEN INSERT (" +
-	       distinct_cols_csv + ", _count) VALUES (" + distinct_cols_csv_i + ", i.dmult);\n\n";
+	if (meta.selected_input_sql.empty()) {
+		sql += update_aux;
+	} else {
+		sql += "DROP TABLE " + selected_old + ";\nDROP TABLE " + selected_new + ";\n";
+	}
 
 	sql += "DELETE FROM " + aux_q + " WHERE _count <= 0;\n\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(dinput_table) + ";\n";

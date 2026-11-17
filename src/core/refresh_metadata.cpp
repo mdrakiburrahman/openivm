@@ -2094,6 +2094,9 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Str("sum_arg", m.sum_arg);
 	io.Str("sum_out", m.sum_out);
 	io.Str("sum_input_expr", m.sum_input_expr, Presence::OPTIONAL);
+	io.Str("selected_input_sql", m.selected_input_sql, Presence::OPTIONAL);
+	io.Arr("selected_input_columns", m.selected_input_columns, Presence::OPTIONAL);
+	io.Arr("selected_source_columns", m.selected_source_columns, Presence::OPTIONAL);
 }
 
 template <class IO>
@@ -2295,6 +2298,10 @@ string RefreshMetadata::DerivedAggregateOutputsToJson(const DerivedAggregateOutp
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
 	auto json = ReadViewString(view_name, "distinct_aux_meta_json");
 	if (!MetadataJson::Read(json, out)) {
+		return false;
+	}
+	if (!out.selected_input_sql.empty() &&
+	    (out.selected_input_columns.empty() || out.selected_source_columns.size() != out.cols.size())) {
 		return false;
 	}
 	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "group_inputs")) {

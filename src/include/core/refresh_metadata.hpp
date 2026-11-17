@@ -340,6 +340,11 @@ public:
 		string sum_out;
 		vector<DerivedAggregateOutput> group_inputs;
 		string sum_input_expr;
+		// Limited inputs use cols/source_exprs for candidate counts. The stored selection
+		// reads openivm_topk_candidates through stable selected_source_columns aliases.
+		string selected_input_sql;
+		vector<string> selected_input_columns;
+		vector<string> selected_source_columns;
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL

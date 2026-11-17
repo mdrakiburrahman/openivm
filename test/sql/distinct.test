@@ -1474,14 +1474,56 @@ CREATE MATERIALIZED VIEW derived_distinct_variant_group AS SELECT variant_typeof
 statement ok
 CREATE VIEW derived_distinct_variant_group_expected AS SELECT variant_typeof(k::VARIANT) g,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source)d GROUP BY variant_typeof(k::VARIANT);
 
-foreach variant group_mul scalar_coalesce
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_post_projected AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,v*2 AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_post_projected_expected AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,v*2 AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_post_nullified AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,NULLIF(v,20) AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_post_nullified_expected AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,NULLIF(v,20) AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_post_projected AS WITH d AS(SELECT DISTINCT v FROM derived_distinct_source),p AS(SELECT v*2 AS v FROM d) SELECT SUM(v)+1 a FROM p;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_post_projected_expected AS WITH d AS(SELECT DISTINCT v FROM derived_distinct_source),p AS(SELECT v*2 AS v FROM d) SELECT SUM(v)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_limit AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_limit_expected AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_limit AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM derived_distinct_source ORDER BY v NULLS LAST LIMIT 2)d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_limit_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM derived_distinct_source ORDER BY v NULLS LAST LIMIT 2)d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_cte_input_limit AS WITH x AS(SELECT k,v FROM derived_distinct_source ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_cte_input_limit_expected AS WITH x AS(SELECT k,v FROM derived_distinct_source ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_cte_limit_offset AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v IS NOT NULL ORDER BY v DESC,k NULLS FIRST LIMIT 3 OFFSET 1),d AS(SELECT DISTINCT k,v FROM x) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_cte_limit_offset_expected AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v IS NOT NULL ORDER BY v DESC,k NULLS FIRST LIMIT 3 OFFSET 1),d AS(SELECT DISTINCT k,v FROM x) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
 
 statement ok
 CREATE MATERIALIZED VIEW derived_distinct_child_{variant} AS SELECT * FROM derived_distinct_{variant};
 
 endloop
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 query I
 SELECT type FROM openivm_views WHERE view_sql_name='derived_distinct_{variant}';
@@ -1499,7 +1541,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte
+foreach variant group_mul scalar_coalesce group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 query I
 SELECT CASE WHEN min(refresh_type)=8
@@ -1518,7 +1560,7 @@ endloop
 statement ok
 INSERT INTO derived_distinct_source VALUES (6,1,20),(7,3,40),(8,3,40),(9,4,NULL),(10,4,NULL);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1534,7 +1576,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
 
 statement ok
 PRAGMA refresh('derived_distinct_child_{variant}');
@@ -1563,7 +1605,7 @@ UPDATE derived_distinct_source SET k=2,v=NULL WHERE id=4;
 statement ok
 DELETE FROM derived_distinct_source WHERE id IN (2,7,9,11,12);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1579,7 +1621,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
 
 statement ok
 PRAGMA refresh('derived_distinct_child_{variant}');
@@ -1605,7 +1647,7 @@ UPDATE derived_distinct_source SET v=50 WHERE id=8;
 statement ok
 INSERT INTO derived_distinct_source VALUES (14,6,60),(15,6,60);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1621,7 +1663,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
 
 statement ok
 PRAGMA refresh('derived_distinct_child_{variant}');
@@ -1649,7 +1691,7 @@ INSERT INTO derived_distinct_source VALUES (16,6,60),(17,1,NULL);
 statement ok
 UPDATE derived_distinct_source SET v=NULL WHERE id=15;
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1665,7 +1707,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
 
 statement ok
 PRAGMA refresh('derived_distinct_child_{variant}');
@@ -1684,7 +1726,7 @@ endloop
 statement ok
 DELETE FROM derived_distinct_source;
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1700,7 +1742,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
 
 statement ok
 PRAGMA refresh('derived_distinct_child_{variant}');
@@ -1720,7 +1762,7 @@ endloop
 statement ok
 INSERT INTO derived_distinct_source VALUES (18,NULL,NULL),(19,1,7),(20,1,7);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1736,7 +1778,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
 
 statement ok
 PRAGMA refresh('derived_distinct_child_{variant}');
@@ -1947,3 +1989,110 @@ endloop
 
 statement ok
 SET openivm_distinct_aux_state=false;
+
+# Candidate counts and stable selection aliases survive reopen and source-column rename.
+load __TEST_DIR__/distinct_limited_reopen.db
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE s(id INT,k INT,v INT);
+
+statement ok
+INSERT INTO s VALUES(1,1,10),(2,1,10),(3,2,NULL),(4,2,30),(5,3,40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_limited AS WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_offset AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k;
+
+statement ok
+INSERT INTO s VALUES(6,4,5);
+
+statement ok
+DELETE FROM s WHERE id=2;
+
+statement ok
+PRAGMA refresh('mv_limited');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_limited EXCEPT ALL SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected) UNION ALL(SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_limited)) THEN error('bag mismatch limited') ELSE true END;
+
+statement ok
+PRAGMA refresh('mv_offset');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_offset EXCEPT ALL SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected) UNION ALL(SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_offset)) THEN error('bag mismatch offset') ELSE true END;
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+UPDATE s SET v=12 WHERE id=4;
+
+statement ok
+DELETE FROM s WHERE id=1;
+
+statement ok
+INSERT INTO s VALUES(7,1,0);
+
+statement ok
+PRAGMA refresh('mv_limited');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_limited EXCEPT ALL SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected) UNION ALL(SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_limited)) THEN error('bag mismatch limited') ELSE true END;
+
+statement ok
+PRAGMA refresh('mv_offset');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_offset EXCEPT ALL SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected) UNION ALL(SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_offset)) THEN error('bag mismatch offset') ELSE true END;
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+ALTER TABLE s RENAME COLUMN v TO amount;
+
+statement ok
+INSERT INTO s VALUES(8,5,3);
+
+statement ok
+UPDATE s SET amount=50 WHERE id=6;
+
+statement ok
+DELETE FROM s WHERE id=3;
+
+statement ok
+PRAGMA refresh('mv_limited');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_limited EXCEPT ALL SELECT * FROM (WITH x AS(SELECT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected) UNION ALL(SELECT * FROM (WITH x AS(SELECT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_limited)) THEN error('bag mismatch limited') ELSE true END;
+
+statement ok
+PRAGMA refresh('mv_offset');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_offset EXCEPT ALL SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected) UNION ALL(SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_offset)) THEN error('bag mismatch offset') ELSE true END;
