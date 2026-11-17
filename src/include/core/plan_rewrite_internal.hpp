@@ -25,6 +25,9 @@ bool PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &pr
 void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt,
                               bool is_top = true);
 void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
+unique_ptr<Expression> MakeNegativeZeroExpression(ClientContext &context, Optimizer &optimizer,
+                                                  unique_ptr<Expression> argument);
+void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> &plan);
 void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan);
 void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan);

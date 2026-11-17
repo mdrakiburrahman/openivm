@@ -125,13 +125,23 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 	for (idx_t i = 0; i < base_col_count; i++) { // mull-ignore: cxx_lt_to_le
 		groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
 	}
+	// SQL equality merges signed zeros, but scalar projections and zero-sign
+	// support counts can observe them. Retain their signs through compaction.
+	Optimizer optimizer(binder, context);
+	for (idx_t i = 0; i < base_col_count; i++) {
+		if (input_types[i].id() == LogicalTypeId::DOUBLE || input_types[i].id() == LogicalTypeId::FLOAT) {
+			groups.push_back(MakeNegativeZeroExpression(
+			    context, optimizer, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i])));
+		}
+	}
 	auto aggregate = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(delta_node));
+	const auto aggregate_mul_index = aggregate->groups.size();
 
 	auto agg_bindings = aggregate->GetColumnBindings();
 	auto agg_types = aggregate->types;
 	auto filter_expr = BoundComparisonExpression::Create(
 	    ExpressionType::COMPARE_NOTEQUAL,
-	    make_uniq<BoundColumnRefExpression>(agg_types[base_col_count], agg_bindings[base_col_count]),
+	    make_uniq<BoundColumnRefExpression>(agg_types[aggregate_mul_index], agg_bindings[aggregate_mul_index]),
 	    make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
 	auto filter = make_uniq<LogicalFilter>(std::move(filter_expr));
 	filter->children.push_back(std::move(aggregate));
@@ -144,7 +154,8 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 		remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(agg_types[i], filter_bindings[i]));
 	}
 	remap_exprs.push_back(BoundCastExpression::AddCastToType(
-	    context, make_uniq<BoundColumnRefExpression>(agg_types[base_col_count], filter_bindings[base_col_count]),
+	    context,
+	    make_uniq<BoundColumnRefExpression>(agg_types[aggregate_mul_index], filter_bindings[aggregate_mul_index]),
 	    LogicalType::INTEGER));
 
 	auto remap_proj = make_uniq<LogicalProjection>(output_table_index, std::move(remap_exprs));

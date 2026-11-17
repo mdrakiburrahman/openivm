@@ -67,6 +67,7 @@ constexpr const char *LARGE_SUM_COL_PREFIX = "openivm_large_sum_";
 constexpr double FINITE_SUM_THRESHOLD = 0x1p960;
 constexpr double FINITE_SUM_SCALE = 0x1p64;
 constexpr const char *NAN_COUNT_COL_PREFIX = "openivm_nan_count_";
+constexpr const char *GROUP_SIGN_COUNT_COL_PREFIX = "openivm_group_sign_count_";
 constexpr const char *POS_INF_COUNT_COL_PREFIX = "openivm_pos_inf_count_";
 constexpr const char *NEG_INF_COUNT_COL_PREFIX = "openivm_neg_inf_count_";
 

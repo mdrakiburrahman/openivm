@@ -11,6 +11,10 @@
 #include "lpts_pipeline.hpp"
 #include "lpts_helpers.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "rules/column_hider.hpp"
@@ -63,6 +67,8 @@
 #include "storage/ducklake_table_entry.hpp"
 
 #include <set>
+#include <cmath>
+#include <limits>
 
 namespace duckdb {
 
@@ -84,16 +90,67 @@ static void RewriteSourceColumns(Binder &binder, SQLStatement &statement);
 
 } // namespace
 
+static Vector CanonicalizeNaNKeys(const Vector &input, idx_t count) {
+	if (!TypeVisitor::Contains(input.GetType(), [](const LogicalType &type) {
+		    return type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE;
+	    })) {
+		return Vector::Ref(input);
+	}
+	Vector result(input.GetType(), count);
+	result.Append(input, count);
+	switch (input.GetType().InternalType()) {
+	case PhysicalType::FLOAT: {
+		auto values = FlatVector::GetDataMutable<float>(result);
+		for (idx_t row = 0; row < count; row++) {
+			if (FlatVector::Validity(result).RowIsValid(row) && std::isnan(values[row])) {
+				values[row] = std::numeric_limits<float>::quiet_NaN();
+			}
+		}
+		break;
+	}
+	case PhysicalType::DOUBLE: {
+		auto values = FlatVector::GetDataMutable<double>(result);
+		for (idx_t row = 0; row < count; row++) {
+			if (FlatVector::Validity(result).RowIsValid(row) && std::isnan(values[row])) {
+				values[row] = std::numeric_limits<double>::quiet_NaN();
+			}
+		}
+		break;
+	}
+	case PhysicalType::STRUCT:
+		for (auto &child : StructVector::GetEntries(result)) {
+			child.Reference(CanonicalizeNaNKeys(child, count));
+		}
+		break;
+	case PhysicalType::LIST: {
+		auto &child = ListVector::GetChildMutable(result);
+		child.Reference(CanonicalizeNaNKeys(child, child.size()));
+		break;
+	}
+	case PhysicalType::ARRAY: {
+		auto &child = ArrayVector::GetChildMutable(result);
+		child.Reference(CanonicalizeNaNKeys(child, child.size()));
+		break;
+	}
+	default:
+		throw InternalException("Unexpected nested floating candidate key type");
+	}
+	return result;
+}
+
 static void CandidateValueKey(DataChunk &input, ExpressionState &, Vector &result) {
 	// SQL equality can hide payload types, interval components, and the sign of zero.
 	auto canonical = TypeContainsVariant(input.data[0].GetType())
 	                     ? CanonicalizeVariantVector(input.data[0], input.size())
 	                     : Vector::Ref(input.data[0]);
+	// NaN signs/payloads are unspecified; their state identity must survive
+	// storage canonicalization. Signed zero and VARIANT payload types stay distinct.
+	auto identity = CanonicalizeNaNKeys(canonical, input.size());
 	auto output = FlatVector::GetDataMutable<string_t>(result);
 	MemoryStream stream;
 	for (idx_t row = 0; row < input.size(); row++) {
 		stream.Rewind();
-		BinarySerializer::Serialize(canonical.GetValue(row), stream);
+		BinarySerializer::Serialize(identity.GetValue(row), stream);
 		output[row] =
 		    StringVector::AddStringOrBlob(result, const_char_ptr_cast(stream.GetData()), stream.GetPosition());
 	}
@@ -1521,41 +1578,11 @@ static bool FindGroupColumns(const CreateMVPlanFacts &facts, TableIndex group_in
 	return false;
 }
 
-static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFacts &facts, TableIndex group_index,
-                              size_t group_count) {
-	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		auto &column = expression.Cast<BoundColumnRefExpression>();
-		return ResolvesToGroupBinding(column.Binding().table_index, column.Binding().column_index, group_index,
-		                              group_count, facts);
-	}
-	bool valid = expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE;
-	ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) {
-		valid = valid && IsGroupExpression(child, facts, group_index, group_count);
-	});
-	return valid;
-}
-
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names) {
 	vector<string> group_names;
 	if (!AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
 		FindGroupColumns(facts, group_index, group_count, output_names, group_names);
-	}
-	// Expressions over keys are constant within a group, not additive aggregates.
-	// Retain the raw hidden key as well: a computed key need not be injective.
-	bool has_hidden_key = false;
-	for (auto &name : group_names) {
-		has_hidden_key |= StringUtil::StartsWith(name, "openivm_group_key_");
-	}
-	if (has_hidden_key && facts.first_projection) {
-		auto &expressions = facts.first_projection->expressions;
-		for (idx_t i = 0; i < expressions.size() && i < output_names.size(); i++) {
-			if (expressions[i]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
-			    IsGroupExpression(*expressions[i], facts, group_index, group_count) &&
-			    std::find(group_names.begin(), group_names.end(), output_names[i]) == group_names.end()) {
-				group_names.push_back(output_names[i]);
-			}
-		}
 	}
 	return group_names;
 }
@@ -1580,6 +1607,15 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		    return node.plan_node->type == LogicalOperatorType::LOGICAL_TOP_N ||
 		           node.plan_node->type == LogicalOperatorType::LOGICAL_LIMIT;
 	    });
+	if (!limited_input) {
+		distinct->ResolveOperatorTypes();
+		for (idx_t index = 0; index < meta.cols.size(); index++) {
+			if (distinct->types[index].id() == LogicalTypeId::DOUBLE ||
+			    distinct->types[index].id() == LogicalTypeId::FLOAT) {
+				meta.sign_columns.push_back(meta.cols[index]);
+			}
+		}
+	}
 	if (limited_input) {
 		// Keep the candidate bag, not just today's selected rows: deletes must refill the boundary.
 		LogicalGet *source = nullptr;

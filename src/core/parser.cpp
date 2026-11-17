@@ -519,6 +519,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		InjectDerivedAggregateInputs(select_plan);
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
+		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
@@ -1318,8 +1319,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		const auto &meta = view_model.distinct_aux;
 		emit_aux("create_mv_distinct_aux", meta.aux_table, "distinct_aux_meta_json",
 		         RefreshMetadata::DistinctAuxMetaToJson(meta), [&](const string &aux_target) {
-			         return BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs, meta.source,
-			                                               meta.filter, replace_aux);
+			         return BuildDistinctAuxStateCreateSQL(aux_target, meta, meta.source, replace_aux);
 		         });
 	}
 	if (view_model.HasCountDistinctAux()) {

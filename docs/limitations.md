@@ -112,6 +112,31 @@ two-subtotal result is finite (`1e308`). Exact agreement with native floating-po
 SUM evaluation order is not guaranteed. This also applies to AVG when its SUM
 helper uses this state. Integer and DECIMAL SUMs do not use this decomposition.
 
+## Signed zero and NaN
+
+The sign and payload of NaN are unspecified. `+NaN` and `-NaN` are both NaN and
+compare equal in DuckDB, but `signbit()` and casts to VARCHAR can expose a
+different sign (`nan` versus `-nan`). OpenIVM does not retain extra delta state
+to preserve that representation. This applies to SUM/AVG results, floating group
+keys, DISTINCT representatives, and nested floating candidate values. Numerical
+NaN propagation and recovery to finite or NULL results remain maintained.
+
+Signed zero can affect numerical results: `1 / -0.0` and `1 / +0.0` produce
+opposite infinities. Floating GROUP BY keys retain a negative-zero support count. Refresh
+keeps the stored zero's sign while that sign still occurs in the group, and
+switches it when its last supporting row disappears. Only groups that change
+representation update their indexed key. This adds one `BIGINT` count per
+published floating group key, without rescanning source rows. When both zero
+signs coexist, the representative can differ from DuckDB's input-order-dependent
+choice; exact agreement with that choice is not guaranteed.
+
+DISTINCT aux tuples use the same zero-sign policy for floating columns. A
+sign-only replacement emits a retraction and an insertion even when its total
+multiplicity stays unchanged. This adds one `BIGINT` counter per floating
+DISTINCT column and processes only delta-touched tuples. Limited selections
+compare candidate identities, canonicalizing NaNs while preserving signed zero.
+Delta compaction retains a Boolean zero-sign key for each floating input column.
+
 ## Other limitations
 
 - **DROP MATERIALIZED VIEW syntax** is not supported because DuckDB's parser intercepts

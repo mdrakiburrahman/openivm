@@ -660,8 +660,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		               internal_schema_name, source_keys, view_catalog_name, view_schema_name, build_sql);
 	};
 	auto build_distinct_aux = [&](const RefreshMetadata::DistinctAuxMeta &meta) {
-		return BuildDistinctAuxStateCreateSQL(aux_table_sql(meta.aux_table), meta.cols, meta.source_exprs,
-		                                      aux_source_table(meta.source), meta.filter, /*replace=*/true);
+		return BuildDistinctAuxStateCreateSQL(aux_table_sql(meta.aux_table), meta, aux_source_table(meta.source),
+		                                      /*replace=*/true);
 	};
 	// Full refresh must replace DISTINCT support counts along with the visible rows;
 	// the next incremental refresh uses these counts to detect zero crossings.

@@ -2004,6 +2004,54 @@ static const Expression *ResolveDerivedOutputPassThrough(const Expression &expr,
 	return current;
 }
 
+void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
+	});
+	auto *aggregate = SpineAggregate(spine);
+	if (!aggregate || spine.projections.empty()) {
+		return;
+	}
+	DerivedOutputProjectionMap projections;
+	for (auto *projection : spine.projections) {
+		projections.emplace(projection->table_index, projection);
+	}
+	Optimizer optimizer(binder, context);
+	auto &output = *spine.projections.front();
+	const auto output_count = output.expressions.size();
+	idx_t injected = 0;
+	for (idx_t index = 0; index < output_count; index++) {
+		auto expression = ResolveDerivedOutputPassThrough(*output.expressions[index], projections);
+		if (!expression || expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto binding = expression->Cast<BoundColumnRefExpression>().Binding();
+		if (binding.table_index != aggregate->group_index) {
+			continue;
+		}
+		auto &group = aggregate->groups[binding.column_index];
+		if (group->GetReturnType().id() != LogicalTypeId::DOUBLE &&
+		    group->GetReturnType().id() != LogicalTypeId::FLOAT) {
+			continue;
+		}
+		auto argument = make_uniq<BoundCaseExpression>(MakeNegativeZeroExpression(context, optimizer, group->Copy()),
+		                                               make_uniq<BoundConstantExpression>(Value::INTEGER(1)),
+		                                               make_uniq<BoundConstantExpression>(Value(LogicalType::INTEGER)));
+		auto alias = string(openivm::GROUP_SIGN_COUNT_COL_PREFIX) + to_string(index);
+		ColumnBinding count_binding(aggregate->aggregate_index, ProjectionIndex(aggregate->expressions.size()));
+		aggregate->expressions.push_back(MakeAggregate(context, "count", std::move(argument), alias));
+		aggregate->ResolveOperatorTypes();
+		PropagateHiddenBindingThroughProjectionPath(spine.projections, count_binding, LogicalType::BIGINT, alias);
+		injected++;
+	}
+	if (injected) {
+		plan->ResolveOperatorTypes();
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Retained sign support for %zu floating group keys\n", injected);
+	}
+}
+
 namespace {
 
 /// Renders a bound expression as SQL over published output columns. Bindings in `binding_to_column` become quoted
@@ -2352,9 +2400,6 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 		}
 	}
 	info.complete = true;
-	if (info.outputs.empty()) {
-		info.inputs.clear();
-	}
 	return info;
 }
 

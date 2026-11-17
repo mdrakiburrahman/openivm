@@ -2502,3 +2502,265 @@ query I
 SELECT count(*) FROM((SELECT * FROM overflow_distinct EXCEPT ALL SELECT * FROM overflow_distinct_expected) UNION ALL(SELECT * FROM overflow_distinct_expected EXCEPT ALL SELECT * FROM overflow_distinct));
 ----
 0
+
+# Sign support counters receive the same signed DISTINCT tuple transitions.
+statement ok
+CREATE TABLE distinct_sign_source(id INT,k DOUBLE,v INT);
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(1,'-0.0'::DOUBLE,10),(2,'-0.0'::DOUBLE,20);
+
+statement ok
+CREATE TABLE distinct_nan_sign_source(id INT,v DOUBLE);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(1,-('NaN'::DOUBLE)),(2,10);
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_group AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source ORDER BY v LIMIT 4)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_sign_group_expected AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source ORDER BY v LIMIT 4)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_group_plain AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_sign_group_plain_expected AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_nan AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source ORDER BY v LIMIT 4)d;
+
+statement ok
+CREATE VIEW distinct_sign_nan_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source ORDER BY v LIMIT 4)d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_nan_plain AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source)d;
+
+statement ok
+CREATE VIEW distinct_sign_nan_plain_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source)d;
+
+foreach variant group group_plain nan nan_plain
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_sign_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=1;
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=2;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(2,0::DOUBLE,20);
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(3,'-0.0'::DOUBLE,30);
+
+statement ok
+UPDATE distinct_sign_source SET v=40 WHERE id=3;
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=3;
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(3,'NaN');
+
+statement ok
+UPDATE distinct_nan_sign_source SET v=-('NaN'::DOUBLE) WHERE id=3;
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE id=3;
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=2;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(4,'-0.0'::DOUBLE,20);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE id=1;
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(4,-('NaN'::DOUBLE));
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+DELETE FROM distinct_nan_sign_source;
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(5,0::DOUBLE,15);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(5,-('NaN'::DOUBLE)),(6,15);
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+# Full refresh rebuilds sign counters before incremental sign-only replacements resume.
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(6,'-0.0'::DOUBLE,15);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE isnan(v);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(7,'NaN');
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(7,0::DOUBLE,15);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE isnan(v);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(8,-('NaN'::DOUBLE));
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+ALTER TABLE distinct_sign_source RENAME COLUMN k TO key_value;
+
+statement ok
+ALTER TABLE distinct_nan_sign_source RENAME COLUMN v TO amount;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_group_expected AS SELECT key_value AS k,signbit(key_value) negative,SUM(v)+1 a FROM(SELECT DISTINCT key_value,v FROM distinct_sign_source ORDER BY v LIMIT 4)d GROUP BY key_value;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_group_plain_expected AS SELECT key_value AS k,signbit(key_value) negative,SUM(v)+1 a FROM(SELECT DISTINCT key_value,v FROM distinct_sign_source)d GROUP BY key_value;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_nan_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT amount AS v FROM distinct_nan_sign_source ORDER BY amount LIMIT 4)d;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_nan_plain_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT amount AS v FROM distinct_nan_sign_source)d;
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(8,'-0.0'::DOUBLE,15);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE isnan(amount);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(9,'NaN');
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop

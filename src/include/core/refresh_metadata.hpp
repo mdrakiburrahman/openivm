@@ -345,6 +345,7 @@ public:
 		string selected_input_sql;
 		vector<string> selected_input_columns;
 		vector<string> selected_source_columns;
+		vector<string> sign_columns;
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL
@@ -500,6 +501,7 @@ public:
 	static string LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta);
 
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
+	static vector<pair<string, string>> DistinctSignCountColumns(const DistinctAuxMeta &meta);
 	static vector<string> ExpectedCountDistinctAuxColumns(const CountDistinctAuxMeta &meta);
 	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
 	static vector<string> ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta);

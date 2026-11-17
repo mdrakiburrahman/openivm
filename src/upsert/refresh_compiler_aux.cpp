@@ -837,15 +837,25 @@ vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
 	return output_columns;
 }
 
-string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
-                                      const vector<string> &source_exprs, const string &source_relation,
-                                      const string &filter_sql, bool replace) {
+static string NegativeZeroSQL(const string &value) {
+	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
+}
+
+string BuildDistinctAuxStateCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
+                                      const string &source_relation, bool replace) {
 	string select_list;
 	string group_list;
-	BuildAliasedSourceLists(distinct_cols, source_exprs, select_list, group_list);
-	string filter = filter_sql.empty() ? "" : " WHERE " + filter_sql;
-	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + select_list +
-	       ", count(*)::BIGINT AS _count FROM " + source_relation + filter + " GROUP BY " + group_list;
+	BuildAliasedSourceLists(meta.cols, meta.source_exprs, select_list, group_list);
+	string filter = meta.filter.empty() ? "" : " WHERE " + meta.filter;
+	string counts = ", count(*)::BIGINT AS _count";
+	for (auto &entry : RefreshMetadata::DistinctSignCountColumns(meta)) {
+		auto index = std::find(meta.cols.begin(), meta.cols.end(), entry.first) - meta.cols.begin();
+		auto value = meta.source_exprs.empty() ? SqlUtils::QuoteIdentifier(entry.first) : meta.source_exprs[index];
+		counts += ", COUNT(CASE WHEN " + NegativeZeroSQL(value) + " THEN 1 ELSE NULL END)::BIGINT AS " +
+		          SqlUtils::QuoteIdentifier(entry.second);
+	}
+	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + select_list + counts + " FROM " +
+	       source_relation + filter + " GROUP BY " + group_list;
 }
 
 string CompileDistinctIncremental(const string &view_name, const RefreshMetadata::DistinctAuxMeta &meta,
@@ -899,6 +909,69 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 	    "\nWHEN MATCHED THEN UPDATE SET _count = _aux._count + i.dmult\nWHEN NOT MATCHED AND i.dmult > 0 "
 	    "THEN INSERT (" +
 	    distinct_cols_csv + ", _count) VALUES (" + distinct_cols_csv_i + ", i.dmult);\n\n";
+	auto sign_counts = RefreshMetadata::DistinctSignCountColumns(meta);
+	if (!sign_counts.empty() && meta.selected_input_sql.empty()) {
+		vector<string> state_counts;
+		vector<string> state_updates {"_count = _aux._count + i.dmult"};
+		vector<string> state_names {"_count"};
+		vector<string> state_values {"i.dmult"};
+		vector<string> changes;
+		vector<string> old_values;
+		vector<string> new_values;
+		string old_count = "COALESCE(_aux._count, 0)";
+		auto new_count = old_count + " + i.dmult";
+		for (auto &entry : sign_counts) {
+			auto column = SqlUtils::QuoteIdentifier(entry.first);
+			auto counter = SqlUtils::QuoteIdentifier(entry.second);
+			auto delta = "SUM(" + string(openivm::MULTIPLICITY_COL) + " * CASE WHEN " + NegativeZeroSQL(column) +
+			             " THEN 1 ELSE 0 END)::BIGINT";
+			state_counts.push_back(delta + " AS " + counter);
+			state_names.push_back(counter);
+			state_values.push_back("i." + counter);
+			state_updates.push_back(counter + " = COALESCE(_aux." + counter + ", 0) + i." + counter);
+		}
+		for (auto &column : distinct_cols) {
+			auto quoted = SqlUtils::QuoteIdentifier(column);
+			string old_value = "_aux." + quoted;
+			string new_value = "COALESCE(_aux." + quoted + ", i." + quoted + ")";
+			auto sign = std::find_if(sign_counts.begin(), sign_counts.end(),
+			                         [&](const pair<string, string> &entry) { return entry.first == column; });
+			if (sign != sign_counts.end()) {
+				auto counter = SqlUtils::QuoteIdentifier(sign->second);
+				auto negative = "COALESCE(_aux." + counter + ", 0)";
+				old_value = FloatingRepresentativeSQL(old_value, negative, old_count);
+				new_value = FloatingRepresentativeSQL(new_value, negative + " + i." + counter, "(" + new_count + ")");
+				changes.push_back("concat(" + old_value + ", '') IS DISTINCT FROM concat(" + new_value + ", '')");
+			}
+			old_values.push_back(old_value + " AS " + quoted);
+			new_values.push_back(new_value + " AS " + quoted);
+		}
+		auto changed = StringUtil::Join(changes, " OR ");
+		vector<string> keep {"SUM(" + string(openivm::MULTIPLICITY_COL) + ") <> 0"};
+		for (auto &entry : sign_counts) {
+			keep.push_back("SUM(" + string(openivm::MULTIPLICITY_COL) + " * CASE WHEN " +
+			               NegativeZeroSQL(SqlUtils::QuoteIdentifier(entry.first)) + " THEN 1 ELSE 0 END) <> 0");
+		}
+		sql = "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dinput_table) + " AS SELECT " +
+		      distinct_cols_csv + ", SUM(" + string(openivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult, " +
+		      StringUtil::Join(state_counts, ", ") + " FROM (SELECT " + source_select + ", " +
+		      string(openivm::MULTIPLICITY_COL) + " FROM " + delta_q + ts_filter + filter_clause +
+		      ") openivm_signed_input GROUP BY " + distinct_cols_csv + " HAVING " + StringUtil::Join(keep, " OR ") +
+		      ";\n";
+		auto joined = " FROM " + SqlUtils::QuoteIdentifier(dinput_table) + " i LEFT JOIN " + aux_q + " _aux ON " +
+		              aux_match_aliased;
+		ddist_cte = "WITH ddist AS (SELECT " + StringUtil::Join(old_values, ", ") + ", -1::INTEGER AS dd" + joined +
+		            " WHERE " + old_count + " > 0 AND ((" + new_count + ") <= 0 OR (" + changed +
+		            ")) UNION ALL SELECT " + StringUtil::Join(new_values, ", ") + ", 1::INTEGER AS dd" + joined +
+		            " WHERE (" + new_count + ") > 0 AND (" + old_count + " = 0 OR (" + changed + ")))\n";
+		update_aux = "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dinput_table) + " i ON " +
+		             aux_match_aliased + " WHEN MATCHED THEN UPDATE SET " + StringUtil::Join(state_updates, ", ") +
+		             " WHEN NOT MATCHED AND i.dmult > 0 THEN INSERT (" + distinct_cols_csv + ", " +
+		             StringUtil::Join(state_names, ", ") + ") VALUES (" + distinct_cols_csv_i + ", " +
+		             StringUtil::Join(state_values, ", ") + ");\n";
+		OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] Maintaining sign counts for %zu DISTINCT inputs\n",
+		                    sign_counts.size());
+	}
 	string selected_old = SqlUtils::QuoteIdentifier("openivm_selected_old_" + view_name);
 	string selected_new = SqlUtils::QuoteIdentifier("openivm_selected_new_" + view_name);
 	if (!meta.selected_input_sql.empty()) {
@@ -907,11 +980,23 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 		sql += "CREATE OR REPLACE TEMP TABLE " + selected_old + " AS " + meta.selected_input_sql + ";\n";
 		sql += update_aux;
 		sql += "CREATE OR REPLACE TEMP TABLE " + selected_new + " AS " + meta.selected_input_sql + ";\n";
-		ddist_cte = "WITH ddist AS (SELECT *, -1::INTEGER AS dd FROM (SELECT * FROM " + selected_old +
-		            " EXCEPT ALL SELECT * FROM " + selected_new +
-		            ") openivm_lost UNION ALL SELECT *, 1::INTEGER AS dd "
-		            "FROM (SELECT * FROM " +
-		            selected_new + " EXCEPT ALL SELECT * FROM " + selected_old + ") openivm_gained)\n";
+		auto selected_rows = [&](const string &table) {
+			vector<string> columns {"*"};
+			if (std::any_of(options.column_types.begin(), options.column_types.end(),
+			                [](const LogicalType &type) { return SqlUtils::EqualityCanHideValueIdentity(type); })) {
+				for (idx_t i = 0; i < meta.selected_input_columns.size(); i++) {
+					columns.push_back("openivm_internal_value_key(" +
+					                  SqlUtils::QuoteIdentifier(meta.selected_input_columns[i]) +
+					                  ") AS openivm_selected_identity_" + to_string(i));
+				}
+			}
+			return "SELECT " + StringUtil::Join(columns, ", ") + " FROM " + table;
+		};
+		auto selected_columns = SqlUtils::JoinQuotedColumns(meta.selected_input_columns);
+		ddist_cte = "WITH ddist AS (SELECT " + selected_columns + " , -1::INTEGER AS dd FROM (" +
+		            selected_rows(selected_old) + " EXCEPT ALL " + selected_rows(selected_new) +
+		            ") openivm_lost UNION ALL SELECT " + selected_columns + " , 1::INTEGER AS dd FROM (" +
+		            selected_rows(selected_new) + " EXCEPT ALL " + selected_rows(selected_old) + ") openivm_gained)\n";
 		OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] Differentiating maintained limited input for %s\n",
 		                    view_name.c_str());
 	}
@@ -954,6 +1039,14 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 			expression = "dd";
 		} else if ((input != input_types.end() && input->second == "count_star") || column == openivm::COUNT_STAR_COL) {
 			expression = "1";
+		} else if (StringUtil::StartsWith(column, openivm::GROUP_SIGN_COUNT_COL_PREFIX)) {
+			auto &key = IndexedStateColumn(column_names, column, openivm::GROUP_SIGN_COUNT_COL_PREFIX);
+			auto group = group_expressions.find(key);
+			auto value = group == group_expressions.end() ? SqlUtils::QuoteIdentifier(key) : group->second;
+			if (render_input_expression) {
+				value = render_input_expression(value);
+			}
+			expression = "CASE WHEN " + NegativeZeroSQL(value) + " THEN 1 ELSE 0 END";
 		} else if (StringUtil::StartsWith(column, openivm::NAN_COUNT_COL_PREFIX)) {
 			expression = "CASE WHEN isnan(" + sum_input + ") THEN 1 ELSE 0 END";
 		} else if (StringUtil::StartsWith(column, openivm::POS_INF_COUNT_COL_PREFIX) ||

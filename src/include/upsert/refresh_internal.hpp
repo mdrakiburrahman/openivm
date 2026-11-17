@@ -15,6 +15,10 @@
 
 namespace duckdb {
 
+// Hidden indexed state companions use a published projection position as their suffix.
+const string &IndexedStateColumn(const vector<string> &columns, const string &state_column, const string &prefix);
+string FloatingRepresentativeSQL(const string &value, const string &negative_count, const string &total_count);
+
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 // Precedes the synthetic timestamp of DuckLake signed delta rows, so every row in the range counts.
 constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";

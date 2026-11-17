@@ -2097,6 +2097,7 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Str("selected_input_sql", m.selected_input_sql, Presence::OPTIONAL);
 	io.Arr("selected_input_columns", m.selected_input_columns, Presence::OPTIONAL);
 	io.Arr("selected_source_columns", m.selected_source_columns, Presence::OPTIONAL);
+	io.Arr("sign_columns", m.sign_columns, Presence::OPTIONAL);
 }
 
 template <class IO>
@@ -2491,9 +2492,23 @@ string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta 
 	return MetadataJson::Write(meta);
 }
 
+vector<pair<string, string>> RefreshMetadata::DistinctSignCountColumns(const DistinctAuxMeta &meta) {
+	vector<pair<string, string>> result;
+	for (idx_t index = 0; index < meta.cols.size(); index++) {
+		if (std::find(meta.sign_columns.begin(), meta.sign_columns.end(), meta.cols[index]) !=
+		    meta.sign_columns.end()) {
+			result.emplace_back(meta.cols[index], "openivm_aux_sign_count_" + to_string(index));
+		}
+	}
+	return result;
+}
+
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {
 	auto expected = meta.cols;
 	expected.push_back("_count");
+	for (auto &entry : DistinctSignCountColumns(meta)) {
+		expected.push_back(entry.second);
+	}
 	return expected;
 }
 

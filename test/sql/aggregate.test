@@ -6194,3 +6194,316 @@ SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * F
 0
 
 endloop
+
+# Floating group representatives must still have support after a batched refresh.
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE group_sign_source(id INT,k INT,v DOUBLE,x INT);
+
+statement ok
+INSERT INTO group_sign_source VALUES(1,1,'-0.0'::DOUBLE,10),(2,1,0::DOUBLE,20),(3,2,'-0.0'::DOUBLE,30),(4,3,NULL,5);
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_visible AS SELECT v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE VIEW group_sign_visible_expected AS SELECT v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_hidden AS SELECT CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE VIEW group_sign_hidden_expected AS SELECT CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_multi AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v;
+
+statement ok
+CREATE VIEW group_sign_multi_expected AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_float AS SELECT k,v::FLOAT f,CASE WHEN isnan(v::FLOAT) THEN NULL ELSE signbit(v::FLOAT) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v::FLOAT;
+
+statement ok
+CREATE VIEW group_sign_float_expected AS SELECT k,v::FLOAT f,CASE WHEN isnan(v::FLOAT) THEN NULL ELSE signbit(v::FLOAT) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v::FLOAT;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_nested AS WITH g AS(SELECT k,v,SUM(x) total FROM group_sign_source GROUP BY k,v) SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,total+1 a FROM g;
+
+statement ok
+CREATE VIEW group_sign_nested_expected AS WITH g AS(SELECT k,v,SUM(x) total FROM group_sign_source GROUP BY k,v) SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,total+1 a FROM g;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_having AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v HAVING SUM(x)>0;
+
+statement ok
+CREATE VIEW group_sign_having_expected AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v HAVING SUM(x)>0;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_count AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,COUNT(*)+1 a FROM group_sign_source GROUP BY k,v;
+
+statement ok
+CREATE VIEW group_sign_count_expected AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,COUNT(*)+1 a FROM group_sign_source GROUP BY k,v;
+
+foreach variant visible hidden multi float nested having count
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name='group_sign_{variant}' AND type IN(3,6);
+----
+0
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source WHERE id=1;
+
+statement ok
+INSERT INTO group_sign_source VALUES(10,1,'-0.0'::DOUBLE,999);
+
+statement ok
+UPDATE group_sign_source SET x=x+1 WHERE id=10;
+
+statement ok
+DELETE FROM group_sign_source WHERE id=10;
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source WHERE id=3;
+
+statement ok
+INSERT INTO group_sign_source VALUES(11,2,0::DOUBLE,30);
+
+statement ok
+DELETE FROM group_sign_source WHERE id=2;
+
+statement ok
+INSERT INTO group_sign_source VALUES(12,1,'-0.0'::DOUBLE,20);
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source;
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO group_sign_source VALUES(20,1,0::DOUBLE,4),(21,2,'-0.0'::DOUBLE,6),(22,4,-('NaN'::DOUBLE),7),(23,3,NULL,5);
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source WHERE id=22;
+
+statement ok
+INSERT INTO group_sign_source VALUES(24,4,'NaN'::DOUBLE,7);
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+# NaN signs are unspecified; numerical NaN and NULL recovery remain correct.
+statement ok
+CREATE TABLE nan_sign_source(id INT,k INT,v DOUBLE);
+
+statement ok
+INSERT INTO nan_sign_source VALUES(1,1,-('NaN'::DOUBLE)),(2,1,10),(3,2,'NaN'),(4,2,20),(5,3,-('NaN'::DOUBLE));
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_group AS SELECT k,SUM(v)+1 a FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE VIEW nan_sign_group_expected AS SELECT k,SUM(v)+1 a FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_avg AS SELECT k,SUM(v)+1 a,AVG(v) m FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE VIEW nan_sign_avg_expected AS SELECT k,SUM(v)+1 a,AVG(v) m FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_scalar AS SELECT SUM(v)+1 a FROM nan_sign_source WHERE k=1;
+
+statement ok
+CREATE VIEW nan_sign_scalar_expected AS SELECT SUM(v)+1 a FROM nan_sign_source WHERE k=1;
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_float AS SELECT k,SUM(v::FLOAT)+1 a FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE VIEW nan_sign_float_expected AS SELECT k,SUM(v::FLOAT)+1 a FROM nan_sign_source GROUP BY k;
+
+foreach variant group avg scalar float
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO nan_sign_source VALUES(6,1,'NaN');
+
+statement ok
+UPDATE nan_sign_source SET v=-('NaN'::DOUBLE) WHERE id=6;
+
+statement ok
+DELETE FROM nan_sign_source WHERE id=6;
+
+statement ok
+DELETE FROM nan_sign_source WHERE id IN(1,5);
+
+statement ok
+UPDATE nan_sign_source SET v=-('NaN'::DOUBLE) WHERE id=3;
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO nan_sign_source VALUES(7,1,-('NaN'::DOUBLE)),(8,3,NULL);
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM nan_sign_source;
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO nan_sign_source VALUES(9,1,'NaN'),(10,2,-('NaN'::DOUBLE)),(11,2,15);
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+# Hidden COUNT(*) remains the cardinality anchor when no computed aggregate is published.
+statement ok
+CREATE TABLE sign_count_anchor(id INT,v DOUBLE,x INT);
+
+statement ok
+INSERT INTO sign_count_anchor VALUES(1,'-0.0'::DOUBLE,NULL),(2,'-0.0'::DOUBLE,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW sign_count_anchor_mv AS SELECT v,SUM(x) s FROM sign_count_anchor GROUP BY v HAVING COUNT(*)>1;
+
+statement ok
+CREATE VIEW sign_count_anchor_expected AS SELECT v,SUM(x) s FROM sign_count_anchor GROUP BY v HAVING COUNT(*)>1;
+
+statement ok
+INSERT INTO sign_count_anchor VALUES(3,'-0.0'::DOUBLE,NULL);
+
+statement ok
+PRAGMA refresh('sign_count_anchor_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM sign_count_anchor_mv EXCEPT ALL SELECT * FROM sign_count_anchor_expected) UNION ALL(SELECT * FROM sign_count_anchor_expected EXCEPT ALL SELECT * FROM sign_count_anchor_mv));
+----
+0
+
+statement ok
+DELETE FROM sign_count_anchor;
+
+statement ok
+INSERT INTO sign_count_anchor VALUES(4,0::DOUBLE,NULL),(5,0::DOUBLE,NULL);
+
+statement ok
+PRAGMA refresh('sign_count_anchor_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM sign_count_anchor_mv EXCEPT ALL SELECT * FROM sign_count_anchor_expected) UNION ALL(SELECT * FROM sign_count_anchor_expected EXCEPT ALL SELECT * FROM sign_count_anchor_mv));
+----
+0

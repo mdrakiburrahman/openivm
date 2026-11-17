@@ -200,6 +200,20 @@ LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan,
 	return nullptr;
 }
 
+unique_ptr<Expression> MakeNegativeZeroExpression(ClientContext &context, Optimizer &optimizer,
+                                                  unique_ptr<Expression> argument) {
+	// Only zero needs a representation witness. Ordinary values avoid formatting;
+	// ASCII is portable in exported SQL, unlike a DuckDB-only SIGNBIT call.
+	auto zero = make_uniq<BoundConstantExpression>(Value::DOUBLE(0).DefaultCastAs(argument->GetReturnType()));
+	auto is_zero = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, argument->Copy(), std::move(zero));
+	auto text = BoundCastExpression::AddCastToType(context, std::move(argument), LogicalType::VARCHAR);
+	auto negative = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL,
+	                                                  optimizer.BindScalarFunction("ascii", std::move(text)),
+	                                                  make_uniq<BoundConstantExpression>(Value::INTEGER(45)));
+	return make_uniq<BoundCaseExpression>(std::move(is_zero), std::move(negative),
+	                                      make_uniq<BoundConstantExpression>(Value::BOOLEAN(false)));
+}
+
 static bool IsDecomposedSumAlias(const string &alias) {
 	return StringUtil::StartsWith(alias, openivm::SUM_COL_PREFIX) ||
 	       StringUtil::StartsWith(alias, openivm::VAR_SQ_COL_PREFIX) ||
