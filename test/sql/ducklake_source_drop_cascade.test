@@ -444,6 +444,84 @@ WHERE contains(t.table_name, '__openivm_mv_')
 ----
 0
 
+# DROP MATERIALIZED VIEW reuses staged DuckLake cleanup and transaction checks.
+statement ok
+CREATE SCHEMA dl."Drop.Schema";
+CREATE TABLE dl."Drop.Schema".source(k INTEGER,v INTEGER);
+INSERT INTO dl."Drop.Schema".source VALUES (1,10),(1,10),(2,20);
+CREATE MATERIALIZED VIEW dl."Drop.Schema"."MV.Name" AS SELECT * FROM dl."Drop.Schema".source;
+CREATE MATERIALIZED VIEW dl."Drop.Schema".child AS SELECT * FROM dl."Drop.Schema"."MV.Name";
+
+statement error
+DROP MATERIALIZED VIEW dl."Drop.Schema"."MV.Name" RESTRICT;
+----
+depend
+
+statement ok
+BEGIN;
+
+statement error
+DROP MATERIALIZED VIEW dl."Drop.Schema"."MV.Name" CASCADE;
+----
+single transaction can only write to a single attached database
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_schema='Drop.Schema';
+----
+2
+
+# A rejected DROP leaves both views refreshable after conflicting source DML.
+statement ok
+INSERT INTO dl."Drop.Schema".source VALUES (3,30),(3,30);
+UPDATE dl."Drop.Schema".source SET v=v+1 WHERE k IN (1,3);
+DELETE FROM dl."Drop.Schema".source WHERE k=2;
+
+statement ok
+PRAGMA refresh('dl."Drop.Schema"."MV.Name"');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM dl."Drop.Schema"."MV.Name" EXCEPT ALL SELECT * FROM dl."Drop.Schema".source)
+ UNION ALL
+ (SELECT * FROM dl."Drop.Schema".source EXCEPT ALL SELECT * FROM dl."Drop.Schema"."MV.Name")
+);
+----
+0
+
+statement ok
+PRAGMA refresh('dl."Drop.Schema".child');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM dl."Drop.Schema".child EXCEPT ALL SELECT * FROM dl."Drop.Schema".source)
+ UNION ALL
+ (SELECT * FROM dl."Drop.Schema".source EXCEPT ALL SELECT * FROM dl."Drop.Schema".child)
+);
+----
+0
+
+statement ok
+DROP MATERIALIZED VIEW IF EXISTS dl."Drop.Schema"."MV.Name" CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS dl."Drop.Schema"."MV.Name";
+
+query IIIII
+SELECT
+ (SELECT count(*) FROM duckdb_views() WHERE database_name='dl' AND schema_name='Drop.Schema'),
+ (SELECT count(*) FROM duckdb_tables() WHERE database_name='dl' AND schema_name='Drop.Schema' AND starts_with(table_name,'openivm_')),
+ (SELECT count(*) FROM openivm_views WHERE view_schema='Drop.Schema'),
+ (SELECT count(*) FROM openivm_delta_tables WHERE view_name NOT IN (SELECT view_name FROM openivm_views)),
+ (SELECT count(*) FROM openivm_mv_dependencies WHERE parent_view NOT IN (SELECT view_name FROM openivm_views) OR child_view NOT IN (SELECT view_name FROM openivm_views));
+----
+0	0	0	0	0
+
+query I
+SELECT count(*) FROM dl."Drop.Schema".source;
+----
+4
+
 # Control and internal schemas must not change source ownership or staged cleanup.
 statement ok
 SET openivm_metadata_schema='drop_control';

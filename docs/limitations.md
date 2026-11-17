@@ -146,10 +146,11 @@ to preserve the signs of duplicate zero rows.
 
 ## Other limitations
 
-- **DROP MATERIALIZED VIEW syntax** is not supported because DuckDB's parser intercepts
-  it before the extension can rewrite it. Use `DROP VIEW <mv_name>` instead. OpenIVM
-  cleans the user-facing view, data table, MV delta table, base delta tables that are no
-  longer shared, and metadata rows.
+- **CREATE MATERIALIZED VIEW IF NOT EXISTS** is not supported. `DROP MATERIALIZED VIEW
+  [IF EXISTS] [catalog.][schema.]name [CASCADE]` is supported as an alias for `DROP VIEW`.
+  Both clean the user-facing view, data table, MV delta table, base delta tables that
+  are no longer shared, and metadata rows. DuckLake targets retain the existing
+  restriction on cross-catalog DROP inside an explicit transaction.
 
 - **Schema evolution** is supported for `ADD COLUMN`, `DROP COLUMN`, and `RENAME COLUMN`
   on base tables. `RENAME TO` and `ALTER COLUMN TYPE` are rejected on tracked sources. Dropping a referenced column is

@@ -763,15 +763,20 @@ string RefreshMetadata::SourceTableName(const string &key, const string &catalog
 }
 
 string RefreshMetadata::SourcePredicate(const string &table, const string &catalog, const string &schema) {
+	return SourcePredicate(table, catalog, schema, catalog, schema);
+}
+
+string RefreshMetadata::SourcePredicate(const string &table, const string &catalog, const string &schema,
+                                        const string &legacy_catalog, const string &legacy_schema) {
 	auto name = SourceTableName(table, catalog, schema);
 	// Match both legacy bare keys and qualified keys with catalog identifier rules.
 	return "(" + SqlUtils::IdentifierEqualsSQL("table_name", Value(name).ToSQLString()) + " OR " +
 	       SqlUtils::IdentifierEqualsSQL("table_name", Value(SqlUtils::FullName(catalog, schema, name)).ToSQLString()) +
 	       ") AND " +
-	       SqlUtils::IdentifierEqualsSQL("COALESCE(source_catalog, " + Value(catalog).ToSQLString() + ")",
+	       SqlUtils::IdentifierEqualsSQL("COALESCE(source_catalog, " + Value(legacy_catalog).ToSQLString() + ")",
 	                                     Value(catalog).ToSQLString()) +
 	       " AND " +
-	       SqlUtils::IdentifierEqualsSQL("COALESCE(source_schema, " + Value(schema).ToSQLString() + ")",
+	       SqlUtils::IdentifierEqualsSQL("COALESCE(source_schema, " + Value(legacy_schema).ToSQLString() + ")",
 	                                     Value(schema).ToSQLString());
 }
 
@@ -1218,13 +1223,14 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForMutation(Clie
 }
 
 string RefreshMetadata::SourceOwnerPredicate(const string &table, const string &catalog, const string &schema,
-                                             bool ducklake) {
+                                             bool ducklake, const string &legacy_catalog) {
 	// The catalog type keeps a native `openivm_delta_<name>` key and a DuckLake source
 	// that happens to use that name from being mistaken for each other.
 	if (ducklake) {
-		return SourcePredicate(table, catalog, schema) + " AND catalog_type = 'ducklake'";
+		return SourcePredicate(table, catalog, schema, legacy_catalog, DEFAULT_SCHEMA) +
+		       " AND catalog_type = 'ducklake'";
 	}
-	return SourcePredicate(SqlUtils::DeltaName(table), catalog, schema) +
+	return SourcePredicate(SqlUtils::DeltaName(table), catalog, schema, legacy_catalog, DEFAULT_SCHEMA) +
 	       " AND COALESCE(catalog_type, 'duckdb') <> 'ducklake'";
 }
 
@@ -1402,7 +1408,8 @@ bool RefreshMetadata::HasSourceDeltaConsumers(Connection &con, const DeltaSource
 	auto matches = [&](Connection &reader, const MetadataLocation &location, const string &target) {
 		auto table = location.Table(openivm::DELTA_TABLES_TABLE);
 		auto query = "SELECT count(*) FROM " + target + " WHERE " +
-		             SourcePredicate(source.table_name, source.catalog_name, source.schema_name);
+		             SourcePredicate(source.table_name, source.catalog_name, source.schema_name, location.catalog,
+		                             DEFAULT_SCHEMA);
 		auto consumers = excluded_consumers.find(table);
 		if (consumers != excluded_consumers.end() && !consumers->second.empty()) {
 			query += " AND view_name NOT IN (" + consumers->second + ")";
@@ -1678,14 +1685,19 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_published,
                                          optional_ptr<TransactionalMVMetadataState> transaction_state) {
 	auto internal = GetInternalLocation(view_name);
-	auto predicate =
-	    "(" + SourcePredicate(SqlUtils::DeltaName(view_name), internal.catalog_name, internal.schema_name) + ")";
-	if (include_published) {
-		for (auto &source : {SqlUtils::DeltaName(PublishedViewName(view_name)), PublishedViewName(view_name)}) {
-			predicate += " OR (" + SourcePredicate(source, internal.catalog_name, internal.schema_name) + ")";
+	auto matches = [&](Connection &reader, const MetadataLocation &location, const string &target) {
+		auto predicate = "(" +
+		                 SourcePredicate(SqlUtils::DeltaName(view_name), internal.catalog_name, internal.schema_name,
+		                                 location.catalog, DEFAULT_SCHEMA) +
+		                 ")";
+		if (include_published) {
+			for (auto &source : {SqlUtils::DeltaName(PublishedViewName(view_name)), PublishedViewName(view_name)}) {
+				predicate += " OR (" +
+				             SourcePredicate(source, internal.catalog_name, internal.schema_name, location.catalog,
+				                             DEFAULT_SCHEMA) +
+				             ")";
+			}
 		}
-	}
-	auto matches = [&](Connection &reader, const MetadataLocation &, const string &target) {
 		auto result = reader.Query("SELECT 1 FROM " + target + " WHERE " + predicate + " LIMIT 1");
 		if (result->HasError()) {
 			throw CatalogException("Cannot resolve downstream consumers for '%s': %s", view_name, result->GetError());
