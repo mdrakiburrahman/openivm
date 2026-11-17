@@ -971,6 +971,11 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 			                 ? "CAST(" + sum_input + " AS " + options.column_types.at(i).ToString() + ")"
 			                 : sum_input;
 			if (finite_sum) {
+				auto large = "abs(" + expression + ") >= " + Value::DOUBLE(openivm::FINITE_SUM_THRESHOLD).ToSQLString();
+				expression = StringUtil::StartsWith(column, openivm::LARGE_SUM_COL_PREFIX)
+				                 ? "CASE WHEN " + large + " THEN " + expression + " / " +
+				                       Value::DOUBLE(openivm::FINITE_SUM_SCALE).ToSQLString() + " ELSE 0 END"
+				                 : "CASE WHEN " + large + " THEN 0 ELSE " + expression + " END";
 				expression = "CASE WHEN " + finite_input + " THEN " + expression + " ELSE NULL END";
 			}
 		} else {

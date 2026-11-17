@@ -5911,12 +5911,42 @@ CREATE MATERIALIZED VIEW finite_sum_mixed AS SELECT k,SUM(v) raw,SUM(v)+COUNT(*)
 statement ok
 CREATE VIEW finite_sum_mixed_expected AS SELECT k,SUM(v) raw,SUM(v)+COUNT(*) a FROM finite_sum_source GROUP BY k;
 
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_group AS SELECT k,AVG(v) m,SUM(v)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_avg_group_expected AS SELECT k,AVG(v) m,SUM(v)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_scalar AS SELECT AVG(v) m,SUM(v)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE VIEW finite_sum_avg_scalar_expected AS SELECT AVG(v) m,SUM(v)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_count AS SELECT k,AVG(v) m,COUNT(*)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_avg_count_expected AS SELECT k,AVG(v) m,COUNT(*)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_int AS SELECT k,AVG(v) m,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_avg_int_expected AS SELECT k,AVG(v) m,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_raw_int AS SELECT k,SUM(v) raw,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_raw_int_expected AS SELECT k,SUM(v) raw,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
 query I
 SELECT count(*) FROM openivm_views WHERE view_sql_name LIKE 'finite_sum_%' AND type IN(3,6);
 ----
 0
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 query I
 SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
@@ -5937,7 +5967,7 @@ UPDATE finite_sum_source SET v=15 WHERE id=20;
 statement ok
 DELETE FROM finite_sum_source WHERE id IN(20,21);
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -5961,7 +5991,7 @@ DELETE FROM finite_sum_source WHERE id=4;
 statement ok
 INSERT INTO finite_sum_source VALUES(36,2,45);
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -5982,7 +6012,7 @@ UPDATE finite_sum_source SET v='NaN' WHERE id=9;
 statement ok
 UPDATE finite_sum_source SET v=55 WHERE id=9;
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6000,7 +6030,7 @@ SET openivm_refresh_mode='full';
 statement ok
 INSERT INTO finite_sum_source VALUES(40,1,'Infinity'),(41,7,'NaN');
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6021,7 +6051,7 @@ DELETE FROM finite_sum_source WHERE NOT isfinite(v);
 statement ok
 UPDATE finite_sum_source SET v=60 WHERE id=11;
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6036,7 +6066,7 @@ endloop
 statement ok
 DELETE FROM finite_sum_source;
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6051,7 +6081,7 @@ endloop
 statement ok
 INSERT INTO finite_sum_source VALUES(50,NULL,'NaN'),(51,NULL,10),(52,1,'Infinity'),(53,1,20);
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6066,7 +6096,7 @@ endloop
 statement ok
 DELETE FROM finite_sum_source WHERE NOT isfinite(v);
 
-foreach variant group scalar coalesce cast having order mixed
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6082,3 +6112,85 @@ query I
 SELECT (count(*)>0)::INTEGER FROM openivm_compile_with_facts('finite_sum_group','{"target_dialect":"spark","compile_only":true}') WHERE stmt_kind='data';
 ----
 1
+
+# Finite overflow is recoverable, and the unscaled lane preserves subnormal inputs.
+statement ok
+CREATE TABLE overflow_sum_source(id INT,k INT,v DOUBLE);
+
+statement ok
+INSERT INTO overflow_sum_source VALUES(1,1,1e308),(2,1,1e308),(3,2,-1e308),(4,2,-1e308),(5,3,5e-324);
+
+statement ok
+CREATE MATERIALIZED VIEW overflow_sum_group AS SELECT k,SUM(v)+0 a FROM overflow_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW overflow_sum_group_expected AS SELECT k,SUM(v)+0 a FROM overflow_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW overflow_sum_scalar AS SELECT SUM(v)+0 a FROM overflow_sum_source WHERE k=1;
+
+statement ok
+CREATE VIEW overflow_sum_scalar_expected AS SELECT SUM(v)+0 a FROM overflow_sum_source WHERE k=1;
+
+foreach variant group scalar
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM overflow_sum_source WHERE id IN(2,4);
+
+statement ok
+INSERT INTO overflow_sum_source VALUES(6,1,1e308),(7,2,-1e308),(8,3,5e-324);
+
+statement ok
+UPDATE overflow_sum_source SET v=-v WHERE id IN(6,7);
+
+statement ok
+DELETE FROM overflow_sum_source WHERE id IN(6,7);
+
+foreach variant group scalar
+
+statement ok
+PRAGMA refresh('overflow_sum_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO overflow_sum_source VALUES(9,1,1e308),(10,2,-1e308);
+
+foreach variant group scalar
+
+statement ok
+PRAGMA refresh('overflow_sum_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM overflow_sum_source WHERE id IN(9,10);
+
+foreach variant group scalar
+
+statement ok
+PRAGMA refresh('overflow_sum_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop

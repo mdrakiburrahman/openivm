@@ -76,11 +76,11 @@ protected:
 	void ResolveTypes() override;
 };
 
-// Transparent wrapper around a LogicalMergeInto. At physical-plan creation it decorates
-// DuckDB's resolved action sinks, so only rows that actually INSERT/UPDATE/DELETE are captured.
-class LogicalTransactionalMergeDeltaCapture : public LogicalExtensionOperator {
+// Decorate a native UPDATE sink or MERGE's resolved action sinks. In-place
+// postimages are fetched after the native write, including equality-preserving updates.
+class LogicalTransactionalActionDeltaCapture : public LogicalExtensionOperator {
 public:
-	LogicalTransactionalMergeDeltaCapture(TableCatalogEntry &base_table, TableCatalogEntry &delta_table);
+	LogicalTransactionalActionDeltaCapture(TableCatalogEntry &base_table, TableCatalogEntry &delta_table);
 
 	TableCatalogEntry &base_table;
 	TableCatalogEntry &delta_table;

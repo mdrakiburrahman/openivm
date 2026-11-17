@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
@@ -31,6 +32,13 @@
 #include <sstream>
 
 namespace duckdb {
+
+bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
+	return TypeVisitor::Contains(type, [](const LogicalType &child) {
+		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL ||
+		       child.id() == LogicalTypeId::FLOAT || child.id() == LogicalTypeId::DOUBLE;
+	});
+}
 
 void SqlUtils::CopySessionSetting(ClientContext &from, ClientContext &to, const string &name) {
 	auto &db_config = DBConfig::GetConfig(to);

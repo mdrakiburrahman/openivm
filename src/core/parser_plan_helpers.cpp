@@ -85,7 +85,7 @@ static void RewriteSourceColumns(Binder &binder, SQLStatement &statement);
 } // namespace
 
 static void CandidateValueKey(DataChunk &input, ExpressionState &, Vector &result) {
-	// SQL VARIANT equality normalizes payload types; state identity must retain them.
+	// SQL equality can hide payload types, interval components, and the sign of zero.
 	auto canonical = TypeContainsVariant(input.data[0].GetType())
 	                     ? CanonicalizeVariantVector(input.data[0], input.size())
 	                     : Vector::Ref(input.data[0]);
@@ -1621,7 +1621,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		vector<string> identity_keys;
 		for (idx_t i = 0; i < meta.selected_source_columns.size(); i++) {
 			auto &type = source_types[i];
-			if (TypeContainsVariant(type)) {
+			if (SqlUtils::EqualityCanHideValueIdentity(type)) {
 				identity_keys.push_back("openivm_internal_value_key(" + meta.source_exprs[i] + ")");
 			} else if (type.id() == LogicalTypeId::VARCHAR &&
 			           (!StringType::GetCollation(type).empty() || !default_collation.empty())) {

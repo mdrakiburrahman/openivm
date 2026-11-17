@@ -1099,7 +1099,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	for (auto &entry : d_sum) {
 		auto &alias = entry.first;
 		auto &sum_col = entry.second;
-		if (!d_count.count(alias)) {
+		if (!d_count.count(alias) || derived_columns.count(alias)) {
 			continue;
 		}
 		string count_col = d_count[alias];

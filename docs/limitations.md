@@ -92,6 +92,26 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 | Any visible MV column with a non-summable type (VARCHAR literal, UPPER(group_col), CASE over aggregate, BOOLEAN predicate on aggregate, LIST) | Yes (via group-recompute) | The delta `SUM(openivm_multiplicity * col)` formula can't type-check for these columns; detected in `CompileAggregateGroups` via the delta-view column types and routed to group-recompute. Unified path with `LIST` and `MIN`/`MAX` above. |
 | `HAVING` | Partial | Group-recompute for affected groups; `openivm_having_merge=true` (default) uses the MERGE path when the stored data table holds all groups. |
 
+## Floating-point SUM state
+
+Computed expressions over a `DOUBLE` SUM (for example, `SUM(v) + 1`) retain two
+finite subtotals, plus support counts for NaN and each infinity. The same state
+protects floating SUM outputs and AVG helpers in a view with a computed SUM or
+COUNT. Values with magnitude at least `2^960` are accumulated after division by
+`2^64`; smaller values remain unscaled, preserving subnormal inputs. Each subtotal leaves room
+for up to `BIGINT_MAX` input rows without overflowing. The visible result is
+reconstructed from the subtotals after delta integration, so deleting values can
+recover a finite result even after the visible SUM has overflowed.
+
+Compared with a single finite subtotal, this adds one `DOUBLE` subtotal and its
+`BIGINT` non-NULL count per protected SUM, without per-value state or a scan of
+unchanged source rows. Floating-point reassociation can differ from a
+native DuckDB SUM, including when overflow happens before cancellation. For
+example, DuckDB may return infinity for `1e308 + 1e308 - 1e308`, while the maintained
+two-subtotal result is finite (`1e308`). Exact agreement with native floating-point
+SUM evaluation order is not guaranteed. This also applies to AVG when its SUM
+helper uses this state. Integer and DECIMAL SUMs do not use this decomposition.
+
 ## Other limitations
 
 - **DROP MATERIALIZED VIEW syntax** is not supported because DuckDB's parser intercepts

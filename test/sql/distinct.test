@@ -2311,3 +2311,194 @@ SELECT count(*) FROM((SELECT * FROM default_collation_candidate_mv EXCEPT ALL SE
 
 statement ok
 SET default_collation='';
+
+# Candidate identity preserves interval components and signed zero, including nested values.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE identity_source_interval(id INT,v INTERVAL);
+
+statement ok
+INSERT INTO identity_source_interval VALUES(1,INTERVAL '1 month'),(2,INTERVAL '30 days');
+
+statement ok
+CREATE MATERIALIZED VIEW identity_interval AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v) AS n FROM identity_source_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_interval_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v) AS n FROM identity_source_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_interval VALUES(3,INTERVAL '2 months');
+
+statement ok
+CREATE TABLE identity_source_zero(id INT,v DOUBLE);
+
+statement ok
+INSERT INTO identity_source_zero VALUES(1,'-0.0'::DOUBLE),(2,0::DOUBLE);
+
+statement ok
+CREATE MATERIALIZED VIEW identity_zero AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_zero_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_zero VALUES(3,1::DOUBLE);
+
+statement ok
+CREATE TABLE identity_source_float_zero(id INT,v FLOAT);
+
+statement ok
+INSERT INTO identity_source_float_zero VALUES(1,'-0.0'::FLOAT),(2,0::FLOAT);
+
+statement ok
+CREATE MATERIALIZED VIEW identity_float_zero AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_float_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_float_zero_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_float_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_float_zero VALUES(3,1::FLOAT);
+
+statement ok
+CREATE TABLE identity_source_nested_interval(id INT,v STRUCT(x INTERVAL));
+
+statement ok
+INSERT INTO identity_source_nested_interval VALUES(1,{'x':INTERVAL '1 month'}),(2,{'x':INTERVAL '30 days'});
+
+statement ok
+CREATE MATERIALIZED VIEW identity_nested_interval AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v.x) AS n FROM identity_source_nested_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_nested_interval_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v.x) AS n FROM identity_source_nested_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_nested_interval VALUES(3,{'x':INTERVAL '2 months'});
+
+statement ok
+CREATE TABLE identity_source_nested_zero(id INT,v DOUBLE[]);
+
+statement ok
+INSERT INTO identity_source_nested_zero VALUES(1,['-0.0'::DOUBLE]),(2,[0::DOUBLE]);
+
+statement ok
+CREATE MATERIALIZED VIEW identity_nested_zero AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END AS n FROM identity_source_nested_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_nested_zero_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END AS n FROM identity_source_nested_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_nested_zero VALUES(3,[1::DOUBLE]);
+
+foreach variant interval zero float_zero nested_interval nested_zero
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='identity_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('identity_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM identity_{variant} EXCEPT ALL SELECT * FROM identity_{variant}_expected) UNION ALL(SELECT * FROM identity_{variant}_expected EXCEPT ALL SELECT * FROM identity_{variant}));
+----
+0
+
+endloop
+
+# Native storage may retain the old representation when an UPDATE is SQL-equal.
+foreach variant interval zero float_zero nested_interval nested_zero
+
+statement ok
+INSERT INTO identity_source_{variant} SELECT 6,v FROM identity_source_{variant} WHERE id=1;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=2) WHERE id=6;
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=6;
+
+statement ok
+PRAGMA refresh('identity_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM identity_{variant} EXCEPT ALL SELECT * FROM identity_{variant}_expected) UNION ALL(SELECT * FROM identity_{variant}_expected EXCEPT ALL SELECT * FROM identity_{variant}));
+----
+0
+
+endloop
+
+foreach variant interval zero float_zero nested_interval nested_zero
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=1;
+
+statement ok
+INSERT INTO identity_source_{variant} SELECT 4,v FROM identity_source_{variant} WHERE id=2;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=3) WHERE id=4;
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=4;
+
+statement ok
+INSERT INTO identity_source_{variant} SELECT 5,v FROM identity_source_{variant} WHERE id=2;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=3) WHERE id=5;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=2) WHERE id=5;
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=5;
+
+statement ok
+PRAGMA refresh('identity_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM identity_{variant} EXCEPT ALL SELECT * FROM identity_{variant}_expected) UNION ALL(SELECT * FROM identity_{variant}_expected EXCEPT ALL SELECT * FROM identity_{variant}));
+----
+0
+
+endloop
+
+statement ok
+CREATE TABLE overflow_distinct_source(k INT,v DOUBLE);
+
+statement ok
+INSERT INTO overflow_distinct_source VALUES(1,1e308),(1,1.5e308),(2,-1e308),(2,-1.5e308);
+
+statement ok
+CREATE MATERIALIZED VIEW overflow_distinct AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM overflow_distinct_source ORDER BY k,v LIMIT 4)d GROUP BY k;
+
+statement ok
+CREATE VIEW overflow_distinct_expected AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM overflow_distinct_source ORDER BY k,v LIMIT 4)d GROUP BY k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='overflow_distinct';
+----
+8
+
+statement ok
+DELETE FROM overflow_distinct_source WHERE abs(v)=1.5e308;
+
+statement ok
+INSERT INTO overflow_distinct_source VALUES(1,1.5e308),(2,-1.5e308);
+
+statement ok
+UPDATE overflow_distinct_source SET v=-v WHERE abs(v)=1.5e308;
+
+statement ok
+DELETE FROM overflow_distinct_source WHERE abs(v)=1.5e308;
+
+statement ok
+PRAGMA refresh('overflow_distinct');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_distinct EXCEPT ALL SELECT * FROM overflow_distinct_expected) UNION ALL(SELECT * FROM overflow_distinct_expected EXCEPT ALL SELECT * FROM overflow_distinct));
+----
+0

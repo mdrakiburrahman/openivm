@@ -200,6 +200,12 @@ LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan,
 	return nullptr;
 }
 
+static bool IsDecomposedSumAlias(const string &alias) {
+	return StringUtil::StartsWith(alias, openivm::SUM_COL_PREFIX) ||
+	       StringUtil::StartsWith(alias, openivm::VAR_SQ_COL_PREFIX) ||
+	       StringUtil::StartsWith(alias, openivm::VAR_SQP_COL_PREFIX);
+}
+
 void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
 	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
 		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
@@ -214,13 +220,13 @@ void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_pt
 	for (auto *projection : spine.projections) {
 		projections.emplace(projection->table_index, projection);
 	}
-	std::set<idx_t> sums;
+	std::set<idx_t> computed_inputs;
 	std::function<void(const Expression &, bool)> collect = [&](const Expression &expression, bool computed) {
 		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
 			if (binding.table_index == aggregate->aggregate_index) {
 				if (computed) {
-					sums.insert(binding.column_index.GetIndex());
+					computed_inputs.insert(binding.column_index.GetIndex());
 				}
 			} else if (projections.count(binding.table_index)) {
 				collect(*projections.at(binding.table_index)->expressions[binding.column_index], computed);
@@ -232,16 +238,22 @@ void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_pt
 	for (auto &expression : spine.projections.front()->expressions) {
 		collect(*expression, false);
 	}
+	// Preserve the existing derived-only path; a computed aggregate needs recoverable
+	// state for every floating SUM it shares the MERGE with, including AVG helpers.
+	if (std::none_of(computed_inputs.begin(), computed_inputs.end(), [&](idx_t index) {
+		    auto &sum = aggregate->expressions[index]->Cast<BoundAggregateExpression>();
+		    auto alias = sum.GetAlias().GetIdentifierName();
+		    return !IsDecomposedSumAlias(alias) && !StringUtil::StartsWith(alias, openivm::COUNT_COL_PREFIX);
+	    })) {
+		return;
+	}
 	Optimizer optimizer(binder, context);
 	column_binding_map_t<unique_ptr<Expression>> replacements;
-	for (auto index : sums) {
+	const auto original_aggregate_count = aggregate->expressions.size();
+	for (idx_t index = 0; index < original_aggregate_count; index++) {
 		auto &sum = aggregate->expressions[index]->Cast<BoundAggregateExpression>();
-		auto alias = sum.GetAlias().GetIdentifierName();
 		if (sum.Function().GetName().GetIdentifierName() != "sum" || sum.IsDistinct() || sum.GetFilter() ||
-		    sum.GetChildren()[0]->IsVolatile() || sum.GetReturnType().id() != LogicalTypeId::DOUBLE ||
-		    StringUtil::StartsWith(alias, openivm::SUM_COL_PREFIX) ||
-		    StringUtil::StartsWith(alias, openivm::VAR_SQ_COL_PREFIX) ||
-		    StringUtil::StartsWith(alias, openivm::VAR_SQP_COL_PREFIX)) {
+		    sum.GetChildren()[0]->IsVolatile() || sum.GetReturnType().id() != LogicalTypeId::DOUBLE) {
 			continue;
 		}
 		auto argument = sum.GetChildren()[0]->Copy();
@@ -254,9 +266,28 @@ void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_pt
 		                                      make_uniq<BoundConstantExpression>(positive_infinity)),
 		    BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, argument->Copy(),
 		                                      make_uniq<BoundConstantExpression>(negative_infinity)));
+		auto large = BoundComparisonExpression::Create(
+		    ExpressionType::COMPARE_GREATERTHANOREQUALTO, optimizer.BindScalarFunction("abs", argument->Copy()),
+		    make_uniq<BoundConstantExpression>(Value::DOUBLE(openivm::FINITE_SUM_THRESHOLD)));
+		auto zero = [] {
+			return make_uniq<BoundConstantExpression>(Value::DOUBLE(0));
+		};
+		auto scale = [] {
+			return make_uniq<BoundConstantExpression>(Value::DOUBLE(openivm::FINITE_SUM_SCALE));
+		};
+		auto large_input = make_uniq<BoundCaseExpression>(
+		    large->Copy(), optimizer.BindScalarFunction("/", argument->Copy(), scale()), zero());
+		auto large_sum =
+		    MakeAggregate(context, "sum",
+		                  make_uniq<BoundCaseExpression>(finite->Copy(), std::move(large_input),
+		                                                 make_uniq<BoundConstantExpression>(Value(argument_type))),
+		                  string(openivm::LARGE_SUM_COL_PREFIX) + to_string(index));
 		sum.GetChildrenMutable()[0] = make_uniq<BoundCaseExpression>(
-		    std::move(finite), argument->Copy(), make_uniq<BoundConstantExpression>(Value(argument_type)));
+		    std::move(finite), make_uniq<BoundCaseExpression>(std::move(large), zero(), argument->Copy()),
+		    make_uniq<BoundConstantExpression>(Value(argument_type)));
 		sum.SetAlias(Identifier(string(openivm::FINITE_SUM_COL_PREFIX) + to_string(index)));
+		ColumnBinding large_binding(aggregate->aggregate_index, ProjectionIndex(aggregate->expressions.size()));
+		aggregate->expressions.push_back(std::move(large_sum));
 		vector<ColumnBinding> counts;
 		for (auto prefix :
 		     {openivm::NAN_COUNT_COL_PREFIX, openivm::POS_INF_COUNT_COL_PREFIX, openivm::NEG_INF_COUNT_COL_PREFIX}) {
@@ -288,10 +319,23 @@ void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_pt
 			return make_uniq<BoundConstantExpression>(Value::DOUBLE(value));
 		};
 		ColumnBinding binding(aggregate->aggregate_index, ProjectionIndex(index));
+		auto small_ref = make_uniq<BoundColumnRefExpression>(LogicalType::DOUBLE, binding);
+		auto large_ref = make_uniq<BoundColumnRefExpression>(LogicalType::DOUBLE, large_binding);
+		auto large_zero = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, large_ref->Copy(), zero());
+		auto combined = optimizer.BindScalarFunction(
+		    "*",
+		    optimizer.BindScalarFunction("+", large_ref->Copy(),
+		                                 optimizer.BindScalarFunction("/", small_ref->Copy(), scale())),
+		    scale());
+		// Keep tiny inputs unscaled when the large lane cancels to zero.
 		unique_ptr<Expression> value =
-		    make_uniq<BoundCaseExpression>(present(2), constant(-std::numeric_limits<double>::infinity()),
-		                                   make_uniq<BoundColumnRefExpression>(LogicalType::DOUBLE, binding));
-		auto positive = make_uniq<BoundCaseExpression>(present(2), constant(std::numeric_limits<double>::quiet_NaN()),
+		    make_uniq<BoundCaseExpression>(std::move(large_zero), std::move(small_ref), std::move(combined));
+		value = make_uniq<BoundCaseExpression>(present(2), constant(-std::numeric_limits<double>::infinity()),
+		                                       std::move(value));
+		// Use native arithmetic so CAST to VARCHAR retains the platform's NaN sign.
+		auto opposite_infinities = optimizer.BindScalarFunction("+", constant(std::numeric_limits<double>::infinity()),
+		                                                        constant(-std::numeric_limits<double>::infinity()));
+		auto positive = make_uniq<BoundCaseExpression>(present(2), std::move(opposite_infinities),
 		                                               constant(std::numeric_limits<double>::infinity()));
 		value = make_uniq<BoundCaseExpression>(present(1), std::move(positive), std::move(value));
 		replacements.emplace(binding, make_uniq<BoundCaseExpression>(present(0),
@@ -399,9 +443,7 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 		    sum.GetChildren().size() != 1) {
 			continue;
 		}
-		if (sum.GetAlias().GetIdentifierName().find(string(openivm::SUM_COL_PREFIX)) == 0 ||
-		    sum.GetAlias().GetIdentifierName().find(string(openivm::VAR_SQ_COL_PREFIX)) == 0 ||
-		    sum.GetAlias().GetIdentifierName().find(string(openivm::VAR_SQP_COL_PREFIX)) == 0) {
+		if (IsDecomposedSumAlias(sum.GetAlias().GetIdentifierName())) {
 			continue;
 		}
 

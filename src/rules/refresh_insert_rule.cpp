@@ -555,6 +555,18 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			auto &update = dml->Cast<LogicalUpdate>();
 			const auto &table_name = update.table.name;
 			ResolveUpdateDefaults(input, update);
+			if (!update.update_is_del_and_insert &&
+			    std::any_of(update.columns.begin(), update.columns.end(), [&](PhysicalIndex column) {
+				    return SqlUtils::EqualityCanHideValueIdentity(update.table.GetColumns().GetColumn(column).Type());
+			    })) {
+				// DuckDB can skip SQL-equal storage updates: proposed SET values need
+				// not be the persisted postimages (e.g. -0.0 -> +0.0 or 1 month -> 30 days).
+				auto capture = make_uniq<LogicalTransactionalActionDeltaCapture>(update.table, *delta_table);
+				capture->children.push_back(std::move(*dml_owner));
+				*dml_owner = std::move(capture);
+				OPENIVM_DEBUG_PRINT("[INSERT RULE] native UPDATE postimage capture for '%s'\n", table_name.c_str());
+				break;
+			}
 			vector<unique_ptr<Expression>> update_expressions;
 			update_expressions.reserve(update.expressions.size());
 			for (idx_t index = 0; index < update.expressions.size(); index++) {
@@ -572,7 +584,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		case LogicalOperatorType::LOGICAL_MERGE_INTO: {
 			auto &merge = dml->Cast<LogicalMergeInto>();
 			const auto &table_name = merge.table.name;
-			auto capture = make_uniq<LogicalTransactionalMergeDeltaCapture>(merge.table, *delta_table);
+			auto capture = make_uniq<LogicalTransactionalActionDeltaCapture>(merge.table, *delta_table);
 			capture->children.push_back(std::move(*dml_owner));
 			*dml_owner = std::move(capture);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional MERGE action delta capture for '%s'\n",

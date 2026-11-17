@@ -24,6 +24,8 @@ struct SessionLocation {
 
 class SqlUtils {
 public:
+	// SQL equality can merge observably different values, including nested ones.
+	static bool EqualityCanHideValueIdentity(const LogicalType &type);
 	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
 	                                     const Identifier &schema) {
 		return EntryLookupInfo(lookup, QualifiedName(catalog, schema, lookup.GetEntryIdentifier()));

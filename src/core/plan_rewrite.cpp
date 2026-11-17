@@ -1185,8 +1185,9 @@ void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan) {
 		string alias = name == "count_star" ? string(openivm::COUNT_STAR_COL)
 		                                    : "openivm_aggregate_input_" + to_string(binding.column_index.GetIndex());
 		auto aggregate_alias = expression.GetAlias().GetIdentifierName();
-		for (auto prefix : {openivm::FINITE_SUM_COL_PREFIX, openivm::NAN_COUNT_COL_PREFIX,
-		                    openivm::POS_INF_COUNT_COL_PREFIX, openivm::NEG_INF_COUNT_COL_PREFIX}) {
+		for (auto prefix :
+		     {openivm::FINITE_SUM_COL_PREFIX, openivm::LARGE_SUM_COL_PREFIX, openivm::NAN_COUNT_COL_PREFIX,
+		      openivm::POS_INF_COUNT_COL_PREFIX, openivm::NEG_INF_COUNT_COL_PREFIX}) {
 			if (StringUtil::StartsWith(aggregate_alias, prefix)) {
 				alias = aggregate_alias;
 				break;
@@ -2326,14 +2327,17 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 			}
 		}
 	}
+	const bool recoverable_sums = std::any_of(info.inputs.begin(), info.inputs.end(), [](const AggregateInput &input) {
+		return StringUtil::StartsWith(input.output_column, openivm::FINITE_SUM_COL_PREFIX);
+	});
 	OutputExpressionRenderer renderer(binding_to_column, projections);
 	for (idx_t i = 0; i < resolved_expressions.size(); i++) {
 		auto &expression = *resolved_expressions[i];
 		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
-		    (IncrementalTableNames::IsInternalColumn(output_names[i]) &&
-		     !StringUtil::StartsWith(output_names[i], openivm::SORT_VALUE_PREFIX)) ||
-		    std::find(decomposed_outputs.begin(), decomposed_outputs.end(), output_names[i]) !=
-		        decomposed_outputs.end()) {
+		    (!recoverable_sums && ((IncrementalTableNames::IsInternalColumn(output_names[i]) &&
+		                            !StringUtil::StartsWith(output_names[i], openivm::SORT_VALUE_PREFIX)) ||
+		                           std::find(decomposed_outputs.begin(), decomposed_outputs.end(), output_names[i]) !=
+		                               decomposed_outputs.end()))) {
 			continue;
 		}
 		string expression_sql;

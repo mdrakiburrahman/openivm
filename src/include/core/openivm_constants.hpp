@@ -62,6 +62,10 @@ constexpr const char *COUNT_COL_PREFIX = "openivm_count_";
 // bound output without inspecting SQL text or aliases.
 constexpr const char *SUM_COUNT_COL_PREFIX = "openivm_nonnull_sum_count_";
 constexpr const char *FINITE_SUM_COL_PREFIX = "openivm_finite_sum_";
+constexpr const char *LARGE_SUM_COL_PREFIX = "openivm_large_sum_";
+// Two finite lanes leave 64 exponent bits for accumulating up to BIGINT_MAX input rows.
+constexpr double FINITE_SUM_THRESHOLD = 0x1p960;
+constexpr double FINITE_SUM_SCALE = 0x1p64;
 constexpr const char *NAN_COUNT_COL_PREFIX = "openivm_nan_count_";
 constexpr const char *POS_INF_COUNT_COL_PREFIX = "openivm_pos_inf_count_";
 constexpr const char *NEG_INF_COUNT_COL_PREFIX = "openivm_neg_inf_count_";
