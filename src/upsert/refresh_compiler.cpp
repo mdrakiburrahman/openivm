@@ -1186,15 +1186,17 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 }
 
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const string &delta_ts_filter, const string &catalog_prefix, bool insert_only,
-                                 string *appended_rows) {
+                                 const vector<LogicalType> &column_types, const string &delta_ts_filter,
+                                 const string &catalog_prefix, bool insert_only, string *appended_rows) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
-	return CompileProjectionDelta(data_table, delta_view, column_names, delta_ts_filter, insert_only, appended_rows);
+	return CompileProjectionDelta(data_table, delta_view, column_names, column_types, delta_ts_filter, insert_only,
+	                              appended_rows);
 }
 
 string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
-                              const string &delta_ts_filter, bool insert_only, string *appended_rows) {
+                              const vector<LogicalType> &column_types, const string &delta_ts_filter, bool insert_only,
+                              string *appended_rows) {
 	string mul = string(openivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
@@ -1221,11 +1223,27 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 		return "INSERT INTO " + data_table + " " + rows + ";\n";
 	}
 
+	// Separate SQL-equal zero representations in both consolidation and copy
+	// deletion. Otherwise a sign-only replacement disappears, or deletes a copy
+	// with the opposite sign from a mixed bag.
+	D_ASSERT(column_names.size() == column_types.size());
+	string group_columns = select_columns;
+	for (idx_t index = 0; index < column_names.size(); index++) {
+		if (column_types[index].id() == LogicalTypeId::FLOAT || column_types[index].id() == LogicalTypeId::DOUBLE) {
+			auto column = SqlUtils::QuoteIdentifier(column_names[index]);
+			group_columns += ", " + SqlUtils::NegativeZeroSQL(column);
+			match_conditions += " AND (" + SqlUtils::NegativeZeroSQL("v." + column) + ") = (" +
+			                    SqlUtils::NegativeZeroSQL("d." + column) + ")";
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[CompileProjectionDelta] Preserving zero signs in tuple consolidation for %s\n",
+	                    data_table.c_str());
+
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).
 	// _net > 0 = net insertions, _net < 0 = net deletions. With integer weights this is
 	// just SUM(weight) — no CASE round-trip needed.
 	string cte_body = "SELECT " + select_columns + ",\n    SUM(" + mul + ") AS _net\n  FROM " + delta_view + ts_where +
-	                  "\n  GROUP BY " + select_columns + "\n  HAVING SUM(" + mul + ") != 0";
+	                  "\n  GROUP BY " + group_columns + "\n  HAVING SUM(" + mul + ") != 0";
 
 	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER. Join
 	// negative net tuples to the MV first so duplicate ranking only touches affected
@@ -1243,7 +1261,7 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 	                      "\n), openivm_ranked_deletes AS (\n"
 	                      "  SELECT rowid, _net,\n"
 	                      "    ROW_NUMBER() OVER (PARTITION BY " +
-	                      select_columns +
+	                      group_columns +
 	                      " ORDER BY rowid) AS _rn\n"
 	                      "  FROM openivm_delete_candidates\n"
 	                      ")\n"

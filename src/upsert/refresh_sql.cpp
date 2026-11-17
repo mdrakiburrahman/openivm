@@ -573,6 +573,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
 	string publication_sql;
 	vector<string> publication_columns;
+	vector<LogicalType> publication_types;
 	string publication_query;
 	bool global_publication = false;
 	bool publication_has_filter = false;
@@ -588,15 +589,25 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	if (!snapshot_publication && !publication->HasError() && publication->RowCount() &&
 	    !publication->Collection().GetValue(0, 0).IsNull()) {
+		auto record_column = [&](const ColumnDefinition &column) {
+			publication_columns.push_back(column.Name().GetIdentifierName());
+			publication_types.push_back(column.Type());
+		};
 		if (target_is_ducklake) {
-			publication_columns =
-			    metadata.GetTableColumns(internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
+			auto table = con.TableInfo(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                           Identifier(PublishedViewName(view_name)));
+			if (!table) {
+				throw CatalogException("Missing publication table for materialized view '%s'", view_name);
+			}
+			for (auto &column : table->columns) {
+				record_column(column);
+			}
 		} else {
 			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(
 			    context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
 			                           Identifier(PublishedViewName(view_name))));
 			for (auto &column : published_entry.GetColumns().Logical()) {
-				publication_columns.push_back(column.Name().GetIdentifierName());
+				record_column(column);
 			}
 		}
 		publication_query = publication->Collection().GetValue(0, 0).ToString();
@@ -620,9 +631,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                     DialectQuoteIdent(internal_schema_name, SqlDialect::SPARK) + ".";
 			}
 		}
-		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
-		                                      publication_columns, target_is_ducklake, delta_metadata_table, {}, "",
-		                                      active_facts.target_dialect, "", "", delta_metadata_tables);
+		publication_sql =
+		    BuildPublishViewSQL(view_name, publication_prefix, publication_source_query, publication_columns,
+		                        publication_types, target_is_ducklake, delta_metadata_table, {}, "",
+		                        active_facts.target_dialect, "", "", delta_metadata_tables);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -1160,15 +1172,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			refresh_plan.skip_projection_key_delta = true;
 		} else {
 			upsert_query = CompileProjectionRefresh(
-			    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, delta_ts_filter,
-			    internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
+			    metadata, view_name, column_names, column_types, delta_table_names, data_table, view_query_sql,
+			    delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
 			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only, delete_retry_plan,
 			    &appended_projection_rows);
 			if (delete_retry_plan && delete_retry_plan->IsActive()) {
 				fallback_upsert_query = CompileProjectionRefresh(
-				    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, delta_ts_filter,
-				    internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
-				    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only);
+				    metadata, view_name, column_names, column_types, delta_table_names, data_table, view_query_sql,
+				    delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete,
+				    insert_only, fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only);
 			}
 		}
 		break;
@@ -1766,14 +1778,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto visible = publication_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name));
 			auto visible_delta = "(SELECT *, CAST(0 AS BIGINT) AS " + string(openivm::PUBLISHED_ORDINAL_COL) +
 			                     " FROM " + signed_publication_rows + ")";
-			publication_sql =
-			    CompileProjectionDelta(visible, visible_delta, publication_columns, signed_publication_filter);
+			publication_sql = CompileProjectionDelta(visible, visible_delta, publication_columns, publication_types,
+			                                         signed_publication_filter);
 			OPENIVM_DEBUG_PRINT("[PUBLISH] Applying exact signed row changes for %s\n", view_name.c_str());
 		} else {
 			publication_sql = BuildPublishViewSQL(
-			    view_name, publication_prefix, publication_source_query, publication_columns, target_is_ducklake,
-			    delta_metadata_table, scope_columns, "", active_facts.target_dialect, appended_projection_rows,
-			    retained_publication_scope.rows, delta_metadata_tables);
+			    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
+			    target_is_ducklake, delta_metadata_table, scope_columns, "", active_facts.target_dialect,
+			    appended_projection_rows, retained_publication_scope.rows, delta_metadata_tables);
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}

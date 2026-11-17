@@ -466,6 +466,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
+	vector<LogicalType> output_types;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
@@ -522,6 +523,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 
+		select_plan->ResolveOperatorTypes();
+		output_types = select_plan->types;
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
 		full_outer_scopes = BuildFullOuterScopes(post_rewrite_facts);
 		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
@@ -1671,12 +1674,16 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		auto published_delta =
 		    internal_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name)));
 		vector<string> visible_columns;
-		for (auto &name : output_names) {
+		vector<LogicalType> visible_types;
+		for (idx_t index = 0; index < output_names.size(); index++) {
+			auto &name = output_names[index];
 			if (!IncrementalTableNames::IsInternalColumn(name)) {
 				visible_columns.push_back(name);
+				visible_types.push_back(output_types[index]);
 			}
 		}
 		visible_columns.push_back(openivm::PUBLISHED_ORDINAL_COL);
+		visible_types.push_back(LogicalType::BIGINT);
 		if (parse_data_ref.is_replace && !has_downstream_views && !target_is_ducklake) {
 			ddl.push_back("DROP TABLE IF EXISTS " + published);
 			ddl.push_back("DROP TABLE IF EXISTS " + published_delta);
@@ -1710,7 +1717,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		if (parse_data_ref.is_replace) {
 			ddl.push_back(BuildPublishViewSQL(
-			    view_name, internal_catalog_prefix, published_query, visible_columns, target_is_ducklake,
+			    view_name, internal_catalog_prefix, published_query, visible_columns, visible_types, target_is_ducklake,
 			    SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {}, creation_timestamp,
 			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)));
 		}

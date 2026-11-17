@@ -33,6 +33,10 @@
 
 namespace duckdb {
 
+string SqlUtils::NegativeZeroSQL(const string &value) {
+	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
+}
+
 bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
 	return TypeVisitor::Contains(type, [](const LogicalType &child) {
 		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL ||

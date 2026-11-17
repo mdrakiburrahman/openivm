@@ -136,6 +136,10 @@ multiplicity stays unchanged. This adds one `BIGINT` counter per floating
 DISTINCT column and processes only delta-touched tuples. Limited selections
 compare candidate identities, canonicalizing NaNs while preserving signed zero.
 Delta compaction retains a Boolean zero-sign key for each floating input column.
+Publication uses the same witness for floating output columns when consolidating
+old and new visible rows, so sign-only changes also reach dependent views.
+Projection refreshes use the witness for tuple consolidation and copy deletion
+to preserve the signs of duplicate zero rows.
 
 ## Other limitations
 

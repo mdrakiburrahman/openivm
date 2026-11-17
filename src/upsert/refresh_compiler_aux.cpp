@@ -837,10 +837,6 @@ vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
 	return output_columns;
 }
 
-static string NegativeZeroSQL(const string &value) {
-	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
-}
-
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
                                       const string &source_relation, bool replace) {
 	string select_list;
@@ -851,7 +847,7 @@ string BuildDistinctAuxStateCreateSQL(const string &target_table, const RefreshM
 	for (auto &entry : RefreshMetadata::DistinctSignCountColumns(meta)) {
 		auto index = std::find(meta.cols.begin(), meta.cols.end(), entry.first) - meta.cols.begin();
 		auto value = meta.source_exprs.empty() ? SqlUtils::QuoteIdentifier(entry.first) : meta.source_exprs[index];
-		counts += ", COUNT(CASE WHEN " + NegativeZeroSQL(value) + " THEN 1 ELSE NULL END)::BIGINT AS " +
+		counts += ", COUNT(CASE WHEN " + SqlUtils::NegativeZeroSQL(value) + " THEN 1 ELSE NULL END)::BIGINT AS " +
 		          SqlUtils::QuoteIdentifier(entry.second);
 	}
 	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + select_list + counts + " FROM " +
@@ -923,8 +919,8 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 		for (auto &entry : sign_counts) {
 			auto column = SqlUtils::QuoteIdentifier(entry.first);
 			auto counter = SqlUtils::QuoteIdentifier(entry.second);
-			auto delta = "SUM(" + string(openivm::MULTIPLICITY_COL) + " * CASE WHEN " + NegativeZeroSQL(column) +
-			             " THEN 1 ELSE 0 END)::BIGINT";
+			auto delta = "SUM(" + string(openivm::MULTIPLICITY_COL) + " * CASE WHEN " +
+			             SqlUtils::NegativeZeroSQL(column) + " THEN 1 ELSE 0 END)::BIGINT";
 			state_counts.push_back(delta + " AS " + counter);
 			state_names.push_back(counter);
 			state_values.push_back("i." + counter);
@@ -950,7 +946,8 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 		vector<string> keep {"SUM(" + string(openivm::MULTIPLICITY_COL) + ") <> 0"};
 		for (auto &entry : sign_counts) {
 			keep.push_back("SUM(" + string(openivm::MULTIPLICITY_COL) + " * CASE WHEN " +
-			               NegativeZeroSQL(SqlUtils::QuoteIdentifier(entry.first)) + " THEN 1 ELSE 0 END) <> 0");
+			               SqlUtils::NegativeZeroSQL(SqlUtils::QuoteIdentifier(entry.first)) +
+			               " THEN 1 ELSE 0 END) <> 0");
 		}
 		sql = "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dinput_table) + " AS SELECT " +
 		      distinct_cols_csv + ", SUM(" + string(openivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult, " +
@@ -1046,7 +1043,7 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 			if (render_input_expression) {
 				value = render_input_expression(value);
 			}
-			expression = "CASE WHEN " + NegativeZeroSQL(value) + " THEN 1 ELSE 0 END";
+			expression = "CASE WHEN " + SqlUtils::NegativeZeroSQL(value) + " THEN 1 ELSE 0 END";
 		} else if (StringUtil::StartsWith(column, openivm::NAN_COUNT_COL_PREFIX)) {
 			expression = "CASE WHEN isnan(" + sum_input + ") THEN 1 ELSE 0 END";
 		} else if (StringUtil::StartsWith(column, openivm::POS_INF_COUNT_COL_PREFIX) ||

@@ -26,6 +26,7 @@ class SqlUtils {
 public:
 	// SQL equality can merge observably different values, including nested ones.
 	static bool EqualityCanHideValueIdentity(const LogicalType &type);
+	static string NegativeZeroSQL(const string &value);
 	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
 	                                     const Identifier &schema) {
 		return EntryLookupInfo(lookup, QualifiedName(catalog, schema, lookup.GetEntryIdentifier()));
