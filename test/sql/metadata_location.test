@@ -175,7 +175,7 @@ BEGIN;
 statement error
 DROP VIEW data.observation.report;
 ----
-cannot run inside an explicit transaction
+Cannot run DROP VIEW CASCADE inside an explicit transaction
 
 statement ok
 ROLLBACK;
