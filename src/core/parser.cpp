@@ -2299,7 +2299,9 @@ static void RejectCrossCatalogDropInTransaction(ClientContext &context, Connecti
 		return;
 	}
 	for (auto &view : views) {
-		if (StringUtil::CIEquals(view.first.catalog, target_catalog)) {
+		if (StringUtil::CIEquals(view.first.catalog, target_catalog) || view.first.explicit_placement) {
+			// Explicit metadata placement has its own, more specific transaction
+			// diagnostic in TrackedDropProgram::Append.
 			continue;
 		}
 		SelectDropMetadata(context, con, view.first);
