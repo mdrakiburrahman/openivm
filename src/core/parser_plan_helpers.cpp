@@ -1536,6 +1536,8 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex
 	return group_names;
 }
 
+static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column);
+
 void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanFacts &facts,
                                      const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta) {
 	auto &aggregate = *facts.aggregates.front();
@@ -1550,10 +1552,6 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		                                                                                   : input.GetReturnType();
 		meta.sum_input_expr = "CAST(" + SqlUtils::QuoteIdentifier(meta.sum_arg) + " AS " + type.ToString() + ")";
 	}
-	auto group_cols = DeriveGroupColumnNames(facts, aggregate.group_index, aggregate.groups.size(), output_names);
-	if (group_cols.empty()) {
-		return;
-	}
 	LogicalDistinct *distinct = nullptr;
 	for (auto &node : facts.plan_nodes_post_order) {
 		if (node.plan_node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
@@ -1564,7 +1562,67 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 	D_ASSERT(distinct);
 	auto bindings = distinct->GetColumnBindings();
 	D_ASSERT(bindings.size() == meta.cols.size());
-	LptsExpressionRenderer renderer(context, SqlDialect::DUCKDB, [&](const ColumnBinding &binding, const char *) {
+	// Resolve the input through bound projections and filters. Parsed CTE names
+	// have no catalog identity, and their expressions must also apply to delta rows.
+	auto *source = distinct->children[0].get();
+	vector<LogicalOperator *> filters;
+	while ((source->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	        source->type == LogicalOperatorType::LOGICAL_FILTER) &&
+	       source->children.size() == 1) {
+		if (source->type == LogicalOperatorType::LOGICAL_FILTER) {
+			filters.push_back(source);
+		}
+		source = source->children[0].get();
+	}
+	if (source->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = source->Cast<LogicalGet>();
+		auto table = get.GetTable();
+		D_ASSERT(table);
+		meta.source = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+		LptsExpressionRenderer::BindingResolver resolve_input;
+		LptsExpressionRenderer input_renderer(
+		    context, SqlDialect::DUCKDB,
+		    [&](const ColumnBinding &binding, const char *where) { return resolve_input(binding, where); });
+		resolve_input = [&](const ColumnBinding &binding, const char *) -> string {
+			if (binding.table_index == get.table_index) {
+				string column;
+				if (!GetLogicalGetColumnName(get, binding.column_index, column)) {
+					throw InternalException("Could not resolve DISTINCT source column");
+				}
+				return SqlUtils::QuoteIdentifier(column);
+			}
+			auto projection = facts.projections_by_index.find(binding.table_index);
+			D_ASSERT(projection != facts.projections_by_index.end());
+			return input_renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
+		};
+		meta.source_exprs.clear();
+		vector<string> select_list;
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			BoundColumnRefExpression input(LogicalType::SQLNULL, bindings[i]);
+			meta.source_exprs.push_back(input_renderer.ExpressionToAliasedString(input));
+			select_list.push_back(meta.source_exprs.back() + " AS " + SqlUtils::QuoteIdentifier(meta.cols[i]));
+		}
+		auto predicates = input_renderer.ScanFiltersToSql(get);
+		for (auto *filter : filters) {
+			for (auto &expression : filter->expressions) {
+				predicates.push_back("(" + input_renderer.ExpressionToAliasedString(*expression) + ")");
+			}
+		}
+		meta.filter = StringUtil::Join(predicates, " AND ");
+		meta.input_sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + meta.source +
+		                 (meta.filter.empty() ? "" : " WHERE " + meta.filter);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Resolved DISTINCT input to bound source %s\n", meta.source.c_str());
+	}
+	auto group_cols = DeriveGroupColumnNames(facts, aggregate.group_index, aggregate.groups.size(), output_names);
+	if (group_cols.empty()) {
+		return;
+	}
+	// Declare recursive callbacks separately: MSVC cannot capture a renderer in its own initializer.
+	LptsExpressionRenderer::BindingResolver resolve_group;
+	LptsExpressionRenderer renderer(context, SqlDialect::DUCKDB, [&](const ColumnBinding &binding, const char *where) {
+		return resolve_group(binding, where);
+	});
+	resolve_group = [&](const ColumnBinding &binding, const char *) -> string {
 		auto match = std::find(bindings.begin(), bindings.end(), binding);
 		if (match != bindings.end()) {
 			return SqlUtils::QuoteIdentifier(meta.cols[match - bindings.begin()]);
@@ -1575,7 +1633,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		auto projection = facts.projections_by_index.find(binding.table_index);
 		D_ASSERT(projection != facts.projections_by_index.end());
 		return renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
-	});
+	};
 	for (auto &column : group_cols) {
 		auto name = std::find(output_names.begin(), output_names.end(), column);
 		D_ASSERT(name != output_names.end());
@@ -1644,8 +1702,6 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 	}
 	return group_names;
 }
-
-static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column);
 
 static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const CreateMVPlanFacts &facts) {
 	TableIndex table_index = bcr->Binding().table_index;

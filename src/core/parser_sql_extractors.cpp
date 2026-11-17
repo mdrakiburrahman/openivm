@@ -174,7 +174,7 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 		if (expression->GetExpressionClass() == ExpressionClass::STAR) {
 			return false;
 		}
-		out_cols.push_back(expression->ToString());
+		out_cols.push_back(expression->GetName().GetIdentifierName());
 	}
 	out_filter_sql = ExprSQL(distinct->where_clause);
 	auto input = distinct->Copy();

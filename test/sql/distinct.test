@@ -1444,6 +1444,36 @@ CREATE MATERIALIZED VIEW derived_distinct_group_permuted AS SELECT SUM(v)*2 a,k 
 statement ok
 CREATE VIEW derived_distinct_group_permuted_expected AS SELECT SUM(v)*2 a,k AS renamed FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
 
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_cte AS WITH x AS(SELECT k,v FROM derived_distinct_source) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_cte_expected AS WITH x AS(SELECT k,v FROM derived_distinct_source) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_cte_expr AS WITH x AS(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v>5) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_cte_expr_expected AS WITH x AS(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v>5) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_cte_chain AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE k>=1 OR k IS NULL),y AS MATERIALIZED(SELECT k,v+1 AS v FROM x WHERE v>10),d AS MATERIALIZED(SELECT DISTINCT k,v FROM y) SELECT SUM(v)*2 a,k AS renamed FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_cte_chain_expected AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE k>=1 OR k IS NULL),y AS MATERIALIZED(SELECT k,v+1 AS v FROM x WHERE v>10),d AS MATERIALIZED(SELECT DISTINCT k,v FROM y) SELECT SUM(v)*2 a,k AS renamed FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_cte AS WITH x AS(SELECT v*2 AS v FROM derived_distinct_source WHERE v>=0) SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM x)d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_cte_expected AS WITH x AS(SELECT v*2 AS v FROM derived_distinct_source WHERE v>=0) SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM x)d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_variant_group AS SELECT variant_typeof(k::VARIANT) g,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source)d GROUP BY variant_typeof(k::VARIANT);
+
+statement ok
+CREATE VIEW derived_distinct_variant_group_expected AS SELECT variant_typeof(k::VARIANT) g,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source)d GROUP BY variant_typeof(k::VARIANT);
+
 foreach variant group_mul scalar_coalesce
 
 statement ok
@@ -1451,7 +1481,7 @@ CREATE MATERIALIZED VIEW derived_distinct_child_{variant} AS SELECT * FROM deriv
 
 endloop
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
 
 query I
 SELECT type FROM openivm_views WHERE view_sql_name='derived_distinct_{variant}';
@@ -1469,7 +1499,7 @@ SELECT count(*) FROM (
 
 endloop
 
-foreach variant group_mul scalar_coalesce group_renamed group_computed group_projected group_permuted
+foreach variant group_mul scalar_coalesce group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte
 
 query I
 SELECT CASE WHEN min(refresh_type)=8
@@ -1488,7 +1518,7 @@ endloop
 statement ok
 INSERT INTO derived_distinct_source VALUES (6,1,20),(7,3,40),(8,3,40),(9,4,NULL),(10,4,NULL);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1533,7 +1563,7 @@ UPDATE derived_distinct_source SET k=2,v=NULL WHERE id=4;
 statement ok
 DELETE FROM derived_distinct_source WHERE id IN (2,7,9,11,12);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1575,7 +1605,7 @@ UPDATE derived_distinct_source SET v=50 WHERE id=8;
 statement ok
 INSERT INTO derived_distinct_source VALUES (14,6,60),(15,6,60);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1619,7 +1649,7 @@ INSERT INTO derived_distinct_source VALUES (16,6,60),(17,1,NULL);
 statement ok
 UPDATE derived_distinct_source SET v=NULL WHERE id=15;
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1654,7 +1684,7 @@ endloop
 statement ok
 DELETE FROM derived_distinct_source;
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');
@@ -1690,7 +1720,7 @@ endloop
 statement ok
 INSERT INTO derived_distinct_source VALUES (18,NULL,NULL),(19,1,7),(20,1,7);
 
-foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group
 
 statement ok
 PRAGMA refresh('derived_distinct_{variant}');

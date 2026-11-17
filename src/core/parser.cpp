@@ -1317,8 +1317,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		const auto &meta = view_model.distinct_aux;
 		emit_aux("create_mv_distinct_aux", meta.aux_table, "distinct_aux_meta_json",
 		         RefreshMetadata::DistinctAuxMetaToJson(meta), [&](const string &aux_target) {
-			         return BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs,
-			                                               "(" + meta.input_sql + ")", "", replace_aux);
+			         return BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs, meta.source,
+			                                               meta.filter, replace_aux);
 		         });
 	}
 	if (view_model.HasCountDistinctAux()) {
