@@ -510,6 +510,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_output_names, select_rewrite_needs);
 
+		RewriteNonFiniteSumInputs(context, *select_planner.binder, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.

@@ -25,6 +25,7 @@ class Planner;
 // Compiler-only source boundary; generated columns retain their logical identity.
 void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement);
 TableFunction SourceColumnsFunction();
+ScalarFunction CandidateValueKeyFunction();
 
 BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr);
 

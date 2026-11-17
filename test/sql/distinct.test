@@ -2096,3 +2096,218 @@ PRAGMA refresh('mv_offset');
 
 statement ok
 SELECT CASE WHEN EXISTS((SELECT * FROM mv_offset EXCEPT ALL SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected) UNION ALL(SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_offset)) THEN error('bag mismatch offset') ELSE true END;
+
+# Limited candidate identity preserves raw strings and VARIANT payload types.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE exact_candidates(k VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO exact_candidates VALUES('A'),('a');
+
+statement ok
+CREATE TABLE typed_candidates(v VARIANT);
+
+statement ok
+INSERT INTO typed_candidates VALUES(1::TINYINT::VARIANT),(1::BIGINT::VARIANT);
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_collated AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 2)d;
+
+statement ok
+CREATE VIEW exact_candidate_collated_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 2)d;
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_percent AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 50 PERCENT)d;
+
+statement ok
+CREATE VIEW exact_candidate_percent_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 50 PERCENT)d;
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_variant AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM typed_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW exact_candidate_variant_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM typed_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE TABLE nested_candidates(v VARIANT);
+
+statement ok
+INSERT INTO nested_candidates VALUES({'x':1::TINYINT}::VARIANT),({'x':1::BIGINT}::VARIANT);
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_nested AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v.x) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM nested_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW exact_candidate_nested_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v.x) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM nested_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE TABLE finite_distinct_source(k INT,v DOUBLE);
+
+statement ok
+INSERT INTO finite_distinct_source VALUES(1,'NaN'),(1,10),(2,'Infinity'),(2,20),(3,'-Infinity'),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_nan AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM finite_distinct_source ORDER BY v,k LIMIT 6)d GROUP BY k;
+
+statement ok
+CREATE VIEW exact_candidate_nan_expected AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM finite_distinct_source ORDER BY v,k LIMIT 6)d GROUP BY k;
+
+statement ok
+INSERT INTO exact_candidates VALUES('b');
+
+statement ok
+INSERT INTO typed_candidates VALUES('x'::VARIANT);
+
+statement ok
+INSERT INTO nested_candidates VALUES({'x':'s'}::VARIANT);
+
+statement ok
+DELETE FROM finite_distinct_source WHERE NOT isfinite(v);
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO exact_candidates VALUES('A'),('c');
+
+statement ok
+DELETE FROM exact_candidates WHERE k COLLATE C='a';
+
+statement ok
+INSERT INTO typed_candidates VALUES(2::SMALLINT::VARIANT);
+
+statement ok
+DELETE FROM typed_candidates WHERE variant_typeof(v)='INT8';
+
+statement ok
+DELETE FROM nested_candidates WHERE variant_typeof(v.x)='INT8';
+
+statement ok
+INSERT INTO finite_distinct_source VALUES(1,'Infinity'),(1,'NaN');
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO exact_candidates VALUES('d');
+
+statement ok
+INSERT INTO typed_candidates VALUES(3::TINYINT::VARIANT);
+
+statement ok
+INSERT INTO nested_candidates VALUES({'x':3::TINYINT}::VARIANT);
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM exact_candidates WHERE k COLLATE C='A';
+
+statement ok
+DELETE FROM typed_candidates WHERE variant_typeof(v)='INT64';
+
+statement ok
+DELETE FROM nested_candidates WHERE variant_typeof(v.x)='INT64';
+
+statement ok
+DELETE FROM finite_distinct_source WHERE NOT isfinite(v);
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+query I
+SELECT (count(*)>0)::INTEGER FROM openivm_compile_with_facts('exact_candidate_collated','{"target_dialect":"spark","compile_only":true}') WHERE stmt_kind='data';
+----
+1
+
+# Default collations require the same byte identity as declared column collations.
+statement ok
+SET default_collation='nocase';
+
+statement ok
+CREATE TABLE default_collation_candidates(k VARCHAR);
+
+statement ok
+INSERT INTO default_collation_candidates VALUES('A'),('a');
+
+statement ok
+CREATE MATERIALIZED VIEW default_collation_candidate_mv AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM default_collation_candidates ORDER BY v LIMIT 2)d;
+
+statement ok
+INSERT INTO default_collation_candidates VALUES('b');
+
+statement ok
+PRAGMA refresh('default_collation_candidate_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM default_collation_candidate_mv EXCEPT ALL SELECT SUM(v)+1 FROM(SELECT DISTINCT ascii(k) AS v FROM default_collation_candidates ORDER BY v LIMIT 2)d) UNION ALL(SELECT SUM(v)+1 FROM(SELECT DISTINCT ascii(k) AS v FROM default_collation_candidates ORDER BY v LIMIT 2)d EXCEPT ALL SELECT * FROM default_collation_candidate_mv));
+----
+0
+
+statement ok
+SET default_collation='';

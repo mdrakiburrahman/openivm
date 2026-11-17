@@ -42,6 +42,11 @@ when necessary and finalizes the output after combining the old state and delta.
 Group cardinality is tracked separately, so deleting a group still removes it
 even when its projected count contains a constant.
 
+Computed floating SUM inputs retain a finite subtotal and separate NaN/positive-
+infinity/negative-infinity counts. Removing the last non-finite input can then
+restore a finite result. These inputs add three count states and predicates to
+the aggregate; ordinary integer SUM inputs keep their existing state.
+
 Grouped finalization joins the affected deltas to stored MV state before MERGE;
 it does not rescan the source tables. Scalar aggregates update their raw state
 and then finalize the single output row. Plain AVG and variance outputs retain
@@ -60,6 +65,11 @@ the candidate state twice and stages two temporary selection tables; candidate
 storage includes ordering columns needed below DISTINCT. Ordinary DISTINCT inputs
 keep their existing tuple-transition path. Projections between DISTINCT and SUM
 are resolved for both the SUM value and its non-NULL count.
+
+Candidate counts use byte keys for collated strings and lossless canonical keys
+for VARIANT values, so grouping cannot merge values whose bytes or payload types
+are observable by the selected expression. Percentage limits retain their unit
+through LPTS rendering and currently require the native DuckDB dialect.
 
 Recreate an affected MV created by an older compiler to initialize the hidden
 raw inputs required by this finalization.

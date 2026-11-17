@@ -926,6 +926,16 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 	for (auto &group : meta.group_inputs) {
 		group_expressions[group.output_column] = group.expression_sql;
 	}
+	bool finite_sum =
+	    std::any_of(derived_outputs.inputs.begin(), derived_outputs.inputs.end(), [](const AggregateInput &input) {
+		    return StringUtil::StartsWith(input.output_column, openivm::FINITE_SUM_COL_PREFIX);
+	    });
+	auto sum_input = meta.sum_input_expr.empty() ? sum_arg_q : meta.sum_input_expr;
+	if (render_input_expression) {
+		sum_input = render_input_expression(sum_input);
+	}
+	string finite_input =
+	    "(" + sum_input + " < CAST('Infinity' AS DOUBLE) AND " + sum_input + " > CAST('-Infinity' AS DOUBLE))";
 	vector<string> projections;
 	for (idx_t i = 0; i < column_names.size(); i++) {
 		auto &column = column_names[i];
@@ -944,19 +954,24 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 			expression = "dd";
 		} else if ((input != input_types.end() && input->second == "count_star") || column == openivm::COUNT_STAR_COL) {
 			expression = "1";
+		} else if (StringUtil::StartsWith(column, openivm::NAN_COUNT_COL_PREFIX)) {
+			expression = "CASE WHEN isnan(" + sum_input + ") THEN 1 ELSE 0 END";
+		} else if (StringUtil::StartsWith(column, openivm::POS_INF_COUNT_COL_PREFIX) ||
+		           StringUtil::StartsWith(column, openivm::NEG_INF_COUNT_COL_PREFIX)) {
+			auto infinity = StringUtil::StartsWith(column, openivm::POS_INF_COUNT_COL_PREFIX)
+			                    ? "CAST('Infinity' AS DOUBLE)"
+			                    : "CAST('-Infinity' AS DOUBLE)";
+			expression = "CASE WHEN " + sum_input + " = " + infinity + " THEN 1 ELSE 0 END";
 		} else if ((input != input_types.end() && input->second == "count") ||
 		           StringUtil::StartsWith(column, openivm::SUM_COUNT_COL_PREFIX)) {
-			auto sum_input = meta.sum_input_expr.empty() ? sum_arg_q : meta.sum_input_expr;
-			if (render_input_expression) {
-				sum_input = render_input_expression(sum_input);
-			}
-			expression = "CASE WHEN (" + sum_input + ") IS NULL THEN 0 ELSE 1 END";
+			expression = finite_sum ? "CASE WHEN " + finite_input + " THEN 1 ELSE 0 END"
+			                        : "CASE WHEN (" + sum_input + ") IS NULL THEN 0 ELSE 1 END";
 		} else if ((input != input_types.end() && input->second == "sum") || column == sum_out) {
 			expression = meta.sum_input_expr.empty()
-			                 ? "CAST(" + sum_arg_q + " AS " + options.column_types.at(i).ToString() + ")"
-			                 : meta.sum_input_expr;
-			if (render_input_expression) {
-				expression = render_input_expression(expression);
+			                 ? "CAST(" + sum_input + " AS " + options.column_types.at(i).ToString() + ")"
+			                 : sum_input;
+			if (finite_sum) {
+				expression = "CASE WHEN " + finite_input + " THEN " + expression + " ELSE NULL END";
 			}
 		} else {
 			throw InternalException("Unrecognized DISTINCT aggregate state column '%s'", column);

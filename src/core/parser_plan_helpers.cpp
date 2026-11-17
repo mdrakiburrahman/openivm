@@ -9,6 +9,10 @@
 #include "core/sql_utils.hpp"
 #include "lpts_expression_renderer.hpp"
 #include "lpts_pipeline.hpp"
+#include "lpts_helpers.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -79,6 +83,25 @@ struct SourceColumnsBindData : public TableFunctionData {
 static void RewriteSourceColumns(Binder &binder, SQLStatement &statement);
 
 } // namespace
+
+static void CandidateValueKey(DataChunk &input, ExpressionState &, Vector &result) {
+	// SQL VARIANT equality normalizes payload types; state identity must retain them.
+	auto canonical = TypeContainsVariant(input.data[0].GetType())
+	                     ? CanonicalizeVariantVector(input.data[0], input.size())
+	                     : Vector::Ref(input.data[0]);
+	auto output = FlatVector::GetDataMutable<string_t>(result);
+	MemoryStream stream;
+	for (idx_t row = 0; row < input.size(); row++) {
+		stream.Rewind();
+		BinarySerializer::Serialize(canonical.GetValue(row), stream);
+		output[row] =
+		    StringVector::AddStringOrBlob(result, const_char_ptr_cast(stream.GetData()), stream.GetPosition());
+	}
+}
+
+ScalarFunction CandidateValueKeyFunction() {
+	return ScalarFunction("openivm_internal_value_key", {LogicalType::ANY}, LogicalType::BLOB, CandidateValueKey);
+}
 
 TableFunction SourceColumnsFunction() {
 	TableFunction function("openivm_source_columns", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -1573,6 +1596,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		meta.cols.clear();
 		meta.source_exprs.clear();
 		meta.filter.clear();
+		vector<LogicalType> source_types;
 		for (auto &entry : facts.gets_by_index) {
 			auto &get = *entry.second;
 			if (get.GetTable().get() != table.get()) {
@@ -1589,8 +1613,25 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 					meta.cols.push_back("openivm_topk_source_" + to_string(meta.cols.size()));
 					meta.source_exprs.push_back(expression);
 					meta.selected_source_columns.push_back(column);
+					source_types.push_back(get.GetColumnType(ColumnIndex(get.GetColumnIds()[i].GetPrimaryIndex())));
 				}
 			}
+		}
+		auto default_collation = Settings::Get<DefaultCollationSetting>(context);
+		vector<string> identity_keys;
+		for (idx_t i = 0; i < meta.selected_source_columns.size(); i++) {
+			auto &type = source_types[i];
+			if (TypeContainsVariant(type)) {
+				identity_keys.push_back("openivm_internal_value_key(" + meta.source_exprs[i] + ")");
+			} else if (type.id() == LogicalTypeId::VARCHAR &&
+			           (!StringType::GetCollation(type).empty() || !default_collation.empty())) {
+				// The BLOB key splits collated-equal strings without changing their stored collation.
+				identity_keys.push_back("unhex(hex(" + meta.source_exprs[i] + "))");
+			}
+		}
+		for (auto &key : identity_keys) {
+			meta.cols.push_back("openivm_topk_identity_" + to_string(meta.cols.size()));
+			meta.source_exprs.push_back(key);
 		}
 		bindings = aggregate.children[0]->GetColumnBindings();
 		for (idx_t i = 0; i < bindings.size(); i++) {

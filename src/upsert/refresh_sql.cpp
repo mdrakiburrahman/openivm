@@ -1257,7 +1257,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			if (!aux_meta.selected_input_sql.empty()) {
 				input_columns = &aux_meta.selected_input_columns;
 				vector<string> candidates;
-				for (idx_t i = 0; i < aux_meta.cols.size(); i++) {
+				for (idx_t i = 0; i < aux_meta.selected_source_columns.size(); i++) {
 					candidates.push_back(SqlUtils::QuoteIdentifier(aux_meta.cols[i]) + " AS " +
 					                     SqlUtils::QuoteIdentifier(aux_meta.selected_source_columns[i]));
 				}

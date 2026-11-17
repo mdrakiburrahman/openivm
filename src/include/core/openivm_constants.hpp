@@ -61,6 +61,10 @@ constexpr const char *COUNT_COL_PREFIX = "openivm_count_";
 // the visible projection index, which associates the state with the exact
 // bound output without inspecting SQL text or aliases.
 constexpr const char *SUM_COUNT_COL_PREFIX = "openivm_nonnull_sum_count_";
+constexpr const char *FINITE_SUM_COL_PREFIX = "openivm_finite_sum_";
+constexpr const char *NAN_COUNT_COL_PREFIX = "openivm_nan_count_";
+constexpr const char *POS_INF_COUNT_COL_PREFIX = "openivm_pos_inf_count_";
+constexpr const char *NEG_INF_COUNT_COL_PREFIX = "openivm_neg_inf_count_";
 
 // Hidden COUNT(*) injected into AGGREGATE_GROUP MVs that don't already have a
 // count aggregate. Tracks per-group cardinality so the cleanup can delete rows

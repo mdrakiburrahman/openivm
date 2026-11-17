@@ -1184,6 +1184,14 @@ void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan) {
 		// Reuse published raw inputs; retain hidden state only when a projection consumes them.
 		string alias = name == "count_star" ? string(openivm::COUNT_STAR_COL)
 		                                    : "openivm_aggregate_input_" + to_string(binding.column_index.GetIndex());
+		auto aggregate_alias = expression.GetAlias().GetIdentifierName();
+		for (auto prefix : {openivm::FINITE_SUM_COL_PREFIX, openivm::NAN_COUNT_COL_PREFIX,
+		                    openivm::POS_INF_COUNT_COL_PREFIX, openivm::NEG_INF_COUNT_COL_PREFIX}) {
+			if (StringUtil::StartsWith(aggregate_alias, prefix)) {
+				alias = aggregate_alias;
+				break;
+			}
+		}
 		changed |= PropagateHiddenBindingThroughProjectionPath(spine.projections, binding, expression.GetReturnType(),
 		                                                       alias, true);
 	}

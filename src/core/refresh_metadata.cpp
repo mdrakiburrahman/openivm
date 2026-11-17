@@ -2300,8 +2300,8 @@ bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMet
 	if (!MetadataJson::Read(json, out)) {
 		return false;
 	}
-	if (!out.selected_input_sql.empty() &&
-	    (out.selected_input_columns.empty() || out.selected_source_columns.size() != out.cols.size())) {
+	if (!out.selected_input_sql.empty() && (out.selected_input_columns.empty() || out.selected_source_columns.empty() ||
+	                                        out.selected_source_columns.size() > out.cols.size())) {
 		return false;
 	}
 	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "group_inputs")) {
