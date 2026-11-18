@@ -1808,10 +1808,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 					continue;
 				}
 				meta.selected_identity_exprs.push_back(std::move(identity));
-				string name = "openivm_tuple_identity_" + to_string(i);
-				while (std::find(meta.cols.begin(), meta.cols.end(), name) != meta.cols.end()) {
-					name += '_';
-				}
+				auto name = meta.InternalColumn("openivm_tuple_identity_" + to_string(i));
 				meta.cols.push_back(std::move(name));
 				meta.source_exprs.push_back(
 				    SqlUtils::ValueIdentitySQL(meta.source_exprs[i], distinct_types[i], default_collation));

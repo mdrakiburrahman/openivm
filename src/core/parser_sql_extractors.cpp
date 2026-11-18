@@ -199,6 +199,7 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 
 string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::DistinctAuxMeta &meta,
                                   const string &aux_table) {
+	const auto count_column = SqlUtils::QuoteIdentifier(meta.InternalColumn("_count"));
 	const auto &columns = meta.representative_input ? meta.selected_source_columns : meta.cols;
 	auto statement = ParseSelect(sql);
 	D_ASSERT(statement);
@@ -243,18 +244,21 @@ string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::Dist
 		auto value = SqlUtils::QuoteIdentifier(columns[i]);
 		for (const auto &entry : sign_counts) {
 			if (entry.first == columns[i]) {
-				value = SqlUtils::FloatingRepresentativeSQL(value, SqlUtils::QuoteIdentifier(entry.second), "_count");
+				value =
+				    SqlUtils::FloatingRepresentativeSQL(value, SqlUtils::QuoteIdentifier(entry.second), count_column);
 			}
 		}
 		outputs.push_back(value + " AS " +
 		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
 	}
 	for (idx_t i = columns.size(); i < distinct->select_list.size(); i++) {
-		outputs.push_back("_count AS " +
+		outputs.push_back(count_column + " AS " +
 		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
 	}
-	auto replacement = ParseSelect("SELECT " + StringUtil::Join(outputs, ", ") + " FROM " + aux_table +
-	                               " WHERE _count > 0" + (meta.representative_input ? " AND openivm_selected" : ""));
+	auto replacement = ParseSelect(
+	    "SELECT " + StringUtil::Join(outputs, ", ") + " FROM " + aux_table + " WHERE " + count_column + " > 0" +
+	    (meta.representative_input ? " AND " + SqlUtils::QuoteIdentifier(meta.InternalColumn("openivm_selected"))
+	                               : ""));
 	auto &selected = replacement->node->Cast<SelectNode>();
 	distinct->select_list = std::move(selected.select_list);
 	distinct->from_table = std::move(selected.from_table);

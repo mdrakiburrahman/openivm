@@ -4213,3 +4213,280 @@ SELECT count(*) FROM((SELECT * FROM filtered_sign_{type}_{variant} EXCEPT ALL SE
 endloop
 
 endloop
+
+
+# User DISTINCT columns may use the compiler's preferred count and weight names.
+# Allocate internal names consistently across CREATE, refresh, and state checks.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+CREATE TABLE distinct_names_{type}_source(id INT,k INT,v {type});
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(1,1,10),(2,2,20),(3,2,20),(4,NULL,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dd_scalar AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dd_scalar_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dd_group AS SELECT dd g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d GROUP BY dd;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dd_group_expected AS SELECT dd g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d GROUP BY dd;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dmult_scalar AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d WHERE dmult>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dmult_scalar_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d WHERE dmult>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dmult_group AS SELECT dmult g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d GROUP BY dmult;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dmult_group_expected AS SELECT dmult g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d GROUP BY dmult;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}__count_scalar AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d WHERE _count>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}__count_scalar_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d WHERE _count>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}__count_group AS SELECT _count g,SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d GROUP BY _count;
+
+statement ok
+CREATE VIEW distinct_names_{type}__count_group_expected AS SELECT _count g,SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d GROUP BY _count;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_suffixes AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k+10 AS "DD_",k AS dmult,k+20 AS "DMULT_",k AS _count,k+30 AS "_COUNT_",k AS openivm_aux_sign_count_8,k+40 AS "OPENIVM_AUX_SIGN_COUNT_8_",v AS x FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_suffixes_expected AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k+10 AS "DD_",k AS dmult,k+20 AS "DMULT_",k AS _count,k+30 AS "_COUNT_",k AS openivm_aux_sign_count_8,k+40 AS "OPENIVM_AUX_SIGN_COUNT_8_",v AS x FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_sum_names AS SELECT SUM(dd)+1 a FROM(SELECT DISTINCT k,v AS dd,v AS dmult,v AS _count FROM distinct_names_{type}_source)d;
+
+statement ok
+CREATE VIEW distinct_names_{type}_sum_names_expected AS SELECT SUM(dd)+1 a FROM(SELECT DISTINCT k,v AS dd,v AS dmult,v AS _count FROM distinct_names_{type}_source)d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_limited AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source ORDER BY dd NULLS LAST,v NULLS LAST LIMIT 3)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_limited_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source ORDER BY dd NULLS LAST,v NULLS LAST LIMIT 3)d WHERE dd>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_joint AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k AS dmult,k AS _count,k AS openivm_selected,k+10 AS "OPENIVM_SELECTED_",k AS openivm_chosen,k+20 AS "OPENIVM_CHOSEN_",k AS openivm_selected_identity_0,k+30 AS "OPENIVM_SELECTED_IDENTITY_0_",k AS extra_key,k AS openivm_tuple_identity_12,k+40 AS "OPENIVM_TUPLE_IDENTITY_12_",v AS x,v AS y FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_joint_expected AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k AS dmult,k AS _count,k AS openivm_selected,k+10 AS "OPENIVM_SELECTED_",k AS openivm_chosen,k+20 AS "OPENIVM_CHOSEN_",k AS openivm_selected_identity_0,k+30 AS "OPENIVM_SELECTED_IDENTITY_0_",k AS extra_key,k AS openivm_tuple_identity_12,k+40 AS "OPENIVM_TUPLE_IDENTITY_12_",v AS x,v AS y FROM distinct_names_{type}_source)d WHERE dd>1;
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_names_{type}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,20),(5,2,30),(6,3,40),(7,1,5);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=50 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id IN(1,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,20);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=50 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_names_{type}_source;
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(8,NULL,NULL);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,0),(9,2,50),(10,2,50),(11,NULL,60),(12,4,0);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=50 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,50),(13,3,30);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=70 WHERE id IN(9,99);
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id IN(10,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,70),(14,3,40);
+
+statement ok
+UPDATE distinct_names_{type}_source SET v=100 WHERE id=99;
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=2,v=10 WHERE id=9;
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id IN(11,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop

@@ -2508,12 +2508,24 @@ string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta 
 	return MetadataJson::Write(meta);
 }
 
+string RefreshMetadata::DistinctAuxMeta::InternalColumn(const string &name) const {
+	string result = name;
+	auto matches = [&](const string &column) {
+		return StringUtil::CIEquals(column, result);
+	};
+	while (std::any_of(cols.begin(), cols.end(), matches) ||
+	       std::any_of(selected_input_columns.begin(), selected_input_columns.end(), matches)) {
+		result += '_';
+	}
+	return result;
+}
+
 vector<pair<string, string>> RefreshMetadata::DistinctSignCountColumns(const DistinctAuxMeta &meta) {
 	vector<pair<string, string>> result;
 	for (idx_t index = 0; index < meta.cols.size(); index++) {
 		if (std::find(meta.sign_columns.begin(), meta.sign_columns.end(), meta.cols[index]) !=
 		    meta.sign_columns.end()) {
-			result.emplace_back(meta.cols[index], "openivm_aux_sign_count_" + to_string(index));
+			result.emplace_back(meta.cols[index], meta.InternalColumn("openivm_aux_sign_count_" + to_string(index)));
 		}
 	}
 	return result;
@@ -2521,9 +2533,9 @@ vector<pair<string, string>> RefreshMetadata::DistinctSignCountColumns(const Dis
 
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {
 	auto expected = meta.cols;
-	expected.push_back("_count");
+	expected.push_back(meta.InternalColumn("_count"));
 	if (meta.representative_input) {
-		expected.push_back("openivm_selected");
+		expected.push_back(meta.InternalColumn("openivm_selected"));
 	}
 	for (auto &entry : DistinctSignCountColumns(meta)) {
 		expected.push_back(entry.second);

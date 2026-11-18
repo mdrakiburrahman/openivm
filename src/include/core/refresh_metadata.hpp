@@ -356,6 +356,9 @@ public:
 		// Evaluated on representative transitions, after DISTINCT and before aggregation.
 		string post_filter;
 
+		// Stable across creation and refresh; separate from candidate/selection input names.
+		string InternalColumn(const string &name) const;
+
 		string SelectionTable() const {
 			return selected_input_sql.empty() || representative_input ? "" : aux_table + "_selected";
 		}

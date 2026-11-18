@@ -1339,7 +1339,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					    " openivm_candidates SEMI JOIN " + SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) +
 					    " i ON " +
 					    SqlUtils::BuildNullSafeMatch(aux_meta.selected_source_columns, "openivm_candidates", "i") +
-					    " WHERE _count > 0 AND openivm_selected)";
+					    " WHERE " + SqlUtils::QuoteIdentifier(aux_meta.InternalColumn("_count")) + " > 0 AND " +
+					    SqlUtils::QuoteIdentifier(aux_meta.InternalColumn("openivm_selected")) + ")";
 					aux_meta.selected_input_sql = SqlUtils::ReplaceTableReferences(
 					    aux_meta.selected_input_sql, "openivm_topk_candidates", candidate_bag);
 				} else {
