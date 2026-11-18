@@ -188,6 +188,7 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 		}
 		out_cols.push_back(expression->GetName().GetIdentifierName());
 	}
+	QueryResult::DeduplicateColumns(out_cols);
 	out_filter_sql = ExprSQL(distinct->where_clause);
 	auto input = distinct->Copy();
 	input->modifiers.clear();
@@ -203,8 +204,9 @@ string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::Dist
 	D_ASSERT(statement);
 	SelectNode *distinct = nullptr;
 	for (auto select : Selects(*statement->node)) {
-		// The lowered DISTINCT may include its internal count_star support output.
-		if (select->select_list.size() < columns.size() || select->groups.group_expressions.size() != columns.size()) {
+		// Repeated DISTINCT expressions retain separate output positions, while
+		// the parser deduplicates GROUP BY keys. A hidden count_star may follow.
+		if (select->select_list.size() < columns.size()) {
 			continue;
 		}
 		bool groups_only = true;
@@ -212,6 +214,13 @@ string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::Dist
 			auto &expression = select->select_list[i];
 			groups_only &= std::any_of(select->groups.group_expressions.begin(), select->groups.group_expressions.end(),
 			                           [&](const auto &group) { return expression->Equals(*group); });
+		}
+		for (auto &group : select->groups.group_expressions) {
+			bool projected = false;
+			for (idx_t i = 0; i < columns.size(); i++) {
+				projected |= select->select_list[i]->Equals(*group);
+			}
+			groups_only &= projected;
 		}
 		for (idx_t i = columns.size(); i < select->select_list.size(); i++) {
 			auto count = MatchFunction(*select->select_list[i], "count_star");

@@ -353,6 +353,8 @@ public:
 		vector<string> selected_identity_exprs;
 		bool representative_input = false;
 		string selected_view_sql;
+		// Evaluated on representative transitions, after DISTINCT and before aggregation.
+		string post_filter;
 
 		string SelectionTable() const {
 			return selected_input_sql.empty() || representative_input ? "" : aux_table + "_selected";

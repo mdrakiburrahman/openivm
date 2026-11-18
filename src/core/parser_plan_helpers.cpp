@@ -1840,6 +1840,21 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		D_ASSERT(projection != facts.projections_by_index.end());
 		return renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
 	};
+	if (!limited_input) {
+		// Limited selections already include this path. Ordinary DISTINCT must
+		// filter its old/new representatives, rather than filtering source support.
+		vector<string> predicates;
+		for (auto *node = aggregate.children[0].get(); node != distinct && node->children.size() == 1;
+		     node = node->children[0].get()) {
+			if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
+				for (auto &expression : node->expressions) {
+					predicates.push_back("(" + renderer.ExpressionToAliasedString(*expression) + ")");
+				}
+			}
+		}
+		meta.post_filter = StringUtil::Join(predicates, " AND ");
+		OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT representative filter: %s\n", meta.post_filter.c_str());
+	}
 	for (auto &expression : aggregate.expressions) {
 		auto &input = expression->Cast<BoundAggregateExpression>();
 		if (input.Function().GetName().GetIdentifierName() != "sum") {

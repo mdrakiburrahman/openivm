@@ -2113,6 +2113,7 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Arr("selected_identity_exprs", m.selected_identity_exprs, Presence::OPTIONAL);
 	io.Bool("representative_input", m.representative_input, Presence::OPTIONAL);
 	io.Str("selected_view_sql", m.selected_view_sql, Presence::OPTIONAL);
+	io.Str("post_filter", m.post_filter, Presence::OPTIONAL);
 }
 
 template <class IO>

@@ -3851,3 +3851,365 @@ endloop
 
 statement ok
 SET threads=1;
+
+# Filters between DISTINCT and a scalar aggregate must apply to emitted tuple
+# transitions. Repeated DISTINCT expressions also retain separate output slots
+# when the SQL parser deduplicates their GROUP BY expressions.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+CREATE TABLE distinct_input_{type}_source(id INT,k INT,v {type});
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(1,1,10),(2,1,20),(3,1,20),(4,2,5),(5,NULL,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_inline AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source)d WHERE v>10;
+
+statement ok
+CREATE VIEW distinct_input_{type}_inline_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source)d WHERE v>10;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_projected AS WITH d AS(SELECT DISTINCT k,v FROM distinct_input_{type}_source),p AS(SELECT k,v*2 n FROM d),q AS(SELECT n FROM p WHERE n>20 AND k IS NOT NULL) SELECT SUM(n)+1 a FROM q;
+
+statement ok
+CREATE VIEW distinct_input_{type}_projected_expected AS WITH d AS(SELECT DISTINCT k,v FROM distinct_input_{type}_source),p AS(SELECT k,v*2 n FROM d),q AS(SELECT n FROM p WHERE n>20 AND k IS NOT NULL) SELECT SUM(n)+1 a FROM q;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_limited AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d WHERE v>10;
+
+statement ok
+CREATE VIEW distinct_input_{type}_limited_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d WHERE v>10;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_duplicate_key AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x FROM distinct_input_{type}_source)d GROUP BY a;
+
+statement ok
+CREATE VIEW distinct_input_{type}_duplicate_key_expected AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x FROM distinct_input_{type}_source)d GROUP BY a;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_duplicate_value AS SELECT k,SUM(x)+1 z FROM(SELECT DISTINCT k,v AS x,v AS y FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_input_{type}_duplicate_value_expected AS SELECT k,SUM(x)+1 z FROM(SELECT DISTINCT k,v AS x,v AS y FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_duplicate_scalar AS SELECT SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x,v AS y FROM distinct_input_{type}_source)d;
+
+statement ok
+CREATE VIEW distinct_input_{type}_duplicate_scalar_expected AS SELECT SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x,v AS y FROM distinct_input_{type}_source)d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_unnamed_key AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,k,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_input_{type}_unnamed_key_expected AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,k,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_unnamed_value AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,v,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_input_{type}_unnamed_value_expected AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,v,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_expression_key AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k+1 a,k+1 b,v x,1 c FROM distinct_input_{type}_source)d GROUP BY a;
+
+statement ok
+CREATE VIEW distinct_input_{type}_expression_key_expected AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k+1 a,k+1 b,v x,1 c FROM distinct_input_{type}_source)d GROUP BY a;
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_input_{type}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,1,2),(6,1,5),(7,1,30);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=9 WHERE id=99;
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=8 WHERE id=2;
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# All ordinary post-filter inputs disappear while DISTINCT support remains.
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,1,30);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=5 WHERE id IN(3,7,99);
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# Empty and refill before one refresh, then exercise persisted filter metadata.
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,1,5);
+
+statement ok
+UPDATE distinct_input_{type}_source SET k=NULL,v=100 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_input_{type}_source;
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(8,2,40),(9,2,40),(10,NULL,50),(11,NULL,NULL);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,2,40),(12,3,5);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=60 WHERE id IN(8,99);
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id IN(9,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,2,0),(13,3,30);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=70 WHERE id=99;
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=5 WHERE id=8;
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id IN(10,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# Post-DISTINCT predicates must observe the old and new representatives, not
+# merely filter the source support. Cover sign-counter and joint-candidate paths.
+foreach type FLOAT DOUBLE
+
+statement ok
+CREATE TABLE filtered_sign_{type}_source(id INT,x {type},y {type});
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(1,'-0.0'::{type},'-0.0'::{type}),(2,'-0.0'::{type},'-0.0'::{type});
+
+statement ok
+CREATE MATERIALIZED VIEW filtered_sign_{type}_counter AS WITH d AS(SELECT DISTINCT x FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(x)) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW filtered_sign_{type}_counter_expected AS WITH d AS(SELECT DISTINCT x FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(x)) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW filtered_sign_{type}_joint AS WITH d AS(SELECT DISTINCT x,y FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(y)) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW filtered_sign_{type}_joint_expected AS WITH d AS(SELECT DISTINCT x,y FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(y)) SELECT SUM(n)+1 a FROM p;
+
+foreach variant counter joint
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='filtered_sign_{type}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM filtered_sign_{type}_{variant} EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}_expected) UNION ALL(SELECT * FROM filtered_sign_{type}_{variant}_expected EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(99,0,0);
+
+statement ok
+UPDATE filtered_sign_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM filtered_sign_{type}_source WHERE signbit(x) OR id=99;
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(3,0,0),(4,0,0);
+
+foreach variant counter joint
+
+statement ok
+PRAGMA refresh('filtered_sign_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM filtered_sign_{type}_{variant} EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}_expected) UNION ALL(SELECT * FROM filtered_sign_{type}_{variant}_expected EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(99,0,0);
+
+statement ok
+UPDATE filtered_sign_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM filtered_sign_{type}_source;
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(5,'-0.0'::{type},'-0.0'::{type});
+
+foreach variant counter joint
+
+statement ok
+PRAGMA refresh('filtered_sign_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM filtered_sign_{type}_{variant} EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}_expected) UNION ALL(SELECT * FROM filtered_sign_{type}_{variant}_expected EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop

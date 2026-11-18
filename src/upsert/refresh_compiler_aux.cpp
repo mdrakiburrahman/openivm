@@ -1129,7 +1129,12 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 		}
 		projections.push_back(expression + " AS " + SqlUtils::QuoteIdentifier(column));
 	}
-	string raw_delta = "(" + ddist_cte + "SELECT " + StringUtil::Join(projections, ", ") + " FROM ddist WHERE dd <> 0)";
+	string post_filter = meta.post_filter;
+	if (!post_filter.empty() && render_input_expression) {
+		post_filter = render_input_expression(post_filter);
+	}
+	string raw_delta = "(" + ddist_cte + "SELECT " + StringUtil::Join(projections, ", ") + " FROM ddist WHERE dd <> 0" +
+	                   (post_filter.empty() ? "" : " AND (" + post_filter + ")") + ")";
 	string aggregate_sql =
 	    group_columns.empty()
 	        ? CompileSimpleAggregates(view_name, column_names, options.view_query_sql, false, "", catalog_prefix,
