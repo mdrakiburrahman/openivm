@@ -302,12 +302,6 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	return result;
 }
 
-string FloatingRepresentativeSQL(const string &value, const string &negative_count, const string &total_count) {
-	return "CASE WHEN (" + value + ") = 0 THEN CASE WHEN " + negative_count + " = 0 THEN abs(" + value + ") WHEN " +
-	       negative_count + " = " + total_count + " THEN -abs(" + value + ") ELSE " + value + " END ELSE " + value +
-	       " END";
-}
-
 const string &IndexedStateColumn(const vector<string> &columns, const string &state_column, const string &prefix) {
 	D_ASSERT(StringUtil::StartsWith(state_column, prefix));
 	idx_t index = 0;
@@ -816,7 +810,7 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		auto current = "COALESCE(v." + quoted_key + ", d." + quoted_key + ")";
 		// Keep a zero representative while its sign is present, and switch
 		// when its last supporting row disappears.
-		auto representative = FloatingRepresentativeSQL(current, negative, group_count);
+		auto representative = SqlUtils::FloatingRepresentativeSQL(current, negative, group_count);
 		updated_column_expressions[key] = representative;
 		auto alias = SqlUtils::QuoteIdentifier("openivm_group_representative_" + to_string(key_insert_values.size()));
 		representative_projections.push_back(representative + " AS " + alias);

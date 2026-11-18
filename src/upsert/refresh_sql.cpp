@@ -713,9 +713,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (!metadata.GetDistinctAuxMeta(view_name, meta)) {
 			return "";
 		}
-		if (meta.representative_input) {
-			source_sql =
-			    UseDistinctRepresentatives(source_sql, meta.selected_source_columns, aux_table_sql(meta.aux_table));
+		if (meta.representative_input || !meta.sign_columns.empty()) {
+			source_sql = UseDistinctRepresentatives(source_sql, meta, aux_table_sql(meta.aux_table));
 		}
 		OPENIVM_DEBUG_PRINT("[UPSERT] Rebuilding DISTINCT support counts for %s with full refresh\n",
 		                    view_name.c_str());

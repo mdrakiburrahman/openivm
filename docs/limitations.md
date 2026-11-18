@@ -136,7 +136,9 @@ choice is not guaranteed.
 DISTINCT aux tuples use the same zero-sign policy for floating columns. A
 sign-only replacement emits a retraction and an insertion even when its total
 multiplicity stays unchanged. A tuple with one scalar floating column uses a
-`BIGINT` sign counter; multiple floating columns retain joint candidate identities
+`BIGINT` sign counter. Initial load and full refresh read the aggregate input
+from that counter state, so parallel DISTINCT execution cannot seed inconsistent
+representatives. Multiple floating columns retain joint candidate identities
 and a supported representative so their signs cannot form a nonexistent tuple.
 Ordinary refresh processes only delta-touched equivalence classes. Limited
 selections compare candidate identities, canonicalizing NaNs while preserving

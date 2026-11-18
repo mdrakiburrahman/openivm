@@ -1599,10 +1599,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                                          meta.output_cols, meta.null_aware, meta.null_aware_left_col));
 	} else {
 		auto initial_query = time_travel_pins.StripFrom(context, view_query);
-		if (view_model.HasDistinctAux() && view_model.distinct_aux.representative_input) {
+		if (view_model.HasDistinctAux() &&
+		    (view_model.distinct_aux.representative_input || !view_model.distinct_aux.sign_columns.empty())) {
 			const auto &meta = view_model.distinct_aux;
-			initial_query = UseDistinctRepresentatives(initial_query, meta.selected_source_columns,
-			                                           get_aux_state_target(meta.aux_table));
+			initial_query = UseDistinctRepresentatives(initial_query, meta, get_aux_state_target(meta.aux_table));
 		} else if (view_model.HasDistinctAux() && !view_model.distinct_aux.SelectionTable().empty()) {
 			const auto &meta = view_model.distinct_aux;
 			initial_query = SqlUtils::ReplaceTableReferences(meta.selected_view_sql, "openivm_distinct_selected",

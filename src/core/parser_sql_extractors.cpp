@@ -196,20 +196,26 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 	return !out_cols.empty();
 }
 
-string UseDistinctRepresentatives(const string &sql, const vector<string> &columns, const string &aux_table) {
+string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::DistinctAuxMeta &meta,
+                                  const string &aux_table) {
+	const auto &columns = meta.representative_input ? meta.selected_source_columns : meta.cols;
 	auto statement = ParseSelect(sql);
 	D_ASSERT(statement);
 	SelectNode *distinct = nullptr;
 	for (auto select : Selects(*statement->node)) {
-		// LPTS lowers the single inner DISTINCT to a pure GROUP BY. Aggregate
-		// blocks have additional outputs and cannot match this shape.
-		if (select->select_list.size() != columns.size() || select->groups.group_expressions.size() != columns.size()) {
+		// The lowered DISTINCT may include its internal count_star support output.
+		if (select->select_list.size() < columns.size() || select->groups.group_expressions.size() != columns.size()) {
 			continue;
 		}
 		bool groups_only = true;
-		for (auto &expression : select->select_list) {
+		for (idx_t i = 0; i < columns.size(); i++) {
+			auto &expression = select->select_list[i];
 			groups_only &= std::any_of(select->groups.group_expressions.begin(), select->groups.group_expressions.end(),
 			                           [&](const auto &group) { return expression->Equals(*group); });
+		}
+		for (idx_t i = columns.size(); i < select->select_list.size(); i++) {
+			auto count = MatchFunction(*select->select_list[i], "count_star");
+			groups_only &= count && count->GetArguments().empty() && !count->Filter();
 		}
 		if (!groups_only) {
 			continue;
@@ -223,12 +229,23 @@ string UseDistinctRepresentatives(const string &sql, const vector<string> &colum
 		throw InternalException("Missing DISTINCT representative input");
 	}
 	vector<string> outputs;
+	auto sign_counts = RefreshMetadata::DistinctSignCountColumns(meta);
 	for (idx_t i = 0; i < columns.size(); i++) {
-		outputs.push_back(SqlUtils::QuoteIdentifier(columns[i]) + " AS " +
+		auto value = SqlUtils::QuoteIdentifier(columns[i]);
+		for (const auto &entry : sign_counts) {
+			if (entry.first == columns[i]) {
+				value = SqlUtils::FloatingRepresentativeSQL(value, SqlUtils::QuoteIdentifier(entry.second), "_count");
+			}
+		}
+		outputs.push_back(value + " AS " +
+		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
+	}
+	for (idx_t i = columns.size(); i < distinct->select_list.size(); i++) {
+		outputs.push_back("_count AS " +
 		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
 	}
 	auto replacement = ParseSelect("SELECT " + StringUtil::Join(outputs, ", ") + " FROM " + aux_table +
-	                               " WHERE _count > 0 AND openivm_selected");
+	                               " WHERE _count > 0" + (meta.representative_input ? " AND openivm_selected" : ""));
 	auto &selected = replacement->node->Cast<SelectNode>();
 	distinct->select_list = std::move(selected.select_list);
 	distinct->from_table = std::move(selected.from_table);

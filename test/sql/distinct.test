@@ -3706,3 +3706,148 @@ SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELE
 endloop
 
 endloop
+
+# A single floating DISTINCT column uses sign counters. CREATE and full refresh
+# must seed the aggregate from that same aux representative, even when parallel
+# GROUP BY executions could independently pick different zero signs.
+statement ok
+SET threads=4;
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type float double
+
+statement ok
+CREATE TABLE seed_{type}_source(id INT,k INT,x {type});
+
+statement ok
+INSERT INTO seed_{type}_source SELECT r,r%128,CASE WHEN (r//128)%7=0 THEN '-0.0'::{type} ELSE 0 END FROM range(300000)t(r);
+
+statement ok
+CREATE MATERIALIZED VIEW seed_{type}_scalar AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW seed_{type}_scalar_expected AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW seed_{type}_group AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW seed_{type}_group_expected AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+# Direct SUM retains a hidden count_star output in the lowered DISTINCT block.
+statement ok
+CREATE MATERIALIZED VIEW seed_{type}_direct AS SELECT k,SUM(x)+1 a FROM(SELECT DISTINCT k,x FROM seed_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW seed_{type}_direct_expected AS SELECT k,SUM(x)+1 a FROM(SELECT DISTINCT k,x FROM seed_{type}_source)d GROUP BY k;
+
+statement ok
+SET VARIABLE seed_scalar_aux=(SELECT 'openivm_distinct_count_'||view_name FROM openivm_views WHERE view_sql_name='seed_{type}_scalar');
+
+statement ok
+CREATE VIEW seed_{type}_scalar_chosen AS WITH p AS MATERIALIZED(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM seed_{type}_source),d AS(SELECT DISTINCT p.k,p.n FROM p JOIN query_table(getvariable('seed_scalar_aux')) a ON p.k IS NOT DISTINCT FROM a.k AND p.n=CASE WHEN signbit(a.x) THEN 1 ELSE 0 END WHERE a._count>0) SELECT SUM(n)+1 a FROM d;
+
+statement ok
+SET VARIABLE seed_group_aux=(SELECT 'openivm_distinct_count_'||view_name FROM openivm_views WHERE view_sql_name='seed_{type}_group');
+
+statement ok
+CREATE VIEW seed_{type}_group_chosen AS WITH p AS MATERIALIZED(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM seed_{type}_source),d AS(SELECT DISTINCT p.k,p.n FROM p JOIN query_table(getvariable('seed_group_aux')) a ON p.k IS NOT DISTINCT FROM a.k AND p.n=CASE WHEN signbit(a.x) THEN 1 ELSE 0 END WHERE a._count>0) SELECT k,SUM(n)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW seed_{type}_direct_chosen AS SELECT * FROM seed_{type}_direct_expected;
+
+# Mixed signs permit different native DISTINCT choices. Check the actual seed
+# invariant using the base query restricted to the supported aux choice.
+# After deletion below, also compare the original unrestricted base query.
+foreach variant scalar group
+
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_chosen) UNION ALL(SELECT * FROM seed_{type}_{variant}_chosen EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO seed_{type}_source VALUES(999999,0,'-0.0'::{type});
+
+statement ok
+UPDATE seed_{type}_source SET x=1 WHERE id=999999;
+
+statement ok
+DELETE FROM seed_{type}_source WHERE signbit(x) OR id=999999;
+
+foreach variant scalar group direct
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='seed_{type}_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('seed_{type}_{variant}');
+
+# All surviving zeros are positive: native query equality is now unambiguous.
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_expected) UNION ALL(SELECT * FROM seed_{type}_{variant}_expected EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO seed_{type}_source SELECT r+1000000,r%128,CASE WHEN (r//128)%7=0 THEN '-0.0'::{type} ELSE 0 END FROM range(300000)t(r);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant scalar group direct
+
+statement ok
+PRAGMA refresh('seed_{type}_{variant}');
+
+# EXCEPT ALL compares the base DISTINCT query with its supported aux choice
+# while both zero signs coexist; the direct sum is independent of that choice.
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_chosen) UNION ALL(SELECT * FROM seed_{type}_{variant}_chosen EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO seed_{type}_source VALUES(999999,0,'-0.0'::{type});
+
+statement ok
+UPDATE seed_{type}_source SET x=1 WHERE id=999999;
+
+statement ok
+DELETE FROM seed_{type}_source WHERE signbit(x) OR id=999999;
+
+foreach variant scalar group direct
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='seed_{type}_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('seed_{type}_{variant}');
+
+# All surviving zeros are positive: native query equality is now unambiguous.
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_expected) UNION ALL(SELECT * FROM seed_{type}_{variant}_expected EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET threads=1;

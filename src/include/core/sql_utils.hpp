@@ -27,6 +27,8 @@ public:
 	// SQL equality can merge observably different values, including nested ones.
 	static bool EqualityCanHideValueIdentity(const LogicalType &type);
 	static string NegativeZeroSQL(const string &value);
+	static string FloatingRepresentativeSQL(const string &value, const string &negative_count,
+	                                        const string &total_count);
 	static string ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation = "");
 	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
 	                                     const Identifier &schema) {

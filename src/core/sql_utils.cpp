@@ -37,6 +37,13 @@ string SqlUtils::NegativeZeroSQL(const string &value) {
 	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
 }
 
+string SqlUtils::FloatingRepresentativeSQL(const string &value, const string &negative_count,
+                                           const string &total_count) {
+	return "CASE WHEN (" + value + ") = 0 THEN CASE WHEN " + negative_count + " = 0 THEN abs(" + value + ") WHEN " +
+	       negative_count + " = " + total_count + " THEN -abs(" + value + ") ELSE " + value + " END ELSE " + value +
+	       " END";
+}
+
 string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation) {
 	if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
 		return NegativeZeroSQL(value);

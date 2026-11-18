@@ -971,8 +971,9 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 			if (sign != sign_counts.end()) {
 				auto counter = SqlUtils::QuoteIdentifier(sign->second);
 				auto negative = "COALESCE(_aux." + counter + ", 0)";
-				old_value = FloatingRepresentativeSQL(old_value, negative, old_count);
-				new_value = FloatingRepresentativeSQL(new_value, negative + " + i." + counter, "(" + new_count + ")");
+				old_value = SqlUtils::FloatingRepresentativeSQL(old_value, negative, old_count);
+				new_value =
+				    SqlUtils::FloatingRepresentativeSQL(new_value, negative + " + i." + counter, "(" + new_count + ")");
 				changes.push_back("concat(" + old_value + ", '') IS DISTINCT FROM concat(" + new_value + ", '')");
 			}
 			old_values.push_back(old_value + " AS " + quoted);
