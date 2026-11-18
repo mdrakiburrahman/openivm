@@ -165,9 +165,21 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 			}
 		}
 	}
+	if (!distinct || !distinct->groups.group_expressions.empty() || distinct->having) {
+		return false;
+	}
+	// The bound input resolver handles projections, filters and limits in unary
+	// source subqueries too; do not reject them before it can inspect the plan.
+	auto source = distinct->from_table.get();
+	while (source->type == TableReferenceType::SUBQUERY) {
+		auto select = AsSelect(*source->Cast<SubqueryRef>().subquery->node);
+		if (!select) {
+			return false;
+		}
+		source = select->from_table.get();
+	}
 	string alias;
-	if (!distinct || !ReadSource(*distinct->from_table, out_source, alias) ||
-	    !distinct->groups.group_expressions.empty() || distinct->having) {
+	if (!ReadSource(*source, out_source, alias)) {
 		return false;
 	}
 	for (auto &expression : distinct->select_list) {

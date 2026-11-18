@@ -352,6 +352,11 @@ public:
 		vector<string> sign_columns;
 		vector<string> selected_identity_exprs;
 		bool representative_input = false;
+		string selected_view_sql;
+
+		string SelectionTable() const {
+			return selected_input_sql.empty() || representative_input ? "" : aux_table + "_selected";
+		}
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL

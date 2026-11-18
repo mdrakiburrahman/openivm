@@ -2112,6 +2112,7 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Arr("sign_columns", m.sign_columns, Presence::OPTIONAL);
 	io.Arr("selected_identity_exprs", m.selected_identity_exprs, Presence::OPTIONAL);
 	io.Bool("representative_input", m.representative_input, Presence::OPTIONAL);
+	io.Str("selected_view_sql", m.selected_view_sql, Presence::OPTIONAL);
 }
 
 template <class IO>
@@ -2556,6 +2557,9 @@ vector<string> RefreshMetadata::GetAuxiliaryTables(const string &view_name) {
 	DistinctAuxMeta distinct;
 	if (GetDistinctAuxMeta(view_name, distinct)) {
 		tables.push_back(distinct.aux_table);
+		if (!distinct.SelectionTable().empty()) {
+			tables.push_back(distinct.SelectionTable());
+		}
 	}
 	CountDistinctAuxMeta count_distinct;
 	if (GetCountDistinctAuxMeta(view_name, count_distinct)) {
@@ -2575,9 +2579,13 @@ vector<string> RefreshMetadata::GetAuxiliaryTables(const string &view_name) {
 bool RefreshMetadata::AuxStateNeedsRepair(const string &view_name, const string &catalog_name,
                                           const string &schema_name) {
 	DistinctAuxMeta distinct;
-	if (GetDistinctAuxMeta(view_name, distinct) &&
-	    !TableColumnsMatch(catalog_name, schema_name, distinct.aux_table, ExpectedDistinctAuxColumns(distinct))) {
-		return true;
+	if (GetDistinctAuxMeta(view_name, distinct)) {
+		if (!TableColumnsMatch(catalog_name, schema_name, distinct.aux_table, ExpectedDistinctAuxColumns(distinct)) ||
+		    (!distinct.SelectionTable().empty() &&
+		     !TableColumnsMatch(catalog_name, schema_name, distinct.SelectionTable(),
+		                        distinct.selected_input_columns))) {
+			return true;
+		}
 	}
 	CountDistinctAuxMeta count_distinct;
 	if (GetCountDistinctAuxMeta(view_name, count_distinct) &&

@@ -3167,3 +3167,292 @@ SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT *
 0
 
 endloop
+
+# Multiple floating sign witnesses must choose a supported tuple jointly.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type FLOAT DOUBLE
+
+statement ok
+CREATE TABLE correlated_{type}_source(id INT,g INT,x {type},y {type});
+
+statement ok
+INSERT INTO correlated_{type}_source VALUES(1,1,'-0.0'::{type},'-0.0'::{type}),(2,1,'-0.0'::{type},0),(3,1,0,'-0.0'::{type});
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_scalar AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW correlated_{type}_scalar_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_group AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+CREATE VIEW correlated_{type}_group_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_limited_scalar AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW correlated_{type}_limited_scalar_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_limited_group AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+CREATE VIEW correlated_{type}_limited_group_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+INSERT INTO correlated_{type}_source VALUES(99,1,'-0.0'::{type},'-0.0'::{type});
+
+statement ok
+UPDATE correlated_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM correlated_{type}_source WHERE id IN(1,99);
+
+foreach variant scalar group limited_scalar limited_group
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='correlated_{type}_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('correlated_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM correlated_{type}_{variant} EXCEPT ALL SELECT * FROM correlated_{type}_{variant}_expected) UNION ALL(SELECT * FROM correlated_{type}_{variant}_expected EXCEPT ALL SELECT * FROM correlated_{type}_{variant}));
+----
+0
+
+endloop
+
+# Empty and refill before one refresh, restoring the all-negative representative.
+statement ok
+INSERT INTO correlated_{type}_source VALUES(99,1,0,0);
+
+statement ok
+UPDATE correlated_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM correlated_{type}_source;
+
+statement ok
+INSERT INTO correlated_{type}_source VALUES(4,1,'-0.0'::{type},'-0.0'::{type}),(5,1,'-0.0'::{type},'-0.0'::{type});
+
+foreach variant scalar group limited_scalar limited_group
+
+statement ok
+PRAGMA refresh('correlated_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM correlated_{type}_{variant} EXCEPT ALL SELECT * FROM correlated_{type}_{variant}_expected) UNION ALL(SELECT * FROM correlated_{type}_{variant}_expected EXCEPT ALL SELECT * FROM correlated_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# A parallel source DISTINCT and its candidate-bag DISTINCT can pick different
+# collated representatives. The aggregate must use its persisted input selection.
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TABLE selected_parallel_source(id INT,k INT,v VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO selected_parallel_source SELECT r,r%128,CASE WHEN r%256<128 THEN 'A' ELSE 'a' END FROM range(300000)t(r);
+
+statement ok
+CREATE MATERIALIZED VIEW selected_parallel_limit AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW selected_parallel_limit_expected AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW selected_parallel_percent AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW selected_parallel_percent_expected AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW selected_parallel_nested AS WITH d AS(SELECT DISTINCT k,v FROM(SELECT k,v FROM selected_parallel_source ORDER BY id LIMIT 300000)d ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW selected_parallel_nested_expected AS WITH d AS(SELECT DISTINCT k,v FROM(SELECT k,v FROM selected_parallel_source ORDER BY id LIMIT 300000)d ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+INSERT INTO selected_parallel_source VALUES(999999,0,'A');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source WHERE ascii(v)=65 OR id=999999;
+
+foreach variant limit percent nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='selected_parallel_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('selected_parallel_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selected_parallel_{variant} EXCEPT ALL SELECT * FROM selected_parallel_{variant}_expected) UNION ALL(SELECT * FROM selected_parallel_{variant}_expected EXCEPT ALL SELECT * FROM selected_parallel_{variant}));
+----
+0
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET threads=4;
+
+# Rebuild both the persisted input and the aggregate, then resume incrementally.
+statement ok
+INSERT INTO selected_parallel_source VALUES(999999,0,'a');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source;
+
+statement ok
+INSERT INTO selected_parallel_source SELECT r,r,'A' FROM range(128)t(r);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant limit percent nested
+
+statement ok
+PRAGMA refresh('selected_parallel_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selected_parallel_{variant} EXCEPT ALL SELECT * FROM selected_parallel_{variant}_expected) UNION ALL(SELECT * FROM selected_parallel_{variant}_expected EXCEPT ALL SELECT * FROM selected_parallel_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO selected_parallel_source VALUES(999999,0,'A');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source;
+
+statement ok
+INSERT INTO selected_parallel_source SELECT r,r,'a' FROM range(128)t(r);
+
+foreach variant limit percent nested
+
+statement ok
+PRAGMA refresh('selected_parallel_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selected_parallel_{variant} EXCEPT ALL SELECT * FROM selected_parallel_{variant}_expected) UNION ALL(SELECT * FROM selected_parallel_{variant}_expected EXCEPT ALL SELECT * FROM selected_parallel_{variant}));
+----
+0
+
+endloop
+
+# DROP includes the persisted selection, alongside the candidate count state.
+statement ok
+CREATE TABLE dropped_selection_tables AS SELECT 'openivm_distinct_count_' || view_name || '_selected' table_name FROM openivm_views WHERE view_sql_name LIKE 'selected_parallel_%';
+
+foreach variant limit percent nested
+
+statement ok
+DROP MATERIALIZED VIEW selected_parallel_{variant};
+
+endloop
+
+query I
+SELECT count(*) FROM duckdb_tables()t JOIN dropped_selection_tables d USING(table_name);
+----
+0
+
+# Replacement can change both the candidate schema and aggregate-input width.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE MATERIALIZED VIEW selection_replacement AS WITH d AS(SELECT DISTINCT v FROM selected_parallel_source ORDER BY v LIMIT 1),p AS(SELECT ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW selection_replacement AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW selection_replacement_expected AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+INSERT INTO selected_parallel_source VALUES(1000,0,'A'),(999999,0,'a');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source WHERE id IN(0,999999);
+
+statement ok
+PRAGMA refresh('selection_replacement');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selection_replacement EXCEPT ALL SELECT * FROM selection_replacement_expected) UNION ALL(SELECT * FROM selection_replacement_expected EXCEPT ALL SELECT * FROM selection_replacement));
+----
+0
+
+# Unary input resolution also ignores order-only wrappers without a limit.
+statement ok
+CREATE TABLE ordered_unary_source(id INT,v INT);
+
+statement ok
+INSERT INTO ordered_unary_source VALUES(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW ordered_unary_distinct AS WITH d AS(SELECT DISTINCT n FROM(SELECT v+1 n FROM ordered_unary_source ORDER BY v)s) SELECT SUM(n)+1 a FROM d;
+
+statement ok
+CREATE VIEW ordered_unary_expected AS WITH d AS(SELECT DISTINCT n FROM(SELECT v+1 n FROM ordered_unary_source ORDER BY v)s) SELECT SUM(n)+1 a FROM d;
+
+statement ok
+INSERT INTO ordered_unary_source VALUES(99,10),(3,30);
+
+statement ok
+UPDATE ordered_unary_source SET v=40 WHERE id=99;
+
+statement ok
+DELETE FROM ordered_unary_source WHERE id IN(1,99);
+
+statement ok
+PRAGMA refresh('ordered_unary_distinct');
+
+query I
+SELECT count(*) FROM((SELECT * FROM ordered_unary_distinct EXCEPT ALL SELECT * FROM ordered_unary_expected) UNION ALL(SELECT * FROM ordered_unary_expected EXCEPT ALL SELECT * FROM ordered_unary_distinct));
+----
+0

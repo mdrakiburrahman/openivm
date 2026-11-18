@@ -837,6 +837,23 @@ vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
 	return output_columns;
 }
 
+string DistinctSelectionInputSQL(const RefreshMetadata::DistinctAuxMeta &meta, const string &candidate_table) {
+	vector<string> columns;
+	for (idx_t i = 0; i < meta.selected_source_columns.size(); i++) {
+		columns.push_back("openivm_candidates." + SqlUtils::QuoteIdentifier(meta.cols[i]) + " AS " +
+		                  SqlUtils::QuoteIdentifier(meta.selected_source_columns[i]));
+	}
+	auto candidates = "(SELECT " + StringUtil::Join(columns, ", ") + " FROM " + candidate_table +
+	                  " openivm_candidates CROSS JOIN generate_series(1, openivm_candidates._count) "
+	                  "openivm_copies WHERE openivm_candidates._count > 0)";
+	return SqlUtils::ReplaceTableReferences(meta.selected_input_sql, "openivm_topk_candidates", candidates);
+}
+
+string BuildDistinctSelectionCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
+                                       const string &candidate_table) {
+	return "CREATE OR REPLACE TABLE " + target_table + " AS " + DistinctSelectionInputSQL(meta, candidate_table);
+}
+
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
                                       const string &source_relation, bool replace) {
 	string select_list;
@@ -988,15 +1005,22 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 		OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] Maintaining sign counts for %zu DISTINCT inputs\n",
 		                    sign_counts.size());
 	}
-	string selected_old = SqlUtils::QuoteIdentifier("openivm_selected_old_" + view_name);
+	auto selection_table = meta.SelectionTable();
+	string selected_old = selection_table.empty() ? SqlUtils::QuoteIdentifier("openivm_selected_old_" + view_name)
+	                                              : catalog_prefix + SqlUtils::QuoteIdentifier(selection_table);
 	string selected_new = SqlUtils::QuoteIdentifier("openivm_selected_new_" + view_name);
 	if (!meta.selected_input_sql.empty()) {
 		// Differentiate the bounded input after integrating source deltas into its candidate bag.
 		// Both eviction and refill rows reach the aggregate, even for an insert-only source batch.
-		sql += "CREATE OR REPLACE TEMP TABLE " + selected_old + " AS " + meta.selected_input_sql + ";\n";
+		if (selection_table.empty()) {
+			sql += "CREATE OR REPLACE TEMP TABLE " + selected_old + " AS " + meta.selected_input_sql + ";\n";
+		}
 		sql += update_aux;
 		if (meta.representative_input) {
-			vector<string> identity_columns(meta.cols.begin() + meta.selected_source_columns.size(), meta.cols.end());
+			vector<string> identity_columns;
+			for (idx_t i = meta.selected_source_columns.size(); i < meta.cols.size(); i++) {
+				identity_columns.push_back(meta.cols[i]);
+			}
 			auto touched_match = SqlUtils::BuildNullSafeMatch(meta.selected_source_columns, "a", "i");
 			// Retain a chosen tuple while it has support. Re-rank only delta-touched
 			// equivalence classes after count integration, including zero-net replacements.
@@ -1116,7 +1140,14 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 	if (meta.selected_input_sql.empty()) {
 		sql += update_aux;
 	} else {
-		sql += "DROP TABLE " + selected_old + ";\nDROP TABLE " + selected_new + ";\n";
+		if (selection_table.empty()) {
+			sql += "DROP TABLE " + selected_old + ";\n";
+		} else {
+			// Preserve the exact selection whose contribution is now integrated.
+			sql += "DELETE FROM " + selected_old + ";\nINSERT INTO " + selected_old + " SELECT * FROM " + selected_new +
+			       ";\n";
+		}
+		sql += "DROP TABLE " + selected_new + ";\n";
 	}
 
 	sql += "DELETE FROM " + aux_q + " WHERE _count <= 0;\n\n";

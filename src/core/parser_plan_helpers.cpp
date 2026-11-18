@@ -1587,6 +1587,35 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex
 	return group_names;
 }
 
+string BuildDistinctSelectedViewSQL(AstNode &node, const vector<string> &input_columns,
+                                    const vector<string> &output_columns) {
+	std::function<bool(AstNode &)> replace_input = [&](AstNode &candidate) {
+		if (candidate.NodeType() == "Aggregate") {
+			D_ASSERT(candidate.children.size() == 1);
+			auto names = candidate.children[0]->OutputColumnNames();
+			// CREATE-time DISTINCT normalization appends its support count after
+			// the original input columns; the parent aggregate does not consume it.
+			D_ASSERT(names.size() >= input_columns.size());
+			names.resize(input_columns.size());
+			candidate.children[0] =
+			    make_uniq<AstGetNode>("", vector<string>(), "openivm_distinct_selected", TableIndex(0), input_columns,
+			                          std::move(names), vector<string>());
+			return true;
+		}
+		for (auto &child : candidate.children) {
+			if (replace_input(*child)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (!replace_input(node)) {
+		throw InternalException("Missing aggregate for maintained DISTINCT selection");
+	}
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Reading limited DISTINCT aggregate input from maintained selection\n");
+	return AstToCteList(node)->ToQuery(true, output_columns);
+}
+
 static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column);
 
 void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanFacts &facts,
@@ -1696,7 +1725,8 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		auto *source = distinct->children[0].get();
 		vector<LogicalOperator *> filters;
 		while ((source->type == LogicalOperatorType::LOGICAL_PROJECTION ||
-		        source->type == LogicalOperatorType::LOGICAL_FILTER) &&
+		        source->type == LogicalOperatorType::LOGICAL_FILTER ||
+		        source->type == LogicalOperatorType::LOGICAL_ORDER_BY) &&
 		       source->children.size() == 1) {
 			if (source->type == LogicalOperatorType::LOGICAL_FILTER) {
 				filters.push_back(source);
@@ -1745,6 +1775,8 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 	}
 
 	if (!limited_input) {
+		// Per-column counters cannot preserve correlations between floating signs.
+		meta.representative_input = meta.sign_columns.size() > 1;
 		for (idx_t i = 0; i < distinct_types.size(); i++) {
 			auto &type = distinct_types[i];
 			if (type.id() != LogicalTypeId::FLOAT && type.id() != LogicalTypeId::DOUBLE &&
@@ -1767,7 +1799,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 				meta.selected_identity_exprs.push_back(std::move(identity));
 				string name = "openivm_tuple_identity_" + to_string(i);
 				while (std::find(meta.cols.begin(), meta.cols.end(), name) != meta.cols.end()) {
-					name += "_";
+					name += '_';
 				}
 				meta.cols.push_back(std::move(name));
 				meta.source_exprs.push_back(

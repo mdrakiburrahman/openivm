@@ -467,6 +467,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
 	vector<LogicalType> output_types;
+	unique_ptr<AstNode> initial_load_ast;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
@@ -547,7 +548,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto ast = LogicalPlanToAst(context, candidate, dialect, time_travel_pins.Resolver(),
 			                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 			auto cte_list = AstToCteList(*ast, dialect);
-			return cte_list->ToQuery(true, output_names);
+			auto sql = cte_list->ToQuery(true, output_names);
+			initial_load_ast = std::move(ast);
+			return sql;
 		};
 		auto serialize_original = [&]() {
 			try {
@@ -929,6 +932,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                          distinct_sum_arg,
 		                          distinct_sum_out};
 		PopulateDistinctAggregateInputs(context, facts, output_names, distinct_aux_candidate);
+		if (!distinct_aux_candidate.SelectionTable().empty()) {
+			D_ASSERT(initial_load_ast);
+			distinct_aux_candidate.selected_view_sql = BuildDistinctSelectedViewSQL(
+			    *initial_load_ast, distinct_aux_candidate.selected_input_columns, output_names);
+		}
 		model_input.distinct_aux_candidate = &distinct_aux_candidate;
 	}
 	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux_candidate;
@@ -1324,6 +1332,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		         RefreshMetadata::DistinctAuxMetaToJson(meta), [&](const string &aux_target) {
 			         return BuildDistinctAuxStateCreateSQL(aux_target, meta, meta.source, replace_aux);
 		         });
+		if (!meta.SelectionTable().empty()) {
+			add_profile_marker("create_mv_distinct_selection");
+			ddl.push_back(BuildDistinctSelectionCreateSQL(get_aux_state_target(meta.SelectionTable()), meta,
+			                                              get_aux_state_target(meta.aux_table)));
+			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
+			            SqlUtils::QuoteIdentifier(meta.SelectionTable()));
+		}
 	}
 	if (view_model.HasCountDistinctAux()) {
 		const auto &meta = view_model.count_distinct_aux;
@@ -1588,6 +1603,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			const auto &meta = view_model.distinct_aux;
 			initial_query = UseDistinctRepresentatives(initial_query, meta.selected_source_columns,
 			                                           get_aux_state_target(meta.aux_table));
+		} else if (view_model.HasDistinctAux() && !view_model.distinct_aux.SelectionTable().empty()) {
+			const auto &meta = view_model.distinct_aux;
+			initial_query = SqlUtils::ReplaceTableReferences(meta.selected_view_sql, "openivm_distinct_selected",
+			                                                 get_aux_state_target(meta.SelectionTable()));
 		}
 		ddl.push_back("create table " + initial_load_target + " as " + initial_query);
 	}

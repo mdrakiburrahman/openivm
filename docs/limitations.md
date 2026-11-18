@@ -135,9 +135,12 @@ choice is not guaranteed.
 
 DISTINCT aux tuples use the same zero-sign policy for floating columns. A
 sign-only replacement emits a retraction and an insertion even when its total
-multiplicity stays unchanged. This adds one `BIGINT` counter per floating
-DISTINCT column and processes only delta-touched tuples. Limited selections
-compare candidate identities, canonicalizing NaNs while preserving signed zero.
+multiplicity stays unchanged. A tuple with one scalar floating column uses a
+`BIGINT` sign counter; multiple floating columns retain joint candidate identities
+and a supported representative so their signs cannot form a nonexistent tuple.
+Ordinary refresh processes only delta-touched equivalence classes. Limited
+selections compare candidate identities, canonicalizing NaNs while preserving
+signed zero.
 Delta compaction retains a Boolean zero-sign key for each floating input column.
 Publication uses the same witness for floating output columns when consolidating
 old and new visible rows, so sign-only changes also reach dependent views.
@@ -154,6 +157,14 @@ delta-touched equivalence classes participate in ordinary incremental refresh.
 Initial load and full refresh read the same selected representatives as the aux
 state. Existing aux-state MVs must be recreated with `CREATE OR REPLACE
 MATERIALIZED VIEW` to populate the identity and representative metadata.
+
+Limited DISTINCT inputs additionally persist the exact selected aggregate-input
+bag in `<candidate_count_table>_selected`. Initial load and full refresh derive
+the aggregate from that snapshot. Incremental refresh retracts the persisted
+selection, inserts the new selection's contribution, and saves the new snapshot
+in the same native transaction. This adds storage proportional to the selected
+input bag and a snapshot write per refresh; it does not rescan the source table.
+DROP and replacement clean up or replace this state alongside candidate counts.
 
 Limited FLOAT/DOUBLE DISTINCT exports use portable SQL witnesses for signed
 zero. Exports that require DuckDB's opaque value serialization (INTERVAL,

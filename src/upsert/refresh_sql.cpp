@@ -691,6 +691,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		               internal_schema_name, source_keys, view_catalog_name, view_schema_name, build_sql);
 	};
 	auto check_distinct_identity = [&](const RefreshMetadata::DistinctAuxMeta &meta) {
+		if (!meta.SelectionTable().empty() && meta.selected_view_sql.empty()) {
+			throw CatalogException("Limited DISTINCT selection metadata is missing; recreate the materialized view");
+		}
 		if (active_facts.target_dialect != SqlDialect::DUCKDB &&
 		    (meta.representative_input || RequiresNativeValueIdentity(meta.source_exprs) ||
 		     RequiresNativeValueIdentity(meta.selected_identity_exprs))) {
@@ -716,7 +719,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		OPENIVM_DEBUG_PRINT("[UPSERT] Rebuilding DISTINCT support counts for %s with full refresh\n",
 		                    view_name.c_str());
-		return build_distinct_aux(meta) + ";\n";
+		auto query = build_distinct_aux(meta) + ";\n";
+		if (!meta.SelectionTable().empty()) {
+			query += BuildDistinctSelectionCreateSQL(aux_table_sql(meta.SelectionTable()), meta,
+			                                         aux_table_sql(meta.aux_table)) +
+			         ";\n";
+			source_sql = SqlUtils::ReplaceTableReferences(meta.selected_view_sql, "openivm_distinct_selected",
+			                                              aux_table_sql(meta.SelectionTable()));
+		}
+		return query;
 	};
 	auto in_progress_sql = [&](bool value) {
 		return "UPDATE " + views_metadata_table + " SET refresh_in_progress = " + (value ? "true" : "false") +
@@ -1292,6 +1303,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			check_distinct_identity(aux_meta);
 			ensure_aux_state(aux_meta.aux_table, RefreshMetadata::ExpectedDistinctAuxColumns(aux_meta),
 			                 {aux_meta.source}, [&]() { return build_distinct_aux(aux_meta); });
+			if (!active_facts.compile_only && !aux_meta.SelectionTable().empty() &&
+			    !metadata.TableColumnsMatch(internal_catalog_name, internal_schema_name, aux_meta.SelectionTable(),
+			                                aux_meta.selected_input_columns)) {
+				throw CatalogException(
+				    "Maintained DISTINCT selection is missing or incompatible; restore the selection "
+				    "table or recreate the materialized view");
+			}
 			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
 			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
 			                                              attached_db_schema_name);
@@ -1302,24 +1320,23 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto input_columns = &aux_meta.cols;
 			if (!aux_meta.selected_input_sql.empty()) {
 				input_columns = &aux_meta.selected_input_columns;
-				vector<string> candidates;
-				for (idx_t i = 0; i < aux_meta.selected_source_columns.size(); i++) {
-					candidates.push_back(SqlUtils::QuoteIdentifier(aux_meta.cols[i]) + " AS " +
-					                     SqlUtils::QuoteIdentifier(aux_meta.selected_source_columns[i]));
-				}
-				string candidate_bag = "(SELECT " + StringUtil::Join(candidates, ", ") + " FROM " +
-				                       aux_table_sql(aux_meta.aux_table) + " openivm_candidates";
 				if (aux_meta.representative_input) {
-					candidate_bag +=
-					    " SEMI JOIN " + SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) + " i ON " +
+					vector<string> candidates;
+					for (auto &column : aux_meta.selected_source_columns) {
+						candidates.push_back("openivm_candidates." + SqlUtils::QuoteIdentifier(column));
+					}
+					string candidate_bag =
+					    "(SELECT " + StringUtil::Join(candidates, ", ") + " FROM " + aux_table_sql(aux_meta.aux_table) +
+					    " openivm_candidates SEMI JOIN " + SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) +
+					    " i ON " +
 					    SqlUtils::BuildNullSafeMatch(aux_meta.selected_source_columns, "openivm_candidates", "i") +
 					    " WHERE _count > 0 AND openivm_selected)";
+					aux_meta.selected_input_sql = SqlUtils::ReplaceTableReferences(
+					    aux_meta.selected_input_sql, "openivm_topk_candidates", candidate_bag);
 				} else {
-					candidate_bag += " CROSS JOIN generate_series(1, openivm_candidates._count) "
-					                 "openivm_copies WHERE openivm_candidates._count > 0)";
+					aux_meta.selected_input_sql =
+					    DistinctSelectionInputSQL(aux_meta, aux_table_sql(aux_meta.aux_table));
 				}
-				aux_meta.selected_input_sql = SqlUtils::ReplaceTableReferences(
-				    aux_meta.selected_input_sql, "openivm_topk_candidates", candidate_bag);
 				input_relation = "(" + aux_meta.selected_input_sql + ")";
 				if (active_facts.target_dialect != SqlDialect::DUCKDB) {
 					aux_meta.selected_input_sql = RenderStoredViewQueryForDialect(con, aux_meta.selected_input_sql,

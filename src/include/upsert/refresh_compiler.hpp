@@ -139,6 +139,9 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
                                   const vector<string> &column_names, const AggregateGroupsOptions &options,
                                   const DerivedAggregateOutputInfo &derived_outputs,
                                   const std::function<string(const string &)> &render_input_expression = {});
+string DistinctSelectionInputSQL(const RefreshMetadata::DistinctAuxMeta &meta, const string &candidate_table);
+string BuildDistinctSelectionCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
+                                       const string &candidate_table);
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
                                       const string &source_relation, bool replace);
 string CompileCountDistinctIncremental(const string &view_name, const string &aux_table, const string &delta_source,
