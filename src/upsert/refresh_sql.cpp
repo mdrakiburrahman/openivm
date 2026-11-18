@@ -1301,8 +1301,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		RefreshMetadata::DistinctAuxMeta aux_meta;
 		if (metadata.GetDistinctAuxMeta(view_name, aux_meta)) {
 			check_distinct_identity(aux_meta);
-			ensure_aux_state(aux_meta.aux_table, RefreshMetadata::ExpectedDistinctAuxColumns(aux_meta),
-			                 {aux_meta.source}, [&]() { return build_distinct_aux(aux_meta); });
+			ensure_aux_state(
+			    aux_meta.aux_table, RefreshMetadata::ExpectedDistinctAuxColumns(aux_meta), {aux_meta.source}, [&]() {
+				    // Counts can be reconstructed, but the previously chosen
+				    // representative cannot be inferred from today's row order.
+				    if (aux_meta.representative_input || !aux_meta.sign_columns.empty()) {
+					    OPENIVM_DEBUG_PRINT("[UPSERT] Cannot reconstruct DISTINCT representative state for %s\n",
+					                        view_name.c_str());
+					    throw CatalogException("Cannot repair DISTINCT representative state from current source "
+					                           "data; restore the auxiliary table or recreate the materialized view");
+				    }
+				    return build_distinct_aux(aux_meta);
+			    });
 			if (!active_facts.compile_only && !aux_meta.SelectionTable().empty() &&
 			    !metadata.TableColumnsMatch(internal_catalog_name, internal_schema_name, aux_meta.SelectionTable(),
 			                                aux_meta.selected_input_columns)) {

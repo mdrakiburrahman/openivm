@@ -50,6 +50,17 @@ Some optimized refresh paths maintain auxiliary state tables, such as `openivm_d
 
 Repair is only allowed when no source deltas are pending. If deltas are pending, OpenIVM raises an error and asks you to recreate the view or restore the aux table. This prevents rebuilding aux state from a source table that no longer matches the MV's unprocessed delta cursor.
 
+DISTINCT state that retains a representative cannot be rebuilt independently of
+the materialized aggregate, even when no source deltas are pending. Current row
+order can choose a different SQL-equal value, so rebuilding only that state would
+make subsequent deltas inconsistent with the stored result. This includes
+collated strings, INTERVAL, VARIANT, nested floating values, correlated floating
+signs, and the single-column floating sign-counter path. Missing or incompatible
+representative state raises an error requiring the exact auxiliary state to be
+restored or the MV to be recreated. Plain count state and limited-input candidate
+counts retain their repair path; limited selections have a separate persisted
+snapshot, which must remain intact.
+
 ## Limitations
 
 - `RENAME TO` (renaming a table) and `ALTER COLUMN TYPE` are rejected on IVM-tracked sources before changing the source or its delta. Drop dependent materialized views before making these changes, then recreate them. Untracked tables retain normal DuckDB behavior.
