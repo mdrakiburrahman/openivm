@@ -3456,3 +3456,253 @@ query I
 SELECT count(*) FROM((SELECT * FROM ordered_unary_distinct EXCEPT ALL SELECT * FROM ordered_unary_expected) UNION ALL(SELECT * FROM ordered_unary_expected EXCEPT ALL SELECT * FROM ordered_unary_distinct));
 ----
 0
+
+# Group lineage follows bound output positions after sanitizing/deduplicating names.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE group_alias_source(id INT,k INT,v INT);
+
+statement ok
+INSERT INTO group_alias_source VALUES(1,1,10),(2,1,10),(3,2,20),(4,NULL,NULL),(5,3,5);
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_space AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_space_expected AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_dash AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_dash_expected AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_duplicate AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_duplicate_expected AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_case AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_case_expected AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_suffix AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_suffix_expected AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_sanitized AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_sanitized_expected AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_quote AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_quote_expected AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_repeated AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_repeated_expected AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_space AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_space_expected AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_dash AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_dash_expected AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_duplicate AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_duplicate_expected AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_case AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_case_expected AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_suffix AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_suffix_expected AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_sanitized AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_sanitized_expected AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_quote AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_quote_expected AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_repeated AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_repeated_expected AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='group_alias_{mode}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,1,10),(6,1,30),(7,NULL,40);
+
+statement ok
+UPDATE group_alias_source SET k=2,v=100 WHERE id=99;
+
+statement ok
+UPDATE group_alias_source SET k=NULL,v=50 WHERE id=3;
+
+statement ok
+DELETE FROM group_alias_source WHERE id IN(1,99);
+
+statement ok
+UPDATE group_alias_source SET v=NULL WHERE id=5;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,NULL,0);
+
+statement ok
+UPDATE group_alias_source SET k=4,v=99 WHERE id=99;
+
+statement ok
+DELETE FROM group_alias_source;
+
+statement ok
+INSERT INTO group_alias_source VALUES(8,2,5),(9,NULL,NULL),(10,2,5);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,1,0);
+
+statement ok
+UPDATE group_alias_source SET k=4,v=99 WHERE id=99;
+
+statement ok
+DELETE FROM group_alias_source;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,NULL,0),(11,NULL,1);
+
+statement ok
+UPDATE group_alias_source SET k=4,v=99 WHERE id=99;
+
+statement ok
+DELETE FROM group_alias_source WHERE id=99;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop

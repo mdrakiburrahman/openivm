@@ -7,6 +7,7 @@
 #include "core/plan_rewrite_internal.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "lpts_expression_renderer.hpp"
 #include "lpts_pipeline.hpp"
 #include "lpts_helpers.hpp"
@@ -1477,12 +1478,14 @@ static bool ResolvesToGroupBinding(TableIndex table_index, ProjectionIndex colum
 
 static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
                                    const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
-	if (!expr->GetAlias().GetIdentifierName().empty()) {
-		return expr->GetAlias().GetIdentifierName();
-	}
+	// Stored names are sanitized and deduplicated by projection position. A raw
+	// alias can therefore name a different output (or no stored output at all).
 	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
 	    !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
 		return output_names[expr_index];
+	}
+	if (!expr->GetAlias().GetIdentifierName().empty()) {
+		return expr->GetAlias().GetIdentifierName();
 	}
 	return bcr.GetName().GetIdentifierName();
 }
@@ -3334,7 +3337,7 @@ static void AppendHiddenOutputNames(LogicalOperator *plan, vector<string> &outpu
 }
 
 static void DeduplicateOutputNames(vector<string> &output_names) {
-	unordered_set<string> seen;
+	case_insensitive_set_t seen;
 	for (auto &name : output_names) {
 		if (IncrementalTableNames::IsInternalColumn(name)) {
 			continue;
