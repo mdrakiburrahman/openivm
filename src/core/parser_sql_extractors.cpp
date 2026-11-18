@@ -184,6 +184,48 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 	return !out_cols.empty();
 }
 
+string UseDistinctRepresentatives(const string &sql, const vector<string> &columns, const string &aux_table) {
+	auto statement = ParseSelect(sql);
+	D_ASSERT(statement);
+	SelectNode *distinct = nullptr;
+	for (auto select : Selects(*statement->node)) {
+		// LPTS lowers the single inner DISTINCT to a pure GROUP BY. Aggregate
+		// blocks have additional outputs and cannot match this shape.
+		if (select->select_list.size() != columns.size() || select->groups.group_expressions.size() != columns.size()) {
+			continue;
+		}
+		bool groups_only = true;
+		for (auto &expression : select->select_list) {
+			groups_only &= std::any_of(select->groups.group_expressions.begin(), select->groups.group_expressions.end(),
+			                           [&](const auto &group) { return expression->Equals(*group); });
+		}
+		if (!groups_only) {
+			continue;
+		}
+		if (distinct) {
+			throw InternalException("Ambiguous DISTINCT representative input");
+		}
+		distinct = select;
+	}
+	if (!distinct) {
+		throw InternalException("Missing DISTINCT representative input");
+	}
+	vector<string> outputs;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		outputs.push_back(SqlUtils::QuoteIdentifier(columns[i]) + " AS " +
+		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
+	}
+	auto replacement = ParseSelect("SELECT " + StringUtil::Join(outputs, ", ") + " FROM " + aux_table +
+	                               " WHERE _count > 0 AND openivm_selected");
+	auto &selected = replacement->node->Cast<SelectNode>();
+	distinct->select_list = std::move(selected.select_list);
+	distinct->from_table = std::move(selected.from_table);
+	distinct->where_clause = std::move(selected.where_clause);
+	distinct->groups = std::move(selected.groups);
+	OPENIVM_DEBUG_PRINT("[CREATE/REFRESH] Reading DISTINCT representatives from %s\n", aux_table.c_str());
+	return statement->ToString();
+}
+
 bool ExtractCountDistinctAggregate(const string &sql, const vector<string> &group_columns,
                                    const vector<string> &output_names, CountDistinctExtract &out) {
 	auto statement = ParseSelect(sql);

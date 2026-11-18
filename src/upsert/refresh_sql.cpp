@@ -1,4 +1,5 @@
 #include "core/published_view.hpp"
+#include "core/parser_sql_extractors.hpp"
 #include "upsert/refresh_internal.hpp"
 
 #include "compile_facts.hpp"
@@ -22,6 +23,8 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_error_context.hpp"
@@ -32,6 +35,22 @@
 #include <cctype>
 
 namespace duckdb {
+
+static bool RequiresNativeValueIdentity(const vector<string> &expressions) {
+	for (auto &sql : expressions) {
+		for (auto &expression : Parser::GetBuiltinParser().ParseExpressionList(sql)) {
+			bool native = false;
+			ParsedExpressionIterator::VisitExpression<FunctionExpression>(
+			    *expression, [&](const FunctionExpression &fn) {
+				    native |= StringUtil::CIEquals(fn.FunctionName().GetIdentifierName(), "openivm_internal_value_key");
+			    });
+			if (native) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
 
 string SparkPortableRefreshSQL(string sql) {
 	// Use lexer tokens so helper syntax is translated without changing
@@ -671,18 +690,31 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		EnsureAuxState(metadata, con, view_name, aux_table, expected_columns, internal_catalog_name,
 		               internal_schema_name, source_keys, view_catalog_name, view_schema_name, build_sql);
 	};
+	auto check_distinct_identity = [&](const RefreshMetadata::DistinctAuxMeta &meta) {
+		if (active_facts.target_dialect != SqlDialect::DUCKDB &&
+		    (meta.representative_input || RequiresNativeValueIdentity(meta.source_exprs) ||
+		     RequiresNativeValueIdentity(meta.selected_identity_exprs))) {
+			throw NotImplementedException(
+			    "Lossless DISTINCT identity for this input type requires native DuckDB execution");
+		}
+	};
 	auto build_distinct_aux = [&](const RefreshMetadata::DistinctAuxMeta &meta) {
+		check_distinct_identity(meta);
 		return BuildDistinctAuxStateCreateSQL(aux_table_sql(meta.aux_table), meta, aux_source_table(meta.source),
 		                                      /*replace=*/true);
 	};
-	// Full refresh must replace DISTINCT support counts along with the visible rows;
-	// the next incremental refresh uses these counts to detect zero crossings.
-	auto rebuild_distinct_aux = [&]() -> string {
+	// Seed the aggregate and its support counts from the same representatives, even
+	// when parallel GROUP BY execution chooses different SQL-equal input values.
+	auto rebuild_distinct_aux = [&](string &source_sql) -> string {
 		RefreshMetadata::DistinctAuxMeta meta;
 		if (!metadata.GetDistinctAuxMeta(view_name, meta)) {
 			return "";
 		}
-		OPENIVM_DEBUG_PRINT("[UPSERT] Rebuilding DISTINCT support counts for %s after full refresh\n",
+		if (meta.representative_input) {
+			source_sql =
+			    UseDistinctRepresentatives(source_sql, meta.selected_source_columns, aux_table_sql(meta.aux_table));
+		}
+		OPENIVM_DEBUG_PRINT("[UPSERT] Rebuilding DISTINCT support counts for %s with full refresh\n",
 		                    view_name.c_str());
 		return build_distinct_aux(meta) + ";\n";
 	};
@@ -698,10 +730,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			source_sql = RenderStoredViewQueryForDialect(con, view_query_sql, vector<string>(),
 			                                             active_facts.target_dialect, view_time_travel_pins);
 		}
-		auto query = BuildRecomputeQuery(metadata, view_name, source_sql, cross_system, attached_db_catalog_name,
-		                                 attached_db_schema_name, internal_catalog_prefix, metadata_prefix,
-		                                 out_post_meta, deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
-		query += rebuild_distinct_aux();
+		auto aux_rebuild = rebuild_distinct_aux(source_sql);
+		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql, cross_system,
+		                                               attached_db_catalog_name, attached_db_schema_name,
+		                                               internal_catalog_prefix, metadata_prefix, out_post_meta,
+		                                               deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
 		if (cross_system && out_pre_meta && out_post_meta) {
 			*out_pre_meta = in_progress_sql(true);
 			*out_post_meta += in_progress_sql(false);
@@ -1256,6 +1289,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::DISTINCT_INCREMENTAL: {
 		RefreshMetadata::DistinctAuxMeta aux_meta;
 		if (metadata.GetDistinctAuxMeta(view_name, aux_meta)) {
+			check_distinct_identity(aux_meta);
 			ensure_aux_state(aux_meta.aux_table, RefreshMetadata::ExpectedDistinctAuxColumns(aux_meta),
 			                 {aux_meta.source}, [&]() { return build_distinct_aux(aux_meta); });
 			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
@@ -1274,9 +1308,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					                     SqlUtils::QuoteIdentifier(aux_meta.selected_source_columns[i]));
 				}
 				string candidate_bag = "(SELECT " + StringUtil::Join(candidates, ", ") + " FROM " +
-				                       aux_table_sql(aux_meta.aux_table) +
-				                       " openivm_candidates CROSS JOIN generate_series(1, openivm_candidates._count) "
-				                       "openivm_copies WHERE openivm_candidates._count > 0)";
+				                       aux_table_sql(aux_meta.aux_table) + " openivm_candidates";
+				if (aux_meta.representative_input) {
+					candidate_bag +=
+					    " SEMI JOIN " + SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) + " i ON " +
+					    SqlUtils::BuildNullSafeMatch(aux_meta.selected_source_columns, "openivm_candidates", "i") +
+					    " WHERE _count > 0 AND openivm_selected)";
+				} else {
+					candidate_bag += " CROSS JOIN generate_series(1, openivm_candidates._count) "
+					                 "openivm_copies WHERE openivm_candidates._count > 0)";
+				}
 				aux_meta.selected_input_sql = SqlUtils::ReplaceTableReferences(
 				    aux_meta.selected_input_sql, "openivm_topk_candidates", candidate_bag);
 				input_relation = "(" + aux_meta.selected_input_sql + ")";
@@ -1368,9 +1409,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		[[fallthrough]];
 	case RefreshType::FULL_REFRESH: {
 		string full_recompute_query = view_query_sql;
+		auto aux_rebuild = rebuild_distinct_aux(full_recompute_query);
 		if (active_facts.target_dialect == SqlDialect::SPARK) {
 			full_recompute_query =
-			    RenderStoredViewQueryForDialect(con, view_query_sql, SqlUtils::WithoutMultiplicity(column_names),
+			    RenderStoredViewQueryForDialect(con, full_recompute_query, SqlUtils::WithoutMultiplicity(column_names),
 			                                    active_facts.target_dialect, view_time_travel_pins);
 		}
 		// Invariant: like the non-cascade recompute path in BuildRecomputeQuery, this path passes the
@@ -1387,9 +1429,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = group_cols;
 		}
-		upsert_query = CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix, false,
-		                                    recompute_unique_keys);
-		upsert_query += rebuild_distinct_aux();
+		upsert_query = aux_rebuild + CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix,
+		                                                  false, recompute_unique_keys);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}

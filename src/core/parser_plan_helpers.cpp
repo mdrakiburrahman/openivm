@@ -1607,8 +1607,10 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		    return node.plan_node->type == LogicalOperatorType::LOGICAL_TOP_N ||
 		           node.plan_node->type == LogicalOperatorType::LOGICAL_LIMIT;
 	    });
+	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
+	distinct->ResolveOperatorTypes();
+	const auto &distinct_types = distinct->types;
 	if (!limited_input) {
-		distinct->ResolveOperatorTypes();
 		for (idx_t index = 0; index < meta.cols.size(); index++) {
 			if (distinct->types[index].id() == LogicalTypeId::DOUBLE ||
 			    distinct->types[index].id() == LogicalTypeId::FLOAT) {
@@ -1653,16 +1655,12 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 				}
 			}
 		}
-		auto default_collation = Settings::Get<DefaultCollationSetting>(context);
 		vector<string> identity_keys;
 		for (idx_t i = 0; i < meta.selected_source_columns.size(); i++) {
 			auto &type = source_types[i];
-			if (SqlUtils::EqualityCanHideValueIdentity(type)) {
-				identity_keys.push_back("openivm_internal_value_key(" + meta.source_exprs[i] + ")");
-			} else if (type.id() == LogicalTypeId::VARCHAR &&
-			           (!StringType::GetCollation(type).empty() || !default_collation.empty())) {
-				// The BLOB key splits collated-equal strings without changing their stored collation.
-				identity_keys.push_back("unhex(hex(" + meta.source_exprs[i] + "))");
+			auto identity = SqlUtils::ValueIdentitySQL(meta.source_exprs[i], type, default_collation);
+			if (!identity.empty()) {
+				identity_keys.push_back(std::move(identity));
 			}
 		}
 		for (auto &key : identity_keys) {
@@ -1670,8 +1668,15 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 			meta.source_exprs.push_back(key);
 		}
 		bindings = aggregate.children[0]->GetColumnBindings();
+		aggregate.children[0]->ResolveOperatorTypes();
 		for (idx_t i = 0; i < bindings.size(); i++) {
-			meta.selected_input_columns.push_back("openivm_topk_input_" + to_string(i));
+			auto column = "openivm_topk_input_" + to_string(i);
+			meta.selected_input_columns.push_back(column);
+			auto identity = SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(column),
+			                                           aggregate.children[0]->types[i], default_collation);
+			if (!identity.empty()) {
+				meta.selected_identity_exprs.push_back(std::move(identity));
+			}
 		}
 		auto selected_plan = aggregate.children[0]->Copy(context);
 		auto ast = LogicalPlanToAst(context, selected_plan, SqlDialect::DUCKDB, {},
@@ -1736,6 +1741,40 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 			meta.input_sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + meta.source +
 			                 (meta.filter.empty() ? "" : " WHERE " + meta.filter);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Resolved DISTINCT input to bound source %s\n", meta.source.c_str());
+		}
+	}
+
+	if (!limited_input) {
+		for (idx_t i = 0; i < distinct_types.size(); i++) {
+			auto &type = distinct_types[i];
+			if (type.id() != LogicalTypeId::FLOAT && type.id() != LogicalTypeId::DOUBLE &&
+			    !SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), type, default_collation).empty()) {
+				meta.representative_input = true;
+			}
+		}
+		if (meta.representative_input) {
+			meta.sign_columns.clear();
+			meta.selected_source_columns = meta.cols;
+			meta.selected_input_columns = meta.cols;
+			meta.selected_input_sql =
+			    "SELECT " + SqlUtils::JoinQuotedColumns(meta.cols) + " FROM openivm_topk_candidates";
+			for (idx_t i = 0; i < distinct_types.size(); i++) {
+				auto identity = SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), distinct_types[i],
+				                                           default_collation);
+				if (identity.empty()) {
+					continue;
+				}
+				meta.selected_identity_exprs.push_back(std::move(identity));
+				string name = "openivm_tuple_identity_" + to_string(i);
+				while (std::find(meta.cols.begin(), meta.cols.end(), name) != meta.cols.end()) {
+					name += "_";
+				}
+				meta.cols.push_back(std::move(name));
+				meta.source_exprs.push_back(
+				    SqlUtils::ValueIdentitySQL(meta.source_exprs[i], distinct_types[i], default_collation));
+			}
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Retaining representatives for %zu DISTINCT identity keys\n",
+			                    meta.selected_identity_exprs.size());
 		}
 	}
 

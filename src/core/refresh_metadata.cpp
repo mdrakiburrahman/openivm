@@ -2110,6 +2110,8 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Arr("selected_input_columns", m.selected_input_columns, Presence::OPTIONAL);
 	io.Arr("selected_source_columns", m.selected_source_columns, Presence::OPTIONAL);
 	io.Arr("sign_columns", m.sign_columns, Presence::OPTIONAL);
+	io.Arr("selected_identity_exprs", m.selected_identity_exprs, Presence::OPTIONAL);
+	io.Bool("representative_input", m.representative_input, Presence::OPTIONAL);
 }
 
 template <class IO>
@@ -2518,6 +2520,9 @@ vector<pair<string, string>> RefreshMetadata::DistinctSignCountColumns(const Dis
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {
 	auto expected = meta.cols;
 	expected.push_back("_count");
+	if (meta.representative_input) {
+		expected.push_back("openivm_selected");
+	}
 	for (auto &entry : DistinctSignCountColumns(meta)) {
 		expected.push_back(entry.second);
 	}

@@ -2764,3 +2764,406 @@ SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * 
 0
 
 endloop
+
+# DISTINCT representatives survive while supported and switch when their last exact value disappears.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE representative_collated_source(id INT,k INT,v VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO representative_collated_source VALUES(1,1,'A'),(2,1,'a');
+
+statement ok
+CREATE MATERIALIZED VIEW representative_collated_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_collated_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_collated_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_collated_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE TABLE representative_interval_source(id INT,k INT,v INTERVAL);
+
+statement ok
+INSERT INTO representative_interval_source VALUES(1,1,INTERVAL '1 month'),(2,1,INTERVAL '30 days');
+
+statement ok
+CREATE MATERIALIZED VIEW representative_interval_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_interval_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_interval_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_interval_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE TABLE representative_variant_source(id INT,k INT,v VARIANT);
+
+statement ok
+INSERT INTO representative_variant_source VALUES(1,1,1::TINYINT::VARIANT),(2,1,1::BIGINT::VARIANT);
+
+statement ok
+CREATE MATERIALIZED VIEW representative_variant_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_variant_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_variant_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_variant_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE TABLE representative_nested_source(id INT,k INT,v DOUBLE[]);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(1,1,['-0.0'::DOUBLE]),(2,1,[0::DOUBLE]);
+
+statement ok
+CREATE MATERIALIZED VIEW representative_nested_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_nested_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_nested_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_nested_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='representative_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 1.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source WHERE id IN(1,99);
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source WHERE id IN(1,99);
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source WHERE id IN(1,99);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source WHERE id IN(1,99);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 2.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_collated_source VALUES(3,1,'A'),(4,1,'A');
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(3,1,INTERVAL '1 month'),(4,1,INTERVAL '1 month');
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(3,1,1::TINYINT::VARIANT),(4,1,1::TINYINT::VARIANT);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(3,1,['-0.0'::DOUBLE]),(4,1,['-0.0'::DOUBLE]);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 3.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 4.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_collated_source VALUES(5,1,'a'),(6,1,'a');
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(5,1,INTERVAL '30 days'),(6,1,INTERVAL '30 days');
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(5,1,1::BIGINT::VARIANT),(6,1,1::BIGINT::VARIANT);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(5,1,[0::DOUBLE]),(6,1,[0::DOUBLE]);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Full refresh rebuilds representatives before loading aggregate state.
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_collated_source VALUES(7,1,'A'),(8,1,'A');
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(7,1,INTERVAL '1 month'),(8,1,INTERVAL '1 month');
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(7,1,1::TINYINT::VARIANT),(8,1,1::TINYINT::VARIANT);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(7,1,['-0.0'::DOUBLE]),(8,1,['-0.0'::DOUBLE]);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop

@@ -144,6 +144,23 @@ old and new visible rows, so sign-only changes also reach dependent views.
 Projection refreshes use the witness for tuple consolidation and copy deletion
 to preserve the signs of duplicate zero rows.
 
+DISTINCT aux state retains supported representatives for collated strings,
+INTERVAL, VARIANT, and nested floating values when SQL equality can hide a
+different projected value (for example, `ascii('A')` versus `ascii('a')` under
+`NOCASE`). Removing the selected value switches to a surviving representative
+and updates the aggregate. When multiple representations coexist, the selected
+representation can differ from DuckDB's input-order-dependent choice. Only
+delta-touched equivalence classes participate in ordinary incremental refresh.
+Initial load and full refresh read the same selected representatives as the aux
+state. Existing aux-state MVs must be recreated with `CREATE OR REPLACE
+MATERIALIZED VIEW` to populate the identity and representative metadata.
+
+Limited FLOAT/DOUBLE DISTINCT exports use portable SQL witnesses for signed
+zero. Exports that require DuckDB's opaque value serialization (INTERVAL,
+VARIANT, or nested floating inputs), and the ordinary representative-state path,
+currently require native DuckDB execution and report an unsupported error for
+other dialects.
+
 ## Other limitations
 
 - **CREATE MATERIALIZED VIEW IF NOT EXISTS** is not supported. `DROP MATERIALIZED VIEW

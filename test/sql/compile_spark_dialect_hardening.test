@@ -586,3 +586,68 @@ SELECT count(*) FROM (
 0
 
 endloop
+
+# Floating candidate keys and selected differences use portable zero-sign witnesses.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type FLOAT DOUBLE
+
+statement ok
+CREATE TABLE spark_identity_source_{type}(id INT,v {type});
+
+statement ok
+INSERT INTO spark_identity_source_{type} VALUES(1,'-0.0'::{type}),(2,1);
+
+statement ok
+CREATE MATERIALIZED VIEW spark_identity_mv_{type} AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM spark_identity_source_{type} ORDER BY v LIMIT 2)d;
+
+query I
+SELECT CASE WHEN count(*) > 0 AND min(refresh_type)=8 AND count(*) FILTER(WHERE sql LIKE '%openivm_internal_value_key%')=0 THEN 1 ELSE 0 END FROM openivm_compile_with_facts('spark_identity_mv_{type}','{"target_dialect":"spark","compile_only":true}');
+----
+1
+
+statement ok
+CREATE VIEW spark_identity_expected_{type} AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM spark_identity_source_{type} ORDER BY v LIMIT 2)d;
+
+statement ok
+INSERT INTO spark_identity_source_{type} VALUES(99,'-0.0'::{type}),(3,1);
+
+statement ok
+UPDATE spark_identity_source_{type} SET v=2 WHERE id=99;
+
+statement ok
+UPDATE spark_identity_source_{type} SET v=3 WHERE id=2;
+
+statement ok
+DELETE FROM spark_identity_source_{type} WHERE id IN(1,99);
+
+statement ok
+PRAGMA refresh('spark_identity_mv_{type}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM spark_identity_mv_{type} EXCEPT ALL SELECT * FROM spark_identity_expected_{type}) UNION ALL(SELECT * FROM spark_identity_expected_{type} EXCEPT ALL SELECT * FROM spark_identity_mv_{type}));
+----
+0
+
+endloop
+
+statement ok
+CREATE TABLE spark_opaque_source(v INTERVAL);
+
+statement ok
+CREATE MATERIALIZED VIEW spark_opaque_mv AS WITH d AS(SELECT DISTINCT v FROM spark_opaque_source),p AS(SELECT extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement error
+SELECT * FROM openivm_compile_with_facts('spark_opaque_mv','{"target_dialect":"spark","compile_only":true}');
+----
+requires native DuckDB execution
+
+# Limited opaque candidates must also reject export before emitting the private helper.
+statement ok
+CREATE MATERIALIZED VIEW spark_opaque_limited AS WITH d AS(SELECT DISTINCT v FROM spark_opaque_source ORDER BY v LIMIT 2),p AS(SELECT extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement error
+SELECT * FROM openivm_compile_with_facts('spark_opaque_limited','{"target_dialect":"spark","compile_only":true}');
+----
+requires native DuckDB execution

@@ -887,14 +887,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 						unsupported_agg = true;
 						break;
 					}
-					if (bound.GetChildren().empty() ||
-					    bound.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					auto bcr =
+					    bound.GetChildren().empty() ? nullptr : GetColumnRefThroughCasts(bound.GetChildren()[0].get());
+					if (!bcr) {
 						unsupported_agg = true;
 						break;
 					}
-					auto &bcr = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>();
-					distinct_sum_arg =
-					    bcr.GetAlias().empty() ? bcr.GetName().GetIdentifierName() : bcr.GetAlias().GetIdentifierName();
+					distinct_sum_arg = bcr->GetAlias().empty() ? bcr->GetName().GetIdentifierName()
+					                                           : bcr->GetAlias().GetIdentifierName();
 					distinct_sum_out = bound.GetAlias().GetIdentifierName();
 					sum_count++;
 				}
@@ -1583,7 +1583,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		ddl.push_back(BuildSemiAntiInitialDataSQL(initial_load_target, aux_target, meta.join_type, meta.left_cols,
 		                                          meta.output_cols, meta.null_aware, meta.null_aware_left_col));
 	} else {
-		ddl.push_back("create table " + initial_load_target + " as " + time_travel_pins.StripFrom(context, view_query));
+		auto initial_query = time_travel_pins.StripFrom(context, view_query);
+		if (view_model.HasDistinctAux() && view_model.distinct_aux.representative_input) {
+			const auto &meta = view_model.distinct_aux;
+			initial_query = UseDistinctRepresentatives(initial_query, meta.selected_source_columns,
+			                                           get_aux_state_target(meta.aux_table));
+		}
+		ddl.push_back("create table " + initial_load_target + " as " + initial_query);
 	}
 	if (staged_cross_catalog_replace) {
 		// DuckDB cannot make the DuckLake objects and native metadata atomic

@@ -350,6 +350,8 @@ public:
 		vector<string> selected_input_columns;
 		vector<string> selected_source_columns;
 		vector<string> sign_columns;
+		vector<string> selected_identity_exprs;
+		bool representative_input = false;
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL

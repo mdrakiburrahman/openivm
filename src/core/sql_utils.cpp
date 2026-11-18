@@ -37,6 +37,17 @@ string SqlUtils::NegativeZeroSQL(const string &value) {
 	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
 }
 
+string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation) {
+	if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+		return NegativeZeroSQL(value);
+	}
+	if (type.id() == LogicalTypeId::VARCHAR &&
+	    (!StringType::GetCollation(type).empty() || !default_collation.empty())) {
+		return "unhex(hex(" + value + "))";
+	}
+	return EqualityCanHideValueIdentity(type) ? "openivm_internal_value_key(" + value + ")" : "";
+}
+
 bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
 	return TypeVisitor::Contains(type, [](const LogicalType &child) {
 		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL ||

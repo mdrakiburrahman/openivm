@@ -843,6 +843,25 @@ string BuildDistinctAuxStateCreateSQL(const string &target_table, const RefreshM
 	string group_list;
 	BuildAliasedSourceLists(meta.cols, meta.source_exprs, select_list, group_list);
 	string filter = meta.filter.empty() ? "" : " WHERE " + meta.filter;
+	if (meta.representative_input) {
+		auto original_cols = SqlUtils::JoinQuotedColumns(meta.selected_source_columns);
+		vector<string> selected_values {original_cols};
+		vector<string> identity_match;
+		for (idx_t i = 0; i < meta.selected_identity_exprs.size(); i++) {
+			auto identity_column = SqlUtils::QuoteIdentifier(meta.cols[meta.selected_source_columns.size() + i]);
+			selected_values.push_back(meta.selected_identity_exprs[i] + " AS " + identity_column);
+			identity_match.push_back("r." + identity_column + " IS NOT DISTINCT FROM c." + identity_column);
+		}
+		return CreateAuxTablePrefix(target_table, replace) + " AS WITH openivm_input AS MATERIALIZED (SELECT " +
+		       select_list + " FROM " + source_relation + filter + "), openivm_counts AS (SELECT " +
+		       SqlUtils::JoinQuotedColumns(meta.cols) + ", COUNT(*)::BIGINT AS _count FROM openivm_input GROUP BY " +
+		       SqlUtils::JoinQuotedColumns(meta.cols) + "), openivm_representatives AS (SELECT " + original_cols +
+		       " FROM openivm_input GROUP BY " + original_cols + "), openivm_selected AS (SELECT " +
+		       StringUtil::Join(selected_values, ", ") + " FROM openivm_representatives) SELECT c.*, (" +
+		       StringUtil::Join(identity_match, " AND ") +
+		       ") AS openivm_selected FROM openivm_counts c JOIN openivm_selected r ON " +
+		       SqlUtils::BuildNullSafeMatch(meta.selected_source_columns, "c", "r");
+	}
 	string counts = ", count(*)::BIGINT AS _count";
 	for (auto &entry : RefreshMetadata::DistinctSignCountColumns(meta)) {
 		auto index = std::find(meta.cols.begin(), meta.cols.end(), entry.first) - meta.cols.begin();
@@ -976,16 +995,28 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 		// Both eviction and refill rows reach the aggregate, even for an insert-only source batch.
 		sql += "CREATE OR REPLACE TEMP TABLE " + selected_old + " AS " + meta.selected_input_sql + ";\n";
 		sql += update_aux;
+		if (meta.representative_input) {
+			vector<string> identity_columns(meta.cols.begin() + meta.selected_source_columns.size(), meta.cols.end());
+			auto touched_match = SqlUtils::BuildNullSafeMatch(meta.selected_source_columns, "a", "i");
+			// Retain a chosen tuple while it has support. Re-rank only delta-touched
+			// equivalence classes after count integration, including zero-net replacements.
+			sql += "MERGE INTO " + aux_q + " a USING (SELECT a.*, ROW_NUMBER() OVER (PARTITION BY " +
+			       SqlUtils::JoinQualifiedQuotedColumns(meta.selected_source_columns, "a") +
+			       " ORDER BY a.openivm_selected DESC NULLS LAST, " +
+			       SqlUtils::JoinQualifiedQuotedColumns(identity_columns, "a") + ") = 1 AS openivm_chosen FROM " +
+			       aux_q + " a SEMI JOIN " + SqlUtils::QuoteIdentifier(dinput_table) + " i ON " + touched_match +
+			       " WHERE a._count > 0) r ON " + SqlUtils::BuildNullSafeMatch(meta.cols, "a", "r") +
+			       " WHEN MATCHED AND a.openivm_selected IS DISTINCT FROM r.openivm_chosen "
+			       "THEN UPDATE SET openivm_selected = r.openivm_chosen;\n";
+			OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] Retaining supported DISTINCT representatives\n");
+		}
 		sql += "CREATE OR REPLACE TEMP TABLE " + selected_new + " AS " + meta.selected_input_sql + ";\n";
 		auto selected_rows = [&](const string &table) {
 			vector<string> columns {"*"};
-			if (std::any_of(options.column_types.begin(), options.column_types.end(),
-			                [](const LogicalType &type) { return SqlUtils::EqualityCanHideValueIdentity(type); })) {
-				for (idx_t i = 0; i < meta.selected_input_columns.size(); i++) {
-					columns.push_back("openivm_internal_value_key(" +
-					                  SqlUtils::QuoteIdentifier(meta.selected_input_columns[i]) +
-					                  ") AS openivm_selected_identity_" + to_string(i));
-				}
+			for (idx_t i = 0; i < meta.selected_identity_exprs.size(); i++) {
+				auto expression = render_input_expression ? render_input_expression(meta.selected_identity_exprs[i])
+				                                          : meta.selected_identity_exprs[i];
+				columns.push_back(expression + " AS openivm_selected_identity_" + to_string(i));
 			}
 			return "SELECT " + StringUtil::Join(columns, ", ") + " FROM " + table;
 		};
