@@ -1476,14 +1476,22 @@ static bool ResolvesToGroupBinding(TableIndex table_index, ProjectionIndex colum
 	return ResolvesToOutputBinding(table_index, column_index, group_index, group_count, facts, false);
 }
 
-static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
-                                   const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
-	// Stored names are sanitized and deduplicated by projection position. A raw
-	// alias can therefore name a different output (or no stored output at all).
-	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
-	    !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
+static string ProjectionOutputName(const LogicalProjection &projection, idx_t expr_index,
+                                   const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                   const BoundColumnRefExpression &bcr) {
+	auto spine = FindOutputSpine(facts.root, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+		       op.type == LogicalOperatorType::LOGICAL_FILTER || op.type == LogicalOperatorType::LOGICAL_ORDER_BY ||
+		       op.type == LogicalOperatorType::LOGICAL_LIMIT || op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
+	// Stored names belong to the view's output projection, after sanitization and
+	// deduplication. A CTE body visited first can have a different output order.
+	if (!spine.projections.empty() && spine.projections.front() == &projection && expr_index < output_names.size() &&
+	    !output_names[expr_index].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
 		return output_names[expr_index];
 	}
+	auto &expr = projection.expressions[expr_index];
 	if (!expr->GetAlias().GetIdentifierName().empty()) {
 		return expr->GetAlias().GetIdentifierName();
 	}
@@ -1528,7 +1536,7 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateM
 		                            facts)) {
 			continue;
 		}
-		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
+		string col_name = ProjectionOutputName(proj, expr_i, facts, output_names, bcr);
 		if (!IncrementalTableNames::IsInternalColumn(col_name) ||
 		    StringUtil::StartsWith(col_name, "openivm_group_key_")) {
 			group_names.push_back(col_name);
@@ -2474,7 +2482,7 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 		if (!ResolveBindingToOccurrenceRef(bcr->Binding(), facts, key_ref)) {
 			continue;
 		}
-		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+		string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 		if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
 			continue;
 		}
@@ -2965,7 +2973,7 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 			    !StringUtil::CIEquals(bcr->GetName().GetIdentifierName(), partition_column)) {
 				continue;
 			}
-			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+			string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 			if (!output_col.empty() && !IncrementalTableNames::IsInternalColumn(output_col)) {
 				partition_column = output_col + "=" + partition_column;
 			}
@@ -2995,7 +3003,7 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 		if (!bcr) {
 			continue;
 		}
-		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+		string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 		if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
 			continue;
 		}
