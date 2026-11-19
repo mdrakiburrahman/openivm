@@ -4628,7 +4628,57 @@ CREATE MATERIALIZED VIEW distinct_cte_{type}_joined_column AS WITH d AS MATERIAL
 statement ok
 CREATE VIEW distinct_cte_{type}_joined_column_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+# HAVING reuses canonical raw state aliases; hidden grouping keys must survive
+# materialized CTE wrappers, including computed keys and publication limits.
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_direct AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_direct_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_limited AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_limited_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_cte AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_cte_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_count AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING COUNT(*)>1;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_count_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING COUNT(*)>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_union_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_union_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_expr_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k%2 ORDER BY k%2 NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_expr_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k%2 ORDER BY k%2 NULLS LAST;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_topk_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST LIMIT 1;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_topk_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST LIMIT 1;
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 # Joins above the only explicit DISTINCT retain their existing group-recompute path.
 query I
@@ -4663,7 +4713,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4692,7 +4742,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4721,7 +4771,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4764,7 +4814,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4780,7 +4830,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 DROP VIEW distinct_cte_{type}_{variant}_expected;
@@ -4853,6 +4903,30 @@ CREATE VIEW distinct_cte_{type}_consumer_union_expected AS WITH d AS MATERIALIZE
 statement ok
 CREATE VIEW distinct_cte_{type}_joined_column_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.value_new n FROM d a JOIN d b ON a.key_new=b.key_new) SELECT SUM(n)+1 a FROM j;
 
+statement ok
+CREATE VIEW distinct_cte_{type}_having_direct_expected AS SELECT key_new,SUM(value_new)+1 a FROM (SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source) d GROUP BY key_new HAVING SUM(value_new)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_limited_expected AS SELECT key_new,SUM(value_new)+1 a FROM (SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source ORDER BY key_new NULLS LAST,value_new NULLS LAST LIMIT 3) d GROUP BY key_new HAVING SUM(value_new)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_cte_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new HAVING SUM(value_new)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_count_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new HAVING COUNT(*)>1;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new ORDER BY key_new NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_union_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new ORDER BY key_new NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_expr_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new%2 ORDER BY key_new%2 NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_topk_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new ORDER BY key_new NULLS LAST LIMIT 1;
+
 endloop
 
 foreach type INTEGER DOUBLE
@@ -4873,7 +4947,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4892,7 +4966,7 @@ SET openivm_refresh_mode='full';
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4927,7 +5001,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');

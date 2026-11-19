@@ -1032,6 +1032,7 @@ LogicalAggregate *SpineAggregate(const OutputSpine &spine) {
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
 		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
 		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
 		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
 	});
@@ -1046,6 +1047,7 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 		    aggregate.groups[i]->GetReturnType(), "openivm_group_key_" + to_string(i), true);
 	}
 	plan->ResolveOperatorTypes();
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Retained %zu aggregate group key bindings\n", aggregate.groups.size());
 }
 
 /// Inject a hidden COUNT(*) (alias `openivm_count_star`) into AGGREGATE_GROUP

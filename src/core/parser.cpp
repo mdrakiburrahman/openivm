@@ -513,12 +513,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		PlanRewrite(context, *select_planner.binder, select_plan, select_output_names, select_rewrite_needs);
 
 		RewriteNonFiniteSumInputs(context, *select_planner.binder, select_plan);
+		// HAVING must reuse these state bindings without replacing their semantic aliases.
+		InjectDerivedAggregateInputs(select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
 		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
-		InjectDerivedAggregateInputs(select_plan);
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
