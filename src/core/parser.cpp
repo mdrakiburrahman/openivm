@@ -512,6 +512,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_output_names, select_rewrite_needs);
 
+		// Hidden sort outputs need the same aggregate state as visible outputs.
+		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
+		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
 		RewriteNonFiniteSumInputs(context, *select_planner.binder, select_plan);
 		// HAVING must reuse these state bindings without replacing their semantic aliases.
 		InjectDerivedAggregateInputs(select_plan);
@@ -519,7 +522,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
-		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		InjectGroupSignCounts(context, *select_planner.binder, select_plan);

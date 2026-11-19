@@ -5782,10 +5782,52 @@ CREATE VIEW derived_sort_count_expected AS
 SELECT k,COUNT(*)+1 n FROM derived_sort_source GROUP BY k
 ORDER BY CAST(COUNT(*)-2 AS UINTEGER) DESC,k LIMIT 1;
 
-foreach variant sum count
+# Aggregates used only by sorting still need raw inputs and finalization.
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_sum AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)+7 DESC NULLS LAST,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_sum_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)+7 DESC NULLS LAST,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_count AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_count_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_count_star AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(*)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_count_star_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(*)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_count_visible AS SELECT k,COUNT(*) n FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_count_visible_expected AS SELECT k,COUNT(*) n FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_coalesce AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COALESCE(COUNT(v)+7,0) DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_coalesce_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COALESCE(COUNT(v)+7,0) DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_ratio AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)/(COUNT(v)+1) DESC NULLS LAST,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_ratio_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)/(COUNT(v)+1) DESC NULLS LAST,k LIMIT 1;
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
 
 query I
 SELECT type FROM openivm_views WHERE view_sql_name='derived_sort_{variant}';
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
 ----
 0
 
@@ -5795,7 +5837,7 @@ endloop
 statement ok
 INSERT INTO derived_sort_source VALUES (7,1,1);
 
-foreach variant sum count
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
 
 statement ok
 PRAGMA refresh('derived_sort_{variant}');
@@ -5822,9 +5864,12 @@ statement ok
 UPDATE derived_sort_source SET v=1 WHERE id=5;
 
 statement ok
+UPDATE derived_sort_source SET v=NULL WHERE id=8;
+
+statement ok
 DELETE FROM derived_sort_source WHERE id IN (3,6,9);
 
-foreach variant sum count
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
 
 statement ok
 PRAGMA refresh('derived_sort_{variant}');
@@ -5843,7 +5888,7 @@ endloop
 statement ok
 DELETE FROM derived_sort_source;
 
-foreach variant sum count
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
 
 statement ok
 PRAGMA refresh('derived_sort_{variant}');
@@ -5854,6 +5899,67 @@ SELECT count(*) FROM (
   UNION ALL
   (SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant})
 );
+----
+0
+
+endloop
+
+# Refill with NULL-only and mixed groups, then cross the full-refresh boundary.
+statement ok
+INSERT INTO derived_sort_source VALUES(30,1,NULL),(31,1,NULL),(40,2,4),(41,2,NULL),(99,1,0);
+
+statement ok
+UPDATE derived_sort_source SET k=2,v=9 WHERE id=99;
+
+statement ok
+DELETE FROM derived_sort_source WHERE id=99;
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO derived_sort_source VALUES(99,1,10);
+
+statement ok
+UPDATE derived_sort_source SET v=NULL WHERE id=40;
+
+statement ok
+DELETE FROM derived_sort_source WHERE id=99;
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
 ----
 0
 
@@ -5941,12 +6047,25 @@ CREATE MATERIALIZED VIEW finite_sum_raw_int AS SELECT k,SUM(v) raw,SUM(id)+1 a F
 statement ok
 CREATE VIEW finite_sum_raw_int_expected AS SELECT k,SUM(v) raw,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
 
+# Floating sort-only SUMs must recover after retracting non-finite inputs too.
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_hidden_order AS SELECT k FROM finite_sum_source GROUP BY k ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
+statement ok
+CREATE VIEW finite_sum_hidden_order_expected AS SELECT k FROM finite_sum_source GROUP BY k ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_hidden_having_order AS SELECT k FROM finite_sum_source GROUP BY k HAVING SUM(v)>=0 ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
+statement ok
+CREATE VIEW finite_sum_hidden_having_order_expected AS SELECT k FROM finite_sum_source GROUP BY k HAVING SUM(v)>=0 ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
 query I
 SELECT count(*) FROM openivm_views WHERE view_sql_name LIKE 'finite_sum_%' AND type IN(3,6);
 ----
 0
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 query I
 SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
@@ -5967,7 +6086,7 @@ UPDATE finite_sum_source SET v=15 WHERE id=20;
 statement ok
 DELETE FROM finite_sum_source WHERE id IN(20,21);
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -5991,7 +6110,7 @@ DELETE FROM finite_sum_source WHERE id=4;
 statement ok
 INSERT INTO finite_sum_source VALUES(36,2,45);
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6012,7 +6131,7 @@ UPDATE finite_sum_source SET v='NaN' WHERE id=9;
 statement ok
 UPDATE finite_sum_source SET v=55 WHERE id=9;
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6030,7 +6149,7 @@ SET openivm_refresh_mode='full';
 statement ok
 INSERT INTO finite_sum_source VALUES(40,1,'Infinity'),(41,7,'NaN');
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6051,7 +6170,7 @@ DELETE FROM finite_sum_source WHERE NOT isfinite(v);
 statement ok
 UPDATE finite_sum_source SET v=60 WHERE id=11;
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6066,7 +6185,7 @@ endloop
 statement ok
 DELETE FROM finite_sum_source;
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6081,7 +6200,7 @@ endloop
 statement ok
 INSERT INTO finite_sum_source VALUES(50,NULL,'NaN'),(51,NULL,10),(52,1,'Infinity'),(53,1,20);
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
@@ -6096,7 +6215,7 @@ endloop
 statement ok
 DELETE FROM finite_sum_source WHERE NOT isfinite(v);
 
-foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
 
 statement ok
 PRAGMA refresh('finite_sum_{variant}');
