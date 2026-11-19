@@ -931,7 +931,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                          distinct_extracted_filter,
 		                          distinct_sum_arg,
 		                          distinct_sum_out};
-		PopulateDistinctAggregateInputs(context, facts, output_names, distinct_aux_candidate);
+		PopulateDistinctAggregateInputs(context, *planner.binder, facts, output_names, distinct_aux_candidate);
 		if (!distinct_aux_candidate.SelectionTable().empty()) {
 			D_ASSERT(initial_load_ast);
 			distinct_aux_candidate.selected_view_sql = BuildDistinctSelectedViewSQL(

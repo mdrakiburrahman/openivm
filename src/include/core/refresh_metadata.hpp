@@ -344,7 +344,7 @@ public:
 		string sum_out;
 		vector<DerivedAggregateOutput> group_inputs;
 		string sum_input_expr;
-		// Limited inputs use cols/source_exprs for candidate counts. The stored selection
+		// Complex or limited inputs use cols/source_exprs for candidate counts. The stored selection
 		// reads openivm_topk_candidates through stable selected_source_columns aliases.
 		string selected_input_sql;
 		vector<string> selected_input_columns;

@@ -56,15 +56,18 @@ With `openivm_distinct_aux_state=true`, supported SUM outputs over an inner
 DISTINCT use the same finalization for grouped and scalar aggregates. The aux
 state emits signed tuple transitions before updating raw SUM/COUNT inputs.
 
-For supported single-source DISTINCT inputs containing an inner `ORDER BY ... LIMIT`,
-the same aux table retains candidate counts. Refresh updates that bag from source
-deltas, compares its old and new selections, and applies their signed difference
-to the aggregate state. This includes evictions and refills when rows cross the
-boundary, even when the source batch only inserts rows. Each refresh selects from
-the candidate state twice and stages two temporary selection tables; candidate
-storage includes ordering columns needed below DISTINCT. Ordinary DISTINCT inputs
-keep their existing tuple-transition path. Projections between DISTINCT and SUM
-are resolved for both the SUM value and its non-NULL count.
+For supported DISTINCT inputs over one physical source, inner `ORDER BY ... LIMIT`
+and non-unary CTE inputs containing joins or `UNION ALL` use maintained candidate
+counts. Refresh updates that bag from source deltas, evaluates the next selection,
+and applies its signed difference from the persisted selection to the aggregate
+state. This includes evictions and refills when rows cross a limit boundary,
+even when the source batch only inserts rows. The child query runs over candidate
+state on refresh; joins and unions therefore add work proportional to evaluating
+that child query. One temporary selection is staged before the new snapshot is
+saved. Candidate storage includes all source columns needed by the child query.
+Unary inputs without limits retain their direct tuple-transition path.
+Projections between DISTINCT and SUM are resolved for both the SUM value and its
+non-NULL count.
 
 Candidate counts use byte keys for collated strings and lossless canonical keys
 for VARIANT values, so grouping cannot merge values whose bytes or payload types

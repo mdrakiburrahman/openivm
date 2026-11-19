@@ -4490,3 +4490,367 @@ SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL S
 endloop
 
 endloop
+
+# Non-unary CTE bodies share the maintained candidate/selection path. They must
+# bind physical sources, retain repeated scans, and maintain the parent aggregate.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER DOUBLE
+
+statement ok
+CREATE TABLE distinct_cte_{type}_source(id INT,k INT,v {type});
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(1,1,10),(2,2,20),(3,2,20),(4,NULL,NULL),(5,NULL,40);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_self_join_cte AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_cte_expected AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_self_join_scalar AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_scalar_expected AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_union_cte AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_cte_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_union_scalar AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_scalar_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_cross_values AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_cross_values_scalar AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_scalar_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_materialized_reuse AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_reuse_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_materialized_group AS WITH b AS MATERIALIZED(SELECT v,k FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a,k AS "key space" FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_group_expected AS WITH b AS MATERIALIZED(SELECT v,k FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a,k AS "key space" FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_union_expressions AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source WHERE id%2=0 UNION ALL SELECT k+1,v*2 FROM distinct_cte_{type}_source WHERE v>10),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_expressions_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source WHERE id%2=0 UNION ALL SELECT k+1,v*2 FROM distinct_cte_{type}_source WHERE v>10),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_cross_expressions AS WITH b AS(SELECT k,v*t.a v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_expressions_expected AS WITH b AS(SELECT k,v*t.a v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_post_filter AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b),p AS(SELECT k,v*2 n FROM d WHERE v>10) SELECT SUM(n)+1 a FROM p WHERE k IS NOT NULL;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_post_filter_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b),p AS(SELECT k,v*2 n FROM d WHERE v>10) SELECT SUM(n)+1 a FROM p WHERE k IS NOT NULL;
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_cte_{type}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20),(6,2,30),(7,3,40);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=3,v=50 WHERE id=99;
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=3,v=25 WHERE id=2;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id IN(1,99);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET v=100 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source;
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20),(8,2,50),(9,2,50),(10,NULL,60),(11,4,0);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=4,v=70 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,50),(12,3,30);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=4,v=80 WHERE id IN(8,99);
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id IN(9,99);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+DROP VIEW distinct_cte_{type}_{variant}_expected;
+
+endloop
+
+statement ok
+ALTER TABLE distinct_cte_{type}_source RENAME COLUMN k TO key_new;
+
+statement ok
+ALTER TABLE distinct_cte_{type}_source RENAME COLUMN v TO value_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_cte_expected AS WITH b AS(SELECT a.key_new,b.value_new FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_scalar_expected AS WITH b AS(SELECT a.key_new,b.value_new FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_cte_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION ALL SELECT key_new,value_new FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_scalar_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION ALL SELECT key_new,value_new FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_scalar_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_reuse_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_group_expected AS WITH b AS MATERIALIZED(SELECT value_new,key_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a,key_new AS "key space" FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_expressions_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source WHERE id%2=0 UNION ALL SELECT key_new+1,value_new*2 FROM distinct_cte_{type}_source WHERE value_new>10),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_expressions_expected AS WITH b AS(SELECT key_new,value_new*t.a value_new FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_post_filter_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION ALL SELECT key_new,value_new FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT key_new,value_new FROM b),p AS(SELECT key_new,value_new*2 n FROM d WHERE value_new>10) SELECT SUM(n)+1 a FROM p WHERE key_new IS NOT NULL;
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,4,80),(13,3,40);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET value_new=1 WHERE id=99;
+
+statement ok
+UPDATE distinct_cte_{type}_source SET key_new=2,value_new=20 WHERE id=8;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id IN(10,99);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET value_new=5 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source;
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(14,NULL,NULL),(15,2,30),(16,2,30);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop

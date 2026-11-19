@@ -692,7 +692,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	};
 	auto check_distinct_identity = [&](const RefreshMetadata::DistinctAuxMeta &meta) {
 		if (!meta.SelectionTable().empty() && meta.selected_view_sql.empty()) {
-			throw CatalogException("Limited DISTINCT selection metadata is missing; recreate the materialized view");
+			throw CatalogException("Maintained DISTINCT selection metadata is missing; recreate the materialized view");
 		}
 		if (active_facts.target_dialect != SqlDialect::DUCKDB &&
 		    (meta.representative_input || RequiresNativeValueIdentity(meta.source_exprs) ||

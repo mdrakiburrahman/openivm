@@ -146,7 +146,7 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex
 class AstNode;
 string BuildDistinctSelectedViewSQL(AstNode &node, const vector<string> &input_columns,
                                     const vector<string> &output_columns);
-void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanFacts &facts,
+void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, const CreateMVPlanFacts &facts,
                                      const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta);
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,

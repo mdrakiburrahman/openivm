@@ -1064,7 +1064,7 @@ string CompileDistinctIncremental(const string &view_name, const RefreshMetadata
 		            ") openivm_lost UNION ALL SELECT " + selected_columns + " , 1::INTEGER AS " + weight_column +
 		            " FROM (" + selected_rows(selected_new) + " EXCEPT ALL " + selected_rows(selected_old) +
 		            ") openivm_gained)\n";
-		OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] Differentiating maintained limited input for %s\n",
+		OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] Differentiating maintained selection for %s\n",
 		                    view_name.c_str());
 	}
 

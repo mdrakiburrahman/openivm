@@ -160,12 +160,15 @@ Initial load and full refresh read the same selected representatives as the aux
 state. Existing aux-state MVs must be recreated with `CREATE OR REPLACE
 MATERIALIZED VIEW` to populate the identity and representative metadata.
 
-Limited DISTINCT inputs additionally persist the exact selected aggregate-input
-bag in `<candidate_count_table>_selected`. Initial load and full refresh derive
-the aggregate from that snapshot. Incremental refresh retracts the persisted
-selection, inserts the new selection's contribution, and saves the new snapshot
-in the same native transaction. This adds storage proportional to the selected
-input bag and a snapshot write per refresh; it does not rescan the source table.
+Complex or limited DISTINCT inputs additionally persist the exact selected
+aggregate-input bag in `<candidate_count_table>_selected`. Initial load and full
+refresh derive the aggregate from that snapshot. Incremental refresh applies the
+signed difference
+between the persisted and new selections, then saves the new snapshot in the same
+native transaction. For non-unary inputs, the selection query includes the joins
+or `UNION ALL` and is evaluated over the maintained candidate bag during refresh.
+This adds storage proportional to the selected input bag and a snapshot write per
+refresh; it does not rescan the source table.
 DROP and replacement clean up or replace this state alongside candidate counts.
 
 Limited FLOAT/DOUBLE DISTINCT exports use portable SQL witnesses for signed

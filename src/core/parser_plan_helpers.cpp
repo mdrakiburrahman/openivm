@@ -1476,15 +1476,19 @@ static bool ResolvesToGroupBinding(TableIndex table_index, ProjectionIndex colum
 	return ResolvesToOutputBinding(table_index, column_index, group_index, group_count, facts, false);
 }
 
-static string ProjectionOutputName(const LogicalProjection &projection, idx_t expr_index,
-                                   const CreateMVPlanFacts &facts, const vector<string> &output_names,
-                                   const BoundColumnRefExpression &bcr) {
-	auto spine = FindOutputSpine(facts.root, [](const LogicalOperator &op) {
+static OutputSpine ViewOutputSpine(LogicalOperator *root) {
+	return FindOutputSpine(root, [](const LogicalOperator &op) {
 		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
 		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
 		       op.type == LogicalOperatorType::LOGICAL_FILTER || op.type == LogicalOperatorType::LOGICAL_ORDER_BY ||
 		       op.type == LogicalOperatorType::LOGICAL_LIMIT || op.type == LogicalOperatorType::LOGICAL_TOP_N;
 	});
+}
+
+static string ProjectionOutputName(const LogicalProjection &projection, idx_t expr_index,
+                                   const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                   const BoundColumnRefExpression &bcr) {
+	auto spine = ViewOutputSpine(facts.root);
 	// Stored names belong to the view's output projection, after sanitization and
 	// deduplication. A CTE body visited first can have a different output order.
 	if (!spine.projections.empty() && spine.projections.front() == &projection && expr_index < output_names.size() &&
@@ -1623,13 +1627,13 @@ string BuildDistinctSelectedViewSQL(AstNode &node, const vector<string> &input_c
 	if (!replace_input(node)) {
 		throw InternalException("Missing aggregate for maintained DISTINCT selection");
 	}
-	OPENIVM_DEBUG_PRINT("[CREATE MV] Reading limited DISTINCT aggregate input from maintained selection\n");
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Reading DISTINCT aggregate input from maintained selection\n");
 	return AstToCteList(node)->ToQuery(true, output_columns);
 }
 
 static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column);
 
-void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanFacts &facts,
+void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, const CreateMVPlanFacts &facts,
                                      const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta) {
 	auto &aggregate = *facts.aggregates.front();
 	LogicalDistinct *distinct = nullptr;
@@ -1642,7 +1646,21 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 	D_ASSERT(distinct);
 	auto bindings = distinct->GetColumnBindings();
 	D_ASSERT(bindings.size() == meta.cols.size());
-	bool limited_input =
+	// Resolve unary inputs directly against a physical scan. Other input shapes
+	// reuse the maintained candidate bag, whose selection preserves joins/UNIONs.
+	auto *distinct_source = distinct->children[0].get();
+	vector<LogicalOperator *> filters;
+	while ((distinct_source->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	        distinct_source->type == LogicalOperatorType::LOGICAL_FILTER ||
+	        distinct_source->type == LogicalOperatorType::LOGICAL_ORDER_BY) &&
+	       distinct_source->children.size() == 1) {
+		if (distinct_source->type == LogicalOperatorType::LOGICAL_FILTER) {
+			filters.push_back(distinct_source);
+		}
+		distinct_source = distinct_source->children[0].get();
+	}
+	bool candidate_input =
+	    distinct_source->type != LogicalOperatorType::LOGICAL_GET ||
 	    std::any_of(facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [](const auto &node) {
 		    return node.plan_node->type == LogicalOperatorType::LOGICAL_TOP_N ||
 		           node.plan_node->type == LogicalOperatorType::LOGICAL_LIMIT;
@@ -1650,7 +1668,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
 	distinct->ResolveOperatorTypes();
 	const auto &distinct_types = distinct->types;
-	if (!limited_input) {
+	if (!candidate_input) {
 		for (idx_t index = 0; index < meta.cols.size(); index++) {
 			if (distinct->types[index].id() == LogicalTypeId::DOUBLE ||
 			    distinct->types[index].id() == LogicalTypeId::FLOAT) {
@@ -1658,7 +1676,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 			}
 		}
 	}
-	if (limited_input) {
+	if (candidate_input) {
 		// Keep the candidate bag, not just today's selected rows: deletes must refill the boundary.
 		LogicalGet *source = nullptr;
 		for (auto &node : facts.plan_nodes_post_order) {
@@ -1683,7 +1701,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 			for (idx_t i = 0; i < get.GetColumnIds().size(); i++) {
 				string column;
 				if (!GetLogicalGetColumnName(get, ProjectionIndex(i), column)) {
-					throw InternalException("Could not resolve limited DISTINCT candidate column");
+					throw InternalException("Could not resolve DISTINCT candidate column");
 				}
 				auto expression = SqlUtils::QuoteIdentifier(column);
 				if (std::find(meta.source_exprs.begin(), meta.source_exprs.end(), expression) ==
@@ -1718,7 +1736,17 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 				meta.selected_identity_exprs.push_back(std::move(identity));
 			}
 		}
-		auto selected_plan = aggregate.children[0]->Copy(context);
+		unique_ptr<LogicalOperator> selected_plan;
+		if (facts.cte_defs_by_index.empty()) {
+			selected_plan = aggregate.children[0]->Copy(context);
+		} else {
+			// CTE_REFs need their enclosing definitions before extracting the input.
+			auto selection_context = facts.root->Copy(context);
+			InlineMaterializedCteRefs(context, binder, selection_context);
+			auto copied_aggregate = SpineAggregate(ViewOutputSpine(selection_context.get()));
+			D_ASSERT(copied_aggregate && copied_aggregate->aggregate_index == aggregate.aggregate_index);
+			selected_plan = std::move(copied_aggregate->children[0]);
+		}
 		auto ast = LogicalPlanToAst(context, selected_plan, SqlDialect::DUCKDB, {},
 		                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 		meta.selected_input_sql = AstToCteList(*ast)->ToQuery(true, meta.selected_input_columns);
@@ -1728,64 +1756,50 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		// The selection keeps stable column aliases when the source is renamed.
 		meta.selected_input_sql =
 		    SqlUtils::ReplaceTableReferences(meta.selected_input_sql, meta.source, "openivm_topk_candidates");
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu candidate columns for limited DISTINCT input\n",
-		                    meta.cols.size());
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu candidate columns for DISTINCT input\n", meta.cols.size());
 	} else {
 		// Resolve the input through bound projections and filters. Parsed CTE names
 		// have no catalog identity, and their expressions must also apply to delta rows.
-		auto *source = distinct->children[0].get();
-		vector<LogicalOperator *> filters;
-		while ((source->type == LogicalOperatorType::LOGICAL_PROJECTION ||
-		        source->type == LogicalOperatorType::LOGICAL_FILTER ||
-		        source->type == LogicalOperatorType::LOGICAL_ORDER_BY) &&
-		       source->children.size() == 1) {
-			if (source->type == LogicalOperatorType::LOGICAL_FILTER) {
-				filters.push_back(source);
-			}
-			source = source->children[0].get();
-		}
-		if (source->type == LogicalOperatorType::LOGICAL_GET) {
-			auto &get = source->Cast<LogicalGet>();
-			auto table = get.GetTable();
-			D_ASSERT(table);
-			meta.source = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
-			LptsExpressionRenderer::BindingResolver resolve_input;
-			LptsExpressionRenderer input_renderer(
-			    context, SqlDialect::DUCKDB,
-			    [&](const ColumnBinding &binding, const char *where) { return resolve_input(binding, where); });
-			resolve_input = [&](const ColumnBinding &binding, const char *) -> string {
-				if (binding.table_index == get.table_index) {
-					string column;
-					if (!GetLogicalGetColumnName(get, binding.column_index, column)) {
-						throw InternalException("Could not resolve DISTINCT source column");
-					}
-					return SqlUtils::QuoteIdentifier(column);
+		auto &get = distinct_source->Cast<LogicalGet>();
+		auto table = get.GetTable();
+		D_ASSERT(table);
+		meta.source = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+		LptsExpressionRenderer::BindingResolver resolve_input;
+		LptsExpressionRenderer input_renderer(
+		    context, SqlDialect::DUCKDB,
+		    [&](const ColumnBinding &binding, const char *where) { return resolve_input(binding, where); });
+		resolve_input = [&](const ColumnBinding &binding, const char *) -> string {
+			if (binding.table_index == get.table_index) {
+				string column;
+				if (!GetLogicalGetColumnName(get, binding.column_index, column)) {
+					throw InternalException("Could not resolve DISTINCT source column");
 				}
-				auto projection = facts.projections_by_index.find(binding.table_index);
-				D_ASSERT(projection != facts.projections_by_index.end());
-				return input_renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
-			};
-			meta.source_exprs.clear();
-			vector<string> select_list;
-			for (idx_t i = 0; i < bindings.size(); i++) {
-				BoundColumnRefExpression input(LogicalType::SQLNULL, bindings[i]);
-				meta.source_exprs.push_back(input_renderer.ExpressionToAliasedString(input));
-				select_list.push_back(meta.source_exprs.back() + " AS " + SqlUtils::QuoteIdentifier(meta.cols[i]));
+				return SqlUtils::QuoteIdentifier(column);
 			}
-			auto predicates = input_renderer.ScanFiltersToSql(get);
-			for (auto *filter : filters) {
-				for (auto &expression : filter->expressions) {
-					predicates.push_back("(" + input_renderer.ExpressionToAliasedString(*expression) + ")");
-				}
-			}
-			meta.filter = StringUtil::Join(predicates, " AND ");
-			meta.input_sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + meta.source +
-			                 (meta.filter.empty() ? "" : " WHERE " + meta.filter);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Resolved DISTINCT input to bound source %s\n", meta.source.c_str());
+			auto projection = facts.projections_by_index.find(binding.table_index);
+			D_ASSERT(projection != facts.projections_by_index.end());
+			return input_renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
+		};
+		meta.source_exprs.clear();
+		vector<string> select_list;
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			BoundColumnRefExpression input(LogicalType::SQLNULL, bindings[i]);
+			meta.source_exprs.push_back(input_renderer.ExpressionToAliasedString(input));
+			select_list.push_back(meta.source_exprs.back() + " AS " + SqlUtils::QuoteIdentifier(meta.cols[i]));
 		}
+		auto predicates = input_renderer.ScanFiltersToSql(get);
+		for (auto *filter : filters) {
+			for (auto &expression : filter->expressions) {
+				predicates.push_back("(" + input_renderer.ExpressionToAliasedString(*expression) + ")");
+			}
+		}
+		meta.filter = StringUtil::Join(predicates, " AND ");
+		meta.input_sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + meta.source +
+		                 (meta.filter.empty() ? "" : " WHERE " + meta.filter);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Resolved DISTINCT input to bound source %s\n", meta.source.c_str());
 	}
 
-	if (!limited_input) {
+	if (!candidate_input) {
 		// Per-column counters cannot preserve correlations between floating signs.
 		meta.representative_input = meta.sign_columns.size() > 1;
 		for (idx_t i = 0; i < distinct_types.size(); i++) {
@@ -1837,8 +1851,8 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		D_ASSERT(projection != facts.projections_by_index.end());
 		return renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
 	};
-	if (!limited_input) {
-		// Limited selections already include this path. Ordinary DISTINCT must
+	if (!candidate_input) {
+		// Maintained selections already include this path. Ordinary DISTINCT must
 		// filter its old/new representatives, rather than filtering source support.
 		vector<string> predicates;
 		for (auto *node = aggregate.children[0].get(); node != distinct && node->children.size() == 1;
@@ -1865,11 +1879,14 @@ void PopulateDistinctAggregateInputs(ClientContext &context, const CreateMVPlanF
 		    "CAST(" + renderer.ExpressionToAliasedString(*input.GetChildren()[0]) + " AS " + type.ToString() + ")";
 	}
 
+	auto output_spine = ViewOutputSpine(facts.root);
+	D_ASSERT(!output_spine.projections.empty());
 	for (auto &column : group_cols) {
 		auto name = std::find(output_names.begin(), output_names.end(), column);
 		D_ASSERT(name != output_names.end());
-		meta.group_inputs.push_back({column, renderer.ExpressionToAliasedString(
-		                                         *facts.first_projection->expressions[name - output_names.begin()])});
+		meta.group_inputs.push_back(
+		    {column, renderer.ExpressionToAliasedString(
+		                 *output_spine.projections.front()->expressions[name - output_names.begin()])});
 	}
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu DISTINCT aggregate group expressions\n", meta.group_inputs.size());
 }
