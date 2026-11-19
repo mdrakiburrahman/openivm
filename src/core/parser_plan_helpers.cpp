@@ -1485,6 +1485,10 @@ static OutputSpine ViewOutputSpine(LogicalOperator *root) {
 	});
 }
 
+LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root) {
+	return SpineAggregate(ViewOutputSpine(root));
+}
+
 static string ProjectionOutputName(const LogicalProjection &projection, idx_t expr_index,
                                    const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                    const BoundColumnRefExpression &bcr) {
@@ -1635,7 +1639,9 @@ static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_inde
 
 void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, const CreateMVPlanFacts &facts,
                                      const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta) {
-	auto &aggregate = *facts.aggregates.front();
+	auto *parent = FindViewOutputAggregate(facts.root);
+	D_ASSERT(parent);
+	auto &aggregate = *parent;
 	LogicalDistinct *distinct = nullptr;
 	for (auto &node : facts.plan_nodes_post_order) {
 		if (node.plan_node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
@@ -1743,7 +1749,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 			// CTE_REFs need their enclosing definitions before extracting the input.
 			auto selection_context = facts.root->Copy(context);
 			InlineMaterializedCteRefs(context, binder, selection_context);
-			auto copied_aggregate = SpineAggregate(ViewOutputSpine(selection_context.get()));
+			auto copied_aggregate = FindViewOutputAggregate(selection_context.get());
 			D_ASSERT(copied_aggregate && copied_aggregate->aggregate_index == aggregate.aggregate_index);
 			selected_plan = std::move(copied_aggregate->children[0]);
 		}

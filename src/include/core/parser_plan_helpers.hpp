@@ -143,6 +143,7 @@ RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientCont
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names);
+LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root);
 class AstNode;
 string BuildDistinctSelectedViewSQL(AstNode &node, const vector<string> &input_columns,
                                     const vector<string> &output_columns);

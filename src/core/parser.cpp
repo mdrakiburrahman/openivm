@@ -873,7 +873,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
 		// demotes back to GROUP_RECOMPUTE.
 		if (!distinct_extracted_cols.empty()) {
-			LogicalAggregate *outer_agg = facts.aggregates.empty() ? nullptr : facts.aggregates.front();
+			auto outer_agg = FindViewOutputAggregate(facts.root);
 			int sum_count = 0;
 			bool unsupported_agg = false;
 			if (outer_agg) {
