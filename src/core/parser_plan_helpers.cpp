@@ -1642,21 +1642,22 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 	auto *parent = FindViewOutputAggregate(facts.root);
 	D_ASSERT(parent);
 	auto &aggregate = *parent;
-	LogicalDistinct *distinct = nullptr;
-	for (auto &node : facts.plan_nodes_post_order) {
-		if (node.plan_node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
-			distinct = &node.plan_node->Cast<LogicalDistinct>();
-			break;
-		}
-	}
-	D_ASSERT(distinct);
-	auto bindings = distinct->GetColumnBindings();
-	D_ASSERT(bindings.size() == meta.cols.size());
+	// Only a DISTINCT on this unary input path can feed direct tuple transitions.
+	// Producer CTE definitions can contain other DISTINCTs with different schemas.
+	auto input_spine = FindOutputSpine(aggregate.children[0].get(), [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_FILTER || op.type == LogicalOperatorType::LOGICAL_ORDER_BY ||
+		       op.type == LogicalOperatorType::LOGICAL_LIMIT || op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
+	auto *input = input_spine.bottom;
+	auto distinct =
+	    input && input->type == LogicalOperatorType::LOGICAL_DISTINCT ? &input->Cast<LogicalDistinct>() : nullptr;
+	vector<ColumnBinding> bindings;
 	// Resolve unary inputs directly against a physical scan. Other input shapes
 	// reuse the maintained candidate bag, whose selection preserves joins/UNIONs.
-	auto *distinct_source = distinct->children[0].get();
+	auto *distinct_source = distinct ? distinct->children[0].get() : nullptr;
 	vector<LogicalOperator *> filters;
-	while ((distinct_source->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	while (distinct_source &&
+	       (distinct_source->type == LogicalOperatorType::LOGICAL_PROJECTION ||
 	        distinct_source->type == LogicalOperatorType::LOGICAL_FILTER ||
 	        distinct_source->type == LogicalOperatorType::LOGICAL_ORDER_BY) &&
 	       distinct_source->children.size() == 1) {
@@ -1666,15 +1667,17 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 		distinct_source = distinct_source->children[0].get();
 	}
 	bool candidate_input =
-	    distinct_source->type != LogicalOperatorType::LOGICAL_GET ||
+	    !distinct_source || distinct_source->type != LogicalOperatorType::LOGICAL_GET ||
 	    std::any_of(facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [](const auto &node) {
 		    return node.plan_node->type == LogicalOperatorType::LOGICAL_TOP_N ||
 		           node.plan_node->type == LogicalOperatorType::LOGICAL_LIMIT;
 	    });
 	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
-	distinct->ResolveOperatorTypes();
-	const auto &distinct_types = distinct->types;
 	if (!candidate_input) {
+		D_ASSERT(distinct);
+		bindings = distinct->GetColumnBindings();
+		D_ASSERT(bindings.size() == meta.cols.size());
+		distinct->ResolveOperatorTypes();
 		for (idx_t index = 0; index < meta.cols.size(); index++) {
 			if (distinct->types[index].id() == LogicalTypeId::DOUBLE ||
 			    distinct->types[index].id() == LogicalTypeId::FLOAT) {
@@ -1753,6 +1756,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 			D_ASSERT(copied_aggregate && copied_aggregate->aggregate_index == aggregate.aggregate_index);
 			selected_plan = std::move(copied_aggregate->children[0]);
 		}
+		D_ASSERT(selected_plan->GetColumnBindings().size() == meta.selected_input_columns.size());
 		auto ast = LogicalPlanToAst(context, selected_plan, SqlDialect::DUCKDB, {},
 		                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 		meta.selected_input_sql = AstToCteList(*ast)->ToQuery(true, meta.selected_input_columns);
@@ -1806,6 +1810,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 	}
 
 	if (!candidate_input) {
+		const auto &distinct_types = distinct->types;
 		// Per-column counters cannot preserve correlations between floating signs.
 		meta.representative_input = meta.sign_columns.size() > 1;
 		for (idx_t i = 0; i < distinct_types.size(); i++) {

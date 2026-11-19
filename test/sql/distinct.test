@@ -4596,12 +4596,45 @@ CREATE MATERIALIZED VIEW distinct_cte_{type}_aggregate_union AS WITH b AS MATERI
 statement ok
 CREATE VIEW distinct_cte_{type}_aggregate_union_expected AS WITH b AS MATERIALIZED(SELECT k,SUM(v) subtotal FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT k,subtotal v FROM b UNION ALL SELECT k+1,subtotal*2 FROM b),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+# Producer and consumer DISTINCTs may have different widths. Bind the direct
+# consumer through its input path; joins/unions retain the complete input bag.
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_producer_union_scalar AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT v FROM j) SELECT SUM(v)+1 a FROM d;
 
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_scalar_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_producer_union_projected AS WITH b AS MATERIALIZED(SELECT v FROM distinct_cte_{type}_source UNION SELECT v FROM distinct_cte_{type}_source),j AS(SELECT a.v x,b.v y FROM b a CROSS JOIN b b),d AS(SELECT DISTINCT x,y FROM j) SELECT SUM(x)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_projected_expected AS WITH b AS MATERIALIZED(SELECT v FROM distinct_cte_{type}_source UNION SELECT v FROM distinct_cte_{type}_source),j AS(SELECT a.v x,b.v y FROM b a CROSS JOIN b b),d AS(SELECT DISTINCT x,y FROM j) SELECT SUM(x)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_joined_distinct AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v+b.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_distinct_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v+b.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_consumer_union AS WITH d AS MATERIALIZED(SELECT DISTINCT v FROM distinct_cte_{type}_source),j AS(SELECT 1 k,v FROM d UNION SELECT 2 k,v FROM d) SELECT SUM(v)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_consumer_union_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT v FROM distinct_cte_{type}_source),j AS(SELECT 1 k,v FROM d UNION SELECT 2 k,v FROM d) SELECT SUM(v)+1 a FROM j;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_joined_column AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_column_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
+
+# Joins above the only explicit DISTINCT retain their existing group-recompute path.
 query I
-SELECT type FROM openivm_views WHERE view_sql_name='distinct_cte_{type}_{variant}';
+SELECT CASE WHEN type=CASE WHEN '{variant}' IN('joined_distinct','joined_column') THEN 6 ELSE 8 END THEN 1 ELSE 0 END FROM openivm_views WHERE view_sql_name='distinct_cte_{type}_{variant}';
 ----
-8
+1
 
 query I
 SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
@@ -4630,7 +4663,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4659,7 +4692,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4688,7 +4721,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4731,7 +4764,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4747,7 +4780,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 DROP VIEW distinct_cte_{type}_{variant}_expected;
@@ -4805,6 +4838,21 @@ CREATE VIEW distinct_cte_{type}_aggregate_counts_expected AS WITH b AS MATERIALI
 statement ok
 CREATE VIEW distinct_cte_{type}_aggregate_union_expected AS WITH b AS MATERIALIZED(SELECT key_new,SUM(value_new) subtotal FROM distinct_cte_{type}_source GROUP BY key_new),j AS(SELECT key_new,subtotal value_new FROM b UNION ALL SELECT key_new+1,subtotal*2 FROM b),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
 
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_scalar_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT value_new FROM j) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_projected_expected AS WITH b AS MATERIALIZED(SELECT value_new FROM distinct_cte_{type}_source UNION SELECT value_new FROM distinct_cte_{type}_source),j AS(SELECT a.value_new x,b.value_new y FROM b a CROSS JOIN b b),d AS(SELECT DISTINCT x,y FROM j) SELECT SUM(x)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_distinct_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.value_new+b.value_new n FROM d a JOIN d b ON a.key_new=b.key_new) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_consumer_union_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT value_new FROM distinct_cte_{type}_source),j AS(SELECT 1 key_new,value_new FROM d UNION SELECT 2 key_new,value_new FROM d) SELECT SUM(value_new)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_column_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.value_new n FROM d a JOIN d b ON a.key_new=b.key_new) SELECT SUM(n)+1 a FROM j;
+
 endloop
 
 foreach type INTEGER DOUBLE
@@ -4825,7 +4873,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4844,7 +4892,7 @@ SET openivm_refresh_mode='full';
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
@@ -4879,7 +4927,7 @@ endloop
 
 foreach type INTEGER DOUBLE
 
-foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column
 
 statement ok
 PRAGMA refresh('distinct_cte_{type}_{variant}');
