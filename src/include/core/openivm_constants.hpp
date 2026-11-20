@@ -136,8 +136,8 @@ enum class RefreshType : uint8_t {
 enum class SemiAntiJoinType : uint8_t { SEMI, ANTI };
 constexpr const char *SEMI_ANTI_JOIN_TYPE_NAMES[] = {"semi", "anti"};
 // A window partition key read directly from a source, or through a lookup join.
-enum class WindowLineageKind : uint8_t { DIRECT, LOOKUP };
-constexpr const char *WINDOW_LINEAGE_KIND_NAMES[] = {"direct", "lookup"};
+enum class WindowLineageKind : uint8_t { DIRECT, LOOKUP, LINEAR };
+constexpr const char *WINDOW_LINEAGE_KIND_NAMES[] = {"direct", "lookup", "linear"};
 
 inline bool IsValidRefreshTypeOrdinal(int64_t raw) {
 	return (raw >= 0 && raw <= 9) || raw == 11;

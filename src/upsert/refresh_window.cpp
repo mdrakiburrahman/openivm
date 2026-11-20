@@ -189,12 +189,96 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 
 enum class LineageAffectedKeysResult : uint8_t { UNAVAILABLE, AVAILABLE, UNSAFE };
 
+static bool ContainsIdentifierToken(const string &sql, const string &token) {
+	if (token.empty()) {
+		return false;
+	}
+	auto haystack = StringUtil::Lower(sql);
+	auto needle = StringUtil::Lower(token);
+	auto is_identifier_char = [](char c) {
+		return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+	};
+	for (auto pos = haystack.find(needle); pos != string::npos; pos = haystack.find(needle, pos + 1)) {
+		auto end = pos + needle.size();
+		if ((pos == 0 || !is_identifier_char(haystack[pos - 1])) &&
+		    (end >= haystack.size() || !is_identifier_char(haystack[end]))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string UnquotedLastIdentifier(const string &table_sql) {
+	auto name = SqlUtils::LastIdentifierPart(table_sql);
+	if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+		name = name.substr(1, name.size() - 2);
+	}
+	return name;
+}
+
+// The plan below the window is linear (projections, filters, UNION ALL over scans), so evaluating
+// the view query with every source occurrence replaced by that source's delta rows (both images)
+// yields every partition key whose input rows changed. Any base reference left behind would
+// evaluate an arm over current rows only and miss deleted keys, so it falls back instead.
 static LineageAffectedKeysResult
-BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                    const vector<string> &delta_table_names, const vector<string> &partition_cols,
-                                    const string &delta_ts_filter, const string &view_catalog_name,
-                                    const string &view_schema_name, const string &attached_db_catalog_name,
-                                    const string &attached_db_schema_name, string &affected_keys_sql) {
+BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
+                           const vector<string> &delta_table_names,
+                           const vector<RefreshMetadata::WindowPartitionLineageOp> &key_ops, const string &key_col,
+                           const string &delta_ts_filter, const string &view_catalog_name,
+                           const string &view_schema_name, const string &attached_db_catalog_name,
+                           const string &attached_db_schema_name, string &affected_keys_sql) {
+	string scoped = view_query_sql;
+	vector<string> replaced_tables;
+	unordered_set<string> seen_sources;
+	unordered_set<string> covered_sources;
+	for (auto &op : key_ops) {
+		if (op.kind != WindowLineageKind::LINEAR) {
+			return LineageAffectedKeysResult::UNSAFE;
+		}
+		if (!seen_sources.insert(StringUtil::Lower(op.source)).second) {
+			continue;
+		}
+		string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, op.source,
+		                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
+		                                                    attached_db_catalog_name, attached_db_schema_name);
+		string base_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, op.source,
+		                                                   /*delta_table=*/false, view_catalog_name, view_schema_name,
+		                                                   attached_db_catalog_name, attached_db_schema_name);
+		if (delta_table.empty() || base_table.empty()) {
+			return LineageAffectedKeysResult::UNSAFE;
+		}
+		string base_ref = SqlUtils::FindTableReference(scoped, base_table);
+		if (base_ref.empty()) {
+			return LineageAffectedKeysResult::UNSAFE;
+		}
+		scoped = SqlUtils::ReplaceTableReferences(scoped, base_ref,
+		                                          BuildStandardDeltaRowsSQL(delta_table, "", delta_ts_filter));
+		replaced_tables.push_back(UnquotedLastIdentifier(base_table));
+		covered_sources.insert(ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names));
+	}
+	for (auto &table : replaced_tables) {
+		if (ContainsIdentifierToken(scoped, table)) {
+			return LineageAffectedKeysResult::UNSAFE;
+		}
+	}
+	for (auto &dt : delta_table_names) {
+		if (!covered_sources.count(dt)) {
+			return LineageAffectedKeysResult::UNAVAILABLE;
+		}
+	}
+	if (covered_sources.empty()) {
+		return LineageAffectedKeysResult::UNAVAILABLE;
+	}
+	affected_keys_sql =
+	    "SELECT DISTINCT " + SqlUtils::QuoteIdentifier(key_col) + " FROM (" + scoped + ") openivm_changed_partitions";
+	return LineageAffectedKeysResult::AVAILABLE;
+}
+
+static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
+    RefreshMetadata &metadata, Connection &con, const string &view_name, const string &view_query_sql,
+    const vector<string> &delta_table_names, const vector<string> &partition_cols, const string &delta_ts_filter,
+    const string &view_catalog_name, const string &view_schema_name, const string &attached_db_catalog_name,
+    const string &attached_db_schema_name, string &affected_keys_sql) {
 	if (partition_cols.size() != 1) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
@@ -204,6 +288,19 @@ BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, 
 	vector<RefreshMetadata::WindowPartitionLineageOp> lineage_ops;
 	if (!metadata.GetWindowPartitionLineage(view_name, lineage_ops)) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
+	}
+	vector<RefreshMetadata::WindowPartitionLineageOp> key_ops;
+	bool has_linear = false;
+	for (auto &op : lineage_ops) {
+		if (StringUtil::CIEquals(op.output_col, parsed.first)) {
+			has_linear |= op.kind == WindowLineageKind::LINEAR;
+			key_ops.push_back(op);
+		}
+	}
+	if (has_linear) {
+		return BuildLinearAffectedKeysSQL(metadata, view_name, view_query_sql, delta_table_names, key_ops, parsed.first,
+		                                  delta_ts_filter, view_catalog_name, view_schema_name,
+		                                  attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
 	}
 
 	vector<string> arms;
@@ -578,7 +675,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
 	auto lineage_result = BuildLineageStandardAffectedKeysSQL(
-	    metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
+	    metadata, con, view_name, view_query_sql, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
 	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
 	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",

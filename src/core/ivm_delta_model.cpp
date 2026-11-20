@@ -226,6 +226,10 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
 		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, model.window_lineage_ops,
 		                                                  &direct_lineage_ops);
+		if (!has_lineage) {
+			has_lineage = BuildLinearWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
+			                                                   model.window_lineage_ops);
+		}
 		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, facts) ||

@@ -195,6 +195,9 @@ bool IsSummableLogicalType(const LogicalType &type);
 string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
                                const vector<string> &delta_table_names);
 string BaseTableNameFromDeltaKey(const string &delta_key);
+// A tracked delta's rows (both images) without the multiplicity and timestamp columns.
+string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                 const string &extra_predicate = "");
 string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,

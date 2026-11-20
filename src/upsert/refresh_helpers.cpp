@@ -264,8 +264,8 @@ static string ResolveFullOuterDeltaSource(RefreshMetadata &metadata, const strin
 	    current_snapshot);
 }
 
-static string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
-                                        const string &extra_predicate = "") {
+string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                 const string &extra_predicate) {
 	string predicate;
 	if (!last_update.empty()) {
 		predicate = string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP";

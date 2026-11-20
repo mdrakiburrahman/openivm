@@ -1,0 +1,310 @@
+# name: test/sql/window_union_key_scope.test
+# description: ROW_NUMBER over a UNION ALL of filtered projections scopes refresh to the visible partition key
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE uks_east (ent VARCHAR, src VARCHAR, ts INT, val INT, active INT);
+
+statement ok
+CREATE TABLE uks_west (w_ent VARCHAR, w_src VARCHAR, w_ts INT, w_val INT, w_active INT);
+
+statement ok
+INSERT INTO uks_east VALUES
+    ('a', 'x', 1, 10, 1),
+    ('a', 'x', 2, 20, 1),
+    ('b', 'y', 1, 5, 1),
+    ('c', NULL, 3, 7, 1),
+    ('d', 'z', 1, 1, -1);
+
+statement ok
+INSERT INTO uks_west VALUES
+    ('A', 'x', 3, 30, 1),
+    ('e', 'w', 1, 4, 1),
+    ('e', 'w', 1, 4, 1),
+    ('f', 'v', 2, 2, 500);
+
+statement ok
+CREATE MATERIALIZED VIEW uks_mv AS
+WITH pooled AS (
+    SELECT ent AS entity, src AS origin, ts, val FROM uks_east WHERE active >= 0
+    UNION ALL
+    SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west WHERE w_active < 100
+), keyed AS (
+    SELECT lower(entity) || '|' || origin AS obs_key, entity, origin, ts, val FROM pooled
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY obs_key ORDER BY ts DESC, val DESC, entity) AS rn FROM keyed
+)
+SELECT obs_key, entity, origin, ts, val FROM ranked WHERE rn = 1;
+
+statement ok
+CREATE VIEW uks_expected AS
+WITH pooled AS (
+    SELECT ent AS entity, src AS origin, ts, val FROM uks_east WHERE active >= 0
+    UNION ALL
+    SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west WHERE w_active < 100
+), keyed AS (
+    SELECT lower(entity) || '|' || origin AS obs_key, entity, origin, ts, val FROM pooled
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY obs_key ORDER BY ts DESC, val DESC, entity) AS rn FROM keyed
+)
+SELECT obs_key, entity, origin, ts, val FROM ranked WHERE rn = 1;
+
+statement ok
+CREATE VIEW uks_diff AS
+SELECT (SELECT count(*) FROM (
+            SELECT obs_key, entity, origin, ts, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_756b735f6d76_
+            EXCEPT ALL SELECT * FROM uks_expected))
+     + (SELECT count(*) FROM (
+            SELECT * FROM uks_expected
+            EXCEPT ALL SELECT obs_key, entity, origin, ts, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_756b735f6d76_)) AS d;
+
+# The visible key is the window partition binding itself, so every source feeding the
+# linear UNION ALL input contributes changed keys through its delta rows.
+
+query III
+SELECT group_columns,
+       lineage_json LIKE '%"k":"linear"%"source":"uks_east"%',
+       lineage_json LIKE '%"k":"linear"%"source":"uks_west"%'
+FROM openivm_views WHERE view_sql_name = 'uks_mv';
+----
+obs_key=obs_key	true	true
+
+query T
+SELECT refresh_type_name
+FROM openivm_compile_with_facts('uks_mv', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}')
+LIMIT 1;
+----
+WINDOW_PARTITION
+
+query III
+SELECT count(*) FILTER (WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_affected_%'
+                          AND sql LIKE '%openivm_delta_uks_east%'
+                          AND sql LIKE '%openivm_delta_uks_west%'),
+       count(*) FILTER (WHERE regexp_full_match(trim(sql), 'DELETE FROM \S*openivm_data_\S+;?')),
+       count(*) FILTER (WHERE sql LIKE '%DELETE FROM %openivm_data_%WHERE EXISTS (SELECT 1 FROM openivm_affected_%')
+FROM openivm_compile_with_facts('uks_mv', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');
+----
+1	0	1
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# A later row in one arm wins a key that exists in the other arm.
+
+statement ok
+INSERT INTO uks_west VALUES ('a', 'x', 9, 1, 1);
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Removing the last row of a key deletes its output row.
+
+statement ok
+DELETE FROM uks_east WHERE ent = 'b';
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Rekeying a row affects both its old and new key.
+
+statement ok
+UPDATE uks_east SET src = 'q' WHERE ent = 'a' AND ts = 2;
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Rows leaving and entering an arm's filter in the same refresh.
+
+statement ok
+UPDATE uks_east SET active = -1 WHERE ent = 'c';
+
+statement ok
+UPDATE uks_east SET active = 1 WHERE ent = 'd';
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Removing one of two identical rows keeps the key and its multiplicity-insensitive winner.
+
+statement ok
+DELETE FROM uks_west WHERE rowid = (SELECT min(rowid) FROM uks_west WHERE w_ent = 'e');
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# NULL keys are a partition of their own.
+
+statement ok
+UPDATE uks_west SET w_src = NULL WHERE w_ent = 'e';
+
+statement ok
+UPDATE uks_east SET active = 1 WHERE ent = 'c';
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT count(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_756b735f6d76_ WHERE obs_key IS NULL;
+----
+1
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Overlapping changes on both arms for the same key in one refresh.
+
+statement ok
+INSERT INTO uks_east VALUES ('A', 'x', 9, 2, 1);
+
+statement ok
+DELETE FROM uks_west WHERE w_ent = 'a';
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Deleting the NULL-key rows removes that output row.
+
+statement ok
+DELETE FROM uks_west WHERE w_src IS NULL;
+
+statement ok
+DELETE FROM uks_east WHERE src IS NULL;
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT count(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_756b735f6d76_ WHERE obs_key IS NULL;
+----
+0
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Emptying a whole arm.
+
+statement ok
+DELETE FROM uks_west;
+
+statement ok
+PRAGMA refresh('uks_mv');
+
+query I
+SELECT d FROM uks_diff;
+----
+0
+
+# Unsupported shapes keep the unscoped program.
+
+statement ok
+CREATE MATERIALIZED VIEW uks_neg_distinct AS
+WITH pooled AS (
+    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    UNION
+    SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY entity ORDER BY ts DESC, val DESC, origin) AS rn FROM pooled
+)
+SELECT entity, origin, ts, val FROM ranked WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW uks_neg_transformed AS
+WITH pooled AS (
+    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    UNION ALL
+    SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY entity ORDER BY ts DESC, val DESC, origin) AS rn FROM pooled
+)
+SELECT entity || '#' AS entity, origin, ts, val FROM ranked WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW uks_neg_hidden AS
+WITH pooled AS (
+    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    UNION ALL
+    SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY entity ORDER BY ts DESC, val DESC, origin) AS rn FROM pooled
+)
+SELECT origin, ts, val FROM ranked WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW uks_neg_filter AS
+WITH pooled AS (
+    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    UNION ALL
+    SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY entity ORDER BY ts DESC, val DESC, origin) AS rn FROM pooled
+)
+SELECT entity, origin, ts, val FROM ranked WHERE rn = 1 AND val > 0;
+
+query II
+SELECT count(*) FILTER (WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_affected_%'),
+       count(*) FILTER (WHERE regexp_full_match(trim(sql), 'DELETE FROM \S*openivm_data_\S+;?'))
+FROM openivm_compile_with_facts('uks_neg_distinct', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');
+----
+0	1
+
+query II
+SELECT count(*) FILTER (WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_affected_%'),
+       count(*) FILTER (WHERE regexp_full_match(trim(sql), 'DELETE FROM \S*openivm_data_\S+;?'))
+FROM openivm_compile_with_facts('uks_neg_transformed', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');
+----
+0	1
+
+query II
+SELECT count(*) FILTER (WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_affected_%'),
+       count(*) FILTER (WHERE regexp_full_match(trim(sql), 'DELETE FROM \S*openivm_data_\S+;?'))
+FROM openivm_compile_with_facts('uks_neg_hidden', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');
+----
+0	1
+
+query II
+SELECT count(*) FILTER (WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_affected_%'),
+       count(*) FILTER (WHERE regexp_full_match(trim(sql), 'DELETE FROM \S*openivm_data_\S+;?'))
+FROM openivm_compile_with_facts('uks_neg_filter', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');
+----
+0	1
