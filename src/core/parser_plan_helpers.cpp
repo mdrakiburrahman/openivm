@@ -1248,6 +1248,22 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVP
 	return true;
 }
 
+static bool IsStringSentinel(const Expression &expr, bool null_sentinel) {
+	if (expr.return_type != LogicalType::VARCHAR) {
+		return false;
+	}
+	auto *value = &expr;
+	if (value->expression_class == ExpressionClass::BOUND_CAST) {
+		value = value->Cast<BoundCastExpression>().child.get();
+	}
+	if (value->expression_class != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &constant = value->Cast<BoundConstantExpression>().value;
+	return null_sentinel ? constant.IsNull() : (!constant.IsNull() && constant.type().id() == LogicalTypeId::VARCHAR &&
+	                                            StringValue::Get(constant).empty());
+}
+
 // NULLIF(TRIM(x), '') binds to CASE WHEN TRIM(x) = '' THEN NULL ELSE TRIM(x) END.
 // Preserve the transform on the seed delta, not on the fact's partition key.
 static BoundColumnRefExpression *NullableTrimLookupRef(Expression &expr, string &spec) {
@@ -1260,18 +1276,15 @@ static BoundColumnRefExpression *NullableTrimLookupRef(Expression &expr, string 
 	}
 	auto &check = branch.case_checks.front();
 	if (check.when_expr->type != ExpressionType::COMPARE_EQUAL ||
-	    check.then_expr->expression_class != ExpressionClass::BOUND_CONSTANT ||
-	    !check.then_expr->Cast<BoundConstantExpression>().value.IsNull()) {
+	    !IsStringSentinel(*check.then_expr, true)) {
 		return nullptr;
 	}
 	auto &eq = check.when_expr->Cast<BoundComparisonExpression>();
-	if (!eq.left->Equals(*branch.else_expr) || eq.right->expression_class != ExpressionClass::BOUND_CONSTANT) {
+	if (!eq.left->Equals(*branch.else_expr) || !IsStringSentinel(*eq.right, false)) {
 		return nullptr;
 	}
-	auto &constant = eq.right->Cast<BoundConstantExpression>().value;
 	auto &trim = branch.else_expr->Cast<BoundFunctionExpression>();
-	if (constant.IsNull() || constant.type() != LogicalType::VARCHAR || !StringValue::Get(constant).empty() ||
-	    trim.function.name != "trim" || trim.children.size() != 1 || trim.children[0]->return_type != LogicalType::VARCHAR ||
+	if (trim.function.name != "trim" || trim.children.size() != 1 || trim.children[0]->return_type != LogicalType::VARCHAR ||
 	    trim.function.catalog_name != SYSTEM_CATALOG || trim.function.schema_name != DEFAULT_SCHEMA) {
 		return nullptr;
 	}
@@ -1967,6 +1980,33 @@ static bool RawWindowKeyIsProjected(const CreateMVPlanFacts &facts, const vector
 	return false;
 }
 
+static bool IsNormalizedSeedLookup(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                   const vector<WindowLineageOp> &direct_ops) {
+	if (facts.comparison_joins.size() != 1 || facts.comparison_joins.front()->conditions.size() != 1 ||
+	    facts.windows.size() != 1 || facts.windows.front()->expressions.size() != 1 ||
+	    facts.windows.front()->expressions.front()->type != ExpressionType::WINDOW_ROW_NUMBER ||
+	    facts.source_occurrences.size() != 2 || facts.source_occurrences[0].table == facts.source_occurrences[1].table ||
+	    facts.analysis.found_volatile_expression || direct_ops.size() != 1 ||
+	    !RawWindowKeyIsProjected(facts, output_names, direct_ops.front())) {
+		return false;
+	}
+	for (const auto &node : facts.plan_nodes_post_order) {
+		switch (node.plan_node->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_WINDOW:
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_DISTINCT:
+		case LogicalOperatorType::LOGICAL_GET:
+			break;
+		default:
+			return false;
+		}
+	}
+	return true;
+}
+
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     const vector<string> &output_names,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
@@ -1998,12 +2038,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	vector<WindowEquivalenceEdge> edges;
 	vector<WindowLookupEdge> lookup_edges;
 	for (auto *join : facts.comparison_joins) {
-		const bool normalized_seed = facts.comparison_joins.size() == 1 && join->conditions.size() == 1 &&
-		                             facts.windows.size() == 1 && facts.windows[0]->expressions.size() == 1 &&
-		                             facts.source_occurrences.size() == 2 &&
-		                             facts.source_occurrences[0].table != facts.source_occurrences[1].table &&
-		                             direct_ops.size() == 1 && partition_columns.size() == 1 &&
-		                             RawWindowKeyIsProjected(facts, output_names, direct_ops[0]);
+		const bool normalized_seed = partition_columns.size() == 1 && IsNormalizedSeedLookup(facts, output_names, direct_ops);
 		CollectWindowJoinEdges(*join, facts, edges, lookup_edges, normalized_seed);
 	}
 
