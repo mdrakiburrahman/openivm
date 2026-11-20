@@ -110,8 +110,8 @@ struct CreateMVPlanFacts {
 	bool has_descendant_distinct = false;
 };
 
-void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, string &suffix,
-                               string &ordering);
+void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
+                               string &suffix, string &ordering);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 // Qualify an auxiliary-state source by the catalog and schema the view bound it to.

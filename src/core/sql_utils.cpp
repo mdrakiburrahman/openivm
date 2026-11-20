@@ -29,7 +29,6 @@
 #include <cctype>
 #include <cstring>
 #include <regex>
-#include <sstream>
 
 namespace duckdb {
 
@@ -473,31 +472,6 @@ string SqlUtils::EscapeSingleQuotes(const string &input) {
 	return StringUtil::Replace(input, "'", "''");
 }
 
-string SqlUtils::SQLToLowercase(const string &sql) {
-	std::stringstream lowercase_stream;
-	// Quoted identifiers carry physical catalog/schema identities. Folding them
-	// can select a different metadata catalog even though DuckDB binds the name.
-	char quote = '\0';
-	for (char c : sql) {
-		if (quote) {
-			lowercase_stream << c;
-			if (c == quote) {
-				quote = '\0';
-			}
-		} else if (c == '\'' || c == '"') {
-			quote = c;
-			lowercase_stream << c;
-		} else {
-			lowercase_stream << StringUtil::CharacterToLower(c);
-		}
-	}
-	return lowercase_stream.str();
-}
-
-void SqlUtils::RemoveRedundantWhitespaces(string &query) {
-	query = std::regex_replace(query, std::regex("\\s+"), " ");
-}
-
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
 	vector<string> statements;
 	idx_t start = 0;
@@ -649,7 +623,7 @@ string SqlUtils::JsonQuote(const string &value) {
 			result += c;
 		}
 	}
-	result += "\"";
+	result += '"';
 	return result;
 }
 
@@ -1008,18 +982,6 @@ int64_t SqlUtils::ParseRefreshInterval(const string &interval_str) {
 		throw ParserException("Unknown time unit: '" + unit + "'");
 	}
 	return seconds;
-}
-
-int64_t SqlUtils::ExtractRefreshInterval(string &query) {
-	std::regex refresh_re(R"(refresh\s+every\s+'([^']+)')", std::regex::icase);
-	std::smatch match;
-	if (!std::regex_search(query, match, refresh_re)) {
-		return -1;
-	}
-	string interval_str = match[1].str();
-	// Strip the REFRESH EVERY clause from the query
-	query = std::regex_replace(query, refresh_re, "");
-	return ParseRefreshInterval(interval_str);
 }
 
 } // namespace duckdb

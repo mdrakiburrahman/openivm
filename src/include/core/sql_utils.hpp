@@ -40,8 +40,6 @@ public:
 	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string EscapeSingleQuotes(const string &input);
-	static string SQLToLowercase(const string &sql);
-	static void RemoveRedundantWhitespaces(string &query);
 	static vector<string> SplitSQLStatements(const string &sql);
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
@@ -118,10 +116,6 @@ public:
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.
 	static int64_t ParseRefreshInterval(const string &interval_str);
-
-	/// Extract and strip the REFRESH EVERY clause from a CREATE MATERIALIZED VIEW query.
-	/// Returns the parsed interval in seconds, or -1 if not present.
-	static int64_t ExtractRefreshInterval(string &query);
 
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
 	template <class T>

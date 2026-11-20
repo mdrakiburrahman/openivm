@@ -42,6 +42,7 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_index_regen.hpp"
+#include "lpts_expression_renderer.hpp"
 
 #include <functional>
 #include <set>
@@ -952,23 +953,8 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 	plan->ResolveOperatorTypes();
 }
 
-static ColumnBinding AppendProjectionPassthrough(LogicalProjection &proj, const ColumnBinding &binding,
-                                                 const LogicalType &type, const string &alias) {
-	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
-	passthrough->SetAlias(Identifier(alias));
-	proj.expressions.push_back(std::move(passthrough));
-	// Projection types depend only on the bound expressions, not a recursive
-	// resolution of its entire child plan for every appended helper column.
-	proj.types.clear();
-	for (auto &expression : proj.expressions) {
-		proj.types.push_back(expression->GetReturnType());
-	}
-	return ColumnBinding(TableIndex(proj.table_index), ProjectionIndex(proj.expressions.size() - 1));
-}
-
-static ColumnBinding ExposeBindingInProjection(LogicalProjection &proj, const ColumnBinding &binding,
-                                               const LogicalType &type, const string &alias, bool reuse_existing,
-                                               bool &appended) {
+ColumnBinding ExposeBindingInProjection(LogicalProjection &proj, const ColumnBinding &binding, const LogicalType &type,
+                                        const string &alias, bool reuse_existing, bool &appended) {
 	if (reuse_existing) {
 		for (idx_t i = 0; i < proj.expressions.size(); i++) {
 			auto &expression = *proj.expressions[i];
@@ -979,15 +965,31 @@ static ColumnBinding ExposeBindingInProjection(LogicalProjection &proj, const Co
 		}
 	}
 	appended = true;
-	return AppendProjectionPassthrough(proj, binding, type, alias);
+	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
+	passthrough->SetAlias(Identifier(alias));
+	proj.expressions.push_back(std::move(passthrough));
+	return ColumnBinding(TableIndex(proj.table_index), ProjectionIndex(proj.expressions.size() - 1));
+}
+
+static void ResolveProjectionTypes(LogicalProjection &projection) {
+	// Bound output expressions suffice; avoid recursively revisiting the child plan.
+	projection.types.clear();
+	for (auto &expression : projection.expressions) {
+		projection.types.push_back(expression->GetReturnType());
+	}
 }
 
 bool PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path, ColumnBinding binding,
                                                  LogicalType type, const string &alias, bool reuse_existing) {
 	bool appended = false;
 	for (auto it = projection_path.rbegin(); it != projection_path.rend(); ++it) {
-		binding = ExposeBindingInProjection(**it, binding, type, alias, reuse_existing, appended);
-		type = (*it)->expressions[binding.column_index]->GetReturnType();
+		auto &projection = **it;
+		auto previous_count = projection.expressions.size();
+		binding = ExposeBindingInProjection(projection, binding, type, alias, reuse_existing, appended);
+		if (projection.expressions.size() != previous_count) {
+			ResolveProjectionTypes(projection);
+		}
+		type = projection.expressions[binding.column_index]->GetReturnType();
 	}
 	return appended;
 }
@@ -1469,8 +1471,11 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 	for (auto &entry : path) {
 		if (entry.op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			bool appended = false;
-			current =
-			    ExposeBindingInProjection(entry.op->Cast<LogicalProjection>(), current, type, alias, true, appended);
+			auto &projection = entry.op->Cast<LogicalProjection>();
+			current = ExposeBindingInProjection(projection, current, type, alias, true, appended);
+			if (appended) {
+				ResolveProjectionTypes(projection);
+			}
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
 		           StringUtil::StartsWith(alias, openivm::FULL_SCOPE_PREFIX)) {
 			auto &aggregate = entry.op->Cast<LogicalAggregate>();
@@ -2056,210 +2061,52 @@ void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<Lo
 
 namespace {
 
-/// Renders a bound expression as SQL over published output columns. Bindings in `binding_to_column` become quoted
-/// column references; other bindings are inlined through `projections`.
-struct OutputExpressionRenderer {
-	OutputExpressionRenderer(const column_binding_map_t<string> &binding_to_column,
+// Bind published names here; LPTS owns expression syntax and type-preserving rendering.
+class OutputExpressionRenderer {
+public:
+	OutputExpressionRenderer(ClientContext &context, const column_binding_map_t<string> &binding_to_column,
 	                         const DerivedOutputProjectionMap &projections, bool having = false)
-	    : binding_to_column(binding_to_column), projections(projections), having(having) {
+	    : renderer(context, SqlDialect::DUCKDB,
+	               [&](const ColumnBinding &binding, const char *) {
+		               auto name = binding_to_column.find(binding);
+		               if (name != binding_to_column.end()) {
+			               return SQLQuotedIdentifier::ToString(name->second);
+		               }
+		               auto projection = projections.find(binding.table_index);
+		               if (projection == projections.end() ||
+		                   binding.column_index >= projection->second->expressions.size() ||
+		                   !active_bindings.insert(binding).second) {
+			               resolved = false;
+			               return string("NULL");
+		               }
+		               auto sql =
+		                   renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
+		               active_bindings.erase(binding);
+		               return sql;
+	               }),
+	      having(having) {
 	}
 
-	const column_binding_map_t<string> &binding_to_column;
-	const DerivedOutputProjectionMap &projections;
-	// HAVING predicates also render IN-lists and aggregate references, and fall back to the expression's own text for
-	// anything else that cannot be rendered.
-	bool having;
+	bool Render(const Expression &expression, string &sql) {
+		resolved = true;
+		active_bindings.clear();
+		try {
+			sql = renderer.ExpressionToAliasedString(expression);
+		} catch (const NotImplementedException &) {
+			resolved = false;
+		}
+		if (!resolved && having) {
+			sql = "(" + expression.ToString() + ")";
+			return true;
+		}
+		return resolved;
+	}
+
+private:
+	LptsExpressionRenderer renderer;
 	column_binding_set_t active_bindings;
-
-	bool Render(const Expression &expr, string &sql) {
-		if (RenderNode(expr, sql)) {
-			return true;
-		}
-		if (!having) {
-			return false;
-		}
-		sql = "(" + expr.ToString() + ")";
-		return true;
-	}
-
-	bool RenderAll(const vector<unique_ptr<Expression>> &children, idx_t offset, vector<string> &result) {
-		for (idx_t i = offset; i < children.size(); i++) {
-			string child_sql;
-			if (!Render(*children[i], child_sql)) {
-				return false;
-			}
-			result.push_back(std::move(child_sql));
-		}
-		return true;
-	}
-
-	bool RenderNode(const Expression &expr, string &sql) {
-		switch (expr.GetExpressionClass()) {
-		case ExpressionClass::BOUND_COLUMN_REF: {
-			auto &binding = expr.Cast<BoundColumnRefExpression>().Binding();
-			auto entry = binding_to_column.find(binding);
-			if (entry != binding_to_column.end()) {
-				// Always quote references in the persisted expression. The refresh
-				// compiler substitutes quoted identifiers with the post-MERGE state
-				// expression; leaving ordinary names unquoted would make them bind
-				// ambiguously between the target and delta aliases.
-				sql = SQLQuotedIdentifier::ToString(entry->second);
-				return true;
-			}
-			auto projection = projections.find(binding.table_index);
-			if (projection == projections.end() || binding.column_index >= projection->second->expressions.size() ||
-			    !active_bindings.insert(binding).second) {
-				return false;
-			}
-			bool rendered = Render(*projection->second->expressions[binding.column_index], sql);
-			active_bindings.erase(binding);
-			return rendered;
-		}
-		case ExpressionClass::BOUND_FUNCTION: {
-			if (BoundComparisonExpression::IsComparison(expr)) {
-				auto &comparison = expr.Cast<BoundFunctionExpression>();
-				string left_sql;
-				string right_sql;
-				if (!Render(BoundComparisonExpression::Left(comparison), left_sql) ||
-				    !Render(BoundComparisonExpression::Right(comparison), right_sql)) {
-					return false;
-				}
-				sql = "(" + left_sql + " " + ExpressionTypeToOperator(comparison.GetExpressionType()) + " " +
-				      right_sql + ")";
-				return true;
-			}
-			if (BoundCastExpression::IsCast(expr)) {
-				auto &cast = expr.Cast<BoundFunctionExpression>();
-				string child_sql;
-				if (!Render(BoundCastExpression::Child(cast), child_sql)) {
-					return false;
-				}
-				sql = string(BoundCastExpression::IsTryCast(cast) ? "TRY_CAST(" : "CAST(") + child_sql + " AS " +
-				      cast.GetReturnType().ToString() + ")";
-				return true;
-			}
-			auto &function = expr.Cast<BoundFunctionExpression>();
-			vector<string> children;
-			const auto &name = function.Function().GetName().GetIdentifierName();
-			bool is_operator =
-			    function.IsOperator() || name == "+" || name == "-" || name == "*" || name == "/" || name == "%";
-			if (!RenderAll(function.GetChildren(), 0, children)) {
-				return false;
-			}
-			if (is_operator && children.size() == 2) {
-				sql = "(" + children[0] + " " + name + " " + children[1] + ")";
-			} else if (is_operator && children.size() == 1) {
-				sql = "(" + name + " " + children[0] + ")";
-			} else {
-				// As in LPTS, named STRUCT fields come from the return type.
-				bool named_struct = (name == "struct_pack" || name == "row") &&
-				                    function.GetReturnType().id() == LogicalTypeId::STRUCT &&
-				                    !StructType::IsUnnamed(function.GetReturnType());
-				const auto &named_arguments = function.Function().GetNamedArguments();
-				auto positional_count = function.Function().GetPositionalArgumentCount();
-				for (idx_t i = 0; i < children.size(); i++) {
-					if (named_struct) {
-						children[i] =
-						    SQLQuotedIdentifier::ToString(StructType::GetChildName(function.GetReturnType(), i)) +
-						    " := " + children[i];
-					} else if (i >= positional_count && i - positional_count < named_arguments.size()) {
-						children[i] =
-						    SQLQuotedIdentifier::ToString(named_arguments[i - positional_count]) + " := " + children[i];
-					}
-				}
-				sql = SQLIdentifier::ToString(name) + "(" + StringUtil::Join(children, ", ") + ")";
-			}
-			return true;
-		}
-		case ExpressionClass::BOUND_CONSTANT:
-			sql = expr.Cast<BoundConstantExpression>().GetValue().ToSQLString();
-			return true;
-		case ExpressionClass::BOUND_CASE: {
-			auto &case_expr = expr.Cast<BoundCaseExpression>();
-			sql = "CASE";
-			for (auto &check : case_expr.CaseChecks()) {
-				string when_sql;
-				string then_sql;
-				if (!Render(*check.when_expr, when_sql) || !Render(*check.then_expr, then_sql)) {
-					return false;
-				}
-				sql += " WHEN " + when_sql + " THEN " + then_sql;
-			}
-			string else_sql;
-			if (!Render(*case_expr.ElseExpression(), else_sql)) {
-				return false;
-			}
-			sql += " ELSE " + else_sql + " END";
-			return true;
-		}
-		case ExpressionClass::BOUND_CONJUNCTION: {
-			auto &conjunction = expr.Cast<BoundConjunctionExpression>();
-			vector<string> children;
-			if (!RenderAll(conjunction.GetChildren(), 0, children)) {
-				return false;
-			}
-			auto op = conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? " AND " : " OR ";
-			sql = "(" + StringUtil::Join(children, op) + ")";
-			return true;
-		}
-		case ExpressionClass::BOUND_OPERATOR: {
-			auto &op = expr.Cast<BoundOperatorExpression>();
-			if (expr.GetExpressionType() == ExpressionType::OPERATOR_COALESCE) {
-				vector<string> children;
-				if (!RenderAll(op.GetChildren(), 0, children)) {
-					return false;
-				}
-				sql = "COALESCE(" + StringUtil::Join(children, ", ") + ")";
-				return true;
-			}
-			if (having &&
-			    (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
-			     expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) &&
-			    op.GetChildren().size() >= 2) {
-				string left_sql;
-				vector<string> list;
-				if (!Render(*op.GetChildren()[0], left_sql) || !RenderAll(op.GetChildren(), 1, list)) {
-					return false;
-				}
-				sql = "(" + left_sql +
-				      (expr.GetExpressionType() == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (") +
-				      StringUtil::Join(list, ", ") + "))";
-				return true;
-			}
-			string child_sql;
-			if (op.GetChildren().size() != 1 || !Render(*op.GetChildren()[0], child_sql)) {
-				return false;
-			}
-			if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
-				sql = "(" + child_sql + " IS NULL)";
-			} else if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
-				sql = "(" + child_sql + " IS NOT NULL)";
-			} else if (expr.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
-				sql = "(NOT " + child_sql + ")";
-			} else {
-				return false;
-			}
-			return true;
-		}
-		case ExpressionClass::BOUND_AGGREGATE: {
-			// HAVING can reference an aggregate directly (e.g. `HAVING AVG(x) > 100`); use the output column of
-			// its single argument when that argument is published.
-			auto &aggregate = expr.Cast<BoundAggregateExpression>();
-			if (!having || aggregate.GetChildren().size() != 1 ||
-			    aggregate.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-				return false;
-			}
-			auto entry = binding_to_column.find(aggregate.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding());
-			if (entry == binding_to_column.end()) {
-				return false;
-			}
-			sql = SQLQuotedIdentifier::ToString(entry->second);
-			return true;
-		}
-		default:
-			return false;
-		}
-	}
+	bool resolved = true;
+	bool having;
 };
 
 } // namespace
@@ -2295,8 +2142,8 @@ vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vec
 	return names;
 }
 
-bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
-                                const vector<string> &output_names, string &sql) {
+bool RenderPlanOutputExpression(ClientContext &context, const Expression &expression, LogicalOperator &plan,
+                                const CreateMVPlanFacts &facts, const vector<string> &output_names, string &sql) {
 	DerivedOutputProjectionMap projections;
 	for (auto *projection : facts.projections) {
 		projections[projection->table_index] = projection;
@@ -2334,10 +2181,11 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 			}
 		}
 	}
-	return OutputExpressionRenderer(binding_to_column, projections).Render(expression, sql);
+	return OutputExpressionRenderer(context, binding_to_column, projections).Render(expression, sql);
 }
 
-DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,
+DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(ClientContext &context, const LogicalOperator &plan,
+                                                          const CreateMVPlanFacts &facts,
                                                           const vector<string> &output_names,
                                                           const vector<string> &decomposed_outputs) {
 	DerivedAggregateOutputInfo info;
@@ -2380,7 +2228,7 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 	const bool recoverable_sums = std::any_of(info.inputs.begin(), info.inputs.end(), [](const AggregateInput &input) {
 		return StringUtil::StartsWith(input.output_column, openivm::FINITE_SUM_COL_PREFIX);
 	});
-	OutputExpressionRenderer renderer(binding_to_column, projections);
+	OutputExpressionRenderer renderer(context, binding_to_column, projections);
 	for (idx_t i = 0; i < resolved_expressions.size(); i++) {
 		auto &expression = *resolved_expressions[i];
 		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
@@ -2419,7 +2267,7 @@ static void CollectFilterBindings(Expression &expr, std::set<pair<TableIndex, Pr
 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CollectFilterBindings(child, out); });
 }
 
-string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &output_names) {
+string StripHavingFilter(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names) {
 	// Find PROJECTION → FILTER → AGGREGATE pattern. Only descend through transparent
 	// operators (PROJECTION, FILTER, ORDER, LIMIT, DISTINCT) and — for MATERIALIZED_CTE —
 	// the outer query (children[1]) only. Stripping a FILTER that's nested inside a
@@ -2533,7 +2381,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 
 	// Extract HAVING predicate as SQL.
 	DerivedOutputProjectionMap no_projections;
-	OutputExpressionRenderer renderer(binding_to_alias, no_projections, true);
+	OutputExpressionRenderer renderer(context, binding_to_alias, no_projections, true);
 	string having_sql;
 	for (idx_t i = 0; i < filter.expressions.size(); i++) {
 		string predicate_sql;

@@ -211,10 +211,6 @@ string CreateMetadataTableSQL(const string &table, const string &target, bool re
 	       ")";
 }
 
-string CreateMVDependenciesSQL() {
-	return CreateMetadataTableSQL(openivm::MV_DEPS_TABLE);
-}
-
 void AppendMetadataMigrationSQL(vector<string> &ddl, const string &table, optional_ptr<TableCatalogEntry> existing,
                                 bool remote) {
 	for (auto &column : MetadataColumns(table)) {

@@ -514,14 +514,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 		// Hidden sort outputs need the same aggregate state as visible outputs.
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
-		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
+		StripPublicationModifiers(context, select_plan, output_names, top_k_suffix, top_k_order_suffix);
 		RewriteNonFiniteSumInputs(context, *select_planner.binder, select_plan);
 		// HAVING must reuse these state bindings without replacing their semantic aliases.
 		InjectDerivedAggregateInputs(select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
-		having_predicate = StripHavingFilter(select_plan, output_names);
+		having_predicate = StripHavingFilter(context, select_plan, output_names);
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
@@ -536,8 +536,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
 		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 		if (select_plan) {
-			derived_aggregate_outputs =
-			    ExtractDerivedAggregateOutputs(*select_plan, post_rewrite_facts, output_names, decomposed_outputs);
+			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(context, *select_plan, post_rewrite_facts,
+			                                                           output_names, decomposed_outputs);
 			has_computed_sum_aggregate_projection &= !derived_aggregate_outputs.complete;
 		}
 		add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
@@ -634,7 +634,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		auto &analysis_query = plan->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? plan->children[0] : plan;
 		auto analysis_names = output_names;
 		string analysis_suffix, analysis_order;
-		StripPublicationModifiers(analysis_query, analysis_names, analysis_suffix, analysis_order);
+		StripPublicationModifiers(context, analysis_query, analysis_names, analysis_suffix, analysis_order);
 	}
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (has_query_dependent_binding) {

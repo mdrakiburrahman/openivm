@@ -206,19 +206,6 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 	return std::move(distinct);
 }
 
-static void AddColumnBindingReplacements(const vector<ColumnBinding> &old_bindings,
-                                         const vector<ColumnBinding> &new_bindings,
-                                         vector<ReplacementBinding> &replacement_bindings,
-                                         const ColumnBinding *stop_binding = nullptr) {
-	const idx_t count = std::min(old_bindings.size(), new_bindings.size());
-	for (idx_t i = 0; i < count; i++) {
-		if (stop_binding && new_bindings[i] == *stop_binding) {
-			break;
-		}
-		replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
-	}
-}
-
 static void AddLeafBindingReplacements(const vector<ColumnBinding> &old_bindings,
                                        const vector<ColumnBinding> &new_bindings,
                                        vector<ReplacementBinding> &replacement_bindings,
@@ -370,7 +357,7 @@ static bool ReplaceSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<Logi
 		}
 		if (replaced && !local_replacements.empty()) {
 			ColumnBindingReplacer replacer;
-			replacer.replacement_bindings = local_replacements;
+			replacer.replacement_bindings = std::move(local_replacements);
 			replacer.VisitOperator(*node);
 			join.duplicate_eliminated_columns.clear();
 			node->type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;

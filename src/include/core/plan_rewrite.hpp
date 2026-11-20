@@ -77,8 +77,8 @@ void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOpera
 /// compact CTE graph emitted by LPTS for a stored materialized-view definition.
 void InlineMaterializedCteRefs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 
-bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
-                                const vector<string> &output_names, string &sql);
+bool RenderPlanOutputExpression(ClientContext &context, const Expression &expression, LogicalOperator &plan,
+                                const CreateMVPlanFacts &facts, const vector<string> &output_names, string &sql);
 vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vector<string> &output_names);
 
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
@@ -91,13 +91,14 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
 /// added to the PROJECTION as hidden columns (named `openivm_having_N`) and
 /// `output_names` is extended accordingly — the predicate references the hidden
 /// column names instead of re-rendering the aggregate expression.
-string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &output_names);
+string StripHavingFilter(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names);
 
 /// Extract deterministic scalar outputs computed by the top projection from
 /// aggregate outputs that are also projected by name. `complete` is false when
 /// any user-visible expression cannot be rendered solely in terms of stored
 /// output columns, so refresh compilation can fail closed.
-DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,
+DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(ClientContext &context, const LogicalOperator &plan,
+                                                          const CreateMVPlanFacts &facts,
                                                           const vector<string> &output_names,
                                                           const vector<string> &decomposed_outputs = {});
 

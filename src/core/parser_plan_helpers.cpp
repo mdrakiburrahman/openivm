@@ -314,8 +314,8 @@ void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement)
 	planner.CreatePlan(std::move(statement));
 }
 
-void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, string &suffix,
-                               string &ordering) {
+void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
+                               string &suffix, string &ordering) {
 	vector<LogicalProjection *> projections;
 	auto *slot = &plan;
 	while (*slot && (*slot)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*slot)->children.size() == 1) {
@@ -378,7 +378,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 		for (idx_t i = 0; i < orders->size(); i++) {
 			auto &order = (*orders)[i];
 			string expression;
-			if (!RenderPlanOutputExpression(*order.expression, *plan, facts, output_names, expression)) {
+			if (!RenderPlanOutputExpression(context, *order.expression, *plan, facts, output_names, expression)) {
 				// The outer projection hides a sort value (e.g. SELECT k ORDER BY SUM(v)).
 				// Keep it in maintenance state; only its ordinal crosses the public boundary.
 				D_ASSERT(!projections.empty());
@@ -716,29 +716,18 @@ static bool NormalizeCorrelatedTableFunctionCTE(unique_ptr<LogicalOperator> &can
 	// Carry every domain column through the argument projections. The table-in/out
 	// GET exposes selected child bindings through projected_input.
 	auto carried_bindings = source_bindings;
-	for (idx_t depth = projections.size(); depth > 0; depth--) {
-		auto &projection = projections[depth - 1].get();
-		vector<ColumnBinding> next;
-		next.reserve(carried_bindings.size());
-		for (idx_t i = 0; i < carried_bindings.size(); i++) {
-			optional_idx output;
-			for (idx_t expr = 0; expr < projection.expressions.size(); expr++) {
-				if (projection.expressions[expr]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    projection.expressions[expr]->Cast<BoundColumnRefExpression>().Binding() == carried_bindings[i]) {
-					output = expr;
-					break;
-				}
+	auto carry_through = [&](const vector<reference<LogicalProjection>> &path) {
+		bool appended = false;
+		for (auto it = path.rbegin(); it != path.rend(); ++it) {
+			auto &projection = it->get();
+			for (idx_t i = 0; i < carried_bindings.size(); i++) {
+				carried_bindings[i] =
+				    ExposeBindingInProjection(projection, carried_bindings[i], source_types[i], "", true, appended);
 			}
-			if (!output.IsValid()) {
-				output = projection.expressions.size();
-				projection.expressions.push_back(
-				    make_uniq<BoundColumnRefExpression>(source_types[i], carried_bindings[i]));
-			}
-			next.emplace_back(projection.table_index, ProjectionIndex(output.GetIndex()));
+			projection.ResolveOperatorTypes();
 		}
-		projection.ResolveOperatorTypes();
-		carried_bindings = std::move(next);
-	}
+	};
+	carry_through(projections);
 	auto function_input_bindings = get.children[0]->GetColumnBindings();
 	for (auto &binding : carried_bindings) {
 		auto entry = std::find(function_input_bindings.begin(), function_input_bindings.end(), binding);
@@ -751,29 +740,7 @@ static bool NormalizeCorrelatedTableFunctionCTE(unique_ptr<LogicalOperator> &can
 		}
 	}
 	get.ResolveOperatorTypes();
-	for (idx_t depth = output_projections.size(); depth > 0; depth--) {
-		auto &projection = output_projections[depth - 1].get();
-		vector<ColumnBinding> next;
-		next.reserve(carried_bindings.size());
-		for (idx_t i = 0; i < carried_bindings.size(); i++) {
-			optional_idx output;
-			for (idx_t expr = 0; expr < projection.expressions.size(); expr++) {
-				if (projection.expressions[expr]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    projection.expressions[expr]->Cast<BoundColumnRefExpression>().Binding() == carried_bindings[i]) {
-					output = expr;
-					break;
-				}
-			}
-			if (!output.IsValid()) {
-				output = projection.expressions.size();
-				projection.expressions.push_back(
-				    make_uniq<BoundColumnRefExpression>(source_types[i], carried_bindings[i]));
-			}
-			next.emplace_back(projection.table_index, ProjectionIndex(output.GetIndex()));
-		}
-		projection.ResolveOperatorTypes();
-		carried_bindings = std::move(next);
-	}
+	carry_through(output_projections);
 
 	ColumnBindingReplacer domain_replacer;
 	for (idx_t i = 0; i < domain_ref_bindings.size(); i++) {
@@ -2182,93 +2149,66 @@ string DeriveDirectSourceGroupKey(const CreateMVPlanFacts &facts, const vector<s
 }
 
 static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
-                                      string &column) {
-	TableIndex table_index = binding.table_index;
-	ProjectionIndex column_index = binding.column_index;
+                                      string &column, ProjectionIndex *base_column = nullptr,
+                                      string *cast_type = nullptr) {
 	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = facts.gets_by_index.find(table_index);
+		auto get_it = facts.gets_by_index.find(binding.table_index);
 		if (get_it != facts.gets_by_index.end()) {
 			get = get_it->second;
-			return GetLogicalGetColumnName(*get, column_index, column);
+			if (base_column) {
+				*base_column = binding.column_index;
+			}
+			return GetLogicalGetColumnName(*get, binding.column_index, column);
 		}
-		auto proj_it = facts.projections_by_index.find(table_index);
-		if (proj_it == facts.projections_by_index.end()) {
+		auto proj_it = facts.projections_by_index.find(binding.table_index);
+		if (proj_it == facts.projections_by_index.end() ||
+		    binding.column_index >= proj_it->second->expressions.size()) {
 			return false;
 		}
-		auto *proj = proj_it->second;
-		if (column_index >= proj->expressions.size()) {
-			return false;
-		}
-		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get());
+		string projection_cast;
+		auto *next = GetColumnRefThroughCasts(proj_it->second->expressions[binding.column_index].get(),
+		                                      cast_type ? &projection_cast : nullptr);
 		if (!next) {
 			return false;
 		}
-		table_index = next->Binding().table_index;
-		column_index = next->Binding().column_index;
+		if (cast_type && !projection_cast.empty()) {
+			*cast_type = SqlUtils::ComposeCastSpecs(*cast_type, projection_cast);
+		}
+		binding = next->Binding();
 	}
 	return false;
+}
+
+static bool SetOccurrenceRef(LogicalGet &get, const CreateMVPlanFacts &facts, OccurrenceColumnRef &out) {
+	auto occurrence = facts.occurrence_by_index.find(get.table_index);
+	if (occurrence == facts.occurrence_by_index.end()) {
+		return false;
+	}
+	out.table = occurrence->second.table;
+	out.occurrence = occurrence->second.occurrence;
+	return true;
 }
 
 static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                           OccurrenceColumnRef &out) {
 	LogicalGet *get = nullptr;
-	if (!ResolveBindingToGetColumn(binding, facts, get, out.column)) {
-		return false;
-	}
-	auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
-	if (occurrence_it == facts.occurrence_by_index.end()) {
-		return false;
-	}
-	out.table = occurrence_it->second.table;
-	out.occurrence = occurrence_it->second.occurrence;
-	return true;
+	return ResolveBindingToGetColumn(binding, facts, get, out.column) && SetOccurrenceRef(*get, facts, out);
 }
 
 static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                                   OccurrenceColumnRef &out, string &cast_type,
                                                   const LogicalType &expression_type) {
-	TableIndex table_index = binding.table_index;
-	ProjectionIndex column_index = binding.column_index;
-	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = facts.gets_by_index.find(table_index);
-		if (get_it != facts.gets_by_index.end()) {
-			auto *get = get_it->second;
-			if (!GetLogicalGetColumnName(*get, column_index, out.column)) {
-				return false;
-			}
-			auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
-			if (occurrence_it == facts.occurrence_by_index.end()) {
-				return false;
-			}
-			out.table = occurrence_it->second.table;
-			out.occurrence = occurrence_it->second.occurrence;
-			LogicalType base_type;
-			if (cast_type.empty() && GetLogicalGetColumnType(*get, column_index, base_type) &&
-			    !(base_type == expression_type)) {
-				cast_type = expression_type.ToString();
-			}
-			return true;
-		}
-		auto proj_it = facts.projections_by_index.find(table_index);
-		if (proj_it == facts.projections_by_index.end()) {
-			return false;
-		}
-		auto *proj = proj_it->second;
-		if (column_index >= proj->expressions.size()) {
-			return false;
-		}
-		string projection_cast;
-		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get(), &projection_cast);
-		if (!next) {
-			return false;
-		}
-		if (!projection_cast.empty()) {
-			cast_type = SqlUtils::ComposeCastSpecs(cast_type, projection_cast);
-		}
-		table_index = next->Binding().table_index;
-		column_index = next->Binding().column_index;
+	LogicalGet *get = nullptr;
+	ProjectionIndex base_column;
+	if (!ResolveBindingToGetColumn(binding, facts, get, out.column, &base_column, &cast_type) ||
+	    !SetOccurrenceRef(*get, facts, out)) {
+		return false;
 	}
-	return false;
+	LogicalType base_type;
+	if (cast_type.empty() && GetLogicalGetColumnType(*get, base_column, base_type) && !(base_type == expression_type)) {
+		cast_type = expression_type.ToString();
+	}
+	return true;
 }
 
 static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {

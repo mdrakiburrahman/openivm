@@ -2,6 +2,7 @@
 #include "core/openivm_debug.hpp"
 #include "delta/delta_helpers.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 
@@ -17,11 +18,6 @@
 #include <duckdb/planner/operator/logical_unnest.hpp>
 
 namespace duckdb {
-
-static uint64_t HashBinding(const ColumnBinding &binding) {
-	return std::hash<idx_t>()(binding.table_index.index) ^
-	       (std::hash<idx_t>()(binding.column_index.GetIndex()) * 0x9e3779b97f4a7c15ULL);
-}
 
 static void CollectExpressionBindings(Expression &expression, std::vector<ColumnBinding> &bindings) {
 	if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
@@ -62,144 +58,64 @@ static new_idx GetOrCreateTableIndex(old_idx old_index, Binder &binder,
 	}
 	auto fresh_index = binder.GenerateTableIndex();
 	table_reassign.emplace(old_index, fresh_index);
+	OPENIVM_DEBUG_PRINT("Index regen: Remap %llu -> %llu\n", static_cast<unsigned long long>(old_index.index),
+	                    static_cast<unsigned long long>(fresh_index.index));
 	return fresh_index;
 }
 
-static RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder &binder,
-                                              std::unordered_map<old_idx, new_idx> &table_reassign) {
-	std::vector<ColumnBinding> current_bindings = plan->GetColumnBindings();
-	CollectOperatorExpressionBindings(*plan, current_bindings);
-	bool contains_delim_operator = plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-	                               plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
-	                               plan->type == LogicalOperatorType::LOGICAL_DELIM_GET;
-	std::vector<unique_ptr<LogicalOperator>> rec_children;
-	for (auto &child : plan->children) {
-		RenumberWrapper child_wrap = renumber_table_indices(std::move(child), binder, table_reassign);
-		current_bindings.insert(current_bindings.end(), child_wrap.column_bindings.cbegin(),
-		                        child_wrap.column_bindings.cend());
-		contains_delim_operator = contains_delim_operator || child_wrap.contains_delim_operator;
-		rec_children.emplace_back(std::move(child_wrap.op));
+static void RenumberTableIndices(LogicalOperator &plan, Binder &binder, RenumberWrapper &result) {
+	auto bindings = plan.GetColumnBindings();
+	result.column_bindings.insert(result.column_bindings.end(), bindings.begin(), bindings.end());
+	CollectOperatorExpressionBindings(plan, result.column_bindings);
+	result.contains_delim_operator |= plan.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	                                  plan.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+	                                  plan.type == LogicalOperatorType::LOGICAL_DELIM_GET;
+	for (auto &child : plan.children) {
+		RenumberTableIndices(*child, binder, result);
 	}
-
-	switch (plan->type) {
+	auto remap = [&](TableIndex &index) {
+		index = GetOrCreateTableIndex(index, binder, result.idx_map);
+	};
+	switch (plan.type) {
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-		unique_ptr<LogicalAggregate> agg_ptr = unique_ptr_cast<LogicalOperator, LogicalAggregate>(std::move(plan));
-		{
-			const auto old_gr_idx = agg_ptr->group_index;
-			const auto new_gr_idx = GetOrCreateTableIndex(old_gr_idx, binder, table_reassign);
-			agg_ptr->group_index = new_gr_idx;
+		auto &aggregate = plan.Cast<LogicalAggregate>();
+		remap(aggregate.group_index);
+		remap(aggregate.aggregate_index);
+		if (aggregate.groupings_index.IsValid()) {
+			remap(aggregate.groupings_index);
 		}
-		{
-			const auto old_ag_idx = agg_ptr->aggregate_index;
-			const auto new_ag_idx = GetOrCreateTableIndex(old_ag_idx, binder, table_reassign);
-			agg_ptr->aggregate_index = new_ag_idx;
-		}
-		{
-			const auto old_gs_idx = agg_ptr->groupings_index;
-			if (old_gs_idx.IsValid()) {
-				const auto new_gs_idx = GetOrCreateTableIndex(old_gs_idx, binder, table_reassign);
-				agg_ptr->groupings_index = new_gs_idx;
-			}
-		}
-		agg_ptr->children = std::move(rec_children);
-		return {std::move(agg_ptr), table_reassign, current_bindings, contains_delim_operator};
-	}
-	case LogicalOperatorType::LOGICAL_GET: {
-		unique_ptr<LogicalGet> get_ptr = unique_ptr_cast<LogicalOperator, LogicalGet>(std::move(plan));
-		// Copy serializes DuckLake's bound scan but drops its SQL parameter cache.
-		// Restore it from the bound snapshot while already visiting copied scans.
-		PopulateDuckLakeChangeScanParameters(*get_ptr);
-		const auto current_idx = get_ptr->table_index;
-		const auto new_idx = GetOrCreateTableIndex(current_idx, binder, table_reassign);
-		get_ptr->table_index = new_idx;
-#if OPENIVM_DEBUG
-		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_GET: Change %llu -> %llu\n",
-		                    static_cast<unsigned long long>(current_idx.index),
-		                    static_cast<unsigned long long>(new_idx.index));
-#endif
-		get_ptr->children = std::move(rec_children);
-		return {std::move(get_ptr), table_reassign, current_bindings, contains_delim_operator};
-	}
-	case LogicalOperatorType::LOGICAL_DELIM_GET: {
-		unique_ptr<LogicalDelimGet> delim_get_ptr = unique_ptr_cast<LogicalOperator, LogicalDelimGet>(std::move(plan));
-		const auto current_idx = delim_get_ptr->table_index;
-		const auto new_idx = GetOrCreateTableIndex(current_idx, binder, table_reassign);
-		delim_get_ptr->table_index = new_idx;
-#if OPENIVM_DEBUG
-		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_DELIM_GET: Change %llu -> %llu\n",
-		                    static_cast<unsigned long long>(current_idx.index),
-		                    static_cast<unsigned long long>(new_idx.index));
-#endif
-		return {std::move(delim_get_ptr), table_reassign, current_bindings, contains_delim_operator};
-	}
-	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		unique_ptr<LogicalProjection> proj_ptr = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(plan));
-		const auto current_idx = proj_ptr->table_index;
-		const auto new_idx = GetOrCreateTableIndex(current_idx, binder, table_reassign);
-#if OPENIVM_DEBUG
-		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_PROJECTION: Change %llu -> %llu\n",
-		                    static_cast<unsigned long long>(current_idx.index),
-		                    static_cast<unsigned long long>(new_idx.index));
-#endif
-		proj_ptr->table_index = new_idx;
-		proj_ptr->children = std::move(rec_children);
-		return {std::move(proj_ptr), table_reassign, current_bindings, contains_delim_operator};
-	}
-	case LogicalOperatorType::LOGICAL_UNNEST: {
-		auto &unnest = plan->Cast<LogicalUnnest>();
-		const auto current_idx = unnest.unnest_index;
-		const auto new_idx = GetOrCreateTableIndex(current_idx, binder, table_reassign);
-		unnest.unnest_index = new_idx;
-#if OPENIVM_DEBUG
-		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_UNNEST: Change %llu -> %llu\n",
-		                    static_cast<unsigned long long>(current_idx.index),
-		                    static_cast<unsigned long long>(new_idx.index));
-#endif
-		plan->children = std::move(rec_children);
-		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
-	}
-	case LogicalOperatorType::LOGICAL_UNION:
-	case LogicalOperatorType::LOGICAL_EXCEPT:
-	case LogicalOperatorType::LOGICAL_INTERSECT: {
-		auto &setop = plan->Cast<LogicalSetOperation>();
-		const auto current_idx = setop.table_index;
-		const auto new_idx = GetOrCreateTableIndex(current_idx, binder, table_reassign);
-		setop.table_index = new_idx;
-		plan->children = std::move(rec_children);
-		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
-	}
-	case LogicalOperatorType::LOGICAL_EMPTY_RESULT: {
-		// LogicalEmptyResult stores a `bindings` vector directly (no single
-		// table_index member). Remap each distinct old table_index to a fresh
-		// index so its bindings don't collide with a renumbered LogicalGet
-		// elsewhere in the plan (e.g. inclusion-exclusion terms where the
-		// same source table appears as both full and delta).
-		auto &empty = plan->Cast<LogicalEmptyResult>();
-		for (auto &cb : empty.bindings) {
-			auto old_table = cb.table_index;
-			auto existing = table_reassign.find(old_table);
-			auto new_t = GetOrCreateTableIndex(old_table, binder, table_reassign);
-			if (existing == table_reassign.end()) {
-#if OPENIVM_DEBUG
-				OPENIVM_DEBUG_PRINT("Index regen LOGICAL_EMPTY_RESULT: Change %llu -> %llu\n",
-				                    static_cast<unsigned long long>(old_table.index),
-				                    static_cast<unsigned long long>(new_t.index));
-#endif
-			}
-			cb.table_index = new_t;
-		}
-		plan->children = std::move(rec_children);
-		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
-	}
-	default: {
-#if OPENIVM_DEBUG
-		OPENIVM_DEBUG_PRINT("table indices of type %s ignored.\n", LogicalOperatorToString(plan->type).c_str());
-#endif
 		break;
 	}
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = plan.Cast<LogicalGet>();
+		// Copy serializes DuckLake's bound scan but drops its SQL parameter cache.
+		PopulateDuckLakeChangeScanParameters(get);
+		remap(get.table_index);
+		break;
 	}
-	plan->children = std::move(rec_children);
-	return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
+	case LogicalOperatorType::LOGICAL_DELIM_GET:
+		remap(plan.Cast<LogicalDelimGet>().table_index);
+		break;
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		remap(plan.Cast<LogicalProjection>().table_index);
+		break;
+	case LogicalOperatorType::LOGICAL_UNNEST:
+		remap(plan.Cast<LogicalUnnest>().unnest_index);
+		break;
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+		remap(plan.Cast<LogicalSetOperation>().table_index);
+		break;
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+		// Each stored binding may name a different table; remap all of them.
+		for (auto &binding : plan.Cast<LogicalEmptyResult>().bindings) {
+			remap(binding.table_index);
+		}
+		break;
+	default:
+		break;
+	}
 }
 
 static void RebindExpressionsNullSafe(LogicalOperator &op, ColumnBindingReplacer &replacer,
@@ -231,13 +147,12 @@ static void RebindExpressionsNullSafe(LogicalOperator &op, ColumnBindingReplacer
 static ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings,
                                              const std::unordered_map<old_idx, new_idx> &table_mapping) {
 	ColumnBindingReplacer replacer;
-	std::unordered_set<uint64_t> seen;
+	column_binding_set_t seen;
 	for (const ColumnBinding &cb : bindings) {
 		if (table_mapping.find(cb.table_index) == table_mapping.end()) {
 			continue;
 		}
-		uint64_t key = HashBinding(cb);
-		if (!seen.insert(key).second) {
+		if (!seen.insert(cb).second) {
 			continue;
 		}
 		new_idx new_t = table_mapping.at(cb.table_index);
@@ -248,8 +163,8 @@ static ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &b
 }
 
 RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Binder &binder) {
-	std::unordered_map<old_idx, new_idx> table_reassign;
-	RenumberWrapper res = renumber_table_indices(std::move(plan), binder, table_reassign);
+	RenumberWrapper res {std::move(plan), {}, {}, false};
+	RenumberTableIndices(*res.op, binder, res);
 	ColumnBindingReplacer replacer = vec_to_replacer(res.column_bindings, res.idx_map);
 	if (!res.contains_delim_operator) {
 		replacer.VisitOperator(*res.op);
