@@ -489,7 +489,7 @@ SignedRowLists BuildSignedRowLists(const vector<string> &columns, const string &
 		lists.columns += quoted;
 		if (column == openivm::MULTIPLICITY_COL) {
 			lists.old_rows += "-1";
-			lists.new_rows += "1";
+			lists.new_rows += '1';
 		} else {
 			lists.old_rows += old_alias + quoted;
 			lists.new_rows += new_alias + quoted;
@@ -1024,6 +1024,20 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
+string BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter) {
+	auto weighted_delta = [&](const string &comparison) {
+		return "SELECT openivm_scope_delta.* EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
+		       string(openivm::TIMESTAMP_COL) + ") FROM " + delta + " openivm_scope_delta" +
+		       SqlUtils::BuildRowRepetitionSQL("abs(openivm_scope_delta." + string(openivm::MULTIPLICITY_COL) + ")",
+		                                       "openivm_scope_weights", SqlDialect::DUCKDB) +
+		       BuildGuardedDeltaWhere(delta_ts_filter, string(openivm::MULTIPLICITY_COL) + comparison);
+	};
+	// Add deletions before subtracting insertions: conflicting DML can insert
+	// and delete a transient row whose count is zero in the current table.
+	return "((SELECT * FROM " + current + " UNION ALL " + weighted_delta(" < 0") + ") EXCEPT ALL " +
+	       weighted_delta(" > 0") + ")";
+}
+
 struct FullOuterScopeRelation {
 	string reference;
 	string query;
@@ -1132,18 +1146,8 @@ static FullOuterScopeRows ReadScopeRows(RefreshMetadata &metadata, const string 
 		        ResolveFullOuterDeltaSource(metadata, view_name, name)};
 	}
 	auto delta = metadata.ResolveDeltaQualifiedName(view_name, name);
-	auto weighted_delta = [&](const string &comparison) {
-		return "SELECT openivm_scope_delta.* EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
-		       string(openivm::TIMESTAMP_COL) + ") FROM " + delta + " openivm_scope_delta" +
-		       SqlUtils::BuildRowRepetitionSQL("abs(openivm_scope_delta." + string(openivm::MULTIPLICITY_COL) + ")",
-		                                       "openivm_scope_weights", SqlDialect::DUCKDB) +
-		       BuildGuardedDeltaWhere(delta_ts_filter, string(openivm::MULTIPLICITY_COL) + comparison);
-	};
-	// Add deletions before subtracting insertions: conflicting DML can insert
-	// and delete a transient row whose count is zero in the current table.
-	auto previous = "((SELECT * FROM " + current + " UNION ALL " + weighted_delta(" < 0") + ") EXCEPT ALL " +
-	                weighted_delta(" > 0") + ")";
-	return {current, previous, BuildStandardDeltaRowsSQL(delta, "", delta_ts_filter)};
+	return {current, BuildPreviousSourceRowsSQL(current, delta, delta_ts_filter),
+	        BuildStandardDeltaRowsSQL(delta, "", delta_ts_filter)};
 }
 
 static string BuildScopeChanges(const FullOuterScopeRelation &relation,
@@ -1446,7 +1450,7 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	if (!delta_ts_filter.empty()) {
 		delta_source += " WHERE " + delta_ts_filter;
 	}
-	delta_source += ")";
+	delta_source += ')';
 
 	auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
 	if (data_columns.empty()) {
@@ -1914,9 +1918,9 @@ static string HexEncodeToken(const string &input) {
 	string result;
 	result.reserve(input.size() * 2);
 	for (auto c : input) {
-		auto byte = static_cast<unsigned char>(c);
-		result.push_back(hex[(byte >> 4) & 0x0F]);
-		result.push_back(hex[byte & 0x0F]);
+		auto byte = static_cast<uint32_t>(static_cast<unsigned char>(c));
+		result.push_back(hex[(byte >> 4U) & 0x0FU]);
+		result.push_back(hex[byte & 0x0FU]);
 	}
 	return result;
 }

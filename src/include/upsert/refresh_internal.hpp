@@ -39,6 +39,8 @@ struct DuckLakeSourceLocation {
 	string table_name;
 };
 
+// Reconstruct a native source's previous bag, including conflicting insert/delete batches.
+string BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter);
 // Signed (+1 insert / -1 delete) rows of the snapshots after `last_snapshot_id` through the current one.
 string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
                                         int64_t current_snapshot_id);

@@ -72,6 +72,12 @@ For grouped aggregates over LEFT/RIGHT JOINs, OpenIVM uses the Larson & Zhou MER
 
 The MERGE path adds a hidden `openivm_match_count` column (`COUNT` of the NULL-supplying join key) so right-side aggregate columns can transition between NULL and real values. At CREATE time OpenIVM also generates a *secondary delta* for every LEFT JOIN level: an INSERT into the view's delta table that emits the NULL-padded rows appearing or disappearing when a key's match count crosses zero. Refresh runs it before the MERGE. If a secondary delta cannot be built for some level, the view is created as `GROUP_RECOMPUTE`; if its delta sources cannot be resolved at refresh time, that refresh uses affected-group recompute.
 
+When the last right-side match disappears, the secondary delta adds NULL pads for the **current** preserved input, including rows inserted in the batch. When the first match appears, it retracts pads for the **previous** preserved input, excluding new rows and including deleted rows. Transition counts consolidate all signed changes by join key, so updating a payload leaves that key's support unchanged.
+
+Reading the previous preserved input adds work at match transitions. Native sources reconstruct it from current rows and signed deltas; DuckLake uses the previous snapshot. Group aggregates continue to use incremental MERGE.
+
+After upgrading from the earlier correction program, recreate existing LEFT/RIGHT JOIN aggregate MVs from their original definitions to regenerate their stored secondary-delta SQL. Legacy stored programs retain their earlier behavior until recreated.
+
 ## Compiled SQL (2-table join, 3 terms)
 
 ### IVM query (delta propagation)

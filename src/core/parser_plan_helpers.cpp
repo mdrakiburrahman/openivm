@@ -3261,12 +3261,9 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 	}
 	string qcol = SqlUtils::QuoteIdentifier(inner_col);
 
-	// The correction below assumes a dangling (null-padded) row for this key is ALREADY materialized
-	// in the view -- true only if the preserved-side row (e.g. the order) existed before this refresh
-	// batch. If the preserved-side row is itself brand new in this same batch (e.g. a freshly inserted
-	// order that immediately gets its first line), no dangling row was ever materialized, and applying
-	// this correction would spuriously subtract a row that never existed. Resolve the preserved side's
-	// own base table/column so we can gate on "did this key exist before this batch's delta."
+	// Losing the last inner match creates a NULL-padded row for every current preserved row,
+	// including rows inserted in this batch. Gaining the first match must retract a NULL pad
+	// for old preserved rows; new rows never materialized that pad.
 	LogicalGet *pres_get = nullptr;
 	string pres_col;
 	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get) {
@@ -3277,13 +3274,9 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 		return false;
 	}
 	if (pres_get->table_index == inner_get->table_index || StringUtil::CIEquals(pres_identity, inner_identity)) {
-		// Self-referencing deepest join (preserved and inner sides are the same base table): the
-		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
-		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
-		// shape.
+		// This transition program assumes independently tracked preserved and nullable inputs.
 		return false;
 	}
-	string pres_qcol = SqlUtils::QuoteIdentifier(pres_col);
 
 	// Classify each aggregate output column's contribution to a null-padded row of the deepest join.
 	// output_names layout: [group cols (G)] [visible aggregates (agg.expressions, in order)] [hidden helpers].
@@ -3401,6 +3394,18 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 		return false;
 	}
 
+	// Rebuild the entire old preserved subtree, not just its join-key source: earlier
+	// joins can also gain/lose duplicate rows in the same refresh batch.
+	auto old_x_sql = SqlUtils::RewriteTableReferences(x_sql, [&](const vector<string> &parts) -> string {
+		if (parts.size() != 3) {
+			return "";
+		}
+		auto identity = SqlUtils::FullName(parts[0], parts[1], parts[2]);
+		return facts.source_table_info.count(identity)
+		           ? SqlUtils::QuoteIdentifier(string(openivm::LJSEC_OLD_SOURCE_PREFIX) + identity)
+		           : string();
+	});
+
 	// delta_mv columns: group cols + aggregate cols + openivm_multiplicity (matches the primary INSERT).
 	string col_list;
 	string sel;
@@ -3413,29 +3418,29 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 		sel += contribs[j] + ", ";
 	}
 	col_list += "openivm_multiplicity";
-	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
 	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
 	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
 	string dmv = delta_view_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
-	// The two delta row sources are placeholders resolved at refresh: a regular table reads its
+	// The inner delta row source is resolved at refresh: a regular table reads its
 	// openivm_delta_<table>, a DuckLake table reads ducklake_table_insertions/deletions between
-	// snapshots (whose IDs only exist at refresh time). Both substitutions yield columns (__k, __m).
+	// snapshots (whose IDs only exist at refresh time). It yields columns (__k, __m).
 	string inner_delta_src =
 	    string(openivm::LJSEC_INNER_DELTA_PREFIX) + std::to_string(level) + string(openivm::LJSEC_PLACEHOLDER_SUFFIX);
-	string pres_delta_src =
-	    string(openivm::LJSEC_PRES_DELTA_PREFIX) + std::to_string(level) + string(openivm::LJSEC_PLACEHOLDER_SUFFIX);
-	// The correlated LATERAL form is deliberate: rewriting these as pre-aggregated CTEs restricted to
-	// the delta keys measured ~40% SLOWER at TPC-H SF50 (DuckDB already decorrelates them well).
-	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel +
-	             "\nFROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src + " GROUP BY __k) __t\nJOIN (" + x_sql +
-	             ") X ON X.\"" + key_alias + "\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_identity +
-	             " ib WHERE ib." + qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " +
-	             pres_identity + " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " +
-	             pres_delta_src +
-	             " __pd WHERE __pd.__k = __t.__k), 0) AS __old_pres_count) __op"
-	             "\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND __old_pres_count > 0;";
+	// Share right-side transition counts between the current and old preserved inputs.
+	// Keep the correlated count: DuckDB decorrelates it efficiently without an
+	// additional full GROUP BY over the right table.
+	string transitions = "SELECT __t.__k, __newc FROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src +
+	                     " GROUP BY __k) __t, LATERAL (SELECT (SELECT COUNT(*) FROM " + inner_identity +
+	                     " ib WHERE ib." + qcol +
+	                     " = __t.__k) AS __newc) __n WHERE (__newc > 0) <> ((__newc - __t.dsum) > 0)";
+	string sql = "INSERT INTO " + dmv + " (" + col_list + ") WITH __transitions AS (" + transitions + ") SELECT " +
+	             sel + "1 FROM __transitions __t JOIN (" + x_sql + ") X ON X." + SqlUtils::QuoteIdentifier(key_alias) +
+	             " = __t.__k WHERE __t.__newc = 0 UNION ALL SELECT " + sel + "-1 FROM __transitions __t JOIN (" +
+	             old_x_sql + ") X ON X." + SqlUtils::QuoteIdentifier(key_alias) + " = __t.__k WHERE __t.__newc > 0;";
+	OPENIVM_DEBUG_PRINT("[CREATE] LEFT JOIN secondary level %zu uses current/previous preserved rows\n", level);
+
 	meta.sql += (meta.sql.empty() ? "" : "\n") + sql;
 	meta.inner_tables.push_back(inner_identity);
 	meta.inner_keys.push_back(inner_col);
