@@ -143,6 +143,7 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
                                        const vector<string> &output_names);
 string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                    const vector<string> &output_names,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
