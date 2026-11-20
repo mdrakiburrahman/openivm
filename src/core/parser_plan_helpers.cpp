@@ -5,6 +5,7 @@
 #include "core/plan_rewrite.hpp"
 #include "core/plan_rewrite_internal.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/spark_expression_marker.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/main/settings.hpp"
@@ -14,10 +15,15 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -2001,6 +2007,294 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 
 	for (auto &op : ops) {
 		out.push_back(ToMetadataWindowLineageOp(op));
+	}
+	return !out.empty();
+}
+
+static bool IsSparkExpressionMarkerCall(BoundFunctionExpression &func) {
+	using ScalarCallback = void (*)(DataChunk &, ExpressionState &, Vector &);
+	const auto callback = func.function.GetFunctionCallback().target<ScalarCallback>();
+	return callback && *callback == SparkExpressionMarker;
+}
+
+// Same stability rule as the incremental checker: Spark expression markers stand in for
+// deterministic Spark expressions and are not volatile.
+static bool IsRowLocalDeterministicExpression(Expression &expr) {
+	switch (expr.expression_class) {
+	case ExpressionClass::BOUND_AGGREGATE:
+	case ExpressionClass::BOUND_WINDOW:
+	case ExpressionClass::BOUND_SUBQUERY:
+	case ExpressionClass::BOUND_UNNEST:
+		return false;
+	case ExpressionClass::BOUND_COLUMN_REF:
+		if (expr.Cast<BoundColumnRefExpression>().depth != 0) {
+			return false;
+		}
+		break;
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &func = expr.Cast<BoundFunctionExpression>();
+		auto &name = func.function.name;
+		bool exempt = StringUtil::StartsWith(name, "__internal_compress") ||
+		              StringUtil::StartsWith(name, "__internal_decompress") || name == "error" ||
+		              IsSparkExpressionMarkerCall(func);
+		if (!exempt && func.function.GetStability() != FunctionStability::CONSISTENT) {
+			return false;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	bool supported = true;
+	ExpressionIterator::EnumerateChildren(
+	    expr, [&](Expression &child) { supported = supported && IsRowLocalDeterministicExpression(child); });
+	return supported;
+}
+
+static bool AllRowLocalDeterministic(vector<unique_ptr<Expression>> &expressions) {
+	for (auto &expr : expressions) {
+		if (!expr || !IsRowLocalDeterministicExpression(*expr)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static ColumnBinding ChaseIdentityBinding(ColumnBinding binding, const CreateMVPlanFacts &facts) {
+	for (idx_t depth = 0; depth < 64; depth++) {
+		auto it = facts.projections_by_index.find(binding.table_index);
+		if (it == facts.projections_by_index.end() || binding.column_index >= it->second->expressions.size()) {
+			break;
+		}
+		auto &expr = *it->second->expressions[binding.column_index];
+		if (expr.type != ExpressionType::BOUND_COLUMN_REF || expr.Cast<BoundColumnRefExpression>().depth != 0) {
+			break;
+		}
+		binding = expr.Cast<BoundColumnRefExpression>().binding;
+	}
+	return binding;
+}
+
+// True when the predicate is a bound on the row number that row 1 always satisfies, so every
+// non-empty partition keeps at least one output row.
+static bool KeepsFirstRowNumber(Expression &expr, const ColumnBinding &row_number, const CreateMVPlanFacts &facts) {
+	if (expr.type == ExpressionType::CONJUNCTION_AND) {
+		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
+		for (auto &child : conjunction.children) {
+			if (!KeepsFirstRowNumber(*child, row_number, facts)) {
+				return false;
+			}
+		}
+		return !conjunction.children.empty();
+	}
+	if (expr.expression_class != ExpressionClass::BOUND_COMPARISON) {
+		return false;
+	}
+	auto &comparison = expr.Cast<BoundComparisonExpression>();
+	auto comparison_type = comparison.type;
+	Expression *column = comparison.left.get();
+	Expression *constant = comparison.right.get();
+	if (column->type != ExpressionType::BOUND_COLUMN_REF) {
+		std::swap(column, constant);
+		comparison_type = FlipComparisonExpression(comparison_type);
+	}
+	if (column->type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &column_ref = column->Cast<BoundColumnRefExpression>();
+	if (column_ref.depth != 0 || !(ChaseIdentityBinding(column_ref.binding, facts) == row_number)) {
+		return false;
+	}
+	if (constant->expression_class == ExpressionClass::BOUND_CAST) {
+		auto &cast = constant->Cast<BoundCastExpression>();
+		if (!cast.return_type.IsIntegral()) {
+			return false;
+		}
+		constant = cast.child.get();
+	}
+	if (constant->expression_class != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &value = constant->Cast<BoundConstantExpression>().value;
+	Value limit_value;
+	if (value.IsNull() || !value.type().IsIntegral() ||
+	    !value.DefaultTryCastAs(LogicalType::BIGINT, limit_value, nullptr, true)) {
+		return false;
+	}
+	auto limit = limit_value.GetValue<int64_t>();
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		return limit == 1;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return limit >= 1;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return limit >= 2;
+	default:
+		return false;
+	}
+}
+
+static bool IsLinearWindowInput(LogicalOperator &node, const CreateMVPlanFacts &facts,
+                                unordered_set<idx_t> &table_indexes, idx_t &scans, idx_t depth) {
+	if (depth > 256) {
+		return false;
+	}
+	switch (node.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto &projection = node.Cast<LogicalProjection>();
+		auto it = facts.projections_by_index.find(projection.table_index);
+		if (it == facts.projections_by_index.end() || it->second != &projection ||
+		    !table_indexes.insert(projection.table_index).second || !AllRowLocalDeterministic(projection.expressions)) {
+			return false;
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_FILTER:
+		if (!AllRowLocalDeterministic(node.expressions)) {
+			return false;
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_UNION: {
+		auto &setop = node.Cast<LogicalSetOperation>();
+		if (!setop.setop_all || node.children.size() < 2 || !table_indexes.insert(setop.table_index).second) {
+			return false;
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = node.Cast<LogicalGet>();
+		auto it = facts.gets_by_index.find(get.table_index);
+		if (!node.children.empty() || !node.expressions.empty() || it == facts.gets_by_index.end() ||
+		    it->second != &get || !facts.occurrence_by_index.count(get.table_index) ||
+		    !table_indexes.insert(get.table_index).second) {
+			return false;
+		}
+		scans++;
+		return true;
+	}
+	default:
+		return false;
+	}
+	if (node.type != LogicalOperatorType::LOGICAL_UNION && node.children.size() != 1) {
+		return false;
+	}
+	for (auto &child : node.children) {
+		if (!IsLinearWindowInput(*child, facts, table_indexes, scans, depth + 1)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool BuildLinearWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                          const vector<string> &output_names,
+                                          vector<RefreshMetadata::WindowPartitionLineageOp> &out) {
+	out.clear();
+	if (!facts.root || !facts.first_projection || partition_columns.size() != 1 || facts.windows.size() != 1 ||
+	    facts.source_occurrences.empty() || !facts.comparison_joins.empty() || !facts.outer_joins.empty() ||
+	    !facts.aggregates.empty()) {
+		return false;
+	}
+	auto &window = *facts.windows[0];
+	if (window.expressions.size() != 1 || window.expressions[0]->expression_class != ExpressionClass::BOUND_WINDOW) {
+		return false;
+	}
+	auto &row_number = window.expressions[0]->Cast<BoundWindowExpression>();
+	if (row_number.type != ExpressionType::WINDOW_ROW_NUMBER || row_number.partitions.size() != 1 ||
+	    !row_number.children.empty() || !row_number.arg_orders.empty() || row_number.filter_expr ||
+	    row_number.start_expr || row_number.end_expr || row_number.offset_expr || row_number.default_expr ||
+	    row_number.partitions[0]->type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	for (auto &order : row_number.orders) {
+		if (!order.expression || !IsRowLocalDeterministicExpression(*order.expression)) {
+			return false;
+		}
+	}
+	auto &partition_ref = row_number.partitions[0]->Cast<BoundColumnRefExpression>();
+	if (partition_ref.depth != 0) {
+		return false;
+	}
+	auto partition_binding = ChaseIdentityBinding(partition_ref.binding, facts);
+
+	auto &spec = partition_columns[0];
+	auto pos = spec.find('=');
+	string output_col = pos == string::npos ? spec : spec.substr(0, pos);
+	if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
+		return false;
+	}
+	// The visible key must be the partition value itself, proven by column binding rather than by name.
+	idx_t output_index = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < output_names.size(); i++) {
+		if (StringUtil::CIEquals(output_names[i], output_col)) {
+			if (output_index != DConstants::INVALID_INDEX) {
+				return false;
+			}
+			output_index = i;
+		}
+	}
+	auto &top_expressions = facts.first_projection->expressions;
+	if (output_index == DConstants::INVALID_INDEX || output_index >= top_expressions.size() ||
+	    top_expressions[output_index]->type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &output_ref = top_expressions[output_index]->Cast<BoundColumnRefExpression>();
+	if (output_ref.depth != 0 || !(ChaseIdentityBinding(output_ref.binding, facts) == partition_binding)) {
+		return false;
+	}
+
+	unordered_set<idx_t> table_indexes;
+	LogicalOperator *node = facts.root;
+	if (node->type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
+		if (node->children.size() != 1) {
+			return false;
+		}
+		node = node->children[0].get();
+	}
+	if (node != facts.first_projection) {
+		return false;
+	}
+	ColumnBinding row_number_binding(window.window_index, 0);
+	while (node != &window) {
+		if (node->children.size() != 1) {
+			return false;
+		}
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = node->Cast<LogicalProjection>();
+			auto it = facts.projections_by_index.find(projection.table_index);
+			if (it == facts.projections_by_index.end() || it->second != &projection ||
+			    !table_indexes.insert(projection.table_index).second ||
+			    !AllRowLocalDeterministic(projection.expressions)) {
+				return false;
+			}
+		} else if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
+			for (auto &expression : node->expressions) {
+				if (!expression || !KeepsFirstRowNumber(*expression, row_number_binding, facts)) {
+					return false;
+				}
+			}
+		} else {
+			return false;
+		}
+		node = node->children[0].get();
+	}
+	idx_t scans = 0;
+	if (!table_indexes.insert(window.window_index).second || window.children.size() != 1 ||
+	    !IsLinearWindowInput(*window.children[0], facts, table_indexes, scans, 0) ||
+	    scans != facts.source_occurrences.size()) {
+		return false;
+	}
+
+	case_insensitive_set_t emitted;
+	for (auto &occurrence : facts.source_occurrences) {
+		if (!emitted.insert(occurrence.table).second) {
+			continue;
+		}
+		RefreshMetadata::WindowPartitionLineageOp op;
+		op.kind = "linear";
+		op.output_col = output_col;
+		op.source = occurrence.table;
+		out.push_back(std::move(op));
 	}
 	return !out.empty();
 }

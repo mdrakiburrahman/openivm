@@ -1199,7 +1199,7 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 			}
 			MetadataJson::ExtractJsonString(object, "lookup_cast", op.lookup_cast);
 			MetadataJson::ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
-		} else if (op.kind != "direct") {
+		} else if (op.kind != "direct" && op.kind != "linear") {
 			continue;
 		}
 		out.push_back(std::move(op));
