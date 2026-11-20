@@ -195,6 +195,14 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast);
 	string qoutput_col = SqlUtils::QuoteIdentifier(op.output_col);
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	if (op.null_safe) {
+		string null_safe_lookup_expr = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast, "openivm_lookup");
+		string null_safe_lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast, "openivm_lookup");
+		return "SELECT DISTINCT " + null_safe_lookup_out + " AS " + qoutput_col + " FROM " + lookup_table +
+		       " AS openivm_lookup JOIN (SELECT DISTINCT " + source_expr + " AS openivm_join_key FROM " + delta_table +
+		       filter + ") openivm_changed ON " + null_safe_lookup_expr +
+		       " IS NOT DISTINCT FROM openivm_changed.openivm_join_key";
+	}
 	return "SELECT DISTINCT " + lookup_out + " AS " + qoutput_col + " FROM " + lookup_table + " WHERE " + lookup_expr +
 	       " IN (SELECT DISTINCT " + source_expr + " FROM " + delta_table + filter + ")";
 }
@@ -285,12 +293,13 @@ static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeSourceSpec &source
 	string lookup_col = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast, "l");
 	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast, "l");
 	string output_col = SqlUtils::QuoteIdentifier(op.output_col);
+	string join_operator = op.null_safe ? " IS NOT DISTINCT FROM " : " = ";
 	string current_lookup = "SELECT " + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " +
 	                        lookup_table + " AS l AT (VERSION => " + to_string(lookup_spec.current_snap) + ") ON " +
-	                        lookup_col + " = c.openivm_join_key";
+	                        lookup_col + join_operator + "c.openivm_join_key";
 	string old_lookup = "SELECT " + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " + lookup_table +
 	                    " AS l AT (VERSION => " + to_string(lookup_spec.old_snap) + ") ON " + lookup_col +
-	                    " = c.openivm_join_key";
+	                    join_operator + "c.openivm_join_key";
 	return "(" + current_lookup + " UNION ALL " + old_lookup + ")";
 }
 

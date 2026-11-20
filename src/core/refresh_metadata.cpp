@@ -1199,6 +1199,8 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 			}
 			MetadataJson::ExtractJsonString(object, "lookup_cast", op.lookup_cast);
 			MetadataJson::ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
+			string null_safe;
+			op.null_safe = MetadataJson::ExtractJsonString(object, "null_safe", null_safe) && null_safe == "1";
 		} else if (op.kind != "direct") {
 			continue;
 		}
@@ -1229,6 +1231,9 @@ string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitio
 			}
 			if (!op.lookup_out_cast.empty()) {
 				json += ",\"lookup_out_cast\":" + SqlUtils::JsonQuote(op.lookup_out_cast);
+			}
+			if (op.null_safe) {
+				json += ",\"null_safe\":\"1\"";
 			}
 		}
 		json += "}";

@@ -51,6 +51,33 @@ Window functions without PARTITION BY treat the entire result as one partition.
 Any delta triggers a full recompute (equivalent to full refresh), but the view
 still benefits from empty-delta skipping — no-op when nothing changed.
 
+### Rank per child, aggregate per parent
+
+A view that keeps one row per child with `ROW_NUMBER() OVER (PARTITION BY child_id ORDER BY ...)`
+and then aggregates by a *different* column (`GROUP BY parent_id`) exposes only `parent_id`. The
+window's partition key (`child_id`) is not an output column, so the partition columns cannot be
+read from the output by name. OpenIVM instead scopes the recompute to the affected parents:
+
+- the parents of the old and new rows in the delta, and
+- the parents of every current row of a child that changed (a null-safe lookup on `child_id`),
+  which covers deletion, last-child loss, reassignment, a changed winner, and NULL keys.
+
+The view is then refreshed by deleting and re-inserting only those parents rather than the whole
+table.
+
+The scope is used only when it is provably equal to a full recompute; otherwise the unscoped
+window recompute is kept. All of the following must hold:
+
+- one `ROW_NUMBER` window with a single `PARTITION BY` column and a non-empty `ORDER BY`, and one
+  aggregate (`SUM`, `COUNT`, `MIN`, `MAX`, `BOOL_OR`, `BOOL_AND`, non-distinct, no `ORDER BY`)
+  grouped by one plain column that is not the partition column;
+- no joins, set operations, volatile expressions or DuckLake sources;
+- every source column the view reads above the window is in the ranking keys (the `ORDER BY`
+  columns plus the partition column) and has a type with a total, collation-free order, so rows
+  tied on the ranking keys are indistinguishable and the winner cannot depend on physical order.
+
+`HAVING` is applied to the visible view and its delta as usual; the backing table keeps every group.
+
 ## Running aggregates (opt-in)
 
 With `SET openivm_running_window_incremental = true` (default `false`), insert-only refreshes of
