@@ -22,6 +22,8 @@ struct RefreshPublicationScope {
 	string rows;
 	string cleanup_sql;
 	string signed_rows;
+	// Set by the caller when a window recompute should keep its affected partition keys for publication.
+	bool retain_window_keys = false;
 };
 
 struct ViewLocation {

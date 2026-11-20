@@ -665,7 +665,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	}
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
 	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql,
-	                              running_window_column_names, running_window_incremental, uses_running_suffix);
+	                              running_window_column_names, running_window_incremental, uses_running_suffix,
+	                              publication_scope);
 }
 
 } // namespace duckdb

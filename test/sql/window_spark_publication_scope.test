@@ -1,0 +1,75 @@
+# name: test/sql/window_spark_publication_scope.test
+# description: Spark WINDOW_PARTITION publishes only the partitions touched by the keyed recompute
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE wsp_events (entity_id INT, event_ts INT, seq INT, dim_key INT, amount INT);
+
+statement ok
+CREATE TABLE wsp_dim (dim_key INT, label VARCHAR, active BOOLEAN);
+
+statement ok
+INSERT INTO wsp_events VALUES (1, 1, 1, 10, 5), (2, 1, 1, 10, 7);
+
+statement ok
+INSERT INTO wsp_dim VALUES (10, 'ten', true);
+
+statement ok
+CREATE MATERIALIZED VIEW wsp_mv AS
+WITH ranked AS (
+    SELECT entity_id, event_ts, seq, dim_key, amount,
+           ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY event_ts DESC, seq DESC) AS rn
+    FROM wsp_events
+), latest AS (SELECT * FROM ranked WHERE rn = 1),
+d AS (SELECT dim_key, label FROM wsp_dim WHERE active)
+SELECT latest.entity_id, latest.amount, d.label
+FROM latest LEFT JOIN d ON latest.dim_key = d.dim_key;
+
+statement ok
+INSERT INTO wsp_events VALUES (1, 2, 1, 10, 9);
+
+statement ok
+UPDATE wsp_dim SET label = 'TEN' WHERE dim_key = 10;
+
+query T
+SELECT refresh_type_name
+FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
+LIMIT 1;
+----
+WINDOW_PARTITION
+
+# The next-state relation is restricted to the retained affected partition keys.
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
+WHERE sql LIKE 'CREATE TABLE %`openivm_publish_next___%` AS SELECT v.* FROM (%'
+  AND sql LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_affected___openivm_mv_6d656d6f7279_6d61696e_7773705f6d76_ d WHERE v.`entity_id` <=> d.`entity_id`)%';
+----
+1
+
+# The old side of the signed diff is restricted to the same partitions.
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
+WHERE sql LIKE 'CREATE TABLE %openivm_publish_changes%'
+  AND sql LIKE '%openivm_visible___%v WHERE EXISTS (SELECT 1 FROM openivm_affected___openivm_mv_6d656d6f7279_6d61696e_7773705f6d76_ d WHERE v.`entity_id` <=> d.`entity_id`)) old_rows%';
+----
+1
+
+# The affected-key table is dropped once, after the visible relation is updated.
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
+WHERE sql LIKE 'DROP TABLE IF EXISTS openivm_affected___%';
+----
+1
+
+query I
+SELECT (SELECT MAX(stmt_order) FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
+        WHERE sql LIKE 'DROP TABLE IF EXISTS openivm_affected___%')
+     > (SELECT MAX(stmt_order) FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
+        WHERE sql LIKE 'INSERT INTO %openivm_visible___%' AND sql NOT LIKE '%openivm_delta_openivm_visible%');
+----
+true
