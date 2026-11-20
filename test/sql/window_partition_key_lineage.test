@@ -1,0 +1,144 @@
+# name: test/sql/window_partition_key_lineage.test
+# description: A window partition key is only recognised through a raw output column, never by name
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE wk_fact(entity_id INTEGER, ts INTEGER, seq INTEGER, dim_key INTEGER, amount INTEGER);
+
+statement ok
+CREATE TABLE wk_dim(dim_key INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO wk_fact VALUES (1, 10, 1, 7, 100), (1, 20, 2, 8, 110), (2, 10, 1, 8, 200), (3, 10, 1, 7, 300), (4, 10, 1, 9, 400);
+
+statement ok
+INSERT INTO wk_dim VALUES (7, 'a'), (8, 'b'), (9, 'c');
+
+statement ok
+CREATE MATERIALIZED VIEW wk_raw AS
+WITH latest AS (
+    SELECT * FROM (
+        SELECT entity_id, ts, seq, dim_key, amount,
+               ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+        FROM wk_fact
+    ) r WHERE rn = 1
+)
+SELECT latest.entity_id AS ent, latest.amount, d.label
+FROM latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key;
+
+statement ok
+CREATE MATERIALIZED VIEW wk_transformed AS
+WITH latest AS (
+    SELECT * FROM (
+        SELECT entity_id, ts, seq, dim_key, amount,
+               ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+        FROM wk_fact
+    ) r WHERE rn = 1
+)
+SELECT latest.entity_id + 1000 AS entity_id, latest.amount, d.label
+FROM latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key;
+
+statement ok
+CREATE MATERIALIZED VIEW wk_swapped AS
+WITH latest AS (
+    SELECT * FROM (
+        SELECT entity_id, ts, seq, dim_key, amount,
+               ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+        FROM wk_fact
+    ) r WHERE rn = 1
+)
+SELECT latest.dim_key AS entity_id, latest.entity_id AS ent, latest.amount, d.label
+FROM latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key;
+
+# A transformed output named after the key is not the key; a raw key re-aliased under another name is.
+query III
+SELECT
+    bool_or(sql LIKE '%openivm_affected_%') FILTER (WHERE mv = 'wk_raw'),
+    bool_or(sql LIKE '%openivm_affected_%') FILTER (WHERE mv = 'wk_transformed'),
+    bool_or(sql LIKE '%openivm_affected_%') FILTER (WHERE mv = 'wk_swapped')
+FROM (
+    SELECT 'wk_raw' AS mv, sql FROM openivm_compile_with_facts('wk_raw', '{"target_dialect":"spark","compile_only":true}')
+    UNION ALL
+    SELECT 'wk_transformed', sql FROM openivm_compile_with_facts('wk_transformed', '{"target_dialect":"spark","compile_only":true}')
+    UNION ALL
+    SELECT 'wk_swapped', sql FROM openivm_compile_with_facts('wk_swapped', '{"target_dialect":"spark","compile_only":true}')
+);
+----
+true	false	true
+
+statement ok
+INSERT INTO wk_fact VALUES (1, 30, 3, 9, 120), (5, 10, 1, 7, 500);
+
+statement ok
+UPDATE wk_fact SET entity_id = 6 WHERE entity_id = 3;
+
+statement ok
+UPDATE wk_dim SET label = 'b2' WHERE dim_key = 8;
+
+statement ok
+DELETE FROM wk_fact WHERE entity_id = 4;
+
+statement ok
+PRAGMA refresh('wk_raw');
+
+statement ok
+PRAGMA refresh('wk_transformed');
+
+statement ok
+PRAGMA refresh('wk_swapped');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM wk_raw EXCEPT ALL
+     SELECT latest.entity_id, latest.amount, d.label FROM (
+         SELECT entity_id, dim_key, amount,
+                ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+         FROM wk_fact) latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key WHERE latest.rn = 1)
+    UNION ALL
+    (SELECT latest.entity_id, latest.amount, d.label FROM (
+         SELECT entity_id, dim_key, amount,
+                ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+         FROM wk_fact) latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key WHERE latest.rn = 1
+     EXCEPT ALL SELECT * FROM wk_raw)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM wk_transformed EXCEPT ALL
+     SELECT latest.entity_id + 1000, latest.amount, d.label FROM (
+         SELECT entity_id, dim_key, amount,
+                ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+         FROM wk_fact) latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key WHERE latest.rn = 1)
+    UNION ALL
+    (SELECT latest.entity_id + 1000, latest.amount, d.label FROM (
+         SELECT entity_id, dim_key, amount,
+                ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+         FROM wk_fact) latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key WHERE latest.rn = 1
+     EXCEPT ALL SELECT * FROM wk_transformed)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM wk_swapped EXCEPT ALL
+     SELECT latest.dim_key, latest.entity_id, latest.amount, d.label FROM (
+         SELECT entity_id, dim_key, amount,
+                ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+         FROM wk_fact) latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key WHERE latest.rn = 1)
+    UNION ALL
+    (SELECT latest.dim_key, latest.entity_id, latest.amount, d.label FROM (
+         SELECT entity_id, dim_key, amount,
+                ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC, seq DESC) AS rn
+         FROM wk_fact) latest LEFT JOIN wk_dim d ON latest.dim_key = d.dim_key WHERE latest.rn = 1
+     EXCEPT ALL SELECT * FROM wk_swapped)
+);
+----
+0

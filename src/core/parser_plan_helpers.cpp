@@ -2026,8 +2026,11 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 				continue;
 			}
 			string base_col = ResolveBindingToBaseColumn(bcr, facts);
-			if (!StringUtil::CIEquals(base_col, partition_column) &&
-			    !StringUtil::CIEquals(bcr->GetName(), partition_column)) {
+			// The reference's own name is the output alias, so it only identifies the key when the base column
+			// cannot be resolved; otherwise `other AS key` would be mistaken for the partition key.
+			bool same_key = base_col.empty() ? StringUtil::CIEquals(bcr->GetName(), partition_column)
+			                                 : StringUtil::CIEquals(base_col, partition_column);
+			if (!same_key) {
 				continue;
 			}
 			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);

@@ -35,9 +35,14 @@ static string WindowPartitionOutputColumn(const string &partition_column) {
 }
 
 static vector<string> ProjectedWindowPartitionColumns(const vector<string> &partition_columns,
-                                                      const vector<string> &output_names) {
+                                                      const vector<string> &output_names, bool has_top_projection) {
 	vector<string> projected;
 	for (auto &partition_column : partition_columns) {
+		// With a top projection, a key that never resolved to a raw output column is not visible under its own
+		// name: a same-named output is a transformed or re-aliased expression, not the key.
+		if (has_top_projection && partition_column.find('=') == string::npos) {
+			continue;
+		}
 		auto output_column = WindowPartitionOutputColumn(partition_column);
 		if (!IncrementalTableNames::IsInternalColumn(output_column) && ContainsStringCI(output_names, output_column)) {
 			AddStringCI(projected, partition_column);
@@ -654,7 +659,8 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
 		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, model.window_lineage_ops,
 		                                                  &direct_lineage_ops);
-		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
+		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names,
+		                                                                  facts.first_projection != nullptr);
 		for (auto &node : model.nodes) {
 			if (node.kind == DeltaModelNodeKind::WINDOW) {
 				node.affected_key_columns = model.window_partition_columns;
