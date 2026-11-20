@@ -796,16 +796,27 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	refresh_plan.refresh_type = dispatch_refresh_type;
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	RefreshPublicationScope retained_publication_scope;
-	auto publication_scope = !publication_query.empty() && !global_publication && target_is_ducklake &&
-	                                 active_facts.target_dialect == SqlDialect::DUCKDB
-	                             ? &retained_publication_scope
-	                             : nullptr;
+	bool no_ducklake_delta_source =
+	    std::none_of(delta_sources.begin(), delta_sources.end(), [](const RefreshMetadata::DeltaSource &source) {
+		    return StringUtil::CIEquals(source.catalog_type, "ducklake");
+	    });
+	// A Spark window recompute already knows the affected partition keys; keep them for publication
+	// so the visible relation is not rebuilt and diffed in full on every refresh.
+	bool spark_scoped_window_publication = dispatch_refresh_type == RefreshType::WINDOW_PARTITION &&
+	                                       active_facts.target_dialect == SqlDialect::SPARK && !group_cols.empty() &&
+	                                       !publication_query.empty() && !global_publication && !target_is_ducklake &&
+	                                       no_ducklake_delta_source;
+	auto publication_scope =
+	    !publication_query.empty() && !global_publication &&
+	            ((target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB) ||
+	             spark_scoped_window_publication)
+	        ? &retained_publication_scope
+	        : nullptr;
+	retained_publication_scope.retain_window_keys = spark_scoped_window_publication;
 	vector<string> window_publication_keys;
 	if (dispatch_refresh_type == RefreshType::WINDOW_PARTITION && !group_cols.empty() && !publication_query.empty() &&
 	    !global_publication && !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
-	    std::none_of(delta_sources.begin(), delta_sources.end(), [](const RefreshMetadata::DeltaSource &source) {
-		    return StringUtil::CIEquals(source.catalog_type, "ducklake");
-	    })) {
+	    no_ducklake_delta_source) {
 		// Recompute emits exact old/new rows, not aggregate arithmetic. Restrict
 		// publication to their visible tuples instead of every row in a partition.
 		for (auto &column : publication_columns) {
@@ -1668,6 +1679,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// ORDER BY/LIMIT. Keep the signed visible diff for those global wrappers.
 		if (global_publication || active_facts.target_dialect != SqlDialect::DUCKDB) {
 			appended_projection_rows.clear();
+		}
+		if (!retained_publication_scope.rows.empty() && spark_scoped_window_publication &&
+		    !std::all_of(retained_publication_scope.columns.begin(), retained_publication_scope.columns.end(),
+		                 [&](const string &column) {
+			                 return std::find(publication_columns.begin(), publication_columns.end(), column) !=
+			                        publication_columns.end();
+		                 })) {
+			// The partition key is not a published column, so the visible rows cannot be matched to it.
+			// Publish unscoped; the cleanup statement still drops the retained key table.
+			retained_publication_scope.rows.clear();
+			retained_publication_scope.columns.clear();
+			scope_columns.clear();
 		}
 		if (!retained_publication_scope.rows.empty()) {
 			scope_columns = retained_publication_scope.columns;

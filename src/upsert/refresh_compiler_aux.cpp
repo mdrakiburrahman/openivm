@@ -1362,7 +1362,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const vector<string> &column_names,
                               bool running_window_incremental, bool *uses_running_suffix,
-                              bool use_data_modifying_ctes) {
+                              bool use_data_modifying_ctes, RefreshPublicationScope *publication_scope) {
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
@@ -1403,9 +1403,13 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		}
 		string target_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_target");
 		string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
+		auto retained_scope = publication_scope && publication_scope->retain_window_keys ? publication_scope : nullptr;
+		if (retained_scope) {
+			retained_scope->columns = output_columns;
+		}
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
 		                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
-		                                  affected_temp_table);
+		                                  affected_temp_table, {}, "", retained_scope);
 	}
 
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
