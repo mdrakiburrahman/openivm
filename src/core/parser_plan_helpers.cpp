@@ -2623,6 +2623,348 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	return !out.empty();
 }
 
+static bool IsGroupScopeTieSafeType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::UUID:
+		return true;
+	case LogicalTypeId::VARCHAR:
+		return StringType::GetCollation(type).empty();
+	default:
+		return false;
+	}
+}
+
+static bool CollectGroupScopeColumnRefs(Expression &expr, vector<BoundColumnRefExpression *> &refs) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY ||
+	    expr.GetExpressionClass() == ExpressionClass::BOUND_WINDOW ||
+	    expr.GetReturnType().id() == LogicalTypeId::FLOAT || expr.GetReturnType().id() == LogicalTypeId::DOUBLE) {
+		return false;
+	}
+	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+		auto &ref = expr.Cast<BoundColumnRefExpression>();
+		if (ref.Depth() != 0) {
+			return false;
+		}
+		refs.push_back(&ref);
+		return true;
+	}
+	bool ok = true;
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
+		ok = ok && CollectGroupScopeColumnRefs(child, refs);
+	});
+	return ok;
+}
+
+static bool ResolvePlainBindingToGet(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
+                                     ProjectionIndex &column_index) {
+	for (idx_t depth = 0; depth < 16; ++depth) {
+		auto get_it = facts.gets_by_index.find(binding.table_index);
+		if (get_it != facts.gets_by_index.end()) {
+			get = get_it->second;
+			column_index = binding.column_index;
+			return true;
+		}
+		auto proj_it = facts.projections_by_index.find(binding.table_index);
+		if (proj_it == facts.projections_by_index.end() ||
+		    binding.column_index.GetIndex() >= proj_it->second->expressions.size()) {
+			return false;
+		}
+		auto &expr = *proj_it->second->expressions[binding.column_index.GetIndex()];
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		binding = expr.Cast<BoundColumnRefExpression>().Binding();
+	}
+	return false;
+}
+
+static bool FindWindowAncestors(LogicalOperator &op, const LogicalWindow &window, vector<LogicalOperator *> &ancestors) {
+	if (&op == &window) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (FindWindowAncestors(*child, window, ancestors)) {
+			ancestors.push_back(&op);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                  vector<string> &partition_columns,
+                                  vector<RefreshMetadata::WindowPartitionLineageOp> &ops) {
+	partition_columns.clear();
+	ops.clear();
+	auto decline = [](const char *reason) {
+		OPENIVM_DEBUG_PRINT("[WINDOW GROUP SCOPE] declined: %s\n", reason);
+		return false;
+	};
+	if (!facts.root || !facts.first_projection || facts.analysis.found_volatile_expression ||
+	    !facts.ducklake_table_info.empty() || !facts.comparison_joins.empty() || !facts.outer_joins.empty() ||
+	    !facts.setops_by_index.empty() || !facts.cte_refs_by_table_index.empty() || !facts.cte_defs_by_index.empty() ||
+	    facts.windows.size() != 1 || facts.aggregates.size() != 1 || facts.source_occurrences.size() != 1) {
+		return decline("unsupported plan shape");
+	}
+	for (const auto &node : facts.plan_nodes_post_order) {
+		switch (node.plan_node->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_WINDOW:
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		case LogicalOperatorType::LOGICAL_GET:
+			break;
+		default:
+			return decline("unsupported plan node");
+		}
+	}
+
+	auto &window = *facts.windows.front();
+	auto &aggregate = *facts.aggregates.front();
+	if (window.expressions.size() != 1 ||
+	    window.expressions.front()->GetExpressionClass() != ExpressionClass::BOUND_WINDOW ||
+	    window.expressions.front()->GetExpressionType() != ExpressionType::WINDOW_ROW_NUMBER) {
+		return decline("window is not a single ROW_NUMBER");
+	}
+	auto &row_number = window.expressions.front()->Cast<BoundWindowExpression>();
+	if (row_number.Partitions().size() != 1 || row_number.OrderBy().empty() || row_number.Filter() ||
+	    row_number.IgnoreNulls() || row_number.Distinct() || !row_number.GetChildren().empty() ||
+	    !row_number.ArgOrders().empty()) {
+		return decline("unsupported ROW_NUMBER specification");
+	}
+
+	// Rows tied on the ORDER BY keys must also agree on every column read above the
+	// window; otherwise the unspecified tie-break could move a different row to rank 1.
+	std::set<string> ranking_columns;
+	LogicalGet *partition_get = nullptr;
+	ProjectionIndex partition_column_index;
+	string partition_name;
+	auto add_ranking_column = [&](Expression &expr, bool is_partition) {
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		LogicalGet *get = nullptr;
+		ProjectionIndex column_index;
+		string name;
+		if (!ResolvePlainBindingToGet(expr.Cast<BoundColumnRefExpression>().Binding(), facts, get, column_index) ||
+		    !GetLogicalGetColumnName(*get, column_index, name)) {
+			return false;
+		}
+		if (is_partition) {
+			partition_get = get;
+			partition_column_index = column_index;
+			partition_name = name;
+		}
+		ranking_columns.insert(std::to_string(get->table_index.index) + ":" + StringUtil::Lower(name));
+		return true;
+	};
+	if (!add_ranking_column(*row_number.Partitions().front(), true)) {
+		return decline("partition key is not a plain source column");
+	}
+	for (auto &order : row_number.OrderBy()) {
+		if (!add_ranking_column(*order.expression, false)) {
+			return decline("ORDER BY key is not a plain source column");
+		}
+	}
+
+	vector<LogicalOperator *> ancestors;
+	if (!FindWindowAncestors(*facts.root, window, ancestors)) {
+		return decline("window is not under the plan root");
+	}
+	bool aggregate_above_window = false;
+	vector<Expression *> consumers;
+	for (auto *ancestor : ancestors) {
+		switch (ancestor->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+			break;
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+			if (ancestor == facts.first_projection) {
+				for (auto &expr : ancestor->expressions) {
+					consumers.push_back(expr.get());
+				}
+			}
+			break;
+		case LogicalOperatorType::LOGICAL_FILTER:
+			for (auto &expr : ancestor->expressions) {
+				consumers.push_back(expr.get());
+			}
+			break;
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+			if (ancestor != &aggregate || aggregate_above_window) {
+				return decline("unsupported aggregate placement");
+			}
+			aggregate_above_window = true;
+			for (auto &expr : aggregate.groups) {
+				consumers.push_back(expr.get());
+			}
+			for (auto &expr : aggregate.expressions) {
+				consumers.push_back(expr.get());
+			}
+			break;
+		default:
+			return decline("unsupported node above window");
+		}
+	}
+	if (!aggregate_above_window || aggregate.groups.size() != 1 || aggregate.grouping_sets.size() > 1 ||
+	    !aggregate.grouping_functions.empty()) {
+		return decline("expected a single plain GROUP BY above the window");
+	}
+	static const std::set<string> allowed_aggregates = {"sum", "count", "count_star", "min", "max", "bool_or", "bool_and"};
+	for (auto &expr : aggregate.expressions) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			return decline("unsupported aggregate expression");
+		}
+		auto &call = expr->Cast<BoundAggregateExpression>();
+		if (call.IsDistinct() || call.GetOrderBys() || !allowed_aggregates.count(call.Function().GetName().GetIdentifierName())) {
+			return decline("unsupported aggregate function");
+		}
+	}
+
+	std::set<string> consumed;
+	bool consumed_ok = true;
+	std::function<void(ColumnBinding, idx_t)> consume = [&](ColumnBinding binding, idx_t depth) {
+		if (!consumed_ok) {
+			return;
+		}
+		if (depth >= 16) {
+			consumed_ok = false;
+			return;
+		}
+		if (binding.table_index == window.window_index || binding.table_index == aggregate.group_index ||
+		    binding.table_index == aggregate.aggregate_index || binding.table_index == aggregate.groupings_index) {
+			return;
+		}
+		auto get_it = facts.gets_by_index.find(binding.table_index);
+		if (get_it != facts.gets_by_index.end()) {
+			string name;
+			LogicalType type;
+			if (!GetLogicalGetColumnName(*get_it->second, binding.column_index, name) ||
+			    !GetLogicalGetColumnType(*get_it->second, binding.column_index, type) ||
+			    !IsGroupScopeTieSafeType(type)) {
+				consumed_ok = false;
+				return;
+			}
+			consumed.insert(std::to_string(binding.table_index.index) + ":" + StringUtil::Lower(name));
+			return;
+		}
+		auto proj_it = facts.projections_by_index.find(binding.table_index);
+		if (proj_it == facts.projections_by_index.end() ||
+		    binding.column_index.GetIndex() >= proj_it->second->expressions.size()) {
+			consumed_ok = false;
+			return;
+		}
+		vector<BoundColumnRefExpression *> refs;
+		if (!CollectGroupScopeColumnRefs(*proj_it->second->expressions[binding.column_index.GetIndex()], refs)) {
+			consumed_ok = false;
+			return;
+		}
+		for (auto *ref : refs) {
+			consume(ref->Binding(), depth + 1);
+		}
+	};
+	for (auto *consumer : consumers) {
+		vector<BoundColumnRefExpression *> refs;
+		if (!CollectGroupScopeColumnRefs(*consumer, refs)) {
+			return decline("unsupported expression above window");
+		}
+		for (auto *ref : refs) {
+			consume(ref->Binding(), 0);
+		}
+	}
+	if (!consumed_ok) {
+		return decline("column read above the window is unresolved or not tie-safe");
+	}
+	LogicalType partition_type;
+	if (!GetLogicalGetColumnType(*partition_get, partition_column_index, partition_type) ||
+	    !IsGroupScopeTieSafeType(partition_type)) {
+		return decline("partition key type is not tie-safe");
+	}
+	for (auto &column : consumed) {
+		if (!ranking_columns.count(column)) {
+			return decline("column read above the window is not covered by the ranking keys");
+		}
+	}
+
+	if (aggregate.groups.front()->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return decline("group key is not a plain column");
+	}
+	LogicalGet *group_get = nullptr;
+	ProjectionIndex group_column_index;
+	string group_name;
+	if (!ResolvePlainBindingToGet(aggregate.groups.front()->Cast<BoundColumnRefExpression>().Binding(), facts,
+	                              group_get, group_column_index) ||
+	    group_get != partition_get || !GetLogicalGetColumnName(*group_get, group_column_index, group_name)) {
+		return decline("group key does not resolve to the ranked source");
+	}
+	if (group_column_index == partition_column_index) {
+		return decline("group key is the window partition key");
+	}
+	auto occurrence_it = facts.occurrence_by_index.find(partition_get->table_index);
+	if (occurrence_it == facts.occurrence_by_index.end()) {
+		return decline("source occurrence not found");
+	}
+
+	string output_name;
+	idx_t visible_matches = 0;
+	auto &top_expressions = facts.first_projection->expressions;
+	for (idx_t i = 0; i < top_expressions.size(); ++i) {
+		if (top_expressions[i]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto &ref = top_expressions[i]->Cast<BoundColumnRefExpression>();
+		if (ResolvesToGroupBinding(ref.Binding().table_index, ref.Binding().column_index, aggregate.group_index, 1,
+		                           facts)) {
+			output_name = ProjectionOutputName(top_expressions[i], i, output_names, ref);
+			visible_matches++;
+		}
+	}
+	if (visible_matches != 1 || output_name.empty() || IncrementalTableNames::IsInternalColumn(output_name)) {
+		return decline("group key is not exposed exactly once");
+	}
+
+	const auto &table = occurrence_it->second.table;
+	RefreshMetadata::WindowPartitionLineageOp direct;
+	direct.kind = WindowLineageKind::DIRECT;
+	direct.output_col = output_name;
+	direct.source = table;
+	direct.source_col = group_name;
+	ops.push_back(direct);
+	// Parents of every current row of a changed child cover the new winner and any
+	// surviving old winner; deleted old rows are covered by the direct arm.
+	RefreshMetadata::WindowPartitionLineageOp lookup;
+	lookup.kind = WindowLineageKind::LOOKUP;
+	lookup.output_col = output_name;
+	lookup.source = table;
+	lookup.source_col = partition_name;
+	lookup.lookup = table;
+	lookup.lookup_col = partition_name;
+	lookup.lookup_out = group_name;
+	lookup.null_safe = true;
+	ops.push_back(lookup);
+	partition_columns.push_back(output_name + "=" + group_name);
+	return true;
+}
+
 void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
                                        const vector<string> &output_names) {
 	if (partition_columns.empty()) {

@@ -149,6 +149,11 @@ string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
+/// Scope a window-then-aggregate view whose ranking key is hidden to the visible
+/// GROUP BY key. Declines unless ties among ranked rows are provably immaterial.
+bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                  vector<string> &partition_columns,
+                                  vector<RefreshMetadata::WindowPartitionLineageOp> &ops);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
 /// A same-named source/output key for a single-source, key-local plan; empty if

@@ -396,6 +396,8 @@ public:
 		string lookup_cast;
 		string lookup_out;
 		string lookup_out_cast;
+		// Lookup arm only: match changed source values to lookup values with IS NOT DISTINCT FROM.
+		bool null_safe = false;
 	};
 
 	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);

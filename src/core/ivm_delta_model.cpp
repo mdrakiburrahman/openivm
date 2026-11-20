@@ -227,6 +227,16 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, model.window_lineage_ops,
 		                                                  &direct_lineage_ops);
 		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
+		if (!analysis.found_asof_join) {
+			// A visible output merely named like the partition key is not proof that it carries
+			// that key once the aggregate regroups by another column, so this builder wins.
+			vector<string> group_scope_columns;
+			vector<RefreshMetadata::WindowPartitionLineageOp> group_scope_ops;
+			if (BuildWindowGroupScopeLineage(facts, output_names, group_scope_columns, group_scope_ops)) {
+				model.window_partition_columns = std::move(group_scope_columns);
+				model.window_lineage_ops = std::move(group_scope_ops);
+			}
+		}
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, facts) ||
 		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {

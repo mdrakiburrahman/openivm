@@ -1,0 +1,326 @@
+# name: test/sql/window_group_scope.test
+# description: Rank-per-child then aggregate-per-parent recomputes only the affected parents
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE wgs_obs(child INT, parent INT, ts INT, status VARCHAR, qty INT);
+
+statement ok
+INSERT INTO wgs_obs VALUES
+(1,10,1,'ready',1),(1,10,2,'blocked',2),
+(2,10,1,'ready',3),
+(3,20,1,'ready',4),(3,30,1,'ready',5),
+(4,30,1,NULL,NULL),
+(NULL,10,1,'ready',6),(NULL,20,2,'ready',7);
+
+statement ok
+CREATE MATERIALIZED VIEW wgs_totals AS
+WITH ranked AS (
+    SELECT child, parent, ts, status, qty,
+           row_number() OVER (PARTITION BY child ORDER BY ts DESC, parent, status, qty) AS rn
+    FROM wgs_obs)
+SELECT parent, count(*) AS n, sum(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS n_ready, sum(qty) AS q
+FROM ranked WHERE rn = 1 GROUP BY parent;
+
+statement ok
+CREATE VIEW wgs_ref AS
+WITH ranked AS (
+    SELECT child, parent, ts, status, qty,
+           row_number() OVER (PARTITION BY child ORDER BY ts DESC, parent, status, qty) AS rn
+    FROM wgs_obs)
+SELECT parent, count(*) AS n, sum(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS n_ready, sum(qty) AS q
+FROM ranked WHERE rn = 1 GROUP BY parent;
+
+# The affected parents come from the old and new winners of the changed children, not a bare delete.
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_totals','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_order=1 AND lower(sql) LIKE '%openivm_affected_%';
+----
+1
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_totals','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE lower(sql) LIKE 'delete from %' AND lower(sql) NOT LIKE '%exists%';
+----
+0
+
+query IIII rowsort
+SELECT * FROM wgs_totals;
+----
+10	2	1	5
+20	2	2	11
+30	1	0	NULL
+
+# The winner moves to another parent while the child's other row stays behind.
+statement ok
+UPDATE wgs_obs SET parent = 30 WHERE child = 1 AND ts = 2;
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query IIII rowsort
+SELECT * FROM wgs_totals;
+----
+10	1	1	3
+20	2	2	11
+30	2	0	2
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
+
+# Losing a parent's last child removes the parent row.
+statement ok
+DELETE FROM wgs_obs WHERE child = 4;
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query IIII rowsort
+SELECT * FROM wgs_totals;
+----
+10	1	1	3
+20	2	2	11
+30	1	0	2
+
+statement ok
+DELETE FROM wgs_obs WHERE child = 2;
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query IIII rowsort
+SELECT * FROM wgs_totals;
+----
+20	2	2	11
+30	1	0	2
+
+# NULL child ids form one ranking partition; removing its winner promotes a row of another parent.
+statement ok
+DELETE FROM wgs_obs WHERE child IS NULL AND ts = 2;
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
+
+# NULL parent ids form one group.
+statement ok
+INSERT INTO wgs_obs VALUES (5,NULL,1,'ready',8),(6,10,1,'ready',9);
+
+statement ok
+UPDATE wgs_obs SET parent = NULL WHERE child = 6;
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
+
+query I
+SELECT count(*) FROM wgs_totals WHERE parent IS NULL AND n = 2;
+----
+1
+
+# Duplicate rows are counted once per child; deleting one copy leaves the other.
+statement ok
+INSERT INTO wgs_obs VALUES (7,20,5,'ready',1),(7,20,5,'ready',1);
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
+
+statement ok
+DELETE FROM wgs_obs WHERE rowid = (SELECT min(rowid) FROM wgs_obs WHERE child = 7);
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
+
+# Several conflicting changes are refreshed as one batch.
+statement ok
+INSERT INTO wgs_obs VALUES (8,30,9,'ready',2);
+
+statement ok
+UPDATE wgs_obs SET status = 'blocked' WHERE child = 3;
+
+statement ok
+DELETE FROM wgs_obs WHERE child = 5;
+
+statement ok
+UPDATE wgs_obs SET parent = 20 WHERE child = 1;
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
+
+statement ok
+DELETE FROM wgs_obs;
+
+statement ok
+PRAGMA refresh('wgs_totals');
+
+query I
+SELECT count(*) FROM wgs_totals;
+----
+0
+
+# Ranking keys that do not cover every column read above the window leave the baseline program.
+statement ok
+CREATE MATERIALIZED VIEW wgs_open_ties AS
+WITH ranked AS (
+    SELECT child, parent, qty, row_number() OVER (PARTITION BY child ORDER BY ts DESC) AS rn FROM wgs_obs)
+SELECT parent, sum(qty) AS q FROM ranked WHERE rn = 1 GROUP BY parent;
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_open_ties','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE lower(sql) LIKE '%openivm_affected_%';
+----
+0
+
+# A transformed output that reuses the group key's name is not the group key.
+statement ok
+CREATE MATERIALIZED VIEW wgs_shadow AS
+WITH ranked AS (
+    SELECT child, parent, ts, qty, row_number() OVER (PARTITION BY child ORDER BY ts DESC, parent, qty) AS rn FROM wgs_obs)
+SELECT parent + 1 AS parent, sum(qty) AS q FROM ranked WHERE rn = 1 GROUP BY parent;
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_shadow','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE lower(sql) LIKE '%openivm_affected_%';
+----
+0
+
+# An output that merely carries the partition key's name does not decide the scope: the group key does.
+statement ok
+INSERT INTO wgs_obs VALUES (1,10,1,'ready',1),(1,20,2,'ready',2),(2,10,1,'ready',3),(3,30,1,'ready',4);
+
+statement ok
+CREATE MATERIALIZED VIEW wgs_renamed AS
+WITH ranked AS (
+    SELECT child, parent, qty, row_number() OVER (PARTITION BY child ORDER BY parent, qty) AS rn FROM wgs_obs)
+SELECT parent AS child, count(*) AS n, sum(qty) AS q FROM ranked WHERE rn = 1 GROUP BY parent;
+
+statement ok
+CREATE VIEW wgs_renamed_ref AS
+WITH ranked AS (
+    SELECT child, parent, qty, row_number() OVER (PARTITION BY child ORDER BY parent, qty) AS rn FROM wgs_obs)
+SELECT parent AS child, count(*) AS n, sum(qty) AS q FROM ranked WHERE rn = 1 GROUP BY parent;
+
+statement ok
+CREATE MATERIALIZED VIEW wgs_maxed AS
+WITH ranked AS (
+    SELECT child, parent, row_number() OVER (PARTITION BY child ORDER BY parent) AS rn FROM wgs_obs)
+SELECT parent, max(child) AS child, count(*) AS n FROM ranked WHERE rn = 1 GROUP BY parent;
+
+statement ok
+CREATE VIEW wgs_maxed_ref AS
+WITH ranked AS (
+    SELECT child, parent, row_number() OVER (PARTITION BY child ORDER BY parent) AS rn FROM wgs_obs)
+SELECT parent, max(child) AS child, count(*) AS n FROM ranked WHERE rn = 1 GROUP BY parent;
+
+statement ok
+DELETE FROM wgs_obs WHERE child = 1 AND parent = 10;
+
+statement ok
+INSERT INTO wgs_obs VALUES (4,10,1,'ready',5),(3,40,1,'ready',6);
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_renamed','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_order=1 AND lower(sql) LIKE '%openivm_affected_%';
+----
+1
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_maxed','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_order=1 AND lower(sql) LIKE '%openivm_affected_%';
+----
+1
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_renamed','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE lower(sql) LIKE 'delete from %' AND lower(sql) NOT LIKE '%exists%';
+----
+0
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('wgs_maxed','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE lower(sql) LIKE 'delete from %' AND lower(sql) NOT LIKE '%exists%';
+----
+0
+
+statement ok
+PRAGMA refresh('wgs_renamed');
+
+statement ok
+PRAGMA refresh('wgs_maxed');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_renamed_ref EXCEPT ALL SELECT * FROM wgs_renamed);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_renamed EXCEPT ALL SELECT * FROM wgs_renamed_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_maxed_ref EXCEPT ALL SELECT * FROM wgs_maxed);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_maxed EXCEPT ALL SELECT * FROM wgs_maxed_ref);
+----
+0
