@@ -21,6 +21,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -379,7 +380,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
-		exec_con.Query("SET preserve_insertion_order=false");
+		Settings::Set<PreserveInsertionOrderSetting>(*exec_con.context, SetScope::SESSION, Value::BOOLEAN(false));
 		// The archive lives in the metadata location exec_con selected (catalog and schema).
 		string archive_catalog;
 		string archive_schema;
@@ -1478,7 +1479,7 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 			program +=
 			    BuildTransactionalRefreshViewSQL(context, metadata_con, location.catalog_name, location.schema_name,
 			                                     node, attached_db_catalog_name, attached_db_schema_name);
-			program += "\n";
+			program += '\n';
 		}
 		if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
 			program += hook_sql + ";\n";
