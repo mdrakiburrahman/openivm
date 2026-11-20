@@ -2562,6 +2562,34 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 	return metadata_op;
 }
 
+static bool IsRawWindowKey(const Expression &expr, const CreateMVPlanFacts &facts, const WindowLineageOp &key) {
+	if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto binding = expr.Cast<BoundColumnRefExpression>().Binding();
+	for (idx_t depth = 0; depth < 16; ++depth) {
+		auto get = facts.gets_by_index.find(binding.table_index);
+		if (get != facts.gets_by_index.end()) {
+			string column;
+			auto occ = facts.occurrence_by_index.find(binding.table_index);
+			return occ != facts.occurrence_by_index.end() && occ->second.table == key.source_table &&
+			       occ->second.occurrence == key.source_occurrence &&
+			       GetLogicalGetColumnName(*get->second, binding.column_index, column) &&
+			       StringUtil::CIEquals(column, key.source_col);
+		}
+		auto proj = facts.projections_by_index.find(binding.table_index);
+		if (proj == facts.projections_by_index.end() || binding.column_index >= proj->second->expressions.size()) {
+			return false;
+		}
+		auto &expr = proj->second->expressions[binding.column_index.GetIndex()];
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		binding = expr->Cast<BoundColumnRefExpression>().Binding();
+	}
+	return false;
+}
+
 static bool RawWindowKeyIsProjected(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                     const WindowLineageOp &key) {
 	if (!facts.first_projection || !key.source_cast.empty()) {
@@ -2569,29 +2597,8 @@ static bool RawWindowKeyIsProjected(const CreateMVPlanFacts &facts, const vector
 	}
 	auto &exprs = facts.first_projection->expressions;
 	for (idx_t i = 0; i < exprs.size() && i < output_names.size(); ++i) {
-		if (!StringUtil::CIEquals(output_names[i], key.output_col) || exprs[i]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
-			continue;
-		}
-		auto binding = exprs[i]->Cast<BoundColumnRefExpression>().Binding();
-		for (idx_t depth = 0; depth < 16; ++depth) {
-			auto get = facts.gets_by_index.find(binding.table_index);
-			if (get != facts.gets_by_index.end()) {
-				string column;
-				auto occ = facts.occurrence_by_index.find(binding.table_index);
-				return occ != facts.occurrence_by_index.end() && occ->second.table == key.source_table &&
-				       occ->second.occurrence == key.source_occurrence &&
-				       GetLogicalGetColumnName(*get->second, binding.column_index, column) &&
-				       StringUtil::CIEquals(column, key.source_col);
-			}
-			auto proj = facts.projections_by_index.find(binding.table_index);
-			if (proj == facts.projections_by_index.end() || binding.column_index >= proj->second->expressions.size()) {
-				return false;
-			}
-			auto &expr = proj->second->expressions[binding.column_index.GetIndex()];
-			if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
-				return false;
-			}
-			binding = expr->Cast<BoundColumnRefExpression>().Binding();
+		if (StringUtil::CIEquals(output_names[i], key.output_col) && IsRawWindowKey(*exprs[i], facts, key)) {
+			return true;
 		}
 	}
 	return false;
@@ -2605,6 +2612,22 @@ static bool IsNormalizedSeedLookup(const CreateMVPlanFacts &facts, const vector<
 	    facts.source_occurrences.size() != 2 || facts.source_occurrences[0].table == facts.source_occurrences[1].table ||
 	    facts.analysis.found_volatile_expression || direct_ops.size() != 1 ||
 	    !RawWindowKeyIsProjected(facts, output_names, direct_ops.front())) {
+		return false;
+	}
+	// Only the preserved side may supply the partition: an unmatched LEFT JOIN
+	// row can appear or disappear without bearing the changed right-side key.
+	auto &join = *facts.comparison_joins.front();
+	if (join.join_type != JoinType::LEFT || join.children.size() != 2) {
+		return false;
+	}
+	auto *left = join.children[0].get();
+	while ((left->type == LogicalOperatorType::LOGICAL_PROJECTION || left->type == LogicalOperatorType::LOGICAL_FILTER) &&
+	       left->children.size() == 1) {
+		left = left->children[0].get();
+	}
+	auto &window = *facts.windows.front();
+	auto &partitions = window.expressions.front()->Cast<BoundWindowExpression>().Partitions();
+	if (left != &window || partitions.size() != 1 || !IsRawWindowKey(*partitions.front(), facts, direct_ops.front())) {
 		return false;
 	}
 	for (const auto &node : facts.plan_nodes_post_order) {
