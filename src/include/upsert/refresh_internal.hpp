@@ -104,7 +104,6 @@ struct DeltaActivityResult {
 		bool has_deletes = false;
 		bool requires_full_refresh = false;
 		int64_t pending_rows = -1;
-		int64_t pending_deletes = -1;
 		int64_t last_snapshot_id = -1;
 		int64_t current_snapshot_id = -1;
 	};

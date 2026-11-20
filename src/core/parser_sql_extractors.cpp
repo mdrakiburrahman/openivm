@@ -1,7 +1,6 @@
 #include "core/parser_sql_extractors.hpp"
 #include "core/sql_utils.hpp"
 #include "core/openivm_debug.hpp"
-#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
@@ -19,19 +18,6 @@
 
 namespace duckdb {
 namespace {
-
-static unique_ptr<SelectStatement> ParseSelect(const string &sql) {
-	auto parser = Parser::GetBuiltinParser();
-	try {
-		parser.ParseQuery(sql);
-	} catch (const ParserException &) {
-		return nullptr;
-	}
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		return nullptr;
-	}
-	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-}
 
 static SelectNode *AsSelect(QueryNode &node) {
 	return node.type == QueryNodeType::SELECT_NODE ? &node.Cast<SelectNode>() : nullptr;
@@ -150,7 +136,7 @@ static string RenameQualifier(ParsedExpression &expression, const string &table,
 
 bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &out_input_sql, string &out_source,
                           string &out_filter_sql) {
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	if (!statement) {
 		return false;
 	}
@@ -201,7 +187,7 @@ string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::Dist
                                   const string &aux_table) {
 	const auto count_column = SqlUtils::QuoteIdentifier(meta.InternalColumn("_count"));
 	const auto &columns = meta.representative_input ? meta.selected_source_columns : meta.cols;
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	D_ASSERT(statement);
 	SelectNode *distinct = nullptr;
 	for (auto select : Selects(*statement->node)) {
@@ -255,7 +241,7 @@ string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::Dist
 		outputs.push_back(count_column + " AS " +
 		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
 	}
-	auto replacement = ParseSelect(
+	auto replacement = SqlUtils::TryParseSelect(
 	    "SELECT " + StringUtil::Join(outputs, ", ") + " FROM " + aux_table + " WHERE " + count_column + " > 0" +
 	    (meta.representative_input ? " AND " + SqlUtils::QuoteIdentifier(meta.InternalColumn("openivm_selected"))
 	                               : ""));
@@ -270,7 +256,7 @@ string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::Dist
 
 bool ExtractCountDistinctAggregate(const string &sql, const vector<string> &group_columns,
                                    const vector<string> &output_names, CountDistinctExtract &out) {
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	auto select = statement ? AsSelect(*statement->node) : nullptr;
 	string alias;
 	if (!select || group_columns.empty() || select->groups.group_expressions.size() != group_columns.size() ||
@@ -306,7 +292,7 @@ bool ExtractCountDistinctAggregate(const string &sql, const vector<string> &grou
 }
 
 bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_names, FilteredGroupCountExtract &out) {
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	if (!statement || output_names.size() != 1) {
 		return false;
 	}
@@ -368,7 +354,7 @@ bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_n
 
 bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	auto &meta = out.meta;
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	auto select = statement ? AsSelect(*statement->node) : nullptr;
 	if (!select || !ReadOutputs(*select, meta.output_cols, out.output_exprs, out.output_refs)) {
 		return false;

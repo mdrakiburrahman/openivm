@@ -24,6 +24,8 @@ struct OutputSpine {
 	LogicalOperator *bottom = nullptr;
 };
 OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(const LogicalOperator &)> &pass_through);
+// Follow ORDER BY/LIMIT/TOP_N and materialized CTE consumers above aggregate state.
+OutputSpine FindAggregateOutputSpine(LogicalOperator *root);
 /// The aggregate at the bottom of the spine, directly or below a HAVING filter.
 LogicalAggregate *SpineAggregate(const OutputSpine &spine);
 

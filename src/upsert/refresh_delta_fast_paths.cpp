@@ -122,7 +122,6 @@ static void ApplyChangeStats(DeltaActivityResult::Source &source, const RefreshM
 	source.ok = stats.ok;
 	if (stats.ok) {
 		source.pending_rows = stats.total;
-		source.pending_deletes = stats.deletes;
 		source.has_changes = stats.total > 0;
 		source.has_deletes = stats.deletes > 0;
 	}

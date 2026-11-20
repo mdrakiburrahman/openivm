@@ -221,11 +221,7 @@ static bool IsDecomposedSumAlias(const string &alias) {
 }
 
 void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
-		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
-		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
-	});
+	auto spine = FindAggregateOutputSpine(plan.get());
 	auto *aggregate = SpineAggregate(spine);
 	if (!aggregate || spine.projections.empty()) {
 		return;

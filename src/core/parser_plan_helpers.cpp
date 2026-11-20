@@ -1048,12 +1048,12 @@ static void AppendUniqueValues(vector<T> &target, const vector<T> &source) {
 	}
 }
 
-static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
-                                       unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
-                                       bool under_join, const LogicalOperator *redundant_distinct,
-                                       PlanAnalysis &analysis, TableIndex internal_delim_cte = TableIndex()) {
+static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
+                                     unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
+                                     bool under_join, const LogicalOperator *redundant_distinct, PlanAnalysis &analysis,
+                                     TableIndex internal_delim_cte = TableIndex()) {
 	if (!op) {
-		return "";
+		return;
 	}
 	for (auto &binding : op->GetColumnBindings()) {
 		facts.max_table_index = std::max(facts.max_table_index, binding.table_index.index);
@@ -1079,7 +1079,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	if (redundant_distinct && op != redundant_distinct && op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		facts.has_descendant_distinct = true;
 	}
-	string first_table;
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && !internal_delim_dedup) {
 		seen_agg_above = true;
 		auto &agg = op->Cast<LogicalAggregate>();
@@ -1171,10 +1170,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		facts.has_cardinality_changing_filter =
 		    facts.has_cardinality_changing_filter || !!get.table_filters.HasFilters();
 		AddGetFacts(get, current_catalog, facts, next_occurrence);
-		auto table_ref = get.GetTable();
-		if (table_ref.get()) {
-			first_table = table_ref.get()->name.GetIdentifierName();
-		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op->Cast<LogicalCTERef>();
 		facts.cte_refs_by_table_index[cte_ref.table_index] = &cte_ref;
@@ -1192,13 +1187,10 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	vector<idx_t> child_ids;
 	child_ids.reserve(op->children.size());
 	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis, TableIndex child_delim_cte) {
-		string child_first = CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above,
-		                                              under_join, redundant_distinct, child_analysis, child_delim_cte);
+		CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above, under_join,
+		                         redundant_distinct, child_analysis, child_delim_cte);
 		D_ASSERT(!facts.plan_nodes_post_order.empty());
 		child_ids.push_back(facts.plan_nodes_post_order.size() - 1);
-		if (first_table.empty()) {
-			first_table = std::move(child_first);
-		}
 	};
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
@@ -1221,9 +1213,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		for (auto &child : op->children) {
 			collect_child(child.get(), analysis, internal_delim_cte);
 		}
-	}
-	if (!first_table.empty()) {
-		facts.first_table_name[op] = first_table;
 	}
 	CreateMVPlanNodeFacts node_facts;
 	node_facts.plan_node = op;
@@ -1265,7 +1254,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	}
 	facts.plan_node_ids[op] = node_id;
 	facts.plan_nodes_post_order.push_back(std::move(node_facts));
-	return first_table;
 }
 
 static bool IsHiddenHavingColumn(const string &name) {

@@ -132,19 +132,6 @@ static bool ParseRunningWindowExpression(const ParsedExpression &expression, Run
 	return !out.argument.empty();
 }
 
-static unique_ptr<SelectStatement> ParseRunningSelect(const string &sql) {
-	auto parser = Parser::GetBuiltinParser();
-	try {
-		parser.ParseQuery(sql);
-	} catch (const ParserException &) {
-		return nullptr;
-	}
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		return nullptr;
-	}
-	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-}
-
 static SelectNode *RunningSelect(QueryNode &node) {
 	if (node.type != QueryNodeType::SELECT_NODE) {
 		return nullptr;
@@ -390,7 +377,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 	}
 	while (std::any_of(plan.source_columns.begin(), plan.source_columns.end(),
 	                   [&](const string &name) { return StringUtil::CIEquals(name, plan.suffix_position); })) {
-		plan.suffix_position += "_";
+		plan.suffix_position += '_';
 	}
 	plan.partition_column = parsed_partition;
 	plan.order_column = parsed_order;
@@ -491,7 +478,7 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 			visible_column_names.push_back(col);
 		}
 	}
-	auto statement = ParseRunningSelect(view_query_sql);
+	auto statement = SqlUtils::TryParseSelect(view_query_sql);
 	auto *select = statement ? RunningSelect(*statement->node) : nullptr;
 	if (!select) {
 		return "";

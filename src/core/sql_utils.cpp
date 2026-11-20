@@ -472,6 +472,19 @@ string SqlUtils::EscapeSingleQuotes(const string &input) {
 	return StringUtil::Replace(input, "'", "''");
 }
 
+unique_ptr<SelectStatement> SqlUtils::TryParseSelect(const string &sql) {
+	auto parser = Parser::GetBuiltinParser();
+	try {
+		parser.ParseQuery(sql);
+	} catch (const ParserException &) {
+		return nullptr;
+	}
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return nullptr;
+	}
+	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+}
+
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
 	vector<string> statements;
 	idx_t start = 0;

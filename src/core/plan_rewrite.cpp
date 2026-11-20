@@ -1020,6 +1020,14 @@ OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(cons
 	return spine;
 }
 
+OutputSpine FindAggregateOutputSpine(LogicalOperator *root) {
+	return FindOutputSpine(root, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
+	});
+}
+
 LogicalAggregate *SpineAggregate(const OutputSpine &spine) {
 	auto *node = spine.bottom;
 	if (node && node->type == LogicalOperatorType::LOGICAL_FILTER && node->children.size() == 1) {
@@ -1141,11 +1149,7 @@ static bool IsHiddenAggregateAlias(const string &alias) {
 }
 
 void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan) {
-	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
-		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
-		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
-	});
+	auto spine = FindAggregateOutputSpine(plan.get());
 	auto *aggregate = SpineAggregate(spine);
 	if (!aggregate || spine.projections.empty()) {
 		return;
@@ -2012,11 +2016,7 @@ static const Expression *ResolveDerivedOutputPassThrough(const Expression &expr,
 }
 
 void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
-		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
-		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
-	});
+	auto spine = FindAggregateOutputSpine(plan.get());
 	auto *aggregate = SpineAggregate(spine);
 	if (!aggregate || spine.projections.empty()) {
 		return;
@@ -2112,11 +2112,7 @@ private:
 } // namespace
 
 vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vector<string> &output_names) {
-	auto spine = FindOutputSpine(&plan, [](const LogicalOperator &op) {
-		return op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
-		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
-	});
+	auto spine = FindAggregateOutputSpine(&plan);
 	auto *aggregate = SpineAggregate(spine);
 	if (!aggregate) {
 		return {};

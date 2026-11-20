@@ -16,6 +16,7 @@ namespace duckdb {
 // Originally from the compiler extension; inlined here to remove the external dependency.
 
 class BaseTableRef;
+class SelectStatement;
 
 struct SessionLocation {
 	string catalog;
@@ -40,6 +41,8 @@ public:
 	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string EscapeSingleQuotes(const string &input);
+	// Null for a parse error, multiple statements, or a statement other than SELECT.
+	static unique_ptr<SelectStatement> TryParseSelect(const string &sql);
 	static vector<string> SplitSQLStatements(const string &sql);
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
