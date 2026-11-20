@@ -101,11 +101,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 	auto &db_config = duckdb::DBConfig::GetConfig(instance);
 
-	// OpenIVM materializes and refreshes relations, not ordered result streams.
-	// Make unordered execution the database-wide default for connections created
-	// after the extension is loaded. Entry points also set the current ClientContext
-	// explicitly because pre-existing local settings override global defaults.
-	db_config.SetOption(PreserveInsertionOrderSetting::SettingIndex, Value::BOOLEAN(false));
 	// CREATE/ALTER MATERIALIZED VIEW and transactional DROP VIEW are expanded into
 	// ordinary DuckDB statements by OpenIVM's parser override. FALLBACK leaves every
 	// statement OpenIVM does not recognize with DuckDB's native parser.

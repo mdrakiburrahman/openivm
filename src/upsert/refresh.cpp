@@ -17,13 +17,11 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/query_error_context.hpp"
-#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/parser.hpp"
 #include <chrono>
@@ -1104,11 +1102,6 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 
 static void RefreshViewsLocked(ClientContext &context, const FunctionParameters &parameters, bool pipeline) {
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
-	// PRAGMA refresh refreshes relational state, not ordered output. Force the
-	// OpenIVM entry point onto DuckDB's unordered execution mode even if this
-	// connection previously had a local preserve_insertion_order=true setting.
-	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
-	                                                              Value::BOOLEAN(false));
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;
