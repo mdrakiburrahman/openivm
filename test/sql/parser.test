@@ -1364,8 +1364,71 @@ WHERE view_sql_name IN ('peg_delete_cte', 'peg_update_cte', 'peg_insert_cte', 'p
 ----
 0
 
+# DROP uses the native grammar, including comments, quoted names and IF EXISTS.
 statement ok
-DROP VIEW "PEG.Schema"."MV.AS";
+DROP /* header comment */ MATERIALIZED VIEW IF EXISTS "openmaterialized_view_parser_test"."PEG.Schema"."MV.AS" RESTRICT;
+
+query IIIII
+SELECT
+ (SELECT count(*) FROM duckdb_views() WHERE schema_name='PEG.Schema' AND view_name='MV.AS'),
+ (SELECT count(*) FROM duckdb_tables() WHERE schema_name='PEG.Schema' AND starts_with(table_name,'openivm_')),
+ (SELECT count(*) FROM openivm_views WHERE view_sql_name='MV.AS'),
+ (SELECT count(*) FROM openivm_delta_tables WHERE view_name NOT IN (SELECT view_name FROM openivm_views)),
+ (SELECT count(*) FROM duckdb_tables() WHERE table_name='openivm_delta_peg_source');
+----
+0	0	0	0	0
+
+statement ok
+DROP MATERIALIZED VIEW IF EXISTS "PEG.Schema"."MV.AS";
+
+statement error
+DROP MATERIALIZED VIEW "PEG.Schema"."MV.AS";
+----
+does not exist
+
+# Cascading a parent removes dependent MV state and the final source delta.
+statement ok
+CREATE MATERIALIZED VIEW "PEG.Schema".parent AS SELECT * FROM peg_source;
+CREATE MATERIALIZED VIEW "PEG.Schema".child AS SELECT * FROM "PEG.Schema".parent;
+
+statement error
+DROP MATERIALIZED VIEW "PEG.Schema".parent RESTRICT;
+----
+depend
+
+statement error
+DROP VIEW "PEG.Schema".parent;
+----
+depend
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_schema='PEG.Schema';
+----
+2
+
+statement ok
+BEGIN;
+DROP MATERIALIZED VIEW "PEG.Schema".parent CASCADE;
+COMMIT;
+
+query IIIII
+SELECT
+ (SELECT count(*) FROM duckdb_views() WHERE schema_name='PEG.Schema'),
+ (SELECT count(*) FROM duckdb_tables() WHERE schema_name='PEG.Schema'),
+ (SELECT count(*) FROM openivm_views WHERE view_schema='PEG.Schema'),
+ (SELECT count(*) FROM openivm_mv_dependencies WHERE parent_view NOT IN (SELECT view_name FROM openivm_views) OR child_view NOT IN (SELECT view_name FROM openivm_views)),
+ (SELECT count(*) FROM duckdb_tables() WHERE table_name='openivm_delta_peg_source');
+----
+0	0	0	0	0
+
+# Native statement ordering also permits CREATE, DROP, and reuse in one batch.
+statement ok
+CREATE MATERIALIZED VIEW peg_reused AS SELECT * FROM peg_source;
+DROP MATERIALIZED VIEW peg_reused;
+CREATE MATERIALIZED VIEW peg_reused AS SELECT * FROM peg_source;
+DROP VIEW peg_reused;
+
+statement ok
 DROP TABLE peg_source;
 DROP SCHEMA "PEG.Schema";
 SET allow_parser_override_extension='fallback';
