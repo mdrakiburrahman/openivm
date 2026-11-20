@@ -5305,3 +5305,100 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Issue #73: nested and INTERVAL group keys support MERGE even though DuckDB ART
+# indexes reject their storage types. Scalar keys must retain their indexes.
+foreach key list_key struct_key map_key array_key interval_key int_key
+
+statement ok
+CREATE TABLE complex_key_src(id INT, list_key INT[], struct_key STRUCT(x INT),
+    map_key MAP(INT,INT), array_key INT[2], interval_key INTERVAL, int_key INT,v INT);
+INSERT INTO complex_key_src VALUES
+    (1,[1],{'x':1},map([1],[1]),[1,2],INTERVAL '1 day',1,10),
+    (2,[1],{'x':1},map([1],[1]),[1,2],INTERVAL '1 day',1,20),
+    (3,[2],{'x':2},map([2],[2]),[2,3],INTERVAL '2 days',2,-30),
+    (4,NULL,NULL,NULL,NULL,NULL,NULL,8);
+CREATE MATERIALIZED VIEW complex_key_mv AS
+    SELECT {key} AS key,SUM(v) total,COUNT(*) n FROM complex_key_src GROUP BY {key};
+CREATE MATERIALIZED VIEW complex_key_having AS
+    SELECT {key} AS key,SUM(v) total,COUNT(*) n FROM complex_key_src GROUP BY {key} HAVING SUM(v)>0;
+CREATE VIEW complex_key_expected AS
+    SELECT {key} AS key,SUM(v) total,COUNT(*) n FROM complex_key_src GROUP BY {key};
+
+query I
+SELECT count(*) FROM openivm_views WHERE
+    (view_sql_name='complex_key_mv' AND type=0) OR (view_sql_name='complex_key_having' AND type=1);
+----
+2
+
+query I
+SELECT (count(*)=CASE WHEN '{key}'='int_key' THEN 2 ELSE 0 END)::INT
+FROM duckdb_indexes() i JOIN openivm_views v
+    ON i.table_name='openivm_data_'||v.view_name
+WHERE v.view_sql_name IN('complex_key_mv','complex_key_having');
+----
+1
+
+statement ok
+INSERT INTO complex_key_src VALUES
+    (5,[1],{'x':1},map([1],[1]),[1,2],INTERVAL '1 day',1,5),
+    (6,[3],{'x':3},map([3],[3]),[3,4],INTERVAL '3 days',3,40),
+    (99,[1],{'x':1},map([1],[1]),[1,2],INTERVAL '1 day',1,100);
+UPDATE complex_key_src SET v=15 WHERE id=1;
+UPDATE complex_key_src SET list_key=[2],struct_key={'x':2},map_key=map([2],[2]),
+    array_key=[2,3],interval_key=INTERVAL '2 days',int_key=2,v=-50 WHERE id=2;
+DELETE FROM complex_key_src WHERE id IN(3,99);
+PRAGMA refresh('complex_key_mv');
+PRAGMA refresh('complex_key_having');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM complex_key_mv EXCEPT ALL SELECT * FROM complex_key_expected)
+    UNION ALL(SELECT * FROM complex_key_expected EXCEPT ALL SELECT * FROM complex_key_mv)
+    UNION ALL(SELECT * FROM complex_key_having EXCEPT ALL SELECT * FROM complex_key_expected WHERE total>0)
+    UNION ALL(SELECT * FROM complex_key_expected WHERE total>0 EXCEPT ALL SELECT * FROM complex_key_having));
+----
+0
+
+statement ok
+SET openivm_refresh_mode='full';
+UPDATE complex_key_src SET v=-v WHERE id=2;
+INSERT INTO complex_key_src VALUES(99,NULL,NULL,NULL,NULL,NULL,NULL,100);
+UPDATE complex_key_src SET v=200 WHERE id=99;
+DELETE FROM complex_key_src WHERE id=99;
+PRAGMA refresh('complex_key_mv');
+PRAGMA refresh('complex_key_having');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM complex_key_mv EXCEPT ALL SELECT * FROM complex_key_expected)
+    UNION ALL(SELECT * FROM complex_key_expected EXCEPT ALL SELECT * FROM complex_key_mv)
+    UNION ALL(SELECT * FROM complex_key_having EXCEPT ALL SELECT * FROM complex_key_expected WHERE total>0)
+    UNION ALL(SELECT * FROM complex_key_expected WHERE total>0 EXCEPT ALL SELECT * FROM complex_key_having));
+----
+0
+
+statement ok
+SET openivm_refresh_mode='incremental';
+INSERT INTO complex_key_src VALUES(99,NULL,NULL,NULL,NULL,NULL,NULL,100);
+UPDATE complex_key_src SET v=200 WHERE id=99;
+DELETE FROM complex_key_src;
+PRAGMA refresh('complex_key_mv');
+PRAGMA refresh('complex_key_having');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM complex_key_mv EXCEPT ALL SELECT * FROM complex_key_expected)
+    UNION ALL(SELECT * FROM complex_key_expected EXCEPT ALL SELECT * FROM complex_key_mv)
+    UNION ALL(SELECT * FROM complex_key_having EXCEPT ALL SELECT * FROM complex_key_expected WHERE total>0)
+    UNION ALL(SELECT * FROM complex_key_expected WHERE total>0 EXCEPT ALL SELECT * FROM complex_key_having));
+----
+0
+
+statement ok
+DROP VIEW complex_key_expected;
+DROP VIEW complex_key_having;
+DROP VIEW complex_key_mv;
+DROP TABLE complex_key_src;
+
+endloop

@@ -466,6 +466,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
+	vector<LogicalType> output_types;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
@@ -517,6 +518,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
+		output_types = select_plan->types;
 
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
 		full_outer_scopes = BuildFullOuterScopes(post_rewrite_facts);
@@ -1818,7 +1820,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// the index up in every native view catalog; its full recompute upserts against it.
 	bool explicit_native = metadata_location.explicit_placement && metadata.IsNativeCatalog(view_target_catalog);
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native)) {
+	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native) &&
+	    CanCreateGroupIndex(aggregate_columns, output_names, output_types)) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = SqlUtils::QuoteIdentifier(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +

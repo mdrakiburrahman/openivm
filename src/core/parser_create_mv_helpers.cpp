@@ -19,6 +19,23 @@
 
 namespace duckdb {
 
+bool CanCreateGroupIndex(const vector<string> &groups, const vector<string> &names, const vector<LogicalType> &types) {
+	D_ASSERT(names.size() == types.size());
+	for (auto &group : groups) {
+		auto name = std::find_if(names.begin(), names.end(),
+		                         [&](const string &candidate) { return StringUtil::CIEquals(candidate, group); });
+		if (name == names.end()) {
+			throw InternalException("Missing output type for materialized-view group column '%s'", group);
+		}
+		auto type = types[name - names.begin()].InternalType();
+		if (type != PhysicalType::BOOL && !TypeIsNumeric(type) && type != PhysicalType::VARCHAR) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Skipping ART index for unsupported group column '%s'\n", group.c_str());
+			return false;
+		}
+	}
+	return true;
+}
+
 string SqlCsvLiteralOrNull(const vector<string> &values) {
 	if (values.empty()) {
 		return "null";
