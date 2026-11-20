@@ -88,6 +88,7 @@ constexpr const char *LJSEC_PRES_DELTA_PREFIX = "__OPENIVM_LJSEC_PRES_DELTA_";
 constexpr const char *LJSEC_PLACEHOLDER_SUFFIX = "__";
 // Quoted relation placeholder followed by the qualified source identity.
 constexpr const char *LJSEC_OLD_SOURCE_PREFIX = "__OPENIVM_LJSEC_OLD_SOURCE_";
+constexpr const char *LJSEC_OLD_NATIVE_DELTA_PREFIX = "__OPENIVM_LJSEC_OLD_NATIVE_DELTA_";
 
 // Temporary table prefix for companion row snapshots
 constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";

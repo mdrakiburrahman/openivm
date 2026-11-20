@@ -74,7 +74,7 @@ The MERGE path adds a hidden `openivm_match_count` column (`COUNT` of the NULL-s
 
 When the last right-side match disappears, the secondary delta adds NULL pads for the **current** preserved input, including rows inserted in the batch. When the first match appears, it retracts pads for the **previous** preserved input, excluding new rows and including deleted rows. Transition counts consolidate all signed changes by join key, so updating a payload leaves that key's support unchanged.
 
-Reading the previous preserved input adds work at match transitions. Native sources reconstruct it from current rows and signed deltas; DuckLake uses the previous snapshot. Group aggregates continue to use incremental MERGE.
+Native sources reconstruct only the columns the correction reads from current rows and signed deltas. The reconstruction runs for first-match transitions, and restricts the source of a direct join key to those keys when it can do so safely. DuckLake reads the previous snapshot. Group aggregates continue to use incremental MERGE.
 
 After upgrading from the earlier correction program, recreate existing LEFT/RIGHT JOIN aggregate MVs from their original definitions to regenerate their stored secondary-delta SQL. Legacy stored programs retain their earlier behavior until recreated.
 

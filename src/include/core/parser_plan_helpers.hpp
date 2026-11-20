@@ -132,8 +132,7 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, TableIndex
 // side's pending changes belong; refresh substitutes them (see openivm_constants.hpp). The out_*
 // params report the two sides' identities so refresh can pick the right row source per backend.
 // The Larson & Zhou secondary-delta correction for every LEFT JOIN level; empty sql when unsupported.
-RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientContext &context,
-                                                                      const CreateMVPlanFacts &facts,
+RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(Binder &binder, const CreateMVPlanFacts &facts,
                                                                       const vector<string> &output_names,
                                                                       const string &view_name,
                                                                       const string &delta_view_catalog_prefix);

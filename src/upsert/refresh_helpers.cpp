@@ -1024,20 +1024,6 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
-string BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter) {
-	auto weighted_delta = [&](const string &comparison) {
-		return "SELECT openivm_scope_delta.* EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
-		       string(openivm::TIMESTAMP_COL) + ") FROM " + delta + " openivm_scope_delta" +
-		       SqlUtils::BuildRowRepetitionSQL("abs(openivm_scope_delta." + string(openivm::MULTIPLICITY_COL) + ")",
-		                                       "openivm_scope_weights", SqlDialect::DUCKDB) +
-		       BuildGuardedDeltaWhere(delta_ts_filter, string(openivm::MULTIPLICITY_COL) + comparison);
-	};
-	// Add deletions before subtracting insertions: conflicting DML can insert
-	// and delete a transient row whose count is zero in the current table.
-	return "((SELECT * FROM " + current + " UNION ALL " + weighted_delta(" < 0") + ") EXCEPT ALL " +
-	       weighted_delta(" > 0") + ")";
-}
-
 struct FullOuterScopeRelation {
 	string reference;
 	string query;
@@ -1146,7 +1132,7 @@ static FullOuterScopeRows ReadScopeRows(RefreshMetadata &metadata, const string 
 		        ResolveFullOuterDeltaSource(metadata, view_name, name)};
 	}
 	auto delta = metadata.ResolveDeltaQualifiedName(view_name, name);
-	return {current, BuildPreviousSourceRowsSQL(current, delta, delta_ts_filter),
+	return {current, SqlUtils::BuildPreviousSourceRowsSQL(current, delta, delta_ts_filter),
 	        BuildStandardDeltaRowsSQL(delta, "", delta_ts_filter)};
 }
 

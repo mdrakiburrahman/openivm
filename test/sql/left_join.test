@@ -1394,3 +1394,41 @@ DROP VIEW payload_expected;
 DROP VIEW payload_mv;
 DROP TABLE payload_right;
 DROP TABLE payload_left;
+
+# Only the preserved inputs used by the join can participate in old-row matching.
+# Re-evaluating an unused volatile generated column would hide the inserted row
+# from EXCEPT ALL and retract a NULL pad twice.
+statement ok
+CREATE SEQUENCE volatile_pad_seq;
+CREATE TABLE volatile_pad_left(k INT, grp INT, tag INT,
+    unused BIGINT GENERATED ALWAYS AS (nextval('volatile_pad_seq')));
+CREATE TABLE volatile_pad_right(k INT, v INT);
+INSERT INTO volatile_pad_left(k,grp,tag) VALUES (1,10,0),(2,20,0);
+CREATE MATERIALIZED VIEW volatile_pad_mv AS
+    SELECT p.grp,COUNT(*) n,COUNT(r.v) m,SUM(r.v) s
+    FROM volatile_pad_left p LEFT JOIN volatile_pad_right r ON p.k=r.k GROUP BY p.grp;
+CREATE VIEW volatile_pad_expected AS
+    SELECT p.grp,COUNT(*) n,COUNT(r.v) m,SUM(r.v) s
+    FROM volatile_pad_left p LEFT JOIN volatile_pad_right r ON p.k=r.k GROUP BY p.grp;
+UPDATE volatile_pad_left SET tag=1 WHERE k=1;
+INSERT INTO volatile_pad_left(k,grp,tag) VALUES (99,99,0);
+UPDATE volatile_pad_left SET tag=20 WHERE k=99;
+DELETE FROM volatile_pad_left WHERE k=99;
+INSERT INTO volatile_pad_right VALUES (1,5);
+PRAGMA refresh('volatile_pad_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM volatile_pad_mv EXCEPT ALL SELECT * FROM volatile_pad_expected)
+    UNION ALL
+    (SELECT * FROM volatile_pad_expected EXCEPT ALL SELECT * FROM volatile_pad_mv)
+);
+----
+0
+
+statement ok
+DROP VIEW volatile_pad_expected;
+DROP VIEW volatile_pad_mv;
+DROP TABLE volatile_pad_right;
+DROP TABLE volatile_pad_left;
+DROP SEQUENCE volatile_pad_seq;

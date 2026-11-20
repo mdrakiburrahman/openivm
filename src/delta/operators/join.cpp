@@ -1930,7 +1930,8 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 			RefreshMetadata::LeftJoinSecondaryMeta secondary;
 			// Old stored correction programs use the previous primary-delta convention.
 			if (metadata.GetLeftJoinSecondaryMeta(input.context.view, secondary) &&
-			    secondary.sql.find(openivm::LJSEC_OLD_SOURCE_PREFIX) != string::npos) {
+			    (secondary.sql.find(openivm::LJSEC_OLD_SOURCE_PREFIX) != string::npos ||
+			     secondary.sql.find(openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX) != string::npos)) {
 				guard = [&](unique_ptr<LogicalOperator> &term, uint64_t active_mask, uint64_t old_mask) {
 					GuardKeptOuterJoinsForMask(context, input.context.metadata_con, binder, term.get(), leaves,
 					                           active_mask, old_mask, input.context.view,
