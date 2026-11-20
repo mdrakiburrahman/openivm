@@ -2340,7 +2340,9 @@ static void RejectCrossCatalogDropInTransaction(ClientContext &context, Connecti
 		return;
 	}
 	for (auto &view : views) {
-		if (StringUtil::CIEquals(view.first.catalog, target_catalog)) {
+		if (StringUtil::CIEquals(view.first.catalog, target_catalog) || view.first.explicit_placement) {
+			// Explicit metadata placement has its own, more specific transaction
+			// diagnostic in TrackedDropProgram::Append.
 			continue;
 		}
 		SelectDropMetadata(context, con, view.first);
@@ -2351,8 +2353,8 @@ static void RejectCrossCatalogDropInTransaction(ClientContext &context, Connecti
 		OPENIVM_DEBUG_PRINT("[DROP] Refusing cross-catalog explicit transaction for '%s' in '%s'\n", name.c_str(),
 		                    view.first.catalog.c_str());
 		throw CatalogException("Cannot run %s inside an explicit transaction: dependent materialized view '%s' is "
-		                       "registered in database '%s', and DuckDB can write only one attached database per "
-		                       "transaction. Run the cascade in autocommit mode or drop the dependent view first.",
+		                       "registered in database '%s'; a single transaction can only write to a single attached "
+		                       "database. Run the cascade in autocommit mode or drop the dependent view first.",
 		                       statement, name, view.first.catalog);
 	}
 }

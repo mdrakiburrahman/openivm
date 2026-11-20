@@ -175,7 +175,7 @@ BEGIN;
 statement error
 DROP VIEW data.observation.report;
 ----
-Cannot run DROP VIEW CASCADE inside an explicit transaction
+DROP cannot run inside an explicit transaction: OpenIVM metadata is stored in control.OpenIVM Control
 
 statement ok
 ROLLBACK;
