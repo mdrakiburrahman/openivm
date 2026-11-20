@@ -47,7 +47,7 @@ WINDOW_PARTITION
 query I
 SELECT COUNT(*) FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
 WHERE sql LIKE 'CREATE TABLE %`openivm_publish_next___%` AS SELECT v.* FROM (%'
-  AND sql LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_affected___openivm_mv_6d656d6f7279_6d61696e_7773705f6d76_ d WHERE v.`entity_id` <=> d.`entity_id`)%';
+  AND sql LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_affected___% d WHERE v.`entity_id`%<=>%d.`entity_id`)%';
 ----
 1
 
@@ -55,7 +55,7 @@ WHERE sql LIKE 'CREATE TABLE %`openivm_publish_next___%` AS SELECT v.* FROM (%'
 query I
 SELECT COUNT(*) FROM openivm_compile_with_facts('wsp_mv', '{"target_dialect":"spark","compile_only":true}')
 WHERE sql LIKE 'CREATE TABLE %openivm_publish_changes%'
-  AND sql LIKE '%openivm_visible___%v WHERE EXISTS (SELECT 1 FROM openivm_affected___openivm_mv_6d656d6f7279_6d61696e_7773705f6d76_ d WHERE v.`entity_id` <=> d.`entity_id`)) old_rows%';
+  AND sql LIKE '%openivm_visible___%v WHERE EXISTS (SELECT 1 FROM openivm_affected___% d WHERE v.`entity_id`%<=>%d.`entity_id`)) old_rows%';
 ----
 1
 
