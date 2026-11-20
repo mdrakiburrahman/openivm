@@ -489,7 +489,7 @@ SignedRowLists BuildSignedRowLists(const vector<string> &columns, const string &
 		lists.columns += quoted;
 		if (column == openivm::MULTIPLICITY_COL) {
 			lists.old_rows += "-1";
-			lists.new_rows += "1";
+			lists.new_rows += '1';
 		} else {
 			lists.old_rows += old_alias + quoted;
 			lists.new_rows += new_alias + quoted;
@@ -951,20 +951,16 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 }
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           bool cross_system, const string &attached_catalog, const string &attached_schema,
-                           const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta,
-                           vector<string> *deferred_cleanup, const vector<string> &delta_metadata_tables,
-                           const string &data_catalog) {
+                           bool has_unique_index, bool cross_system, const string &attached_catalog,
+                           const string &attached_schema, const string &catalog_prefix, const string &metadata_prefix,
+                           string *out_post_meta, vector<string> *deferred_cleanup,
+                           const vector<string> &delta_metadata_tables, const string &data_catalog) {
 	string qdt = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
-	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
-	// transaction, which DuckDB's on-disk unique index rejects, so those views need the upsert form.
-	auto recompute_view_type = metadata.GetViewType(view_name);
+	// Indexed keys cannot be deleted and reinserted in the same on-disk transaction.
+	// Non-indexable group keys use the ordinary DELETE/INSERT full-refresh form.
 	vector<string> unique_keys;
 	string recompute_temp;
-	auto view_location = metadata.GetStoredViewLocation(view_name, attached_catalog, attached_schema);
-	if (!metadata.IsDuckLakeCatalog(view_location.catalog_name) &&
-	    (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING)) {
+	if (has_unique_index) {
 		unique_keys = metadata.GetGroupColumns(view_name);
 		if (!unique_keys.empty()) {
 			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
@@ -1446,7 +1442,7 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	if (!delta_ts_filter.empty()) {
 		delta_source += " WHERE " + delta_ts_filter;
 	}
-	delta_source += ")";
+	delta_source += ')';
 
 	auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
 	if (data_columns.empty()) {
@@ -1914,9 +1910,9 @@ static string HexEncodeToken(const string &input) {
 	string result;
 	result.reserve(input.size() * 2);
 	for (auto c : input) {
-		auto byte = static_cast<unsigned char>(c);
-		result.push_back(hex[(byte >> 4) & 0x0F]);
-		result.push_back(hex[byte & 0x0F]);
+		auto byte = static_cast<uint32_t>(static_cast<unsigned char>(c));
+		result.push_back(hex[(byte >> 4U) & 0x0FU]);
+		result.push_back(hex[byte & 0x0FU]);
 	}
 	return result;
 }

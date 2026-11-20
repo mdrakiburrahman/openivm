@@ -5327,7 +5327,7 @@ CREATE VIEW complex_key_expected AS
 
 query I
 SELECT count(*) FROM openivm_views WHERE
-    (view_sql_name='complex_key_mv' AND type=0) OR (view_sql_name='complex_key_having' AND type=1);
+    (view_sql_name='complex_key_mv' AND type=0) OR (view_sql_name='complex_key_having' AND type=4);
 ----
 2
 
@@ -5366,6 +5366,15 @@ UPDATE complex_key_src SET v=-v WHERE id=2;
 INSERT INTO complex_key_src VALUES(99,NULL,NULL,NULL,NULL,NULL,NULL,100);
 UPDATE complex_key_src SET v=200 WHERE id=99;
 DELETE FROM complex_key_src WHERE id=99;
+
+query I
+SELECT (bool_or(contains(sql,'INSERT OR REPLACE'))=('{key}'='int_key'))::INT
+FROM openivm_compile_with_facts('complex_key_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');
+----
+1
+
+statement ok
 PRAGMA refresh('complex_key_mv');
 PRAGMA refresh('complex_key_having');
 
