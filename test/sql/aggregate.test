@@ -5306,8 +5306,9 @@ SELECT count(*) FROM (
 ----
 0
 
-# Issue #73: nested and INTERVAL group keys support MERGE even though DuckDB ART
-# indexes reject their storage types. Scalar keys must retain their indexes.
+# Issue #73: nested group keys support MERGE even though DuckDB ART indexes
+# reject their storage types. Scalar keys must retain their indexes. INTERVAL
+# retains full refresh because DuckDB inserts FIRST to keep its representative.
 foreach key list_key struct_key map_key array_key interval_key int_key
 
 statement ok
@@ -5326,8 +5327,10 @@ CREATE VIEW complex_key_expected AS
     SELECT {key} AS key,SUM(v) total,COUNT(*) n FROM complex_key_src GROUP BY {key};
 
 query I
-SELECT count(*) FROM openivm_views WHERE
-    (view_sql_name='complex_key_mv' AND type=0) OR (view_sql_name='complex_key_having' AND type=4);
+SELECT count(*) FROM openivm_views
+WHERE view_sql_name IN('complex_key_mv','complex_key_having')
+    AND type=CASE WHEN '{key}'='interval_key' THEN 3
+        WHEN view_sql_name='complex_key_having' THEN 4 ELSE 0 END;
 ----
 2
 
