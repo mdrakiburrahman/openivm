@@ -128,6 +128,16 @@ DROP VIEW lifecycle_drop_mv;
 statement ok
 ROLLBACK;
 
+# The materialized spelling uses the same transactional cleanup path.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP MATERIALIZED VIEW lifecycle_drop_mv;
+
+statement ok
+ROLLBACK;
+
 query III
 SELECT
     (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_drop_mv'),

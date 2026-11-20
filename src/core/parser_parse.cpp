@@ -19,6 +19,11 @@ namespace duckdb {
 
 namespace {
 
+static arena_ptr<TransformResultValue> TransformMaterializedViewDropType(PEGTransformer &transformer, ParseResult &) {
+	OPENIVM_DEBUG_PRINT("[MV PARSER] Parsed DROP MATERIALIZED VIEW as native DROP VIEW\n");
+	return transformer.MakeResult<CatalogType>(CatalogType::VIEW_ENTRY);
+}
+
 static arena_ptr<TransformResultValue> TransformRefreshEvery(PEGTransformer &transformer, ParseResult &result) {
 	auto &list = result.Cast<ListParseResult>();
 	auto interval = transformer.Transform<string>(list.GetChild(1));
@@ -107,24 +112,26 @@ static grammar_transform_process_function_t Finalize(const transform_finalize_fu
 
 class MaterializedViewGrammar : public GrammarExtension {
 public:
-	MaterializedViewGrammar() : GrammarExtension("openivm", "Materialized-view creation and refresh scheduling") {
+	MaterializedViewGrammar() : GrammarExtension("openivm", "Materialized-view lifecycle statements") {
 	}
 
 	vector<GrammarChange> GetChanges() const override {
-		return {GrammarChange::AddRule("OpenIVMCreate <- 'CREATE' OrReplace? 'MATERIALIZED' 'VIEW' QualifiedName "
-		                               "OpenIVMCreateRefresh? 'AS' SelectStatementInternal",
-		                               Finalize(TransformMaterializedView)),
-		        GrammarChange::AddRule("OpenIVMCreateRefresh <- 'REFRESH' OpenIVMRefreshEvery",
-		                               Finalize(TransformRefreshClause)),
-		        GrammarChange::AddRule("OpenIVMRefreshEvery <- 'EVERY' StringLiteral", Finalize(TransformRefreshEvery)),
-		        GrammarChange::AddRule("OpenIVMRefreshManual <- 'MANUAL'", Finalize(TransformRefreshManual)),
-		        GrammarChange::AddRule("OpenIVMRefreshMode <- OpenIVMRefreshEvery / OpenIVMRefreshManual",
-		                               Finalize(TransformRefreshMode)),
-		        GrammarChange::AddRule("OpenIVMAlter <- 'ALTER' 'MATERIALIZED' 'VIEW' QualifiedName 'SET' 'REFRESH' "
-		                               "OpenIVMRefreshMode",
-		                               Finalize(TransformMaterializedView)),
-		        GrammarChange::PrependChoice("Statement", "OpenIVMCreate"),
-		        GrammarChange::PrependChoice("Statement", "OpenIVMAlter")};
+		return {
+		    GrammarChange::SetTransformProcess("MaterializedViewEntry", Finalize(TransformMaterializedViewDropType)),
+		    GrammarChange::AddRule("OpenIVMCreate <- 'CREATE' OrReplace? 'MATERIALIZED' 'VIEW' QualifiedName "
+		                           "OpenIVMCreateRefresh? 'AS' SelectStatementInternal",
+		                           Finalize(TransformMaterializedView)),
+		    GrammarChange::AddRule("OpenIVMCreateRefresh <- 'REFRESH' OpenIVMRefreshEvery",
+		                           Finalize(TransformRefreshClause)),
+		    GrammarChange::AddRule("OpenIVMRefreshEvery <- 'EVERY' StringLiteral", Finalize(TransformRefreshEvery)),
+		    GrammarChange::AddRule("OpenIVMRefreshManual <- 'MANUAL'", Finalize(TransformRefreshManual)),
+		    GrammarChange::AddRule("OpenIVMRefreshMode <- OpenIVMRefreshEvery / OpenIVMRefreshManual",
+		                           Finalize(TransformRefreshMode)),
+		    GrammarChange::AddRule("OpenIVMAlter <- 'ALTER' 'MATERIALIZED' 'VIEW' QualifiedName 'SET' 'REFRESH' "
+		                           "OpenIVMRefreshMode",
+		                           Finalize(TransformMaterializedView)),
+		    GrammarChange::PrependChoice("Statement", "OpenIVMCreate"),
+		    GrammarChange::PrependChoice("Statement", "OpenIVMAlter")};
 	}
 };
 

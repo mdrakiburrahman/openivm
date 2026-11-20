@@ -610,9 +610,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
 
-	// Normalize FILTER aggregates in the full plan before analysis so the checker
-	// sees CASE expressions instead of raw FILTER and doesn't set incremental_compatible=false.
-	// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
+	// Apply the same safe FILTER normalization to the full analysis plan as to
+	// select_plan above. Aggregates that cannot use NULL masking retain native FILTER.
 	auto analysis_start = create_profile_now();
 	if (full_plan_rewrite_needs.aggregate_filters) {
 		RewriteAggregateFilters(context, plan);
@@ -674,13 +673,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// and sends the refresh plan through the generic N-way join rule instead.
 		view_query = original_view_query;
 		lpts_fallback = true;
-	}
-	if (analysis.found_filtered_list) {
-		view_query = original_view_query;
-		lpts_fallback = true;
-		OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for "
-		                    "group-recompute: %s\n",
-		                    view_query.c_str());
 	}
 	auto classification_start = create_profile_now();
 	bool has_full_outer_aggregate = analysis.found_full_outer && analysis.found_aggregation;
@@ -2246,18 +2238,20 @@ static vector<TrackedDropView> CollectTrackedViewDropOrder(ClientContext &contex
 			return;
 		}
 		auto internal = RefreshMetadata(con).GetInternalLocation(view.second);
-		string predicate;
-		for (auto &source : {SqlUtils::DeltaName(view.second), IncrementalTableNames::DataTableName(view.second),
-		                     PublishedViewName(view.second), SqlUtils::DeltaName(PublishedViewName(view.second))}) {
-			if (!predicate.empty()) {
-				predicate += " OR ";
-			}
-			predicate +=
-			    "(" + RefreshMetadata::SourcePredicate(source, internal.catalog_name, internal.schema_name) + ")";
-		}
 		vector<TrackedDropView> children;
 		for (auto &location : locations) {
 			SelectDropMetadata(context, con, location);
+			string predicate;
+			for (auto &source : {SqlUtils::DeltaName(view.second), IncrementalTableNames::DataTableName(view.second),
+			                     PublishedViewName(view.second), SqlUtils::DeltaName(PublishedViewName(view.second))}) {
+				if (!predicate.empty()) {
+					predicate += " OR ";
+				}
+				predicate += "(" +
+				             RefreshMetadata::SourcePredicate(source, internal.catalog_name, internal.schema_name,
+				                                              location.catalog, DEFAULT_SCHEMA) +
+				             ")";
+			}
 			auto rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 			                      predicate + " ORDER BY view_name");
 			if (rows->HasError()) {
@@ -2308,6 +2302,34 @@ static vector<TrackedDropView> LeaseTrackedViewDropOrder(ClientContext &context,
 		}
 	}
 	return views;
+}
+
+// DuckDB cannot commit writes to two attached native databases in one
+// transaction. Diagnose a cross-catalog cascade before binding any cleanup SQL.
+static void RejectCrossCatalogDropInTransaction(ClientContext &context, Connection &con,
+                                                const vector<TrackedDropView> &views, const string &target_catalog,
+                                                const string &statement) {
+	if (context.transaction.IsAutoCommit()) {
+		return;
+	}
+	for (auto &view : views) {
+		if (StringUtil::CIEquals(view.first.catalog, target_catalog) || view.first.explicit_placement) {
+			// Explicit metadata placement has its own, more specific transaction
+			// diagnostic in TrackedDropProgram::Append.
+			continue;
+		}
+		SelectDropMetadata(context, con, view.first);
+		RefreshMetadata metadata(con);
+		auto location = metadata.GetStoredViewLocation(view.second);
+		auto name =
+		    SqlUtils::FullName(location.catalog_name, location.schema_name, metadata.GetViewSQLName(view.second));
+		OPENIVM_DEBUG_PRINT("[DROP] Refusing cross-catalog explicit transaction for '%s' in '%s'\n", name.c_str(),
+		                    view.first.catalog.c_str());
+		throw CatalogException("Cannot run %s inside an explicit transaction: dependent materialized view '%s' is "
+		                       "registered in database '%s'; a single transaction can only write to a single attached "
+		                       "database. Run the cascade in autocommit mode or drop the dependent view first.",
+		                       statement, name, view.first.catalog);
+	}
 }
 
 struct TrackedDropProgram {
@@ -2454,10 +2476,10 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			}
 			continue;
 		}
-		auto owners =
-		    RefreshMetadata::SourceOwnerPredicate(drop_info.GetQualifiedName().Name().GetIdentifierName(),
-		                                          drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
-		                                          drop_info.GetQualifiedName().Schema().GetIdentifierName(), ducklake);
+		auto owners = RefreshMetadata::SourceOwnerPredicate(drop_info.GetQualifiedName().Name().GetIdentifierName(),
+		                                                    drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
+		                                                    drop_info.GetQualifiedName().Schema().GetIdentifierName(),
+		                                                    ducklake, registry.catalog);
 		auto dependent_rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
 		                                " WHERE " + owners + " ORDER BY view_name");
 		if (dependent_rows->HasError()) {
@@ -2495,7 +2517,11 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			roots.emplace_back(registry, dependent_rows->Collection().GetValue(0, row).ToString());
 		}
 	}
-	for (auto &view : LeaseTrackedViewDropOrder(context, con, locations, roots)) {
+	auto drop_views = LeaseTrackedViewDropOrder(context, con, locations, roots);
+	RejectCrossCatalogDropInTransaction(context, con, drop_views,
+	                                    drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
+	                                    schema_drop ? "DROP SCHEMA CASCADE" : "DROP TABLE CASCADE");
+	for (auto &view : drop_views) {
 		program.Append(context, con, view, drop_info.GetQualifiedName().Catalog().GetIdentifierName(), true,
 		               OnEntryNotFound::RETURN_NULL);
 		TransactionalMVMetadataState::Get(context).RegisterViewDrop(view.second);
@@ -2622,11 +2648,15 @@ static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo 
 	}
 
 	auto root_metadata_location = RefreshMetadata::CurrentLocation(con);
-	vector<TrackedDropView> drop_views = {{root_metadata_location, view_key}};
-	if (drop_info.cascade) {
-		drop_views = LeaseTrackedViewDropOrder(
-		    context, con, RefreshMetadata::MetadataLocations(context, openivm::VIEWS_TABLE), drop_views);
+	auto drop_views =
+	    LeaseTrackedViewDropOrder(context, con, RefreshMetadata::MetadataLocations(context, openivm::VIEWS_TABLE),
+	                              {{root_metadata_location, view_key}});
+	if (!drop_info.cascade && drop_views.size() > 1) {
+		throw CatalogException("Cannot drop materialized view '%s' because dependent materialized views exist. "
+		                       "Use CASCADE to drop them too.",
+		                       drop_info.GetQualifiedName().ToString());
 	}
+	RejectCrossCatalogDropInTransaction(context, con, drop_views, catalog_name, "DROP VIEW CASCADE");
 	TrackedDropProgram drop_program;
 	for (auto &view : drop_views) {
 		drop_program.Append(context, con, view, root_metadata_location.catalog, drop_info.cascade,
