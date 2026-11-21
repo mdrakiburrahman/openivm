@@ -1,0 +1,509 @@
+# name: test/sql/late_append_window_trim.test
+# description: Late facts strictly older than a partition's materialized winner must not rewrite that partition
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE MACRO lat_program(mv) AS TABLE
+SELECT stmt_order, regexp_replace(lower(sql), '\s+', ' ', 'g') AS sql
+FROM openivm_compile_with_facts(mv, '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}');
+
+statement ok
+CREATE TABLE lat_events(k INT, ts TIMESTAMP, rev INT, tag BIGINT, note VARCHAR);
+
+statement ok
+CREATE TABLE lat_tags(tag BIGINT, label VARCHAR, active BOOLEAN);
+
+statement ok
+INSERT INTO lat_events VALUES
+    (1, '2024-03-01 10:00:00', 1, 10, 'k1 winner'),
+    (1, '2024-02-01 10:00:00', 1, 20, 'k1 older'),
+    (2, '2024-03-05 08:00:00', 1, 10, 'k2 winner'),
+    (2, '2024-01-15 08:00:00', 1, 10, 'k2 older'),
+    (3, '2024-03-07 09:00:00', 1, 30, 'k3 winner'),
+    (4, '2024-03-09 12:00:00', 1, NULL, 'k4 null tag'),
+    (NULL, '2024-03-02 00:00:00', 1, 10, 'null key'),
+    (5, NULL, 1, 20, 'k5 null ts');
+
+statement ok
+INSERT INTO lat_tags VALUES (10, 'red', true), (20, 'gold', true), (20, 'gold-dup', true), (40, 'blue', false);
+
+statement ok
+CREATE MATERIALIZED VIEW lat_latest AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_events),
+seed AS (SELECT DISTINCT tag FROM lat_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_nulls_first AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC NULLS FIRST, rev) AS rn FROM lat_events),
+seed AS (SELECT DISTINCT tag FROM lat_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_fanout AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_events)
+SELECT ranked.k, ranked.ts, t.label
+FROM ranked LEFT JOIN lat_tags t ON ranked.tag = t.tag WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_down AS SELECT k, ts, note FROM lat_latest WHERE hit;
+
+statement ok
+CREATE VIEW lat_latest_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_events),
+seed AS (SELECT DISTINCT tag FROM lat_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE VIEW lat_nulls_first_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC NULLS FIRST, rev) AS rn FROM lat_events),
+seed AS (SELECT DISTINCT tag FROM lat_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE VIEW lat_fanout_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_events)
+SELECT ranked.k, ranked.ts, t.label
+FROM ranked LEFT JOIN lat_tags t ON ranked.tag = t.tag WHERE rn = 1;
+
+statement ok
+CREATE VIEW lat_down_ref AS SELECT k, ts, note FROM lat_latest_ref WHERE hit;
+
+statement ok
+CREATE VIEW lat_mismatch AS
+SELECT 'latest' AS mv, count(*) AS n FROM (
+    (SELECT * FROM lat_latest EXCEPT ALL SELECT * FROM lat_latest_ref) UNION ALL
+    (SELECT * FROM lat_latest_ref EXCEPT ALL SELECT * FROM lat_latest))
+UNION ALL
+SELECT 'nulls_first', count(*) FROM (
+    (SELECT * FROM lat_nulls_first EXCEPT ALL SELECT * FROM lat_nulls_first_ref) UNION ALL
+    (SELECT * FROM lat_nulls_first_ref EXCEPT ALL SELECT * FROM lat_nulls_first))
+UNION ALL
+SELECT 'fanout', count(*) FROM (
+    (SELECT * FROM lat_fanout EXCEPT ALL SELECT * FROM lat_fanout_ref) UNION ALL
+    (SELECT * FROM lat_fanout_ref EXCEPT ALL SELECT * FROM lat_fanout))
+UNION ALL
+SELECT 'downstream', count(*) FROM (
+    (SELECT * FROM lat_down EXCEPT ALL SELECT * FROM lat_down_ref) UNION ALL
+    (SELECT * FROM lat_down_ref EXCEPT ALL SELECT * FROM lat_down));
+
+statement ok
+CREATE VIEW lat_rows AS
+SELECT k, rowid AS rid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6c61745f6c6174657374_;
+
+statement ok
+CREATE TABLE lat_pin AS SELECT * FROM lat_rows;
+
+statement ok
+CREATE VIEW lat_outcome AS
+SELECT format('rewritten={} keys={} mismatched={}', r.n, r.keys, m.names) AS outcome
+FROM (
+    SELECT count(*) AS n, coalesce(string_agg(coalesce(p.k::VARCHAR, 'NULL'), ',' ORDER BY p.k), 'none') AS keys
+    FROM lat_pin p JOIN lat_rows b ON b.k IS NOT DISTINCT FROM p.k WHERE b.rid <> p.rid) r,
+    (SELECT coalesce(string_agg(mv, ',' ORDER BY mv), 'none') AS names FROM lat_mismatch WHERE n <> 0) m;
+
+# The scoped affected-key program trims keys whose changed rows are strictly older than the materialized winner
+query I
+SELECT count(*) FROM lat_program('lat_latest')
+WHERE stmt_order = 1 AND contains(sql, 'not exists') AND contains(sql, 'openivm_cur.k <=> openivm_chg.k')
+  AND contains(sql, 'openivm_chg.ts < openivm_cur.ts');
+----
+1
+
+# Strictly older facts, including a NULL partition key, cannot change any winner
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+INSERT INTO lat_events VALUES
+    (1, '2023-12-01 00:00:00', 1, 10, 'k1 stale'),
+    (2, '2023-12-02 00:00:00', 1, 20, 'k2 stale'),
+    (NULL, '2023-12-03 00:00:00', 1, 10, 'null key stale');
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=0 keys=none mismatched=none
+
+# A new winner, a stale row and a missing key in one batch scope only the winner and the new key
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+INSERT INTO lat_events VALUES
+    (1, '2024-04-01 00:00:00', 1, 10, 'k1 new winner'),
+    (2, '2023-12-03 00:00:00', 1, 20, 'k2 stale 2'),
+    (6, '2020-01-01 00:00:00', 1, 20, 'k6 new key');
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=1 keys=1 mismatched=none
+
+# An equal timestamp is not strictly older: the lower rev takes over the tie
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+INSERT INTO lat_events VALUES (3, '2024-03-07 09:00:00', 0, 30, 'k3 tie lower rev');
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=1 keys=3 mismatched=none
+
+# Deleting a stale row is ignored, deleting the winner is not
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+DELETE FROM lat_events WHERE note = 'k1 older';
+DELETE FROM lat_events WHERE note = 'k2 winner';
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=1 keys=2 mismatched=none
+
+# Promoting a stale row to the newest timestamp and updating a winner's payload keep their partitions
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+UPDATE lat_events SET ts = '2025-01-01 00:00:00' WHERE note = 'k2 stale';
+UPDATE lat_events SET note = 'k3 payload' WHERE note = 'k3 tie lower rev';
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=2 keys=2,3 mismatched=none
+
+# A newer row for the NULL key and the first dated row for a NULL-timestamp winner
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+INSERT INTO lat_events VALUES
+    (NULL, '2024-05-01 00:00:00', 1, 20, 'null key newer'),
+    (5, '2024-01-01 00:00:00', 1, 20, 'k5 dated');
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=2 keys=5,NULL mismatched=none
+
+# Lookup changes still reach keys that only received stale facts, and a NULL timestamp competes under NULLS FIRST
+statement ok
+UPDATE lat_tags SET active = false WHERE tag = 10;
+UPDATE lat_tags SET label = 'gold-2' WHERE label = 'gold-dup';
+INSERT INTO lat_events VALUES
+    (4, '2023-01-01 00:00:00', 1, 10, 'k4 stale'),
+    (3, NULL, 1, 30, 'k3 null ts');
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT names FROM (SELECT coalesce(string_agg(mv, ',' ORDER BY mv), 'none') AS names FROM lat_mismatch WHERE n <> 0);
+----
+none
+
+# Insert-then-delete pairs in one batch: a stale pair is ignored, a newer pair stays scoped
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+INSERT INTO lat_events VALUES (1, '2022-01-01 00:00:00', 1, 20, 'k1 ephemeral stale');
+DELETE FROM lat_events WHERE note = 'k1 ephemeral stale';
+INSERT INTO lat_events VALUES (4, '2030-01-01 00:00:00', 1, 10, 'k4 ephemeral newer');
+DELETE FROM lat_events WHERE note = 'k4 ephemeral newer';
+INSERT INTO lat_events VALUES (3, '2021-01-01 00:00:00', 1, 30, 'k3 stale again');
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=1 keys=4 mismatched=none
+
+# Deleting every row of a partition removes it
+statement ok
+DELETE FROM lat_events WHERE k = 3;
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT names FROM (SELECT coalesce(string_agg(mv, ',' ORDER BY mv), 'none') AS names FROM lat_mismatch WHERE n <> 0);
+----
+none
+
+# Re-keying a winner moves it out of one partition and into another; re-keying stale rows changes neither
+statement ok
+DELETE FROM lat_pin;
+INSERT INTO lat_pin SELECT * FROM lat_rows;
+UPDATE lat_events SET k = 6 WHERE note = 'k1 new winner';
+UPDATE lat_events SET k = 2 WHERE note = 'k4 stale';
+
+statement ok
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_nulls_first'); PRAGMA refresh('lat_fanout'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=2 keys=1,6 mismatched=none
+
+# Shapes where an older row can still change the output must keep the untrimmed program
+statement ok
+CREATE TABLE lat_d_events(k INT, ts TIMESTAMP, rev INT, tag BIGINT, note VARCHAR);
+
+statement ok
+CREATE TABLE lat_d_tags(tag BIGINT, active BOOLEAN);
+
+statement ok
+CREATE TABLE lat_f_events(k INT, score DOUBLE, tag BIGINT, note VARCHAR);
+
+statement ok
+INSERT INTO lat_d_events VALUES
+    (1, '2024-03-01 10:00:00', 1, 10, 'd1 latest'),
+    (1, '2024-02-01 10:00:00', 1, 10, 'd1 middle'),
+    (1, '2024-01-01 10:00:00', 1, 10, 'd1 earliest'),
+    (2, '2024-03-05 08:00:00', 1, 10, 'd2 latest');
+INSERT INTO lat_d_tags VALUES (10, true);
+
+statement ok
+CREATE MATERIALIZED VIEW lat_ascending AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts, rev) AS rn FROM lat_d_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_top_two AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_d_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn <= 2;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_by_day AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY CAST(ts AS DATE) DESC, rev) AS rn FROM lat_d_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_hidden_order AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_d_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_floating AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY score DESC) AS rn FROM lat_f_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.score, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW lat_rank_only AS
+SELECT k, ts, note FROM (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_d_events) r WHERE rn = 1;
+
+query T rowsort
+SELECT 'lat_latest ' || count(*) FROM lat_program('lat_latest') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_nulls_first ' || count(*) FROM lat_program('lat_nulls_first') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_fanout ' || count(*) FROM lat_program('lat_fanout') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_ascending ' || count(*) FROM lat_program('lat_ascending') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_top_two ' || count(*) FROM lat_program('lat_top_two') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_by_day ' || count(*) FROM lat_program('lat_by_day') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_hidden_order ' || count(*) FROM lat_program('lat_hidden_order') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_floating ' || count(*) FROM lat_program('lat_floating') WHERE contains(sql, 'openivm_cur')
+UNION ALL SELECT 'lat_rank_only ' || count(*) FROM lat_program('lat_rank_only') WHERE contains(sql, 'openivm_cur');
+----
+lat_ascending 0
+lat_by_day 0
+lat_fanout 1
+lat_floating 0
+lat_hidden_order 0
+lat_latest 1
+lat_nulls_first 1
+lat_rank_only 0
+lat_top_two 0
+
+statement ok
+CREATE VIEW lat_ascending_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts, rev) AS rn FROM lat_d_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE VIEW lat_top_two_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC, rev) AS rn FROM lat_d_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn <= 2;
+
+statement ok
+CREATE VIEW lat_by_day_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY CAST(ts AS DATE) DESC, rev) AS rn FROM lat_d_events),
+seed AS (SELECT DISTINCT tag FROM lat_d_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+# Each row is strictly older than a materialized winner by the plain timestamp yet changes its view's output
+statement ok
+INSERT INTO lat_d_events VALUES
+    (1, '2023-06-01 00:00:00', 1, 10, 'd1 before earliest'),
+    (1, '2024-02-15 10:00:00', 1, 10, 'd1 enters top two'),
+    (2, '2024-03-05 07:00:00', 0, 10, 'd2 same day lower rev');
+
+statement ok
+PRAGMA refresh('lat_ascending'); PRAGMA refresh('lat_top_two'); PRAGMA refresh('lat_by_day');
+
+query T
+SELECT coalesce(string_agg(mv, ',' ORDER BY mv), 'none') FROM (
+    SELECT 'ascending' AS mv FROM (
+        (SELECT * FROM lat_ascending EXCEPT ALL SELECT * FROM lat_ascending_ref) UNION ALL
+        (SELECT * FROM lat_ascending_ref EXCEPT ALL SELECT * FROM lat_ascending)) HAVING count(*) > 0
+    UNION ALL
+    SELECT 'top_two' FROM (
+        (SELECT * FROM lat_top_two EXCEPT ALL SELECT * FROM lat_top_two_ref) UNION ALL
+        (SELECT * FROM lat_top_two_ref EXCEPT ALL SELECT * FROM lat_top_two)) HAVING count(*) > 0
+    UNION ALL
+    SELECT 'by_day' FROM (
+        (SELECT * FROM lat_by_day EXCEPT ALL SELECT * FROM lat_by_day_ref) UNION ALL
+        (SELECT * FROM lat_by_day_ref EXCEPT ALL SELECT * FROM lat_by_day)) HAVING count(*) > 0);
+----
+none
+
+# Metadata written before the order columns existed keeps the untrimmed program
+statement ok
+CREATE TABLE lat_l_events(k INT, ts TIMESTAMP, tag BIGINT, note VARCHAR);
+
+statement ok
+CREATE TABLE lat_l_tags(tag BIGINT, active BOOLEAN);
+
+statement ok
+INSERT INTO lat_l_events VALUES (1, '2024-03-01 10:00:00', 10, 'l1 winner'), (2, '2024-03-05 08:00:00', 10, 'l2 winner');
+INSERT INTO lat_l_tags VALUES (10, true);
+
+statement ok
+CREATE MATERIALIZED VIEW lat_legacy AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC) AS rn FROM lat_l_events),
+seed AS (SELECT DISTINCT tag FROM lat_l_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE VIEW lat_legacy_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC) AS rn FROM lat_l_events),
+seed AS (SELECT DISTINCT tag FROM lat_l_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+query I
+SELECT count(*) FROM lat_program('lat_legacy') WHERE contains(sql, 'openivm_cur');
+----
+1
+
+statement ok
+UPDATE openivm_views
+SET lineage_json = regexp_replace(lineage_json, ',"order_col":"[^"]*","order_out":"[^"]*"', '')
+WHERE view_sql_name = 'lat_legacy';
+
+query I
+SELECT count(*) FROM lat_program('lat_legacy') WHERE contains(sql, 'openivm_cur');
+----
+0
+
+statement ok
+INSERT INTO lat_l_events VALUES (1, '2023-12-01 00:00:00', 10, 'l1 stale'), (2, '2024-04-01 00:00:00', 10, 'l2 new winner');
+
+statement ok
+PRAGMA refresh('lat_legacy');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM lat_legacy EXCEPT ALL SELECT * FROM lat_legacy_ref) UNION ALL
+    (SELECT * FROM lat_legacy_ref EXCEPT ALL SELECT * FROM lat_legacy));
+----
+0
+
+# Renaming the timestamp column keeps the trim bound to the renamed source column
+statement ok
+CREATE TABLE lat_r_events(k INT, ts TIMESTAMP, tag BIGINT, note VARCHAR);
+
+statement ok
+CREATE TABLE lat_r_tags(tag BIGINT, active BOOLEAN);
+
+statement ok
+INSERT INTO lat_r_events VALUES (1, '2024-03-01 10:00:00', 10, 'r1 winner'), (2, '2024-03-05 08:00:00', 10, 'r2 winner');
+INSERT INTO lat_r_tags VALUES (10, true);
+
+statement ok
+CREATE MATERIALIZED VIEW lat_renamed AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC) AS rn FROM lat_r_events),
+seed AS (SELECT DISTINCT tag FROM lat_r_tags WHERE active)
+SELECT ranked.k, ranked.ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+ALTER TABLE lat_r_events RENAME COLUMN ts TO seen_at;
+
+query I
+SELECT count(*) FROM lat_program('lat_renamed')
+WHERE stmt_order = 1 AND contains(sql, 'openivm_chg.seen_at < openivm_cur.ts');
+----
+1
+
+statement ok
+CREATE VIEW lat_renamed_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY seen_at DESC) AS rn FROM lat_r_events),
+seed AS (SELECT DISTINCT tag FROM lat_r_tags WHERE active)
+SELECT ranked.k, ranked.seen_at AS ts, ranked.note, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag = seed.tag WHERE rn = 1;
+
+statement ok
+CREATE VIEW lat_renamed_rows AS
+SELECT k, rowid AS rid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6c61745f72656e616d6564_;
+
+statement ok
+CREATE TABLE lat_renamed_pin AS SELECT * FROM lat_renamed_rows;
+
+statement ok
+INSERT INTO lat_r_events VALUES (1, '2023-12-01 00:00:00', 10, 'r1 stale'), (2, '2024-04-01 00:00:00', 10, 'r2 new winner');
+
+statement ok
+PRAGMA refresh('lat_renamed');
+
+query T
+SELECT format('mismatched={} rewritten={}',
+    (SELECT count(*) FROM (
+        (SELECT * FROM lat_renamed EXCEPT ALL SELECT * FROM lat_renamed_ref) UNION ALL
+        (SELECT * FROM lat_renamed_ref EXCEPT ALL SELECT * FROM lat_renamed))),
+    (SELECT string_agg(p.k::VARCHAR, ',' ORDER BY p.k) FROM lat_renamed_pin p JOIN lat_renamed_rows b ON b.k = p.k WHERE b.rid <> p.rid));
+----
+mismatched=0 rewritten=2

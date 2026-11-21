@@ -473,6 +473,10 @@ static bool RewriteWindowLineageFields(vector<RefreshMetadata::WindowPartitionLi
 			op.source_col = new_name;
 			changed = true;
 		}
+		if (AuxSourceMatches(op.source, table_name) && StringUtil::CIEquals(op.order_col, old_name)) {
+			op.order_col = new_name;
+			changed = true;
+		}
 		if (op.kind == WindowLineageKind::LOOKUP && AuxSourceMatches(op.lookup, table_name)) {
 			if (StringUtil::CIEquals(op.lookup_col, old_name)) {
 				op.lookup_col = new_name;

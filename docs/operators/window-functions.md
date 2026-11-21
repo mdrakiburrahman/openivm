@@ -84,6 +84,11 @@ Window functions work with other operators:
 
 - **Window over JOIN:** `SELECT ..., ROW_NUMBER() OVER (...) FROM t1 JOIN t2 ON ...` —
   uses partition recompute when OpenIVM can derive affected partition values from source lineage. Other join shapes use full recompute.
+- **Latest row per key with a lookup:** for `ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC, ...)`
+  filtered to `rn = 1` and `LEFT JOIN`ed to one lookup table, a key is not recomputed when every
+  changed row of it is strictly older than the key's stored row. `ts` must be a plain column that the
+  view also outputs. Equal or `NULL` timestamps, changes to the stored row itself, and lookup changes
+  still recompute the key.
 - **Window with WHERE:** `SELECT ..., RANK() OVER (...) FROM t WHERE active = true` —
   the filter is part of the base query used for partition recompute.
 - **Composite PARTITION BY:** Multiple columns are supported:

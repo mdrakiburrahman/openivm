@@ -2145,6 +2145,9 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::WindowPa
 		io.Str("lookup_out", m.lookup_out);
 		io.Str("lookup_cast", m.lookup_cast, Presence::OMIT_EMPTY);
 		io.Str("lookup_out_cast", m.lookup_out_cast, Presence::OMIT_EMPTY);
+	} else {
+		io.Str("order_col", m.order_col, Presence::OMIT_EMPTY);
+		io.Str("order_out", m.order_out, Presence::OMIT_EMPTY);
 	}
 }
 

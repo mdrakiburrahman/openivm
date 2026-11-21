@@ -396,6 +396,10 @@ public:
 		string lookup_cast;
 		string lookup_out;
 		string lookup_out_cast;
+		// Direct arm only: leading DESC rank order column and the backing column that exposes it. When both are set,
+		// a key whose changed rows all order strictly after the materialized rank-1 row is not affected.
+		string order_col;
+		string order_out;
 	};
 
 	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);

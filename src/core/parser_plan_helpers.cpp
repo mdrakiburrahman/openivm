@@ -39,6 +39,7 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
@@ -2647,6 +2648,208 @@ static bool IsNormalizedSeedLookup(const CreateMVPlanFacts &facts, const vector<
 	return true;
 }
 
+static bool ResolveBareBindingToGet(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
+                                    ProjectionIndex &column_index) {
+	for (idx_t depth = 0; depth < 16; ++depth) {
+		auto get_it = facts.gets_by_index.find(binding.table_index);
+		if (get_it != facts.gets_by_index.end()) {
+			get = get_it->second;
+			column_index = binding.column_index;
+			return true;
+		}
+		auto proj_it = facts.projections_by_index.find(binding.table_index);
+		if (proj_it == facts.projections_by_index.end() ||
+		    binding.column_index.GetIndex() >= proj_it->second->expressions.size()) {
+			return false;
+		}
+		auto &expr = *proj_it->second->expressions[binding.column_index.GetIndex()];
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		binding = expr.Cast<BoundColumnRefExpression>().Binding();
+	}
+	return false;
+}
+
+static bool CollectOperatorAncestors(LogicalOperator &op, const LogicalWindow &window,
+                                     vector<LogicalOperator *> &ancestors) {
+	if (&op == &window) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (CollectOperatorAncestors(*child, window, ancestors)) {
+			ancestors.push_back(&op);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsWindowOrderTrimType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool IsConstantOne(const Expression &expr) {
+	auto *current = &expr;
+	while (BoundCastExpression::IsCast(*current)) {
+		current = &BoundCastExpression::Child(current->Cast<BoundFunctionExpression>());
+	}
+	if (current->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &value = current->Cast<BoundConstantExpression>().GetValue();
+	switch (value.type().id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+		return !value.IsNull() && value.GetValue<int64_t>() == 1;
+	default:
+		return false;
+	}
+}
+
+static bool IsWindowOutputRef(const Expression &expr, const CreateMVPlanFacts &facts, const LogicalWindow &window) {
+	if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto binding = expr.Cast<BoundColumnRefExpression>().Binding();
+	for (idx_t depth = 0; depth < 16; ++depth) {
+		if (binding.table_index == window.window_index) {
+			return binding.column_index.GetIndex() == 0;
+		}
+		auto proj = facts.projections_by_index.find(binding.table_index);
+		if (proj == facts.projections_by_index.end() ||
+		    binding.column_index.GetIndex() >= proj->second->expressions.size()) {
+			return false;
+		}
+		auto &next = *proj->second->expressions[binding.column_index.GetIndex()];
+		if (next.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		binding = next.Cast<BoundColumnRefExpression>().Binding();
+	}
+	return false;
+}
+
+static bool IsRankEqualsOne(const Expression &expr, const CreateMVPlanFacts &facts, const LogicalWindow &window) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			if (IsRankEqualsOne(*child, facts, window)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (expr.GetExpressionType() != ExpressionType::COMPARE_EQUAL || !BoundComparisonExpression::IsComparison(expr)) {
+		return false;
+	}
+	auto &comparison = expr.Cast<BoundFunctionExpression>();
+	auto &left = BoundComparisonExpression::Left(comparison);
+	auto &right = BoundComparisonExpression::Right(comparison);
+	return (IsWindowOutputRef(left, facts, window) && IsConstantOne(right)) ||
+	       (IsConstantOne(left) && IsWindowOutputRef(right, facts, window));
+}
+
+// A key whose pending rows all sort strictly after its materialized rank-1 row leaves that row on top, so it
+// can be left out of the affected keys. Needs a leading DESC order column of the partition's source, exposed
+// bare by the output, with rank = 1 selected. A NULL order value never qualifies a key for the trim.
+static bool BuildWindowOrderTrim(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                 const WindowLineageOp &direct, string &order_col, string &order_out) {
+	auto decline = [](const char *reason) {
+		OPENIVM_DEBUG_PRINT("[WINDOW ORDER TRIM] declined: %s\n", reason);
+		return false;
+	};
+	if (!facts.root || !facts.first_projection || facts.windows.size() != 1) {
+		return decline("unsupported plan shape");
+	}
+	auto &window = *facts.windows.front();
+	if (window.expressions.size() != 1 ||
+	    window.expressions.front()->GetExpressionClass() != ExpressionClass::BOUND_WINDOW ||
+	    window.expressions.front()->GetExpressionType() != ExpressionType::WINDOW_ROW_NUMBER) {
+		return decline("window is not a single ROW_NUMBER");
+	}
+	auto &row_number = window.expressions.front()->Cast<BoundWindowExpression>();
+	if (row_number.Partitions().size() != 1 || row_number.OrderBy().empty() || row_number.Filter() ||
+	    row_number.IgnoreNulls() || row_number.Distinct() || !row_number.GetChildren().empty() ||
+	    !row_number.ArgOrders().empty()) {
+		return decline("unsupported ROW_NUMBER specification");
+	}
+	auto &leading = row_number.OrderBy().front();
+	if (leading.type != OrderType::DESCENDING ||
+	    leading.expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return decline("leading ORDER BY key is not a plain descending column");
+	}
+	LogicalGet *get = nullptr;
+	ProjectionIndex column_index;
+	string name;
+	LogicalType type;
+	if (!ResolveBareBindingToGet(leading.expression->Cast<BoundColumnRefExpression>().Binding(), facts, get,
+	                             column_index) ||
+	    !GetLogicalGetColumnName(*get, column_index, name) || !GetLogicalGetColumnType(*get, column_index, type) ||
+	    !IsWindowOrderTrimType(type)) {
+		return decline("leading ORDER BY key is not a supported plain source column");
+	}
+	auto occurrence = facts.occurrence_by_index.find(get->table_index);
+	if (occurrence == facts.occurrence_by_index.end() || occurrence->second.table != direct.source_table ||
+	    occurrence->second.occurrence != direct.source_occurrence) {
+		return decline("leading ORDER BY key is not read from the partition source");
+	}
+	vector<LogicalOperator *> ancestors;
+	if (!CollectOperatorAncestors(*facts.root, window, ancestors)) {
+		return decline("window is not under the plan root");
+	}
+	bool selects_rank_one = false;
+	for (auto *ancestor : ancestors) {
+		switch (ancestor->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+			break;
+		case LogicalOperatorType::LOGICAL_FILTER:
+			for (auto &expr : ancestor->expressions) {
+				selects_rank_one = selects_rank_one || IsRankEqualsOne(*expr, facts, window);
+			}
+			break;
+		default:
+			return decline("unsupported operator above the window");
+		}
+	}
+	if (!selects_rank_one) {
+		return decline("rank 1 is not selected");
+	}
+	WindowLineageOp order_key = direct;
+	order_key.source_col = name;
+	order_key.source_cast.clear();
+	auto &exprs = facts.first_projection->expressions;
+	for (idx_t i = 0; i < exprs.size() && i < output_names.size(); ++i) {
+		if (!IncrementalTableNames::IsInternalColumn(output_names[i]) && IsRawWindowKey(*exprs[i], facts, order_key)) {
+			order_col = name;
+			order_out = output_names[i];
+			return true;
+		}
+	}
+	return decline("leading ORDER BY key is not exposed by the output");
+}
+
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     const vector<string> &output_names,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
@@ -2677,8 +2880,9 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 
 	vector<WindowEquivalenceEdge> edges;
 	vector<WindowLookupEdge> lookup_edges;
+	const bool normalized_seed =
+	    partition_columns.size() == 1 && IsNormalizedSeedLookup(facts, output_names, direct_ops);
 	for (auto *join : facts.comparison_joins) {
-		const bool normalized_seed = partition_columns.size() == 1 && IsNormalizedSeedLookup(facts, output_names, direct_ops);
 		CollectWindowJoinEdges(*join, facts, edges, lookup_edges, normalized_seed);
 	}
 
@@ -2759,8 +2963,23 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 	}
 
+	bool has_lookup = false;
 	for (auto &op : ops) {
-		out.push_back(ToMetadataWindowLineageOp(op));
+		has_lookup = has_lookup || op.kind == WindowLineageKind::LOOKUP;
+	}
+	string order_col, order_out;
+	const bool order_trim = normalized_seed && has_lookup &&
+	                        BuildWindowOrderTrim(facts, output_names, direct_ops.front(), order_col, order_out);
+	for (auto &op : ops) {
+		auto metadata_op = ToMetadataWindowLineageOp(op);
+		if (order_trim && op.kind == WindowLineageKind::DIRECT && op.source_table == direct_ops.front().source_table &&
+		    op.source_occurrence == direct_ops.front().source_occurrence &&
+		    StringUtil::CIEquals(op.source_col, direct_ops.front().source_col) &&
+		    StringUtil::CIEquals(op.output_col, direct_ops.front().output_col)) {
+			metadata_op.order_col = order_col;
+			metadata_op.order_out = order_out;
+		}
+		out.push_back(std::move(metadata_op));
 	}
 	return !out.empty();
 }
