@@ -119,7 +119,7 @@ WHERE stmt_order = 1 AND contains(sql, 'openivm_cur');
 0
 
 statement ok
-SET openivm_late_append_window_trim = true;
+SET SESSION openivm_late_append_window_trim = true;
 
 # The scoped affected-key program trims keys whose changed rows are strictly older than the materialized winner
 query I
@@ -131,7 +131,7 @@ WHERE stmt_order = 1 AND contains(sql, 'not exists') AND contains(sql, 'openivm_
 
 # Disabling after enabling must also take effect on an existing view.
 statement ok
-SET openivm_late_append_window_trim = false;
+SET SESSION openivm_late_append_window_trim = false;
 
 statement ok
 INSERT INTO lat_events VALUES (1, '2023-11-01 00:00:00', 1, 10, 'default stale');
@@ -149,7 +149,7 @@ WHERE stmt_order = 1 AND contains(sql, 'openivm_cur');
 0
 
 statement ok
-SET openivm_late_append_window_trim = true;
+SET SESSION openivm_late_append_window_trim = true;
 
 # Strictly older facts, including a NULL partition key, cannot change any winner
 statement ok
