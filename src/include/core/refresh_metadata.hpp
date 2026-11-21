@@ -400,6 +400,8 @@ public:
 		// a key whose changed rows all order strictly after the materialized rank-1 row is not affected.
 		string order_col;
 		string order_out;
+		// Lookup arm only: match changed source values to lookup values with IS NOT DISTINCT FROM.
+		bool null_safe = false;
 	};
 
 	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
