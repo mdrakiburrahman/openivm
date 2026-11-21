@@ -155,6 +155,12 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                   vector<string> &partition_columns,
                                   vector<RefreshMetadata::WindowPartitionLineageOp> &ops);
+/// Scope a single ROW_NUMBER partition whose input is only projections, filters and UNION ALL over
+/// table scans, and whose visible key is the partition value itself. Emits one LINEAR op per source;
+/// refresh recomputes the view query over every source's delta rows to find the changed keys.
+bool BuildLinearWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                          const vector<string> &output_names,
+                                          vector<RefreshMetadata::WindowPartitionLineageOp> &out);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
 /// A same-named source/output key for a single-source, key-local plan; empty if
