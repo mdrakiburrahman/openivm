@@ -5414,3 +5414,54 @@ DROP VIEW complex_key_mv;
 DROP TABLE complex_key_src;
 
 endloop
+
+# Bind GROUP BY keys to the stored SELECT outputs, including generated names
+# and quoted aliases whose sanitized spelling collides with another output.
+statement ok
+CREATE TABLE group_output_names_src (id INT, k INT, v INT);
+INSERT INTO group_output_names_src VALUES (1,1,10),(2,2,10),(3,NULL,8);
+CREATE MATERIALIZED VIEW unnamed_list_key_mv AS
+    SELECT list_value(k), SUM(v) AS s, COUNT(*) AS n
+    FROM group_output_names_src GROUP BY list_value(k);
+CREATE MATERIALIZED VIEW quoted_scalar_key_mv AS
+    SELECT SUM(v) AS "Mi_X", k AS "Mi.X", COUNT(*) AS n
+    FROM group_output_names_src GROUP BY k HAVING SUM(v)>0;
+CREATE VIEW unnamed_list_key_expected AS
+    SELECT list_value(k), SUM(v) AS s, COUNT(*) AS n
+    FROM group_output_names_src GROUP BY list_value(k);
+CREATE VIEW quoted_scalar_key_expected AS
+    SELECT SUM(v) AS "Mi_X", k AS "Mi.X", COUNT(*) AS n
+    FROM group_output_names_src GROUP BY k HAVING SUM(v)>0;
+
+query I
+SELECT count(*) FROM duckdb_indexes() i JOIN openivm_views v
+    ON i.table_name='openivm_data_'||v.view_name
+WHERE v.view_sql_name IN ('unnamed_list_key_mv','quoted_scalar_key_mv')
+  AND i.is_unique;
+----
+1
+
+statement ok
+INSERT INTO group_output_names_src VALUES (4,1,-20),(5,3,15),(99,2,35);
+UPDATE group_output_names_src SET k=2,v=14 WHERE id=3;
+UPDATE group_output_names_src SET k=4,v=40 WHERE id=99;
+DELETE FROM group_output_names_src WHERE id IN (2,99);
+PRAGMA refresh('unnamed_list_key_mv');
+PRAGMA refresh('quoted_scalar_key_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM unnamed_list_key_mv EXCEPT ALL SELECT * FROM unnamed_list_key_expected)
+    UNION ALL (SELECT * FROM unnamed_list_key_expected EXCEPT ALL SELECT * FROM unnamed_list_key_mv)
+    UNION ALL (SELECT * FROM quoted_scalar_key_mv EXCEPT ALL SELECT * FROM quoted_scalar_key_expected)
+    UNION ALL (SELECT * FROM quoted_scalar_key_expected EXCEPT ALL SELECT * FROM quoted_scalar_key_mv)
+);
+----
+0
+
+statement ok
+DROP VIEW quoted_scalar_key_mv;
+DROP VIEW unnamed_list_key_mv;
+DROP VIEW quoted_scalar_key_expected;
+DROP VIEW unnamed_list_key_expected;
+DROP TABLE group_output_names_src;

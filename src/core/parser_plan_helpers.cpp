@@ -1512,8 +1512,12 @@ static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFa
 
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names) {
+	// The CTAS operator exposes its inserted row count. Its SELECT child
+	// carries the bindings that correspond to the backing table's output names.
+	auto &root = *facts.root;
+	auto &output = root.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? *root.children[0] : root;
 	vector<string> group_names;
-	if (!AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
+	if (!AddGroupColumnsFromBindings(output, facts, group_index, group_count, output_names, group_names)) {
 		FindGroupColumns(facts, group_index, group_count, output_names, group_names);
 	}
 	// Expressions over keys are constant within a group, not additive aggregates.
