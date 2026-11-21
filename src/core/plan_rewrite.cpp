@@ -2030,6 +2030,15 @@ struct OutputExpressionRenderer {
 				return false;
 			}
 			const auto &name = function.Function().GetName().GetIdentifierName();
+			if (name == "struct_pack") {
+				const auto &fields = StructType::GetChildTypes(function.GetReturnType());
+				if (fields.size() != children.size()) {
+					throw InternalException("struct_pack field count does not match its arguments");
+				}
+				for (idx_t i = 0; i < children.size(); i++) {
+					children[i] = SQLQuotedIdentifier::ToString(fields[i].first) + " := " + children[i];
+				}
+			}
 			if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
 				sql = "(" + children[0] + " " + name + " " + children[1] + ")";
 			} else {

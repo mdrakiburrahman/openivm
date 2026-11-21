@@ -1,4 +1,5 @@
 #include "core/incremental_checker.hpp"
+#include "core/spark_expression_marker.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -243,7 +244,12 @@ static bool IsVolatileExpression(const Expression &expr) {
 	    name == "error") {
 		return false;
 	}
-	return expr.Cast<BoundFunctionExpression>().Function().GetStability() != FunctionStability::CONSISTENT;
+	const auto &function = expr.Cast<BoundFunctionExpression>().Function();
+	using ScalarCallback = void (*)(DataChunk &, ExpressionState &, Vector &);
+	const auto callback_fn = function.GetFunctionCallback();
+	const auto callback = callback_fn.target<ScalarCallback>();
+	return function.GetStability() != FunctionStability::CONSISTENT &&
+	       (!callback || *callback != SparkExpressionMarker);
 }
 
 static bool IsNonFoldableUnnestExpression(const Expression &expr) {
