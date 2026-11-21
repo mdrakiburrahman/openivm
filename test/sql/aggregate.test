@@ -5514,7 +5514,26 @@ SELECT count(*) FROM openivm_views WHERE view_sql_name='reserved_group_alias';
 ----
 0
 
+# The grouped-count helper is absent from a plain projection.
 statement ok
+CREATE MATERIALIZED VIEW noncolliding_count_alias AS
+    SELECT v AS "OPENIVM_COUNT_STAR" FROM reserved_group_alias_src;
+INSERT INTO reserved_group_alias_src VALUES (3,30),(4,40);
+UPDATE reserved_group_alias_src SET v=15 WHERE k=1;
+DELETE FROM reserved_group_alias_src WHERE k=4;
+PRAGMA refresh('noncolliding_count_alias');
+
+query I
+SELECT count(*) FROM (
+    (SELECT "OPENIVM_COUNT_STAR" FROM noncolliding_count_alias EXCEPT ALL SELECT v FROM reserved_group_alias_src)
+    UNION ALL
+    (SELECT v FROM reserved_group_alias_src EXCEPT ALL SELECT "OPENIVM_COUNT_STAR" FROM noncolliding_count_alias)
+);
+----
+0
+
+statement ok
+DROP VIEW noncolliding_count_alias;
 DROP TABLE reserved_group_alias_src;
 
 # A punctuation-only alias survives sanitization and must stay one group
