@@ -1709,9 +1709,26 @@ bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_p
 	return AnyMetadataOwnership(con, openivm::DELTA_TABLES_TABLE, transaction_state, matches);
 }
 
+static constexpr char VIEW_LIST_JSON_PREFIX[] = "json:";
+
+string RefreshMetadata::SerializeViewList(const vector<string> &values) {
+	// Keep the original spelling of ordinary lists for readers of openivm_views.
+	// Use a tagged array whenever commas cannot distinguish names from separators.
+	for (auto &value : values) {
+		if (value.find(',') != string::npos || StringUtil::StartsWith(value, VIEW_LIST_JSON_PREFIX)) {
+			return VIEW_LIST_JSON_PREFIX + SqlUtils::JsonArray(values);
+		}
+	}
+	return StringUtil::Join(values, ",");
+}
+
 vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
+	auto text = ReadViewString(view_name, column);
+	if (StringUtil::StartsWith(text, VIEW_LIST_JSON_PREFIX)) {
+		return SqlUtils::ParseColumnList(text.substr(sizeof(VIEW_LIST_JSON_PREFIX) - 1));
+	}
 	vector<string> values;
-	std::istringstream stream(ReadViewString(view_name, column));
+	std::istringstream stream(text);
 	string token;
 	while (std::getline(stream, token, ',')) {
 		if (!token.empty()) {

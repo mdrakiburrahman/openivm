@@ -490,15 +490,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                             select_planner.properties.always_require_rebind);
 		auto select_output_names = IdentifiersToStrings(select_planner.names);
 		visible_output_count = select_output_names.size();
-		for (auto &name : select_output_names) {
-			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
-			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
-			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
-			    StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX) ||
-			    StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX)) {
-				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
-			}
-		}
 		add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
 		// Inline CTEs without running the full optimizer, which can reshape plans
@@ -518,6 +509,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
+		ValidateMaterializedViewOutputNames(select_output_names, output_names, visible_output_count);
 		output_types = select_plan->types;
 
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
@@ -1221,9 +1213,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
-	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
-	string window_order_cols_val = SqlCsvLiteralOrNull(window_order_columns);
-	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
+	string group_cols_val = ViewListSqlLiteralOrNull(cols_to_store);
+	string window_order_cols_val = ViewListSqlLiteralOrNull(window_order_columns);
+	string agg_types_val = ViewListSqlLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)
 	                        ? "null"
 	                        : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";

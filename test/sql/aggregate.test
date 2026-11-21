@@ -5481,3 +5481,90 @@ DROP VIEW unnamed_list_key_expected;
 DROP TABLE group_output_names_src;
 
 endloop
+
+# A name that binds to an internal helper must fail during CREATE, even when
+# case folding or sanitization creates the collision.
+statement ok
+CREATE TABLE reserved_group_alias_src (k INT, v INT);
+INSERT INTO reserved_group_alias_src VALUES (1,10),(2,20);
+
+statement error
+CREATE MATERIALIZED VIEW reserved_group_alias AS
+    SELECT struct_pack(x:=k) AS "OPENIVM_COUNT_STAR", SUM(v) AS s
+    FROM reserved_group_alias_src GROUP BY struct_pack(x:=k);
+----
+reserved OpenIVM column 'OPENIVM_COUNT_STAR'
+
+statement error
+CREATE MATERIALIZED VIEW reserved_group_alias AS
+    SELECT list_value(k) AS "openivm.multiplicity", SUM(v) AS s
+    FROM reserved_group_alias_src GROUP BY list_value(k);
+----
+reserved OpenIVM column 'openivm.multiplicity'
+
+statement error
+CREATE MATERIALIZED VIEW reserved_group_alias AS
+    SELECT SUM(v) AS "OPENIVM_GROUP_KEY_0", COUNT(*) AS n
+    FROM reserved_group_alias_src GROUP BY list_value(k);
+----
+reserved OpenIVM column 'OPENIVM_GROUP_KEY_0'
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name='reserved_group_alias';
+----
+0
+
+statement ok
+DROP TABLE reserved_group_alias_src;
+
+# A punctuation-only alias survives sanitization and must stay one group
+# column when stored alongside another key.
+foreach key k struct_pack(x:=k)
+
+statement ok
+CREATE TABLE comma_group_src (id INT, k INT, g INT, v INT);
+INSERT INTO comma_group_src VALUES (1,1,1,10),(2,2,1,20),(3,2,2,30),(4,NULL,2,40);
+CREATE MATERIALIZED VIEW comma_group_mv AS
+    SELECT {key} AS ",", g, SUM(v) AS s, COUNT(*) AS n
+    FROM comma_group_src GROUP BY {key},g;
+CREATE VIEW comma_group_expected AS
+    SELECT {key} AS ",", g, SUM(v) AS s, COUNT(*) AS n
+    FROM comma_group_src GROUP BY {key},g;
+
+statement ok
+INSERT INTO comma_group_src VALUES (5,2,1,6),(6,3,2,12),(99,1,1,99);
+UPDATE comma_group_src SET k=3,v=7 WHERE id=3;
+UPDATE comma_group_src SET g=2 WHERE id=99;
+DELETE FROM comma_group_src WHERE id IN (2,99);
+PRAGMA refresh('comma_group_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM comma_group_mv EXCEPT ALL SELECT * FROM comma_group_expected)
+    UNION ALL (SELECT * FROM comma_group_expected EXCEPT ALL SELECT * FROM comma_group_mv)
+);
+----
+0
+
+statement ok
+SET openivm_refresh_mode='full';
+UPDATE comma_group_src SET v=v+3 WHERE id=1;
+INSERT INTO comma_group_src VALUES (7,NULL,2,17);
+DELETE FROM comma_group_src WHERE id=6;
+PRAGMA refresh('comma_group_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM comma_group_mv EXCEPT ALL SELECT * FROM comma_group_expected)
+    UNION ALL (SELECT * FROM comma_group_expected EXCEPT ALL SELECT * FROM comma_group_mv)
+);
+----
+0
+
+statement ok
+SET openivm_refresh_mode='incremental';
+DROP VIEW comma_group_mv;
+DROP VIEW comma_group_expected;
+DROP TABLE comma_group_src;
+
+endloop

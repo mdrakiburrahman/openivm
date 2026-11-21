@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "core/parser_create_mv_helpers.hpp"
+#include "core/refresh_metadata.hpp"
 
 #include "core/compiled_sql_archive.hpp"
 #include "core/metadata_location.hpp"
@@ -36,11 +37,11 @@ bool CanCreateGroupIndex(const vector<string> &groups, const vector<string> &nam
 	return true;
 }
 
-string SqlCsvLiteralOrNull(const vector<string> &values) {
+string ViewListSqlLiteralOrNull(const vector<string> &values) {
 	if (values.empty()) {
 		return "null";
 	}
-	return "'" + StringUtil::Join(values, values.size(), ",", SqlUtils::EscapeSingleQuotes) + "'";
+	return Value(RefreshMetadata::SerializeViewList(values)).ToSQLString();
 }
 
 // Read the caller's snapshot, including metadata inserted earlier in this

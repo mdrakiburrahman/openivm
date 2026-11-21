@@ -248,6 +248,7 @@ public:
 	                                   const string &data_catalog = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
+	static string SerializeViewList(const vector<string> &values);
 	vector<string> GetGroupColumns(const string &view_name);
 
 	// Get common window ORDER BY output/source mappings. Empty means the view

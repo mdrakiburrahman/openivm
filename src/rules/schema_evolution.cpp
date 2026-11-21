@@ -560,8 +560,7 @@ static bool RewriteWindowGroupColumnSources(Connection &con, RefreshMetadata &me
 		}
 	}
 	if (changed) {
-		string value = StringUtil::Join(rewritten, rewritten.size(), ",", [](const string &item) { return item; });
-		UpdateViewMetadataValue(con, view_name, "group_columns", value);
+		UpdateViewMetadataValue(con, view_name, "group_columns", RefreshMetadata::SerializeViewList(rewritten));
 	}
 	return changed;
 }

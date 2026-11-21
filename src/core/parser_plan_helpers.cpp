@@ -2963,6 +2963,32 @@ static string SanitizeOutputName(const string &name) {
 	return clean.empty() ? name : clean;
 }
 
+static bool IsReservedMaterializedViewOutputName(const string &name) {
+	return StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
+	       StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
+	       StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
+	       StringUtil::CIEquals(name, openivm::COUNT_STAR_COL) ||
+	       StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX) ||
+	       StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX);
+}
+
+void ValidateMaterializedViewOutputNames(const vector<string> &original_names, const vector<string> &output_names,
+                                         idx_t visible_count) {
+	case_insensitive_set_t helper_names;
+	for (idx_t i = visible_count; i < output_names.size(); i++) {
+		helper_names.insert(output_names[i]);
+	}
+	for (idx_t i = 0; i < visible_count; i++) {
+		// Sanitization can turn a visible alias such as "openivm.multiplicity" into a helper name.
+		auto &original = original_names[i];
+		auto &output = output_names[i];
+		if (IsReservedMaterializedViewOutputName(original) || IsReservedMaterializedViewOutputName(output) ||
+		    helper_names.count(output)) {
+			throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", original);
+		}
+	}
+}
+
 static LogicalOperator *FindTopNameSource(LogicalOperator *plan) {
 	for (auto *walk = plan; walk;) {
 		if (walk->type == LogicalOperatorType::LOGICAL_PROJECTION ||
