@@ -185,8 +185,9 @@ void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
 	// session-scoped planning settings and TimeZone (which can be folded into
 	// the plan) still need to be mirrored onto the fresh planning connection.
 	static const char *PLANNING_SETTINGS[] = {
-	    "openivm_adaptive_refresh", "openivm_cost_decay",    "openivm_skip_empty_deltas",  "openivm_fk_pruning",
-	    "openivm_ducklake_nterm",   "openivm_regular_nterm", "openivm_regular_nterm_left", "TimeZone",
+	    "openivm_adaptive_refresh",        "openivm_cost_decay",    "openivm_skip_empty_deltas",  "openivm_fk_pruning",
+	    "openivm_ducklake_nterm",          "openivm_regular_nterm", "openivm_regular_nterm_left", "TimeZone",
+	    "openivm_late_append_window_trim",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		SqlUtils::CopySessionSetting(from, to, setting_name);

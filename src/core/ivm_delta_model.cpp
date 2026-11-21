@@ -229,8 +229,8 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	if (model.type == RefreshType::WINDOW_PARTITION) {
 		const auto lineage_partition_columns = model.window_partition_columns;
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
-		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, output_names, model.window_lineage_ops,
-		                                                  &direct_lineage_ops);
+		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
+		                                                  model.window_lineage_ops, &direct_lineage_ops);
 		bool has_linear_lineage = false;
 		if (!has_lineage) {
 			has_linear_lineage = BuildLinearWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
@@ -238,8 +238,8 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 			has_lineage = has_linear_lineage;
 		}
 		// Linear lineage proves the visible binding even when the key is computed above a UNION ALL.
-		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names,
-		                                                                  facts.first_projection != nullptr && !has_linear_lineage);
+		model.window_partition_columns = ProjectedWindowPartitionColumns(
+		    lineage_partition_columns, output_names, facts.first_projection != nullptr && !has_linear_lineage);
 		if (!analysis.found_asof_join) {
 			// A visible output merely named like the partition key is not proof that it carries
 			// that key once the aggregate regroups by another column, so this builder wins.

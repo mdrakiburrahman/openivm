@@ -325,6 +325,8 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
 
 	vector<string> arms;
 	unordered_set<string> covered_sources;
+	const auto trim_data_table =
+	    SqlUtils::GetBoolSetting(*con.context, "openivm_late_append_window_trim", false) ? data_table : "";
 	for (auto &op : lineage_ops) {
 		if (!StringUtil::CIEquals(op.output_col, parsed.first)) {
 			continue;
@@ -334,7 +336,7 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
 			arm_sql = BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
 			                                        op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
 			                                        view_schema_name, attached_db_catalog_name, attached_db_schema_name,
-			                                        data_table, op.order_col, op.order_out);
+			                                        trim_data_table, op.order_col, op.order_out);
 		} else if (op.kind == WindowLineageKind::LOOKUP) {
 			arm_sql = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op,
 			                                            delta_ts_filter, view_catalog_name, view_schema_name,

@@ -111,6 +111,16 @@ FROM (
     FROM lat_pin p JOIN lat_rows b ON b.k IS NOT DISTINCT FROM p.k WHERE b.rid <> p.rid) r,
     (SELECT coalesce(string_agg(mv, ',' ORDER BY mv), 'none') AS names FROM lat_mismatch WHERE n <> 0) m;
 
+# Metadata alone does not opt in: the default program keeps every changed key.
+query I
+SELECT count(*) FROM lat_program('lat_latest')
+WHERE stmt_order = 1 AND contains(sql, 'openivm_cur');
+----
+0
+
+statement ok
+SET openivm_late_append_window_trim = true;
+
 # The scoped affected-key program trims keys whose changed rows are strictly older than the materialized winner
 query I
 SELECT count(*) FROM lat_program('lat_latest')
@@ -118,6 +128,28 @@ WHERE stmt_order = 1 AND contains(sql, 'not exists') AND contains(sql, 'openivm_
   AND contains(sql, 'openivm_chg.ts < openivm_cur.ts');
 ----
 1
+
+# Disabling after enabling must also take effect on an existing view.
+statement ok
+SET openivm_late_append_window_trim = false;
+
+statement ok
+INSERT INTO lat_events VALUES (1, '2023-11-01 00:00:00', 1, 10, 'default stale');
+PRAGMA refresh('lat_latest'); PRAGMA refresh('lat_down');
+
+query T
+SELECT outcome FROM lat_outcome;
+----
+rewritten=1 keys=1 mismatched=none
+
+query I
+SELECT count(*) FROM lat_program('lat_latest')
+WHERE stmt_order = 1 AND contains(sql, 'openivm_cur');
+----
+0
+
+statement ok
+SET openivm_late_append_window_trim = true;
 
 # Strictly older facts, including a NULL partition key, cannot change any winner
 statement ok

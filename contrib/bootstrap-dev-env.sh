@@ -14,11 +14,10 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 export DEBIAN_FRONTEND=noninteractive
 
-# The duckdb gitlink is the deployed extension ABI. The tag gives the DuckDB build
-# its version string, which a shallow submodule clone would otherwise lack.
-DUCKDB_REF=v1.5.2
+# Follow this checkout's ABI, not the separately published benchmark package.
+DUCKDB_REF=$(git rev-parse HEAD:duckdb)
 
-PACKAGES=(build-essential cmake ninja-build git ca-certificates python3 python3-pip libssl-dev pkg-config zip unzip curl gh)
+PACKAGES=(build-essential cmake ninja-build git ca-certificates python3 python3-pip python3-venv libssl-dev pkg-config zip unzip curl gh)
 MISSING=()
 for package in "${PACKAGES[@]}"; do
     dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || MISSING+=("$package")
@@ -44,17 +43,14 @@ init_missing() {
 init_missing . duckdb extension-ci-tools third_party/lpts
 init_missing third_party/lpts third_party/ducklake
 
-if ! git -C duckdb rev-parse -q --verify "refs/tags/$DUCKDB_REF" >/dev/null; then
-    git -C duckdb fetch -q --depth 1 origin tag "$DUCKDB_REF"
-fi
-if [ "$(git -C duckdb rev-parse HEAD)" != "$(git -C duckdb rev-parse "$DUCKDB_REF^{commit}")" ]; then
-    echo "WARNING: duckdb is at $(git -C duckdb rev-parse HEAD), not $DUCKDB_REF; the build will not match the deployed ABI." >&2
+if [ "$(git -C duckdb rev-parse HEAD)" != "$DUCKDB_REF" ]; then
+    echo "WARNING: duckdb is at $(git -C duckdb rev-parse HEAD), not committed gitlink $DUCKDB_REF; preserving the existing checkout." >&2
 fi
 
 echo "Done"
 echo "openivm: $(git rev-parse --abbrev-ref HEAD) $(git rev-parse HEAD)"
 git submodule status -- duckdb extension-ci-tools third_party/lpts
-echo "duckdb: $(git -C duckdb describe --tags)"
+echo "duckdb: $(git -C duckdb describe --tags --always)"
 echo "cmake: $(cmake --version | head -1)"
 echo "ninja: $(ninja --version)"
 echo "Build: GEN=ninja make    Test: make test"
