@@ -3024,7 +3024,7 @@ static void AppendHiddenOutputNames(LogicalOperator *plan, vector<string> &outpu
 }
 
 static void DeduplicateOutputNames(vector<string> &output_names) {
-	unordered_set<string> seen;
+	case_insensitive_set_t seen;
 	for (auto &name : output_names) {
 		if (IncrementalTableNames::IsInternalColumn(name)) {
 			continue;
