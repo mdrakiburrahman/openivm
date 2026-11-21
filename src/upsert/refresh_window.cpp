@@ -156,12 +156,24 @@ static string BuildStandardChangedValuesSQL(RefreshMetadata &metadata, const str
                                             const string &output_col, const string &delta_ts_filter,
                                             const string &view_catalog_name, const string &view_schema_name,
                                             const string &attached_db_catalog_name,
-                                            const string &attached_db_schema_name) {
+                                            const string &attached_db_schema_name, const string &data_table,
+                                            const string &order_col, const string &order_out) {
 	string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, table_name,
 	                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
 	                                                    attached_db_catalog_name, attached_db_schema_name);
 	if (delta_table.empty()) {
 		return "";
+	}
+	if (!data_table.empty() && !order_col.empty() && !order_out.empty() && source_cast.empty()) {
+		// A key whose pending rows all sort strictly after its materialized rank-1 row keeps that row.
+		string changed_key = BuildLineageColumnExpr(source_col, "", "openivm_chg");
+		string changed_order = BuildLineageColumnExpr(order_col, "", "openivm_chg");
+		string current_key = BuildLineageColumnExpr(output_col, "", "openivm_cur");
+		string current_order = BuildLineageColumnExpr(order_out, "", "openivm_cur");
+		return "SELECT DISTINCT " + changed_key + " AS " + SqlUtils::QuoteIdentifier(output_col) + " FROM " +
+		       delta_table + " AS openivm_chg WHERE " + (delta_ts_filter.empty() ? "" : delta_ts_filter + " AND ") +
+		       "NOT EXISTS (SELECT 1 FROM " + data_table + " AS openivm_cur WHERE " + current_key +
+		       " IS NOT DISTINCT FROM " + changed_key + " AND " + changed_order + " < " + current_order + ")";
 	}
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	return "SELECT DISTINCT " + BuildLineageColumnExpr(source_col, source_cast) + " AS " +
@@ -209,12 +221,11 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 
 enum class LineageAffectedKeysResult : uint8_t { UNAVAILABLE, AVAILABLE, UNSAFE };
 
-static LineageAffectedKeysResult
-BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                    const vector<string> &delta_table_names, const vector<string> &partition_cols,
-                                    const string &delta_ts_filter, const string &view_catalog_name,
-                                    const string &view_schema_name, const string &attached_db_catalog_name,
-                                    const string &attached_db_schema_name, string &affected_keys_sql) {
+static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
+    RefreshMetadata &metadata, Connection &con, const string &view_name, const vector<string> &delta_table_names,
+    const vector<string> &partition_cols, const string &delta_ts_filter, const string &view_catalog_name,
+    const string &view_schema_name, const string &attached_db_catalog_name, const string &attached_db_schema_name,
+    const string &data_table, string &affected_keys_sql) {
 	if (partition_cols.size() != 1) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
@@ -234,10 +245,10 @@ BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, 
 		}
 		string arm_sql;
 		if (op.kind == "direct") {
-			arm_sql =
-			    BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
-			                                  op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
-			                                  view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			arm_sql = BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
+			                                        op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
+			                                        view_schema_name, attached_db_catalog_name, attached_db_schema_name,
+			                                        data_table, op.order_col, op.order_out);
 		} else if (op.kind == "lookup") {
 			arm_sql = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op,
 			                                            delta_ts_filter, view_catalog_name, view_schema_name,
@@ -644,7 +655,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	}
 	auto lineage_result = BuildLineageStandardAffectedKeysSQL(
 	    metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
-	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
+	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, data_table, affected_keys_sql);
 	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",
 		                    view_name.c_str());

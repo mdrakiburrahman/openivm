@@ -1191,6 +1191,15 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 			continue;
 		}
 		MetadataJson::ExtractJsonString(object, "source_cast", op.source_cast);
+		if (op.kind == "direct") {
+			string order_col, order_out;
+			if (MetadataJson::ExtractJsonString(object, "order_col", order_col) &&
+			    MetadataJson::ExtractJsonString(object, "order_out", order_out) && !order_col.empty() &&
+			    !order_out.empty()) {
+				op.order_col = std::move(order_col);
+				op.order_out = std::move(order_out);
+			}
+		}
 		if (op.kind == "lookup") {
 			if (!MetadataJson::ExtractJsonString(object, "lookup", op.lookup) ||
 			    !MetadataJson::ExtractJsonString(object, "lookup_col", op.lookup_col) ||
@@ -1221,6 +1230,10 @@ string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitio
 		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
 		if (!op.source_cast.empty()) {
 			json += ",\"source_cast\":" + SqlUtils::JsonQuote(op.source_cast);
+		}
+		if (op.kind == "direct" && !op.order_col.empty() && !op.order_out.empty()) {
+			json += ",\"order_col\":" + SqlUtils::JsonQuote(op.order_col) +
+			        ",\"order_out\":" + SqlUtils::JsonQuote(op.order_out);
 		}
 		if (op.kind == "lookup") {
 			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup) +
