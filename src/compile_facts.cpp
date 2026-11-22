@@ -40,6 +40,44 @@ SqlDialect ParseDialectString(const string &s) {
 	}
 }
 
+// Text of the first `"<key>": { ... }` member. The lenient MetadataJson readers are not nesting-aware, so the clock
+// members are read from this substring instead of the whole document.
+bool ExtractJsonObject(const string &json, const string &key, string &object) {
+	const string needle = "\"" + key + "\"";
+	for (size_t pos = json.find(needle); pos != string::npos; pos = json.find(needle, pos + 1)) {
+		size_t value = pos + needle.size();
+		MetadataJson::SkipSpace(json, value);
+		if (value >= json.size() || json[value] != ':') {
+			continue;
+		}
+		MetadataJson::SkipSpace(json, ++value);
+		if (value >= json.size() || json[value] != '{') {
+			continue;
+		}
+		int depth = 0;
+		bool in_string = false;
+		for (size_t i = value; i < json.size(); i++) {
+			char c = json[i];
+			if (in_string) {
+				if (c == '\\') {
+					i++;
+				} else if (c == '"') {
+					in_string = false;
+				}
+			} else if (c == '"') {
+				in_string = true;
+			} else if (c == '{') {
+				depth++;
+			} else if (c == '}' && --depth == 0) {
+				object = json.substr(value, i - value + 1);
+				return true;
+			}
+		}
+		return false;
+	}
+	return false;
+}
+
 } // namespace
 
 CompileFacts ParseFactsJson(const string &json) {
@@ -84,6 +122,17 @@ CompileFacts ParseFactsJson(const string &json) {
 		    fk.child_columns.size() == fk.parent_columns.size()) {
 			out.fk_relations.push_back(std::move(fk));
 		}
+	}
+
+	string clock_object;
+	if (ExtractJsonObject(json, "clock", clock_object)) {
+		out.clock.present = true;
+		MetadataJson::ExtractJsonString(clock_object, "as_of", out.clock.as_of);
+		MetadataJson::ExtractJsonString(clock_object, "time_zone", out.clock.time_zone);
+		MetadataJson::ExtractJsonString(clock_object, "previous_as_of", out.clock.previous_as_of);
+		MetadataJson::ExtractJsonString(clock_object, "previous_time_zone", out.clock.previous_time_zone);
+		out.clock_outcome = make_shared_ptr<ClockOutcome>();
+		out.clock_outcome->reason = "not_evaluated";
 	}
 
 	return out;
@@ -161,6 +210,9 @@ struct CompileWithFactsBindData : public TableFunctionData {
 	string refresh_type_name;
 	vector<string> stmt_kinds;
 	vector<string> stmt_sqls;
+	bool has_clock = false;
+	string clock_mode;
+	string clock_reason;
 };
 
 struct CompileWithFactsGlobalState : public GlobalTableFunctionState {
@@ -206,6 +258,15 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 	}
 
 	auto result = make_uniq<CompileWithFactsBindData>();
+	if (facts_owned->clock_outcome) {
+		auto &outcome = *facts_owned->clock_outcome;
+		result->has_clock = true;
+		result->clock_mode = outcome.mode;
+		result->clock_reason = outcome.reason;
+		if (outcome.effective_refresh_type >= 0) {
+			type = static_cast<RefreshType>(outcome.effective_refresh_type);
+		}
+	}
 	result->refresh_type_int = static_cast<int32_t>(type);
 	result->refresh_type_name = string(RefreshTypeName(type));
 
@@ -223,6 +284,12 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 	names.emplace_back("stmt_kind");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("sql");
+	if (result->has_clock) {
+		return_types.emplace_back(LogicalType::VARCHAR);
+		names.emplace_back("clock_mode");
+		return_types.emplace_back(LogicalType::VARCHAR);
+		names.emplace_back("clock_reason");
+	}
 
 	return std::move(result);
 }
@@ -244,6 +311,10 @@ void OpenIvmCompileWithFactsExecute(ClientContext &context, TableFunctionInput &
 		output.data[2].SetValue(emitted, Value::INTEGER(static_cast<int32_t>(state.offset)));
 		output.data[3].SetValue(emitted, Value(bd.stmt_kinds[state.offset]));
 		output.data[4].SetValue(emitted, Value(bd.stmt_sqls[state.offset]));
+		if (bd.has_clock) {
+			output.data[5].SetValue(emitted, Value(bd.clock_mode));
+			output.data[6].SetValue(emitted, Value(bd.clock_reason));
+		}
 		state.offset++;
 		emitted++;
 	}

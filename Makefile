@@ -15,6 +15,13 @@ test_release_internal: test_regular_nterm_compiled
 test_regular_nterm_compiled:
 	python3 test/integration/test_regular_nterm_compiled.py ./build/release/duckdb
 
+.PHONY: test_clock_window_group_recompute
+
+test_release_internal: test_clock_window_group_recompute
+
+test_clock_window_group_recompute:
+	python3 test/integration/test_clock_window_group_recompute.py ./build/release/duckdb
+
 .PHONY: test_scheduler_catalog
 
 test_release_internal: test_scheduler_catalog

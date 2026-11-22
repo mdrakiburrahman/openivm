@@ -1,0 +1,283 @@
+# name: test/sql/clock_window_group_recompute.test
+# description: openivm_compile_with_facts clock facts — typed opt-in group recompute for grouped clock predicates
+# group: [sql]
+
+require openivm
+
+require icu
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE src(k INT, ts TIMESTAMP, d DATE, v INT);
+
+# Timestamps are far from the wall clock so the PRAGMA refresh control is stable.
+statement ok
+INSERT INTO src VALUES
+    (1, TIMESTAMP '2020-01-01 00:00:00', DATE '2020-01-01', 1),
+    (1, TIMESTAMP '2100-01-01 00:00:00', DATE '2100-01-01', 2),
+    (2, TIMESTAMP '2020-06-01 00:00:00', DATE '2100-06-01', 10),
+    (NULL, TIMESTAMP '2100-01-01 00:00:00', DATE '2020-06-01', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ts AS
+    SELECT k, SUM(CASE WHEN ts <= current_timestamp THEN v ELSE 0 END) AS s FROM src GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dt AS
+    SELECT k, SUM(CASE WHEN d >= current_date THEN v ELSE 0 END) AS s FROM src GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_where AS
+    SELECT k, SUM(CASE WHEN ts <= current_timestamp THEN v ELSE 0 END) AS s FROM src WHERE v > 0 GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_max_clock AS
+    SELECT k, MAX(current_timestamp) AS s FROM src GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_plain AS SELECT k, SUM(v) AS s FROM src GROUP BY k;
+
+statement ok
+CREATE TABLE mv_ts_before AS SELECT * FROM mv_ts;
+
+# ==========================================
+# Test 1: an absent clock keeps the existing contract — FULL_REFRESH and the original five columns.
+# ==========================================
+
+query TI
+SELECT DISTINCT refresh_type_name, (SELECT count(*) FROM (DESCRIBE SELECT * FROM openivm_compile_with_facts(
+    'mv_ts', '{"target_dialect":"duckdb","compile_only":true}')))
+FROM openivm_compile_with_facts('mv_ts', '{"target_dialect":"duckdb","compile_only":true}');
+----
+FULL_REFRESH	5
+
+# ==========================================
+# Test 2: a valid clock with history selects group recompute and appends clock_mode/clock_reason.
+# ==========================================
+
+query TTTI
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason,
+    (SELECT count(*) FROM (DESCRIBE SELECT * FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}')))
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok	7
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_dt',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok
+
+# ==========================================
+# Test 3: the program embeds the as-of instant, reads the source delta, adds the threshold-crossing keys,
+# and never compares a column with the live clock.
+# ==========================================
+
+statement ok
+CREATE TABLE prog_ts AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}')
+WHERE stmt_kind = 'data';
+
+query IIIII
+SELECT contains(prog, '2026-01-02 08:00:00'),
+       contains(prog, '2026-01-02 07:30:00'),
+       contains(prog, 'IS DISTINCT FROM'),
+       contains(prog, 'delta_src'),
+       NOT regexp_matches(lower(prog), '(ts|d) *(<=|>=) *\(*current_')
+FROM prog_ts;
+----
+true	true	true	true	true
+
+statement ok
+CREATE TABLE prog_dt AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('mv_dt',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}')
+WHERE stmt_kind = 'data';
+
+query IIII
+SELECT contains(prog, '2026-01-01'),
+       contains(prog, '2026-01-02'),
+       contains(prog, 'IS DISTINCT FROM'),
+       NOT regexp_matches(lower(prog), '(ts|d) *(<=|>=) *\(*current_')
+FROM prog_dt;
+----
+true	true	true	true
+
+# ==========================================
+# Test 4: a clock-only advance never compiles to bookkeeping alone — the delta-independent recompute statements
+# are present even though no source row changed since the view was created.
+# ==========================================
+
+query I
+SELECT count(*) > 1 FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}')
+WHERE stmt_kind = 'data' AND (upper(sql) LIKE '%DELETE FROM%' OR upper(sql) LIKE '%INSERT INTO%MV_TS%');
+----
+true
+
+# ==========================================
+# Test 5: history that cannot be trusted falls back to a full recompute at the as-of instant.
+# ==========================================
+
+query TTTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason, contains(prog, '2026-01-02 08:00:00')
+FROM (
+    SELECT refresh_type_name, clock_mode, clock_reason,
+           string_agg(sql, ' ') OVER () AS prog
+    FROM openivm_compile_with_facts('mv_ts',
+        '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles"}}')
+);
+----
+FULL_REFRESH	full_at_as_of	missing_previous	true
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z"}}');
+----
+FULL_REFRESH	full_at_as_of	missing_previous
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"Asia/Tokyo"}}');
+----
+FULL_REFRESH	full_at_as_of	zone_changed
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T07:30:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T08:00:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+FULL_REFRESH	full_at_as_of	clock_regressed
+
+# An unchanged instant is not a regression.
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T08:00:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok
+
+# ==========================================
+# Test 6: an invalid clock never enters incremental maintenance, and its program equals the no-clock program.
+# ==========================================
+
+statement ok
+CREATE TABLE prog_default AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('mv_ts', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+
+statement ok
+CREATE TABLE invalid_clock_modes (label VARCHAR, mode VARCHAR, reason VARCHAR, type_name VARCHAR, prog VARCHAR);
+
+statement ok
+INSERT INTO invalid_clock_modes
+SELECT 'garbage', clock_mode, clock_reason, refresh_type_name, string_agg(sql, '\n' ORDER BY stmt_order) FILTER (WHERE stmt_kind = 'data')
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"not-a-time","time_zone":"America/Los_Angeles"}}')
+GROUP BY clock_mode, clock_reason, refresh_type_name;
+
+statement ok
+INSERT INTO invalid_clock_modes
+SELECT 'offset', clock_mode, clock_reason, refresh_type_name, string_agg(sql, '\n' ORDER BY stmt_order) FILTER (WHERE stmt_kind = 'data')
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00+00:00","time_zone":"America/Los_Angeles"}}')
+GROUP BY clock_mode, clock_reason, refresh_type_name;
+
+statement ok
+INSERT INTO invalid_clock_modes
+SELECT 'bad_zone', clock_mode, clock_reason, refresh_type_name, string_agg(sql, '\n' ORDER BY stmt_order) FILTER (WHERE stmt_kind = 'data')
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"Not/AZone"}}')
+GROUP BY clock_mode, clock_reason, refresh_type_name;
+
+statement ok
+INSERT INTO invalid_clock_modes
+SELECT 'missing_zone', clock_mode, clock_reason, refresh_type_name, string_agg(sql, '\n' ORDER BY stmt_order) FILTER (WHERE stmt_kind = 'data')
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z"}}')
+GROUP BY clock_mode, clock_reason, refresh_type_name;
+
+query TTTTI
+SELECT label, mode, reason, type_name, prog = (SELECT prog FROM prog_default)
+FROM invalid_clock_modes ORDER BY label;
+----
+bad_zone	full_default	invalid_clock	FULL_REFRESH	true
+garbage	full_default	invalid_clock	FULL_REFRESH	true
+missing_zone	full_default	invalid_clock	FULL_REFRESH	true
+offset	full_default	invalid_clock	FULL_REFRESH	true
+
+# ==========================================
+# Test 7: unsupported shapes and unsupported clock use stay on the existing full-refresh path.
+# ==========================================
+
+query TTTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason, 'where'
+FROM openivm_compile_with_facts('mv_where',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+FULL_REFRESH	full_default	unsupported_view_shape	where
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_max_clock',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+FULL_REFRESH	full_default	unsupported_clock_use
+
+# A view that is already incrementally maintainable is not touched by the clock.
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_plain',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+AGGREGATE_GROUP	not_applicable	not_full_refresh_view
+
+# ==========================================
+# Test 8: the Spark dialect gets the same decision and the same crossing-key branch.
+# ==========================================
+
+query TTTI
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason,
+    (SELECT bool_or(contains(sql, 'IS DISTINCT FROM')) FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"spark","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}'))
+FROM openivm_compile_with_facts('mv_ts',
+    '{"target_dialect":"spark","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok	true
+
+# ==========================================
+# Test 9: compiling never mutates the view, and the native default path (no clock) is unchanged —
+# PRAGMA refresh still equals a full recompute.
+# ==========================================
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_ts EXCEPT ALL SELECT * FROM mv_ts_before);
+----
+0
+
+statement ok
+INSERT INTO src VALUES (3, TIMESTAMP '2020-03-01 00:00:00', DATE '2100-03-01', 100);
+
+statement ok
+PRAGMA refresh('mv_ts');
+
+query I
+SELECT (SELECT count(*) FROM (
+    SELECT * FROM mv_ts EXCEPT ALL
+    SELECT k, SUM(CASE WHEN ts <= current_timestamp THEN v ELSE 0 END) FROM src GROUP BY k))
+  + (SELECT count(*) FROM (
+    SELECT k, SUM(CASE WHEN ts <= current_timestamp THEN v ELSE 0 END) FROM src GROUP BY k
+    EXCEPT ALL SELECT * FROM mv_ts));
+----
+0

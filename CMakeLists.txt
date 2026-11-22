@@ -60,6 +60,7 @@ set(EXTENSION_SOURCES
     src/upsert/refresh_compiler_aux.cpp
     src/upsert/refresh_cost_model.cpp
     src/upsert/refresh_index_regen.cpp
+    src/upsert/clock_window.cpp
     src/rules/incremental_rewrite_rule.cpp
     src/rules/refresh_insert_rule.cpp
     src/rules/transactional_delta_capture.cpp

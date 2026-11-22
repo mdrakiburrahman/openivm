@@ -8,6 +8,7 @@
 #include "core/sql_utils.hpp"
 #include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
+#include "upsert/clock_window.hpp"
 #include "upsert/refresh_compiler.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "lpts_pipeline.hpp"
@@ -541,6 +542,58 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto view_time_travel_pins =
 	    PrepareViewQuerySources(con, view_name, view_query_sql, delta_sources, view_catalog_name, view_schema_name,
 	                            attached_db_catalog_name, attached_db_schema_name);
+
+	// Clock-as-input: a view that reads the clock is stored FULL_REFRESH. With a typed `clock` fact and a supported
+	// shape, every clock reference is replaced by the caller's as-of and the view is maintained as a GROUP_RECOMPUTE
+	// over the source-delta keys plus the groups whose clock predicate flips between the previous and new instants.
+	// Without the fact, nothing here runs and the view stays a plain full recompute.
+	bool clock_active = false;
+	string clock_group_query;
+	string clock_crossing_groups;
+	auto set_clock_outcome = [&](openivm::ClockMode mode, const string &reason, RefreshType effective) {
+		if (active_facts.clock_outcome) {
+			active_facts.clock_outcome->mode = openivm::ClockModeName(mode);
+			active_facts.clock_outcome->reason = reason;
+			active_facts.clock_outcome->effective_refresh_type = static_cast<int>(effective);
+		}
+	};
+	if (active_facts.clock.present) {
+		if (view_query_type != RefreshType::FULL_REFRESH) {
+			set_clock_outcome(openivm::ClockMode::NOT_APPLICABLE, "not_full_refresh_view", view_query_type);
+		} else if (!view_time_travel_pins.Empty()) {
+			set_clock_outcome(openivm::ClockMode::FULL_DEFAULT, "unsupported_view_shape", RefreshType::FULL_REFRESH);
+		} else {
+			auto clock_plan =
+			    openivm::PlanClockWindow(con, active_facts.clock, view_query_sql, metadata.GetGroupColumns(view_name),
+			                             !delta_sources.empty(), active_facts.target_dialect);
+			auto clock_mode = clock_plan.mode;
+			auto clock_reason = clock_plan.reason;
+			if (clock_mode == openivm::ClockMode::INCREMENTAL &&
+			    metadata.GetGroupRecomputeAffectedMode(view_name) != GroupRecomputeAffectedMode::SOURCE_DELTA) {
+				clock_mode = openivm::ClockMode::FULL_AT_AS_OF;
+				clock_reason = "unsupported_affected_mode";
+			}
+			if (clock_mode == openivm::ClockMode::INCREMENTAL || clock_mode == openivm::ClockMode::FULL_AT_AS_OF) {
+				view_query_sql = clock_plan.full_query;
+			}
+			if (clock_mode == openivm::ClockMode::INCREMENTAL) {
+				clock_active = true;
+				clock_group_query = std::move(clock_plan.query);
+				clock_crossing_groups = std::move(clock_plan.crossing_groups);
+				view_query_type = RefreshType::GROUP_RECOMPUTE;
+			}
+			set_clock_outcome(clock_mode, clock_reason,
+			                  clock_active ? RefreshType::GROUP_RECOMPUTE : RefreshType::FULL_REFRESH);
+		}
+	}
+	// A path that cannot maintain the view incrementally recomputes it in full, still at the caller's as-of.
+	auto clock_full_fallback = [&](const string &reason) {
+		if (clock_active) {
+			clock_active = false;
+			view_query_type = RefreshType::FULL_REFRESH;
+			set_clock_outcome(openivm::ClockMode::FULL_AT_AS_OF, reason, RefreshType::FULL_REFRESH);
+		}
+	};
 	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
 	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
 	string publication_sql;
@@ -687,6 +740,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// without emitting the change, so recover through the cascading full refresh below.
 		recover_with_cascade_delta = interrupted && metadata.HasDownstreamViews(view_name, false);
 		if (interrupted && !recover_with_cascade_delta) {
+			clock_full_fallback("refresh_recovery");
 			return finalize_refresh_sql(build_full_recompute(true));
 		}
 	}
@@ -781,6 +835,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool has_downstream = metadata.HasDownstreamViews(view_name, false);
 	bool full_recompute_needs_cascade_delta = has_downstream || active_facts.force_view_delta_cascade;
 	bool use_full_recompute = refresh_plan.RequiresFullRecompute();
+	if (use_full_recompute) {
+		clock_full_fallback(force_full_refresh               ? "forced_full_refresh"
+		                    : metadata_requires_full_refresh ? "source_requires_full_refresh"
+		                                                     : "adaptive_full_refresh");
+	}
 
 	if (use_full_recompute && !full_recompute_needs_cascade_delta) {
 		auto full_refresh_start = profile_now();
@@ -924,7 +983,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// Compile-only callers receive the refresh SQL template and re-run it against their own deltas,
 	// so every source counts as active even when its local delta is empty.
 	auto group_recompute_sources = fast_paths.active_delta_table_names;
-	if (group_recompute_sources.empty() && active_facts.compile_only) {
+	if (group_recompute_sources.empty() && (active_facts.compile_only || clock_active)) {
 		group_recompute_sources = delta_table_names;
 	}
 	auto build_group_recompute_specs = [&]() {
@@ -1256,7 +1315,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		throw InvalidInputException("SEMI_ANTI_RECOMPUTE view '%s' has no aux metadata", view_name);
 	}
 	case RefreshType::GROUP_RECOMPUTE: {
-		if (group_recompute_sources.empty() && !active_facts.compile_only) {
+		// A clock advance changes results with no source change, so an empty delta is not a no-op under a clock.
+		if (group_recompute_sources.empty() && !active_facts.compile_only && !clock_active) {
 			upsert_query = "";
 			OPENIVM_DEBUG_PRINT("[UPSERT] GROUP_RECOMPUTE has no active deltas after filtering\n");
 			break;
@@ -1269,9 +1329,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_cols,
 			                                                 view_query_sql, delta_specs);
 		}
-		upsert_query =
-		    CompileGroupRecompute(view_name, view_query_sql, group_cols, delta_specs, internal_catalog_prefix,
-		                          emit_cascade_delta_for_recompute, affected_mode, unmatched_groups);
+		if (clock_active) {
+			unmatched_groups = clock_crossing_groups;
+		}
+		upsert_query = CompileGroupRecompute(view_name, clock_active ? clock_group_query : view_query_sql, group_cols,
+		                                     delta_specs, internal_catalog_prefix, emit_cascade_delta_for_recompute,
+		                                     affected_mode, unmatched_groups);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE "
 		                    "(%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",

@@ -17,6 +17,7 @@ are in [the testing guide](../docs/build/testing.md).
 | `make test_scheduler_catalog` | Native metadata discovery and schema synchronization while an unrelated SQLite-backed DuckLake catalog is locked |
 | `make test_benchmark_metadata` | Benchmark metadata resolution across source and target catalogs |
 | `make test_regular_nterm_compiled` | Exported refresh SQL executed by a separate CLI process |
+| `make test_clock_window_group_recompute` | Clock-as-input group recompute compiled by `openivm_compile_with_facts`, replayed by a separate CLI process, and compared with the same-instant full answer |
 | `make test_remote_metadata` | PostgreSQL metadata, separate client processes, leases, crash recovery, and concurrent source changes |
 
 Python runners provide temporary directories and process/lock orchestration. The

@@ -20,6 +20,24 @@ struct CompileFactsFkRelation {
 	bool rely = true;
 };
 
+// Opt-in run-scoped clock for grouped views whose only volatile input is `current_timestamp` / `current_date`.
+// Timestamps are RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SS[.ffffff]Z`); zones are IANA names. `previous_*` is the clock of
+// the last successful refresh, owned and persisted by the caller. Absent `clock` keeps the view FULL_REFRESH.
+struct ClockFacts {
+	bool present = false;
+	string as_of;
+	string time_zone;
+	string previous_as_of;
+	string previous_time_zone;
+};
+
+// How the clock fact was applied to the compiled view; written by the compiler, read by the table function.
+struct ClockOutcome {
+	string mode = "full_default";
+	string reason;
+	int effective_refresh_type = -1;
+};
+
 // Per-call compile context for `openivm_compile_with_facts`. Field names are
 // snake_case to match the JSON wire form 1:1 — `ParseFactsJson` deserialises
 // the JSON object directly into these fields, and ignores unknown fields.
@@ -47,6 +65,11 @@ public:
 	// constraints (e.g. Spark/Delta tables).
 	unordered_map<string, string> delta_shape;
 	vector<CompileFactsFkRelation> fk_relations;
+
+	ClockFacts clock;
+	// Shared by copies of the facts so GenerateRefreshSQL can report how the clock was applied; allocated only
+	// when `clock` is present.
+	shared_ptr<ClockOutcome> clock_outcome;
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every
