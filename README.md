@@ -170,6 +170,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `PRAGMA openivm_files('view_name')` | Show paths and status of the compiled SQL reference files | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
 | `PRAGMA openivm_declare_rely_fk(child_table, child_columns, parent_table, parent_columns)` | Declare a trusted (RELY) foreign key used by FK-aware join pruning | — |
 | `openivm_compile_with_facts(view_name, facts_json)` | Table function: compile a refresh program as rows without executing it | [Build: compiled SQL](docs/build/building.md#inspect-or-save-compiled-sql-without-files) |
+| `openivm_clock_timestamp()`, `openivm_clock_date()` | The current timestamp and date, for views whose source has a column named `current_timestamp` or `current_date` | [Spark: clock-named columns](docs/spark.md#clock-named-columns) |
 
 ## Schemas, metadata, and compiled SQL
 

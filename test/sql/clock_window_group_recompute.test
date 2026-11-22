@@ -281,3 +281,239 @@ SELECT (SELECT count(*) FROM (
     EXCEPT ALL SELECT * FROM mv_ts));
 ----
 0
+
+# ==========================================
+# Test 10: a source column named after a clock keyword. DuckDB binds an unqualified `current_date` to the column
+# first, so the clock must be written with the unshadowable functions openivm_clock_date() and
+# openivm_clock_timestamp(). The dates are far from the wall clock: a self-comparison would sum every row.
+# ==========================================
+
+statement ok
+CREATE TABLE named(k INT, "current_timestamp" TIMESTAMP, "current_date" DATE, v INT);
+
+statement ok
+INSERT INTO named VALUES
+    (1, TIMESTAMP '2020-01-01 00:00:00', DATE '2020-01-01', 1),
+    (1, TIMESTAMP '2100-01-01 00:00:00', DATE '2100-01-01', 2),
+    (2, TIMESTAMP '2020-06-01 00:00:00', DATE '2100-06-01', 10),
+    (NULL, TIMESTAMP '2100-01-01 00:00:00', DATE '2020-06-01', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW named_dt AS
+    SELECT k, SUM(CASE WHEN "current_date" >= openivm_clock_date() THEN v ELSE 0 END) AS s, COUNT(*) AS n
+    FROM named GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW named_ts AS
+    SELECT k, SUM(CASE WHEN openivm_clock_timestamp() >= "current_timestamp" THEN v ELSE 0 END) AS s, COUNT(*) AS n
+    FROM named GROUP BY k;
+
+query III
+SELECT * FROM named_dt ORDER BY k;
+----
+1	2	2
+2	10	1
+NULL	0	1
+
+query III
+SELECT * FROM named_ts ORDER BY k;
+----
+1	1	2
+2	10	1
+NULL	0	1
+
+# The bare keyword still means the column, so this view is a self-comparison and is not clock-dependent.
+statement ok
+CREATE MATERIALIZED VIEW named_kw AS
+    SELECT k, SUM(CASE WHEN "current_date" >= current_date THEN v ELSE 0 END) AS s FROM named GROUP BY k;
+
+query II
+SELECT * FROM named_kw ORDER BY k;
+----
+1	3
+2	10
+NULL	5
+
+# Control: the clock-named column against a literal.
+statement ok
+CREATE MATERIALIZED VIEW named_col AS
+    SELECT k, SUM(CASE WHEN "current_date" >= DATE '2050-01-01' THEN v ELSE 0 END) AS s FROM named GROUP BY k;
+
+query II
+SELECT * FROM named_col ORDER BY k;
+----
+1	2
+2	10
+NULL	0
+
+# Without a clock fact the function views keep the default full-refresh contract.
+query TI
+SELECT DISTINCT refresh_type_name, (SELECT count(*) FROM (DESCRIBE SELECT * FROM openivm_compile_with_facts(
+    'named_dt', '{"target_dialect":"duckdb","compile_only":true}')))
+FROM openivm_compile_with_facts('named_dt', '{"target_dialect":"duckdb","compile_only":true}');
+----
+FULL_REFRESH	5
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_dt',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_ts',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_kw',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+AGGREGATE_GROUP	not_applicable	not_full_refresh_view
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_col',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+AGGREGATE_GROUP	not_applicable	not_full_refresh_view
+
+# The program compares the column with the as-of literals; the clock functions are fully substituted.
+statement ok
+CREATE TABLE prog_named AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('named_dt',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}')
+WHERE stmt_kind = 'data';
+
+query IIII
+SELECT contains(prog, '2026-01-01'),
+       contains(prog, '2026-01-02'),
+       contains(prog, 'IS DISTINCT FROM'),
+       NOT regexp_matches(lower(prog), 'openivm_clock|get_current|current_date"? *>= *\(*"?current_date')
+FROM prog_named;
+----
+true	true	true	true
+
+# The default refresh path still reads the column.
+statement ok
+INSERT INTO named VALUES (3, TIMESTAMP '2100-03-01 00:00:00', DATE '2100-03-01', 100);
+
+statement ok
+PRAGMA refresh('named_dt');
+
+query III
+SELECT * FROM named_dt ORDER BY k;
+----
+1	2	2
+2	10	1
+3	100	1
+NULL	0	1
+
+# ==========================================
+# Test 11: a select-list alias named after a clock keyword captures the keyword, so the predicate is not a clock.
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_alias_clock AS
+    SELECT d AS current_date, SUM(CASE WHEN d >= current_date THEN v ELSE 0 END) AS s,
+           SUM(CASE WHEN ts <= current_timestamp THEN v ELSE 0 END) AS s2
+    FROM src GROUP BY d;
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('mv_alias_clock',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+FULL_REFRESH	full_default	unsupported_view_shape
+
+# ==========================================
+# Test 12: only the unqualified zero-argument function call inside a supported predicate is a clock.
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW named_out AS SELECT k, MAX(openivm_clock_date()) AS s FROM named GROUP BY k;
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_out',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+FULL_REFRESH	full_default	unsupported_clock_use
+
+statement ok
+CREATE MATERIALIZED VIEW named_qualified AS
+    SELECT k, SUM(CASE WHEN "current_date" >= system.main.openivm_clock_date() THEN v ELSE 0 END) AS s
+    FROM named GROUP BY k;
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_qualified',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+FULL_REFRESH	full_default	unsupported_view_shape
+
+# ==========================================
+# Test 13: a user function with the same name shadows the built-in, so the view is not treated as clock-dependent.
+# ==========================================
+
+statement ok
+CREATE MACRO openivm_clock_date() AS DATE '2000-01-01';
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_dt',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+FULL_REFRESH	full_default	unsupported_clock_use
+
+statement ok
+DROP MACRO openivm_clock_date;
+
+query TTT
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason
+FROM openivm_compile_with_facts('named_dt',
+    '{"target_dialect":"duckdb","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok
+
+# ==========================================
+# Test 14: the functions are current_date and current_timestamp in the session time zone.
+# ==========================================
+
+statement ok
+SET TimeZone='Pacific/Kiritimati';
+
+query IITT
+SELECT openivm_clock_date() = current_date, openivm_clock_timestamp() = current_timestamp,
+       typeof(openivm_clock_date()), typeof(openivm_clock_timestamp());
+----
+true	true	DATE	TIMESTAMP WITH TIME ZONE
+
+statement ok
+SET TimeZone='Pacific/Pago_Pago';
+
+query II
+SELECT openivm_clock_date() = current_date, openivm_clock_timestamp() = current_timestamp;
+----
+true	true
+
+statement ok
+RESET TimeZone;
+
+# ==========================================
+# Test 15: Spark output gets the same decision with the functions substituted.
+# ==========================================
+
+query TTTI
+SELECT DISTINCT refresh_type_name, clock_mode, clock_reason,
+    (SELECT bool_or(contains(lower(sql), 'openivm_clock')) FROM openivm_compile_with_facts('named_dt',
+    '{"target_dialect":"spark","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}'))
+FROM openivm_compile_with_facts('named_dt',
+    '{"target_dialect":"spark","compile_only":true,"clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles","previous_as_of":"2026-01-02T07:30:00Z","previous_time_zone":"America/Los_Angeles"}}');
+----
+GROUP_RECOMPUTE	incremental	ok	false

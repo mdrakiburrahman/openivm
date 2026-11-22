@@ -90,6 +90,26 @@ SELECT k, SUM(CASE WHEN d >= current_date THEN v ELSE 0 END) AS s FROM src GROUP
 
 The view must read one base table, group by plain columns that are all selected, and use only `sum`, `count`, `min`, `max` and `avg` at the top level. Inside the aggregates, `CASE`, `CAST`, arithmetic, comparisons, `AND`/`OR` and `coalesce` are allowed. A clock reference is accepted only as one operand of `<`, `<=`, `>` or `>=` whose other operand is a source column. Any other clock use, `now()`, `random()`, a filter, join, subquery or window leaves the view on the full-recompute path.
 
+### Clock-named columns
+
+DuckDB binds an unqualified `current_date` or `current_timestamp` to a source column or select-list alias of that name before the clock, and quoting does not survive parsing. With a column named `current_date`, `"current_date" >= current_date` is a comparison of the column with itself. A caller that has already resolved which reference is the clock writes it as one of two functions, which a column or alias cannot shadow:
+
+| Function | Value |
+|---|---|
+| `openivm_clock_timestamp()` | `get_current_timestamp()`, a `TIMESTAMP WITH TIME ZONE` |
+| `openivm_clock_date()` | `CAST(get_current_timestamp() AS DATE)`, the date in the session time zone |
+
+```sql
+SELECT k, SUM(CASE WHEN "current_date" >= openivm_clock_date() THEN v ELSE 0 END) AS s FROM src GROUP BY k
+```
+
+- Only the unqualified, zero-argument form counts as the clock. A qualified name, an argument, `DISTINCT`, `FILTER` or `ORDER BY` leaves the view on the full-recompute path.
+- If a user function or macro named `openivm_clock_timestamp` or `openivm_clock_date` exists outside the `system` catalog, `clock_reason` is `unsupported_clock_use`.
+- If a view reads the clock without either function and has a source column named `current_date` or `current_timestamp`, `clock_reason` is `unsupported_view_shape`, because the bare keyword means the column there. A select-list alias named after a clock keyword that is also used as the clock is `unsupported_view_shape` too.
+- Without the `clock` fact these views are `FULL_REFRESH`, like any clock-reading view. The view's stored SQL keeps the function names.
+
+The Spark text depends on how the program was built. With the fact, the `GROUP_RECOMPUTE` and `full_at_as_of` programs contain only `as_of` literals. A default full recompute of a view with no downstream views is the stored DuckDB text, so it contains `openivm_clock_date()` or `openivm_clock_timestamp()` verbatim and the caller maps them to `current_date()` and `current_timestamp()`. A cascaded full recompute renders `openivm_clock_timestamp()` as `current_timestamp()` and `openivm_clock_date()` as `CAST(current_timestamp() AS DATE)`. Columns named `current_date` or `current_timestamp` are rendered as bare identifiers in every case. Spark resolves them to the columns unless both `spark.sql.ansi.enabled` and `spark.sql.ansi.enforceReservedKeywords` are true, in which case the caller must quote them.
+
 ```json
 {"target_dialect":"spark","compile_only":true,
  "clock":{"as_of":"2026-01-02T08:00:00Z","time_zone":"America/Los_Angeles",

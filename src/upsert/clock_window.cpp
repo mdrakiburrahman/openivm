@@ -159,6 +159,46 @@ bool IsUnqualifiedColumn(const ParsedExpression &expression, string &lower_name)
 	return true;
 }
 
+bool IsClockFunctionName(const string &lower, ClockKind &kind) {
+	if (lower == "openivm_clock_timestamp") {
+		kind = ClockKind::TIMESTAMP;
+		return true;
+	}
+	if (lower == "openivm_clock_date") {
+		kind = ClockKind::DATE;
+		return true;
+	}
+	return false;
+}
+
+// `openivm_clock_timestamp()` or `openivm_clock_date()`: unlike the keywords, a function call never binds to a column
+// or a select-list alias.
+bool IsClockFunction(const ParsedExpression &expression, ClockKind &kind) {
+	if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &function = expression.Cast<FunctionExpression>();
+	return !function.IsOperator() && function.GetQualifiedName().Path().size() == 1 &&
+	       function.GetArguments().empty() && !function.Filter() &&
+	       !(function.OrderBy() && !function.OrderBy()->orders.empty()) && !function.Distinct() &&
+	       IsClockFunctionName(StringUtil::Lower(function.FunctionName().GetIdentifierName()), kind);
+}
+
+bool ContainsClockFunctionName(const ParsedExpression &expression) {
+	ClockKind kind = ClockKind::TIMESTAMP;
+	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION &&
+	    IsClockFunctionName(StringUtil::Lower(expression.Cast<FunctionExpression>().FunctionName().GetIdentifierName()),
+	                        kind)) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { found = found || ContainsClockFunctionName(child); });
+	return found;
+}
+
+enum class ClockOperand : uint8_t { NONE, CLOCK, SHADOWED };
+
 bool IsAggregateName(const string &lower) {
 	return lower == "sum" || lower == "count" || lower == "count_star" || lower == "min" || lower == "max" ||
 	       lower == "avg";
@@ -177,19 +217,23 @@ bool IsOrderedComparison(ExpressionType type) {
 // an empty string.
 class AggregateArgumentWalker {
 public:
-	AggregateArgumentWalker(const case_insensitive_set_t &columns_p, vector<ClockUse> &uses_p)
-	    : columns(columns_p), uses(uses_p) {
+	AggregateArgumentWalker(const case_insensitive_set_t &columns_p, const case_insensitive_set_t &aliases_p,
+	                        vector<ClockUse> &uses_p)
+	    : columns(columns_p), aliases(aliases_p), uses(uses_p) {
 	}
 
 	string Walk(unique_ptr<ParsedExpression> &slot) {
 		auto &expression = *slot;
+		ClockKind kind = ClockKind::TIMESTAMP;
 		switch (expression.GetExpressionClass()) {
 		case ExpressionClass::CONSTANT:
 			return "";
 		case ExpressionClass::COLUMN_REF: {
-			string name;
-			ClockKind kind = ClockKind::TIMESTAMP;
-			if (IsUnqualifiedColumn(expression, name) && IsClockKindName(name, kind)) {
+			auto operand = Classify(expression, kind);
+			if (operand == ClockOperand::SHADOWED) {
+				return "unsupported_view_shape";
+			}
+			if (operand == ClockOperand::CLOCK) {
 				return "unsupported_clock_use";
 			}
 			return IsSourceColumn(expression) ? "" : "unsupported_view_shape";
@@ -198,6 +242,9 @@ public:
 			return WalkComparison(slot);
 		case ExpressionClass::FUNCTION: {
 			auto &function = expression.Cast<FunctionExpression>();
+			if (IsClockFunction(expression, kind)) {
+				return "unsupported_clock_use";
+			}
 			if (function.Filter() || (function.OrderBy() && !function.OrderBy()->orders.empty()) ||
 			    function.Distinct() ||
 			    !IsScalarFunctionName(StringUtil::Lower(function.FunctionName().GetIdentifierName()))) {
@@ -222,6 +269,19 @@ private:
 		return column.ColumnNames().size() == 1 && columns.count(column.GetColumnName().GetIdentifierName()) > 0;
 	}
 
+	// DuckDB binds a bare name to a source column first, then to a select-list alias, and only then to the SQL value
+	// function, so a keyword is the clock only when neither exists.
+	ClockOperand Classify(const ParsedExpression &expression, ClockKind &kind) const {
+		if (IsClockFunction(expression, kind)) {
+			return ClockOperand::CLOCK;
+		}
+		string name;
+		if (!IsUnqualifiedColumn(expression, name) || !IsClockKindName(name, kind) || columns.count(name) > 0) {
+			return ClockOperand::NONE;
+		}
+		return aliases.count(name) > 0 ? ClockOperand::SHADOWED : ClockOperand::CLOCK;
+	}
+
 	string WalkChildren(ParsedExpression &expression) {
 		string reason;
 		ParsedExpressionIterator::EnumerateChildren(expression, [&](unique_ptr<ParsedExpression> &child) {
@@ -235,12 +295,15 @@ private:
 	string WalkComparison(unique_ptr<ParsedExpression> &slot) {
 		auto &comparison = slot->Cast<ComparisonExpression>();
 		ClockKind kinds[2] = {ClockKind::TIMESTAMP, ClockKind::TIMESTAMP};
-		bool is_clock[2] = {false, false};
+		ClockOperand clocks[2] = {ClockOperand::NONE, ClockOperand::NONE};
 		unique_ptr<ParsedExpression> *operands[2] = {&comparison.LeftMutable(), &comparison.RightMutable()};
 		for (idx_t i = 0; i < 2; i++) {
-			string name;
-			is_clock[i] = IsUnqualifiedColumn(**operands[i], name) && IsClockKindName(name, kinds[i]);
+			clocks[i] = Classify(**operands[i], kinds[i]);
 		}
+		if (clocks[0] == ClockOperand::SHADOWED || clocks[1] == ClockOperand::SHADOWED) {
+			return "unsupported_view_shape";
+		}
+		bool is_clock[2] = {clocks[0] == ClockOperand::CLOCK, clocks[1] == ClockOperand::CLOCK};
 		if (!is_clock[0] && !is_clock[1]) {
 			return WalkChildren(*slot);
 		}
@@ -249,11 +312,8 @@ private:
 		}
 		idx_t clock_operand = is_clock[0] ? 0 : 1;
 		auto &other = *operands[1 - clock_operand];
-		string other_name;
-		ClockKind other_kind = ClockKind::TIMESTAMP;
 		if (!IsOrderedComparison(slot->GetExpressionType()) ||
-		    other->GetExpressionClass() != ExpressionClass::COLUMN_REF ||
-		    (IsUnqualifiedColumn(*other, other_name) && IsClockKindName(other_name, other_kind))) {
+		    other->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
 			return "unsupported_clock_use";
 		}
 		if (!IsSourceColumn(*other)) {
@@ -269,6 +329,7 @@ private:
 	}
 
 	const case_insensitive_set_t &columns;
+	const case_insensitive_set_t &aliases;
 	vector<ClockUse> &uses;
 };
 
@@ -347,15 +408,36 @@ ClockPlan PlanClockWindow(Connection &con, const ClockFacts &clock, const string
 	for (idx_t i = 0; i < described->ColumnCount(); i++) {
 		columns.insert(described->ColumnName(i).GetIdentifierName());
 	}
+	// A column named after a clock keyword captures the keyword. Only the clock functions can then name the clock.
+	bool clock_functions = false;
+	for (auto &item : select.select_list) {
+		clock_functions = clock_functions || ContainsClockFunctionName(*item);
+	}
 	ClockKind unused = ClockKind::TIMESTAMP;
-	for (auto &name : columns) {
-		if (IsClockKindName(StringUtil::Lower(name), unused)) {
-			return fail(ClockMode::FULL_DEFAULT, "unsupported_view_shape");
+	if (!clock_functions) {
+		for (auto &name : columns) {
+			if (IsClockKindName(StringUtil::Lower(name), unused)) {
+				return fail(ClockMode::FULL_DEFAULT, "unsupported_view_shape");
+			}
+		}
+	} else {
+		// Applies to this connection's catalog search path, the one that bound the view.
+		auto shadowed = con.Query("SELECT count(*) FROM duckdb_functions() WHERE lower(function_name) IN "
+		                          "('openivm_clock_timestamp', 'openivm_clock_date') AND database_name <> 'system'");
+		if (shadowed->HasError() || shadowed->RowCount() != 1 ||
+		    shadowed->Collection().GetValue(0, 0).GetValue<int64_t>() != 0) {
+			return fail(ClockMode::FULL_DEFAULT, "unsupported_clock_use");
+		}
+	}
+	case_insensitive_set_t aliases;
+	for (auto &item : select.select_list) {
+		if (item->HasAlias() && IsClockKindName(StringUtil::Lower(item->GetAlias().GetIdentifierName()), unused)) {
+			aliases.insert(item->GetAlias().GetIdentifierName());
 		}
 	}
 
 	vector<ClockUse> uses;
-	AggregateArgumentWalker walker(columns, uses);
+	AggregateArgumentWalker walker(columns, aliases, uses);
 	vector<string> group_key_sql(group_columns.size());
 	vector<bool> group_seen(group_columns.size(), false);
 	for (auto &item : select.select_list) {

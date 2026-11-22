@@ -21,6 +21,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/catalog/default/default_functions.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/execution/index/art/art.hpp"
@@ -128,6 +129,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterSparkScalarFunctions(loader);
 
+	// `current_date` and `current_timestamp` bind to a column or select-list alias of that name before the clock. These
+	// calls cannot, so a view whose source has such a column can still name the clock.
+	static const DefaultMacro CLOCK_MACROS[] = {
+	    {DEFAULT_SCHEMA, "openivm_clock_timestamp", "() AS get_current_timestamp()"},
+	    {DEFAULT_SCHEMA, "openivm_clock_date", "() AS CAST(get_current_timestamp() AS DATE)"},
+	    {nullptr, nullptr, nullptr}};
+	for (idx_t index = 0; CLOCK_MACROS[index].name != nullptr; index++) {
+		auto info = DefaultFunctionGenerator::CreateInternalMacroInfo(CLOCK_MACROS[index]);
+		loader.RegisterFunction(*info);
+	}
 	db_config.AddExtensionOption("openivm_spark_expression_markers",
 	                             "enable compiler-only opaque Spark expression markers", LogicalType::BOOLEAN,
 	                             Value::BOOLEAN(false));

@@ -12,7 +12,7 @@ T0 = "2026-01-02T07:30:00Z"  # 2026-01-01 23:30:00 in Los Angeles
 T1 = "2026-01-02T08:00:00Z"  # local midnight
 T2 = "2026-01-02T08:00:00.000001Z"  # one microsecond after local midnight
 
-SEED = """INSERT INTO src VALUES
+SEED = """INSERT INTO {t} VALUES
  (1, TIMESTAMP '2026-01-01 23:30:00', DATE '2026-01-01', 1),
  (1, TIMESTAMP '2026-01-02 00:00:00', DATE '2026-01-02', 2),
  (2, TIMESTAMP '2026-01-02 00:00:00', DATE '2026-01-01', 10),
@@ -24,12 +24,22 @@ SEED = """INSERT INTO src VALUES
  (7, TIMESTAMP '2026-01-02 00:00:00', DATE '2026-01-02', 3),
  (NULL, TIMESTAMP '2026-01-01 23:50:00', DATE '2026-01-01', 5);"""
 
-VIEWS = {
-    "ts": "SELECT k, SUM(CASE WHEN ts <= current_timestamp THEN v ELSE 0 END) AS s FROM src GROUP BY k",
-    "dt": "SELECT k, SUM(CASE WHEN d >= current_date THEN v ELSE 0 END) AS s FROM src GROUP BY k",
+# `named` holds the same rows in columns named after the clock keywords; its views read the clock through the
+# unshadowable functions. DML is applied to both tables.
+TABLES = {
+    "src": "CREATE TABLE src(k INT, ts TIMESTAMP, d DATE, v INT)",
+    "named": 'CREATE TABLE named(k INT, "current_timestamp" TIMESTAMP, "current_date" DATE, v INT)',
 }
 
-INSERT_K5 = "INSERT INTO src VALUES (5, TIMESTAMP '2026-01-01 12:00:00', DATE '2025-12-31', 20000)"
+# kind -> (table, column, comparison, clock)
+VIEWS = {
+    "ts": ("src", "ts", "<=", "current_timestamp"),
+    "dt": ("src", "d", ">=", "current_date"),
+    "named_ts": ("named", '"current_timestamp"', "<=", "openivm_clock_timestamp()"),
+    "named_dt": ("named", '"current_date"', ">=", "openivm_clock_date()"),
+}
+
+INSERT_K5 = "INSERT INTO {t} VALUES (5, TIMESTAMP '2026-01-01 12:00:00', DATE '2025-12-31', 20000)"
 
 # (name, initial instant, zone, steps); each step is
 # (instant, zone, DML, expected clock_mode, expected clock_reason, clock alone must change the answer)
@@ -49,7 +59,7 @@ SCENARIOS = [
             (
                 T1,
                 LOS_ANGELES,
-                ["DELETE FROM src WHERE k = 3", "UPDATE src SET k = 4 WHERE k = 1 AND v = 1"],
+                ["DELETE FROM {t} WHERE k = 3", "UPDATE {t} SET k = 4 WHERE k = 1 AND v = 1"],
                 "incremental",
                 "ok",
                 False,
@@ -62,7 +72,7 @@ SCENARIOS = [
         LOS_ANGELES,
         [
             (T1, LOS_ANGELES, [], "incremental", "ok", True),
-            (T2, LOS_ANGELES, ["INSERT INTO src VALUES (6, NULL, NULL, 1)"], "incremental", "ok", True),
+            (T2, LOS_ANGELES, ["INSERT INTO {t} VALUES (6, NULL, NULL, 1)"], "incremental", "ok", True),
             (T2, LOS_ANGELES, [], "incremental", "ok", False),
         ],
     ),
@@ -115,10 +125,17 @@ def instant_literal(instant: str) -> str:
     return "TIMESTAMPTZ '" + instant.replace("T", " ").replace("Z", "+00") + "'"
 
 
+def view_query(kind: str, clock: str = None) -> str:
+    table, column, comparison, live_clock = VIEWS[kind]
+    return (
+        f"SELECT k, SUM(CASE WHEN {column} {comparison} {clock or live_clock} THEN v ELSE 0 END) AS s "
+        f"FROM {table} GROUP BY k"
+    )
+
+
 def oracle(kind: str, instant: str, zone: str) -> str:
     local = f"timezone('{zone}', {instant_literal(instant)})"
-    predicate = f"ts <= {local}" if kind == "ts" else f"d >= CAST({local} AS DATE)"
-    return f"SELECT k, SUM(CASE WHEN {predicate} THEN v ELSE 0 END) AS s FROM src GROUP BY k"
+    return view_query(kind, local if kind.endswith("ts") else f"CAST({local} AS DATE)")
 
 
 def mismatch_sql(kind: str, query: str) -> str:
@@ -144,17 +161,20 @@ def run_scenario(binary: Path, root: Path, name: str, initial: str, initial_zone
     files.mkdir(parents=True)
     database = scenario_dir / "test.db"
 
-    setup = "CREATE TABLE src(k INT, ts TIMESTAMP, d DATE, v INT);\n" + SEED + "\n"
-    for kind, query in VIEWS.items():
-        setup += f"CREATE MATERIALIZED VIEW mv_clock_{kind} AS {query};\n"
+    setup = "".join(f"{create};\n{SEED.format(t=table)}\n" for table, create in TABLES.items())
+    for kind in VIEWS:
+        setup += f"CREATE MATERIALIZED VIEW mv_clock_{kind} AS {view_query(kind)};\n"
     run_duckdb(binary, database, files, initial_zone, setup)
+
+    # Kinds whose same-instant answer differed from a column self-comparison at some step.
+    distinguished = set()
 
     previous = None
     sequence = [(initial, initial_zone, [], "full_at_as_of", "missing_previous", False)] + steps
     for index, (instant, zone, dml, expected_mode, expected_reason, clock_changes_answer) in enumerate(sequence):
         label = f"{name} step {index}"
         if dml:
-            run_duckdb(binary, database, files, zone, ";\n".join(dml) + ";\n")
+            run_duckdb(binary, database, files, zone, "".join(s.format(t=t) + ";\n" for t in TABLES for s in dml))
         clock = {"as_of": instant, "time_zone": zone}
         if previous:
             clock["previous_as_of"], clock["previous_time_zone"] = previous
@@ -183,7 +203,8 @@ def run_scenario(binary: Path, root: Path, name: str, initial: str, initial_zone
             expected_type = "GROUP_RECOMPUTE" if expected_mode == "incremental" else "FULL_REFRESH"
             if {row["refresh_type_name"] for row in rows} != {expected_type}:
                 raise AssertionError(f"{label} {kind}: expected {expected_type} program")
-            if any("current_timestamp" in row["sql"].lower() for row in rows):
+            live_clock = "current_timestamp" if VIEWS[kind][0] == "src" else "openivm_clock"
+            if any(live_clock in row["sql"].lower() for row in rows):
                 raise AssertionError(f"{label} {kind}: the program still reads the live clock")
             for row in rows:
                 statement = row["sql"].rstrip()
@@ -196,7 +217,15 @@ def run_scenario(binary: Path, root: Path, name: str, initial: str, initial_zone
             ]["mismatches"]
             if mismatches != 0:
                 raise AssertionError(f"{label} {kind}: {mismatches} bag mismatches against the same-instant answer")
+            if (
+                kind.startswith("named_")
+                and run_duckdb(binary, database, files, zone, mismatch_sql(kind, view_query(kind, VIEWS[kind][1])))[0][
+                    0
+                ]["mismatches"]
+            ):
+                distinguished.add(kind)
         previous = (instant, zone)
+    return distinguished
 
 
 def main():
@@ -211,10 +240,14 @@ def main():
     if not binary.exists():
         raise SystemExit(f"DuckDB binary not found: {binary}")
 
+    distinguished = set()
     with tempfile.TemporaryDirectory(prefix="openivm_clock_window_") as temp_dir:
         for name, initial, zone, steps in SCENARIOS:
-            run_scenario(binary, Path(temp_dir), name, initial, zone, steps)
+            distinguished |= run_scenario(binary, Path(temp_dir), name, initial, zone, steps)
             print(f"PASS {name}")
+    named = {kind for kind in VIEWS if kind.startswith("named_")}
+    if distinguished != named:
+        raise AssertionError(f"rows never distinguish the clock from a self-comparison for {named - distinguished}")
 
 
 if __name__ == "__main__":
