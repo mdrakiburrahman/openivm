@@ -1115,3 +1115,64 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# #60: substituting the short source name must leave the other scan and string literals intact.
+statement ok
+CREATE TABLE gr_prefix (id INT, grp INT, x INT, label VARCHAR);
+
+statement ok
+CREATE TABLE gr_prefix2 (rid INT, y INT);
+
+statement ok
+INSERT INTO gr_prefix VALUES (1, 1, 10, 'memory.main.gr_prefix'), (2, 1, 20, 'memory.main.gr_prefix'),
+                             (3, 2, 30, 'memory.main.gr_prefix'), (4, 3, 50, 'other');
+
+statement ok
+INSERT INTO gr_prefix2 VALUES (1, 10), (3, 70);
+
+statement ok
+CREATE VIEW gr_prefix_expected AS
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM gr_prefix l ANTI JOIN gr_prefix2 r ON abs(l.x - r.y) <= 1
+    WHERE l.label = 'memory.main.gr_prefix' GROUP BY l.grp;
+
+statement ok
+CREATE MATERIALIZED VIEW gr_prefix_mv AS
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM gr_prefix l ANTI JOIN gr_prefix2 r ON abs(l.x - r.y) <= 1
+    WHERE l.label = 'memory.main.gr_prefix' GROUP BY l.grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'gr_prefix_mv';
+----
+6
+
+statement ok
+INSERT INTO gr_prefix VALUES (5, 2, 40, 'memory.main.gr_prefix'), (6, 1, 45, 'memory.main.gr_prefix');
+
+statement ok
+UPDATE gr_prefix SET x = 47 WHERE id = 6;
+
+statement ok
+DELETE FROM gr_prefix WHERE id = 6;
+
+statement ok
+INSERT INTO gr_prefix2 VALUES (2, 30), (4, 17);
+
+statement ok
+UPDATE gr_prefix2 SET y = 20 WHERE rid = 4;
+
+statement ok
+DELETE FROM gr_prefix2 WHERE rid = 3;
+
+statement ok
+PRAGMA refresh('gr_prefix_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM gr_prefix_mv EXCEPT ALL SELECT * FROM gr_prefix_expected)
+    UNION ALL
+    (SELECT * FROM gr_prefix_expected EXCEPT ALL SELECT * FROM gr_prefix_mv)
+);
+----
+0

@@ -1383,27 +1383,12 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			continue;
 		}
 
-		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when
-		// the catalog is the default `memory` (so `catalog_prefix` is empty for SQL output, but
-		// `lpts_table_prefix` is still `memory.main.` here). Build one affected-key query per
-		// source occurrence. Self-joins must replace only one occurrence at a time; replacing every
-		// occurrence with the delta would miss base rows affected by a delta row on another arm.
-		// Original-SQL recompute paths (e.g. ROLLUP/GROUPING SETS) can contain unqualified
-		// table names, so fall back to identifier-safe bare replacement when the exact LPTS
-		// form is absent.
-		const string &source_full = spec.source_sql;
+		// Replace one scan at a time, including each arm of a self-join. Source
+		// references have already been catalog-qualified, including legacy SQL.
 		auto filtered_variants =
-		    SqlUtils::ReplaceEachPlainOccurrence(affected_view_query_sql, source_full, delta_subselect);
+		    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, spec.source_sql, delta_subselect);
 		if (filtered_variants.empty()) {
-			filtered_variants =
-			    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, source_full, delta_subselect);
-		}
-		if (filtered_variants.empty()) {
-			string filtered = SqlUtils::ReplaceAllOccurrences(affected_view_query_sql, source_full, delta_subselect);
-			if (filtered == affected_view_query_sql) {
-				filtered = SqlUtils::ReplaceTableReferences(affected_view_query_sql, source_full, delta_subselect);
-			}
-			filtered_variants.push_back(std::move(filtered));
+			filtered_variants.push_back(affected_view_query_sql);
 		}
 
 		for (idx_t occurrence = 0; occurrence < filtered_variants.size(); occurrence++) {
