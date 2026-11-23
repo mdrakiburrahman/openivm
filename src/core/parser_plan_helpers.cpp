@@ -1513,8 +1513,12 @@ static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFa
 
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names) {
+	// The CTAS operator exposes its inserted row count. Its SELECT child
+	// carries the bindings that correspond to the backing table's output names.
+	auto &root = *facts.root;
+	auto &output = root.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? *root.children[0] : root;
 	vector<string> group_names;
-	if (!AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
+	if (!AddGroupColumnsFromBindings(output, facts, group_index, group_count, output_names, group_names)) {
 		FindGroupColumns(facts, group_index, group_count, output_names, group_names);
 	}
 	// Expressions over keys are constant within a group, not additive aggregates.
@@ -2960,6 +2964,31 @@ static string SanitizeOutputName(const string &name) {
 	return clean.empty() ? name : clean;
 }
 
+static bool IsReservedMaterializedViewOutputName(const string &name) {
+	return StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
+	       StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
+	       StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
+	       StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX) ||
+	       StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX);
+}
+
+void ValidateMaterializedViewOutputNames(const vector<string> &original_names, const vector<string> &output_names,
+                                         idx_t visible_count) {
+	case_insensitive_set_t helper_names;
+	for (idx_t i = visible_count; i < output_names.size(); i++) {
+		helper_names.insert(output_names[i]);
+	}
+	for (idx_t i = 0; i < visible_count; i++) {
+		// Sanitization can turn a visible alias such as "openivm.multiplicity" into a helper name.
+		auto &original = original_names[i];
+		auto &output = output_names[i];
+		if (IsReservedMaterializedViewOutputName(original) || IsReservedMaterializedViewOutputName(output) ||
+		    helper_names.count(output)) {
+			throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", original);
+		}
+	}
+}
+
 static LogicalOperator *FindTopNameSource(LogicalOperator *plan) {
 	for (auto *walk = plan; walk;) {
 		if (walk->type == LogicalOperatorType::LOGICAL_PROJECTION ||
@@ -3021,7 +3050,7 @@ static void AppendHiddenOutputNames(LogicalOperator *plan, vector<string> &outpu
 }
 
 static void DeduplicateOutputNames(vector<string> &output_names) {
-	unordered_set<string> seen;
+	case_insensitive_set_t seen;
 	for (auto &name : output_names) {
 		if (IncrementalTableNames::IsInternalColumn(name)) {
 			continue;

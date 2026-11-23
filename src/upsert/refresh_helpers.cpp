@@ -951,20 +951,16 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 }
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           bool cross_system, const string &attached_catalog, const string &attached_schema,
-                           const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta,
-                           vector<string> *deferred_cleanup, const vector<string> &delta_metadata_tables,
-                           const string &data_catalog) {
+                           bool has_unique_index, bool cross_system, const string &attached_catalog,
+                           const string &attached_schema, const string &catalog_prefix, const string &metadata_prefix,
+                           string *out_post_meta, vector<string> *deferred_cleanup,
+                           const vector<string> &delta_metadata_tables, const string &data_catalog) {
 	string qdt = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
-	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
-	// transaction, which DuckDB's on-disk unique index rejects, so those views need the upsert form.
-	auto recompute_view_type = metadata.GetViewType(view_name);
+	// Indexed keys cannot be deleted and reinserted in the same on-disk transaction.
+	// Non-indexable group keys use the ordinary DELETE/INSERT full-refresh form.
 	vector<string> unique_keys;
 	string recompute_temp;
-	auto view_location = metadata.GetStoredViewLocation(view_name, attached_catalog, attached_schema);
-	if (!metadata.IsDuckLakeCatalog(view_location.catalog_name) &&
-	    (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING)) {
+	if (has_unique_index) {
 		unique_keys = metadata.GetGroupColumns(view_name);
 		if (!unique_keys.empty()) {
 			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);

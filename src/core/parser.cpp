@@ -459,6 +459,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
+	vector<LogicalType> output_types;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
@@ -482,15 +483,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                             select_planner.properties.always_require_rebind);
 		auto select_output_names = IdentifiersToStrings(select_planner.names);
 		visible_output_count = select_output_names.size();
-		for (auto &name : select_output_names) {
-			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
-			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
-			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
-			    StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX) ||
-			    StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX)) {
-				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
-			}
-		}
 		add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
 		// Inline CTEs without running the full optimizer, which can reshape plans
@@ -510,6 +502,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
+		ValidateMaterializedViewOutputNames(select_output_names, output_names, visible_output_count);
+		output_types = select_plan->types;
 
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
 		full_outer_scopes = BuildFullOuterScopes(post_rewrite_facts);
@@ -1212,9 +1206,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
-	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
-	string window_order_cols_val = SqlCsvLiteralOrNull(window_order_columns);
-	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
+	string group_cols_val = ViewListSqlLiteralOrNull(cols_to_store);
+	string window_order_cols_val = ViewListSqlLiteralOrNull(window_order_columns);
+	string agg_types_val = ViewListSqlLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)
 	                        ? "null"
 	                        : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
@@ -1811,7 +1805,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// the index up in every native view catalog; its full recompute upserts against it.
 	bool explicit_native = metadata_location.explicit_placement && metadata.IsNativeCatalog(view_target_catalog);
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native)) {
+	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native) &&
+	    CanCreateGroupIndex(aggregate_columns, output_names, output_types)) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = SqlUtils::QuoteIdentifier(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +

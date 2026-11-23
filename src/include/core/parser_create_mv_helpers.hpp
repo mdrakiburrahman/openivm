@@ -24,7 +24,9 @@ void InitializeMVMetadata(ClientContext &context, Connection &con, const string 
 // True when the helper committed a new, empty source delta.
 bool InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl,
                            const string &mapping_probe);
-string SqlCsvLiteralOrNull(const vector<string> &values);
+string ViewListSqlLiteralOrNull(const vector<string> &values);
+// ART indexes support scalar storage types; nested group keys still use incremental MERGE.
+bool CanCreateGroupIndex(const vector<string> &groups, const vector<string> &names, const vector<LogicalType> &types);
 void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog, const string &schema,
                                    vector<string> &ddl, const string &view_name, bool is_replace,
                                    const string &view_catalog, const string &view_schema, const string &sql_view_name,

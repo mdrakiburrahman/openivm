@@ -503,7 +503,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
 	optional_ptr<CatalogEntry> index_delta_view_catalog_entry;
-	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || split_native_metadata) {
+	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || target_is_native) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    planning_context,
@@ -657,9 +657,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			source_sql = RenderStoredViewQueryForDialect(con, view_query_sql, vector<string>(),
 			                                             active_facts.target_dialect, view_time_travel_pins);
 		}
-		auto query = BuildRecomputeQuery(metadata, view_name, source_sql, cross_system, attached_db_catalog_name,
-		                                 attached_db_schema_name, internal_catalog_prefix, metadata_prefix,
-		                                 out_post_meta, deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
+		auto query = BuildRecomputeQuery(
+		    metadata, view_name, source_sql,
+		    index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB, cross_system,
+		    attached_db_catalog_name, attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
+		    deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
 		query += rebuild_distinct_aux();
 		if (cross_system && out_pre_meta && out_post_meta) {
 			*out_pre_meta = in_progress_sql(true);
@@ -1333,7 +1335,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// Restricted to DuckDB output: the safe form emits INSERT OR REPLACE, which other dialects do
 		// not share. DuckLake output also has no unique indexes for ON CONFLICT.
 		vector<string> recompute_unique_keys;
-		if (!target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
+		if (index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = group_cols;
 		}
