@@ -85,6 +85,8 @@ void InlineMaterializedCteRefs(ClientContext &context, Binder &binder, unique_pt
 bool RenderPlanOutputExpression(ClientContext &context, const Expression &expression, LogicalOperator &plan,
                                 const CreateMVPlanFacts &facts, const vector<string> &output_names, string &sql);
 vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vector<string> &output_names);
+string ResolvePlanOutputColumn(ColumnBinding binding, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                               const vector<string> &output_names);
 
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
 

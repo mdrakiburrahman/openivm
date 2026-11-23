@@ -2187,9 +2187,9 @@ vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vec
 	return names;
 }
 
-bool RenderPlanOutputExpression(ClientContext &context, const Expression &expression, LogicalOperator &plan,
-                                const CreateMVPlanFacts &facts, const vector<string> &output_names, string &sql) {
-	DerivedOutputProjectionMap projections;
+static column_binding_map_t<string> BuildOutputBindingNames(LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                                            const vector<string> &output_names,
+                                                            DerivedOutputProjectionMap &projections) {
 	for (auto *projection : facts.projections) {
 		projections[projection->table_index] = projection;
 	}
@@ -2203,7 +2203,7 @@ bool RenderPlanOutputExpression(ClientContext &context, const Expression &expres
 		// including when the path ends at a computed expression.
 		if (resolved) {
 			for (auto key : path) {
-				binding_to_column[key] = output_names[i];
+				binding_to_column.emplace(key, output_names[i]);
 			}
 		}
 	}
@@ -2221,11 +2221,26 @@ bool RenderPlanOutputExpression(ClientContext &context, const Expression &expres
 			auto resolved = ResolveDerivedOutputPassThrough(*aggregate->groups[i], projections, &path);
 			if (resolved) {
 				for (auto input_key : path) {
-					binding_to_column[input_key] = name;
+					binding_to_column.emplace(input_key, name);
 				}
 			}
 		}
 	}
+	return binding_to_column;
+}
+
+string ResolvePlanOutputColumn(ColumnBinding binding, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                               const vector<string> &output_names) {
+	DerivedOutputProjectionMap projections;
+	auto names = BuildOutputBindingNames(plan, facts, output_names, projections);
+	auto entry = names.find(binding);
+	return entry == names.end() ? "" : entry->second;
+}
+
+bool RenderPlanOutputExpression(ClientContext &context, const Expression &expression, LogicalOperator &plan,
+                                const CreateMVPlanFacts &facts, const vector<string> &output_names, string &sql) {
+	DerivedOutputProjectionMap projections;
+	auto binding_to_column = BuildOutputBindingNames(plan, facts, output_names, projections);
 	return OutputExpressionRenderer(context, binding_to_column, projections).Render(expression, sql);
 }
 
@@ -2257,7 +2272,7 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(ClientContext &context
 		resolved_expressions.push_back(resolved);
 		if (resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			for (auto key : binding_path) {
-				binding_to_column[key] = output_names[i];
+				binding_to_column.emplace(key, output_names[i]);
 			}
 			auto binding = resolved->Cast<BoundColumnRefExpression>().Binding();
 			for (auto *aggregate : facts.aggregates) {
@@ -2276,7 +2291,8 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(ClientContext &context
 	OutputExpressionRenderer renderer(context, binding_to_column, projections);
 	for (idx_t i = 0; i < resolved_expressions.size(); i++) {
 		auto &expression = *resolved_expressions[i];
-		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
+		if ((expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		     binding_to_column.at(expression.Cast<BoundColumnRefExpression>().Binding()) == output_names[i]) ||
 		    (!recoverable_sums && ((IncrementalTableNames::IsInternalColumn(output_names[i]) &&
 		                            !StringUtil::StartsWith(output_names[i], openivm::SORT_VALUE_PREFIX)) ||
 		                           std::find(decomposed_outputs.begin(), decomposed_outputs.end(), output_names[i]) !=
