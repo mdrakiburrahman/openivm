@@ -18,11 +18,14 @@
 namespace duckdb {
 
 struct PlanRewriteNeeds;
+class BoundAggregateExpression;
+bool IsDerivedAggregate(const BoundAggregateExpression &aggregate);
 class Planner;
 
 // Compiler-only source boundary; generated columns retain their logical identity.
 void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement);
 TableFunction SourceColumnsFunction();
+ScalarFunction CandidateValueKeyFunction();
 
 BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr);
 
@@ -92,7 +95,6 @@ struct CreateMVPlanFacts {
 	unordered_map<TableIndex, ProjectionSourceOccurrence> occurrence_by_index;
 	vector<ProjectionSourceOccurrence> source_occurrences;
 	vector<ProjectionLineageEdge> projection_lineage_edges;
-	unordered_map<const LogicalOperator *, string> first_table_name;
 	unordered_map<TableIndex, int> cte_refs_under_join_count;
 	bool has_union_before_aggregate = false;
 	bool has_unsupported_set_operation = false;
@@ -107,8 +109,8 @@ struct CreateMVPlanFacts {
 	bool has_descendant_distinct = false;
 };
 
-void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, string &suffix,
-                               string &ordering);
+void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
+                               string &suffix, string &ordering);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 // Qualify an auxiliary-state source by the catalog and schema the view bound it to.
@@ -139,6 +141,12 @@ RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(Binder &bi
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names);
+LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root);
+class AstNode;
+string BuildDistinctSelectedViewSQL(AstNode &node, const vector<string> &input_columns,
+                                    const vector<string> &output_columns);
+void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, const CreateMVPlanFacts &facts,
+                                     const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta);
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                                bool include_first_aggregate);

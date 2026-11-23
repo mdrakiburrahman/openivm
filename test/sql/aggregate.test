@@ -3684,10 +3684,11 @@ CREATE MATERIALIZED VIEW mv_sum_null_computed AS
     SELECT grp, SUM(amount) + 0 AS plus_zero, ROUND(SUM(amount), 0) AS rounded
     FROM sum_null_computed GROUP BY grp;
 
+# Raw SUM inputs now keep computed outputs on the incremental MERGE path.
 query I
 SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f636f6d7075746564_';
 ----
-6
+0
 
 statement ok
 UPDATE sum_null_computed SET amount = NULL WHERE id = 1;
@@ -3718,8 +3719,7 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# A scalar computed aggregate has no affected group key, so it must recompute
-# the single result instead of using the additive scalar compiler.
+# Scalar expressions now finalize the single result from incrementally updated raw state.
 statement ok
 CREATE MATERIALIZED VIEW mv_sum_null_computed_scalar AS
     SELECT ROUND(SUM(amount), 0) AS rounded FROM sum_null_computed;
@@ -3727,7 +3727,7 @@ CREATE MATERIALIZED VIEW mv_sum_null_computed_scalar AS
 query I
 SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f636f6d70757465645f7363616c6172_';
 ----
-3
+1
 
 statement ok
 UPDATE sum_null_computed SET amount = NULL;
@@ -4104,8 +4104,8 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# A direct SUM needs NULL-state helper data, but that internal aggregate must
-# not hide a second output that folds SUM/COUNT into one derived expression.
+# Both SUM inputs retain NULL-state helpers, including the one consumed by a
+# derived expression. These helpers must not hide the SUM/COUNT output formula.
 statement ok
 CREATE TABLE sum_null_shape (id INT, grp INT, x INT, y INT, z INT);
 
@@ -4121,10 +4121,10 @@ query I
 SELECT count(*) FROM pragma_table_info('openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f7368617065_')
 WHERE name LIKE 'openivm_nonnull_sum_count_%';
 ----
-1
+2
 
-# The correct ratio changes from 15 to 40. A delta-MERGE incorrectly adds the
-# per-delta ratio (90), producing 105, unless shape accounting selects group recompute.
+# The correct ratio changes from 15 to 40. Finalization must use the updated
+# inputs, rather than adding the per-delta ratio (90) and producing 105.
 statement ok
 INSERT INTO sum_null_shape VALUES (3, 1, 30, 90, 1);
 
@@ -5303,6 +5303,1327 @@ SELECT count(*) FROM (
     UNION ALL
     (SELECT * FROM native_filter_expected EXCEPT ALL SELECT * FROM native_filter_mv)
 );
+----
+0
+
+# Issue #150: maintain raw aggregate state and evaluate projected expressions
+# after applying deltas, including scalar and mixed MIN/MAX outputs.
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE derived_expr_source(id INT,k INT,v INT,x DOUBLE,y INT);
+
+statement ok
+INSERT INTO derived_expr_source VALUES
+(1,1,10,NULL,1),(2,1,15,10,1),(3,1,12,20,NULL),
+(4,2,1,2,2),(5,2,2,NULL,NULL),(6,2,3,4,4),
+(7,NULL,7,3,1),(8,NULL,8,5,NULL),(9,NULL,9,NULL,3);
+
+statement ok
+CREATE TABLE derived_expr_keys(k INT);
+
+statement ok
+INSERT INTO derived_expr_keys VALUES(1),(2),(3);
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_coalesce AS
+SELECT k,COUNT(*)+1 n,COALESCE(SUM(v),0) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_coalesce_expected AS
+SELECT k,COUNT(*)+1 n,COALESCE(SUM(v),0) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_bitwise AS
+SELECT k,COUNT(*)+1 n,COUNT(*) & 1 a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_bitwise_expected AS
+SELECT k,COUNT(*)+1 n,COUNT(*) & 1 a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_native_avg AS
+SELECT k,AVG(x) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_native_avg_expected AS
+SELECT k,AVG(x) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_min_round AS
+SELECT k,MIN(v) min_value,ROUND(MIN(v)/3.0,2) rounded FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_min_round_expected AS
+SELECT k,MIN(v) min_value,ROUND(MIN(v)/3.0,2) rounded FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_computed_key AS
+SELECT k+1 g,COUNT(*)+1 n,SUM(v) derived_expr_source FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_computed_key_expected AS
+SELECT k+1 g,COUNT(*)+1 n,SUM(v) derived_expr_source FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_count AS
+SELECT k,COUNT(*)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_count_expected AS
+SELECT k,COUNT(*)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_scalar AS
+SELECT COUNT(*)+1 n FROM derived_expr_source;
+
+statement ok
+CREATE VIEW derived_expr_scalar_expected AS
+SELECT COUNT(*)+1 n FROM derived_expr_source;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_count_value AS
+SELECT k,COUNT(y)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_count_value_expected AS
+SELECT k,COUNT(y)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_min AS
+SELECT k,COUNT(*)+1 n,MIN(v) lo FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_min_expected AS
+SELECT k,COUNT(*)+1 n,MIN(v) lo FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_max AS
+SELECT k,COUNT(*)*2 n,MAX(v) hi FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_max_expected AS
+SELECT k,COUNT(*)*2 n,MAX(v) hi FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_sum AS
+SELECT k,SUM(v)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_sum_expected AS
+SELECT k,SUM(v)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_abs AS
+SELECT k,COUNT(*)+1 n,ABS(COUNT(*)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_abs_expected AS
+SELECT k,COUNT(*)+1 n,ABS(COUNT(*)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_cast AS
+SELECT k,CAST(COUNT(*)-2 AS UINTEGER) n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_cast_expected AS
+SELECT k,CAST(COUNT(*)-2 AS UINTEGER) n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_having AS
+SELECT k,COUNT(*)+1 n FROM derived_expr_source GROUP BY k HAVING COUNT(*)>2;
+
+statement ok
+CREATE VIEW derived_expr_having_expected AS
+SELECT k,COUNT(*)+1 n FROM derived_expr_source GROUP BY k HAVING COUNT(*)>2;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_collision AS
+SELECT k,COUNT(y)+1 c,AVG(x) state_0 FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_collision_expected AS
+SELECT k,COUNT(y)+1 c,AVG(x) state_0 FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_multiple AS
+SELECT k,COUNT(*)*2+COUNT(y) n,SUM(v)-COUNT(y) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_multiple_expected AS
+SELECT k,COUNT(*)*2+COUNT(y) n,SUM(v)-COUNT(y) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_case AS
+SELECT k,CASE WHEN COUNT(y)>0 THEN SUM(v)/COUNT(y) ELSE 0 END n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_case_expected AS
+SELECT k,CASE WHEN COUNT(y)>0 THEN SUM(v)/COUNT(y) ELSE 0 END n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_left_join AS
+SELECT derived_expr_keys.k,COUNT(derived_expr_source.y)+1 n,COUNT(derived_expr_keys.k)*2 left_count FROM derived_expr_keys LEFT JOIN derived_expr_source ON derived_expr_keys.k=derived_expr_source.k GROUP BY derived_expr_keys.k;
+
+statement ok
+CREATE VIEW derived_expr_left_join_expected AS
+SELECT derived_expr_keys.k,COUNT(derived_expr_source.y)+1 n,COUNT(derived_expr_keys.k)*2 left_count FROM derived_expr_keys LEFT JOIN derived_expr_source ON derived_expr_keys.k=derived_expr_source.k GROUP BY derived_expr_keys.k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_hidden_key AS
+SELECT COUNT(*)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_hidden_key_expected AS
+SELECT COUNT(*)+1 n FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_alias_cte AS
+WITH a AS(SELECT k,COUNT(*) n FROM derived_expr_source GROUP BY k) SELECT k,n+1 n FROM a;
+
+statement ok
+CREATE VIEW derived_expr_alias_cte_expected AS
+WITH a AS(SELECT k,COUNT(*) n FROM derived_expr_source GROUP BY k) SELECT k,n+1 n FROM a;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_duplicate AS
+SELECT k,COUNT(*)+1 n,COUNT(*)+1 m FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_duplicate_expected AS
+SELECT k,COUNT(*)+1 n,COUNT(*)+1 m FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_child AS SELECT k,SUM(n) n FROM derived_expr_count GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_child_expected AS SELECT k,SUM(n) n FROM (SELECT k,COUNT(*)+1 n FROM derived_expr_source GROUP BY k) a GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_scalar_child AS SELECT n*2 n FROM derived_expr_scalar;
+
+statement ok
+CREATE VIEW derived_expr_scalar_child_expected AS SELECT (COUNT(*)+1)*2 n FROM derived_expr_source;
+
+# Finalization preserves aggregate input types and named function arguments.
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_bit_group AS
+SELECT k,CAST(COUNT(*) AS BIT) a,CAST(COUNT(y) AS BIT) b FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_bit_group_expected AS
+SELECT k,CAST(COUNT(*) AS BIT) a,CAST(COUNT(y) AS BIT) b FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_bit_scalar AS
+SELECT CAST(COUNT(*) AS BIT) a FROM derived_expr_source;
+
+statement ok
+CREATE VIEW derived_expr_bit_scalar_expected AS
+SELECT CAST(COUNT(*) AS BIT) a FROM derived_expr_source;
+
+# The field name n also names a stored aggregate input, and must not be
+# substituted when the upsert replaces column references with updated state.
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_struct_group AS
+SELECT k,COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_struct_group_expected AS
+SELECT k,COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_struct_scalar AS
+SELECT COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v)) a FROM derived_expr_source;
+
+statement ok
+CREATE VIEW derived_expr_struct_scalar_expected AS
+SELECT COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v)) a FROM derived_expr_source;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_struct_nested AS
+SELECT k,CAST(struct_pack(n := COUNT(*),nested := struct_pack(total := SUM(v))) AS VARCHAR) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_struct_nested_expected AS
+SELECT k,CAST(struct_pack(n := COUNT(*),nested := struct_pack(total := SUM(v))) AS VARCHAR) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_struct_update AS
+SELECT k,struct_update(struct_pack(n := COUNT(*)),n := COUNT(*)+1) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_struct_update_expected AS
+SELECT k,struct_update(struct_pack(n := COUNT(*)),n := COUNT(*)+1) a FROM derived_expr_source GROUP BY k;
+
+# Keyword function names use ordinary function-call syntax when quoted.
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_position_group AS
+SELECT k,POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_position_group_expected AS
+SELECT k,POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_position_scalar AS
+SELECT POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source;
+
+statement ok
+CREATE VIEW derived_expr_position_scalar_expected AS
+SELECT POSITION('1' IN CAST(SUM(v) AS VARCHAR)) a FROM derived_expr_source;
+
+# A type-field name is not a column reference, even when both are "select".
+statement ok
+CREATE MATERIALIZED VIEW derived_expr_struct_cast AS
+SELECT k,COUNT(*) AS "select",CAST(struct_pack("select" := COUNT(*)) AS STRUCT("select" INTEGER)) a
+FROM derived_expr_source GROUP BY k;
+
+statement ok
+CREATE VIEW derived_expr_struct_cast_expected AS
+SELECT k,COUNT(*) AS "select",CAST(struct_pack("select" := COUNT(*)) AS STRUCT("select" INTEGER)) a
+FROM derived_expr_source GROUP BY k;
+
+foreach variant bit_group struct_group struct_nested struct_update position_group struct_cast
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_{variant}';
+----
+0
+
+endloop
+
+foreach variant bit_scalar struct_scalar position_scalar
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_{variant}';
+----
+1
+
+endloop
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_count';
+----
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_scalar';
+----
+1
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_expr_sum';
+----
+0
+
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_expr_{variant} EXCEPT ALL SELECT * FROM derived_expr_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_expr_{variant}_expected EXCEPT ALL SELECT * FROM derived_expr_{variant})
+);
+----
+0
+
+endloop
+
+# Insert-only MIN/MAX must retain the aggregate type after a derived COUNT output.
+
+statement ok
+INSERT INTO derived_expr_source VALUES(10,1,20,30,1),(11,2,5,6,NULL),(12,4,1,NULL,1),(13,4,2,NULL,2),(14,4,3,NULL,3);
+
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
+
+statement ok
+PRAGMA refresh('derived_expr_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_expr_{variant} EXCEPT ALL SELECT * FROM derived_expr_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_expr_{variant}_expected EXCEPT ALL SELECT * FROM derived_expr_{variant})
+);
+----
+0
+
+endloop
+
+# Batch key moves, NULL changes, removals, and transient rows before a single refresh.
+
+statement ok
+INSERT INTO derived_expr_source VALUES(15,1,22,40,1),(16,5,1,2,1),(17,5,2,4,NULL),(18,5,3,NULL,3),(19,6,1,2,1);
+
+statement ok
+UPDATE derived_expr_source SET k=2,v=23 WHERE id=15;
+
+statement ok
+UPDATE derived_expr_source SET k=2 WHERE id=7;
+
+statement ok
+UPDATE derived_expr_source SET y=NULL,x=8 WHERE id=4;
+
+statement ok
+DELETE FROM derived_expr_source WHERE id IN(15,19) OR k=4;
+
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
+
+statement ok
+PRAGMA refresh('derived_expr_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_expr_{variant} EXCEPT ALL SELECT * FROM derived_expr_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_expr_{variant}_expected EXCEPT ALL SELECT * FROM derived_expr_{variant})
+);
+----
+0
+
+endloop
+
+# Forced full refresh and subsequent incremental refresh preserve the same state.
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO derived_expr_source VALUES(20,1,25,50,NULL),(21,5,4,6,4);
+
+statement ok
+UPDATE derived_expr_source SET v=26 WHERE id=20;
+
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
+
+statement ok
+PRAGMA refresh('derived_expr_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_expr_{variant} EXCEPT ALL SELECT * FROM derived_expr_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_expr_{variant}_expected EXCEPT ALL SELECT * FROM derived_expr_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM derived_expr_source WHERE id=21;
+
+statement ok
+UPDATE derived_expr_source SET y=1 WHERE id=20;
+
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
+
+statement ok
+PRAGMA refresh('derived_expr_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_expr_{variant} EXCEPT ALL SELECT * FROM derived_expr_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_expr_{variant}_expected EXCEPT ALL SELECT * FROM derived_expr_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM derived_expr_source;
+
+foreach variant coalesce bitwise native_avg min_round computed_key count scalar count_value min max sum abs cast having collision multiple case left_join hidden_key alias_cte duplicate child scalar_child bit_group bit_scalar struct_group struct_scalar struct_nested struct_update position_group position_scalar struct_cast
+
+statement ok
+PRAGMA refresh('derived_expr_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_expr_{variant} EXCEPT ALL SELECT * FROM derived_expr_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_expr_{variant}_expected EXCEPT ALL SELECT * FROM derived_expr_{variant})
+);
+----
+0
+
+endloop
+
+# Hidden ORDER BY expressions must finalize from updated raw aggregate state too.
+statement ok
+CREATE TABLE derived_sort_source(id INT,k INT,v INT);
+
+statement ok
+INSERT INTO derived_sort_source VALUES (1,1,5),(2,1,5),(3,2,6),(4,2,6),(5,3,7),(6,3,7);
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_sum AS
+SELECT k,SUM(v)+1 n FROM derived_sort_source GROUP BY k ORDER BY SUM(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_sum_expected AS
+SELECT k,SUM(v)+1 n FROM derived_sort_source GROUP BY k ORDER BY SUM(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_count AS
+SELECT k,COUNT(*)+1 n FROM derived_sort_source GROUP BY k
+ORDER BY CAST(COUNT(*)-2 AS UINTEGER) DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_count_expected AS
+SELECT k,COUNT(*)+1 n FROM derived_sort_source GROUP BY k
+ORDER BY CAST(COUNT(*)-2 AS UINTEGER) DESC,k LIMIT 1;
+
+# Aggregates used only by sorting still need raw inputs and finalization.
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_sum AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)+7 DESC NULLS LAST,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_sum_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)+7 DESC NULLS LAST,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_count AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_count_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_count_star AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(*)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_count_star_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COUNT(*)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_count_visible AS SELECT k,COUNT(*) n FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_count_visible_expected AS SELECT k,COUNT(*) n FROM derived_sort_source GROUP BY k ORDER BY COUNT(v)+7 DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_coalesce AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COALESCE(COUNT(v)+7,0) DESC,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_coalesce_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY COALESCE(COUNT(v)+7,0) DESC,k LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_sort_hidden_ratio AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)/(COUNT(v)+1) DESC NULLS LAST,k LIMIT 1;
+
+statement ok
+CREATE VIEW derived_sort_hidden_ratio_expected AS SELECT k FROM derived_sort_source GROUP BY k ORDER BY SUM(v)/(COUNT(v)+1) DESC NULLS LAST,k LIMIT 1;
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_sort_{variant}';
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
+----
+0
+
+endloop
+
+# The one-row delta makes COUNT(*)-2 negative, although the new group count is valid.
+statement ok
+INSERT INTO derived_sort_source VALUES (7,1,1);
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant})
+);
+----
+0
+
+endloop
+
+# Conflicting changes, including a transient group, precede one refresh.
+statement ok
+INSERT INTO derived_sort_source VALUES (8,3,1),(9,4,1);
+
+statement ok
+UPDATE derived_sort_source SET k=2,v=30 WHERE id=7;
+
+statement ok
+UPDATE derived_sort_source SET v=1 WHERE id=5;
+
+statement ok
+UPDATE derived_sort_source SET v=NULL WHERE id=8;
+
+statement ok
+DELETE FROM derived_sort_source WHERE id IN (3,6,9);
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM derived_sort_source;
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant})
+);
+----
+0
+
+endloop
+
+# Refill with NULL-only and mixed groups, then cross the full-refresh boundary.
+statement ok
+INSERT INTO derived_sort_source VALUES(30,1,NULL),(31,1,NULL),(40,2,4),(41,2,NULL),(99,1,0);
+
+statement ok
+UPDATE derived_sort_source SET k=2,v=9 WHERE id=99;
+
+statement ok
+DELETE FROM derived_sort_source WHERE id=99;
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO derived_sort_source VALUES(99,1,10);
+
+statement ok
+UPDATE derived_sort_source SET v=NULL WHERE id=40;
+
+statement ok
+DELETE FROM derived_sort_source WHERE id=99;
+
+foreach variant sum count hidden_sum hidden_count hidden_count_star hidden_count_visible hidden_coalesce hidden_ratio
+
+statement ok
+PRAGMA refresh('derived_sort_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM derived_sort_{variant} EXCEPT ALL SELECT * FROM derived_sort_{variant}_expected) UNION ALL(SELECT * FROM derived_sort_{variant}_expected EXCEPT ALL SELECT * FROM derived_sort_{variant}));
+----
+0
+
+endloop
+
+# Computed floating SUMs retain finite subtotals and non-finite support counts.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE finite_sum_source(id INT,k INT,v DOUBLE);
+
+statement ok
+INSERT INTO finite_sum_source VALUES(1,1,'NaN'),(2,1,10),(3,2,'Infinity'),(4,2,20),(5,3,'-Infinity'),(6,3,30),(7,4,'Infinity'),(8,4,'-Infinity'),(9,4,40),(10,5,NULL),(11,5,50),(12,6,'NaN');
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_group AS SELECT k,SUM(v)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_group_expected AS SELECT k,SUM(v)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_scalar AS SELECT SUM(v)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE VIEW finite_sum_scalar_expected AS SELECT SUM(v)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_coalesce AS SELECT COALESCE(SUM(v),0)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE VIEW finite_sum_coalesce_expected AS SELECT COALESCE(SUM(v),0)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_cast AS SELECT k,CAST(SUM(v)+1 AS VARCHAR) a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_cast_expected AS SELECT k,CAST(SUM(v)+1 AS VARCHAR) a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_having AS SELECT k,SUM(v)+1 a FROM finite_sum_source GROUP BY k HAVING SUM(v)>=0;
+
+statement ok
+CREATE VIEW finite_sum_having_expected AS SELECT k,SUM(v)+1 a FROM finite_sum_source GROUP BY k HAVING SUM(v)>=0;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_order AS SELECT k,SUM(v)+1 a FROM finite_sum_source GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 4;
+
+statement ok
+CREATE VIEW finite_sum_order_expected AS SELECT k,SUM(v)+1 a FROM finite_sum_source GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 4;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_mixed AS SELECT k,SUM(v) raw,SUM(v)+COUNT(*) a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_mixed_expected AS SELECT k,SUM(v) raw,SUM(v)+COUNT(*) a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_group AS SELECT k,AVG(v) m,SUM(v)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_avg_group_expected AS SELECT k,AVG(v) m,SUM(v)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_scalar AS SELECT AVG(v) m,SUM(v)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE VIEW finite_sum_avg_scalar_expected AS SELECT AVG(v) m,SUM(v)+1 a FROM finite_sum_source;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_count AS SELECT k,AVG(v) m,COUNT(*)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_avg_count_expected AS SELECT k,AVG(v) m,COUNT(*)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_avg_int AS SELECT k,AVG(v) m,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_avg_int_expected AS SELECT k,AVG(v) m,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_raw_int AS SELECT k,SUM(v) raw,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW finite_sum_raw_int_expected AS SELECT k,SUM(v) raw,SUM(id)+1 a FROM finite_sum_source GROUP BY k;
+
+# Floating sort-only SUMs must recover after retracting non-finite inputs too.
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_hidden_order AS SELECT k FROM finite_sum_source GROUP BY k ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
+statement ok
+CREATE VIEW finite_sum_hidden_order_expected AS SELECT k FROM finite_sum_source GROUP BY k ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
+statement ok
+CREATE MATERIALIZED VIEW finite_sum_hidden_having_order AS SELECT k FROM finite_sum_source GROUP BY k HAVING SUM(v)>=0 ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
+statement ok
+CREATE VIEW finite_sum_hidden_having_order_expected AS SELECT k FROM finite_sum_source GROUP BY k HAVING SUM(v)>=0 ORDER BY SUM(v)+7 DESC,k LIMIT 4;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name LIKE 'finite_sum_%' AND type IN(3,6);
+----
+0
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM finite_sum_source WHERE NOT isfinite(v);
+
+statement ok
+INSERT INTO finite_sum_source VALUES(20,1,'NaN'),(21,2,'-Infinity');
+
+statement ok
+UPDATE finite_sum_source SET v=15 WHERE id=20;
+
+statement ok
+DELETE FROM finite_sum_source WHERE id IN(20,21);
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO finite_sum_source VALUES(30,1,'NaN'),(31,2,'Infinity'),(32,3,'-Infinity'),(33,4,'Infinity'),(34,4,'-Infinity'),(35,6,'NaN');
+
+statement ok
+UPDATE finite_sum_source SET v=25 WHERE id=2;
+
+statement ok
+DELETE FROM finite_sum_source WHERE id=4;
+
+statement ok
+INSERT INTO finite_sum_source VALUES(36,2,45);
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM finite_sum_source WHERE NOT isfinite(v);
+
+statement ok
+UPDATE finite_sum_source SET v='NaN' WHERE id=9;
+
+statement ok
+UPDATE finite_sum_source SET v=55 WHERE id=9;
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO finite_sum_source VALUES(40,1,'Infinity'),(41,7,'NaN');
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM finite_sum_source WHERE NOT isfinite(v);
+
+statement ok
+UPDATE finite_sum_source SET v=60 WHERE id=11;
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM finite_sum_source;
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO finite_sum_source VALUES(50,NULL,'NaN'),(51,NULL,10),(52,1,'Infinity'),(53,1,20);
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM finite_sum_source WHERE NOT isfinite(v);
+
+foreach variant group scalar coalesce cast having order mixed avg_group avg_scalar avg_count avg_int raw_int hidden_order hidden_having_order
+
+statement ok
+PRAGMA refresh('finite_sum_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM finite_sum_{variant} EXCEPT ALL SELECT * FROM finite_sum_{variant}_expected) UNION ALL(SELECT * FROM finite_sum_{variant}_expected EXCEPT ALL SELECT * FROM finite_sum_{variant}));
+----
+0
+
+endloop
+
+query I
+SELECT (count(*)>0)::INTEGER FROM openivm_compile_with_facts('finite_sum_group','{"target_dialect":"spark","compile_only":true}') WHERE stmt_kind='data';
+----
+1
+
+# Finite overflow is recoverable, and the unscaled lane preserves subnormal inputs.
+statement ok
+CREATE TABLE overflow_sum_source(id INT,k INT,v DOUBLE);
+
+statement ok
+INSERT INTO overflow_sum_source VALUES(1,1,1e308),(2,1,1e308),(3,2,-1e308),(4,2,-1e308),(5,3,5e-324);
+
+statement ok
+CREATE MATERIALIZED VIEW overflow_sum_group AS SELECT k,SUM(v)+0 a FROM overflow_sum_source GROUP BY k;
+
+statement ok
+CREATE VIEW overflow_sum_group_expected AS SELECT k,SUM(v)+0 a FROM overflow_sum_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW overflow_sum_scalar AS SELECT SUM(v)+0 a FROM overflow_sum_source WHERE k=1;
+
+statement ok
+CREATE VIEW overflow_sum_scalar_expected AS SELECT SUM(v)+0 a FROM overflow_sum_source WHERE k=1;
+
+foreach variant group scalar
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM overflow_sum_source WHERE id IN(2,4);
+
+statement ok
+INSERT INTO overflow_sum_source VALUES(6,1,1e308),(7,2,-1e308),(8,3,5e-324);
+
+statement ok
+UPDATE overflow_sum_source SET v=-v WHERE id IN(6,7);
+
+statement ok
+DELETE FROM overflow_sum_source WHERE id IN(6,7);
+
+foreach variant group scalar
+
+statement ok
+PRAGMA refresh('overflow_sum_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO overflow_sum_source VALUES(9,1,1e308),(10,2,-1e308);
+
+foreach variant group scalar
+
+statement ok
+PRAGMA refresh('overflow_sum_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM overflow_sum_source WHERE id IN(9,10);
+
+foreach variant group scalar
+
+statement ok
+PRAGMA refresh('overflow_sum_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_sum_{variant} EXCEPT ALL SELECT * FROM overflow_sum_{variant}_expected) UNION ALL(SELECT * FROM overflow_sum_{variant}_expected EXCEPT ALL SELECT * FROM overflow_sum_{variant}));
+----
+0
+
+endloop
+
+# Floating group representatives must still have support after a batched refresh.
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE group_sign_source(id INT,k INT,v DOUBLE,x INT);
+
+statement ok
+INSERT INTO group_sign_source VALUES(1,1,'-0.0'::DOUBLE,10),(2,1,0::DOUBLE,20),(3,2,'-0.0'::DOUBLE,30),(4,3,NULL,5);
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_visible AS SELECT v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE VIEW group_sign_visible_expected AS SELECT v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_hidden AS SELECT CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE VIEW group_sign_hidden_expected AS SELECT CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source WHERE k=1 GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_multi AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v;
+
+statement ok
+CREATE VIEW group_sign_multi_expected AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_float AS SELECT k,v::FLOAT f,CASE WHEN isnan(v::FLOAT) THEN NULL ELSE signbit(v::FLOAT) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v::FLOAT;
+
+statement ok
+CREATE VIEW group_sign_float_expected AS SELECT k,v::FLOAT f,CASE WHEN isnan(v::FLOAT) THEN NULL ELSE signbit(v::FLOAT) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v::FLOAT;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_nested AS WITH g AS(SELECT k,v,SUM(x) total FROM group_sign_source GROUP BY k,v) SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,total+1 a FROM g;
+
+statement ok
+CREATE VIEW group_sign_nested_expected AS WITH g AS(SELECT k,v,SUM(x) total FROM group_sign_source GROUP BY k,v) SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,total+1 a FROM g;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_having AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v HAVING SUM(x)>0;
+
+statement ok
+CREATE VIEW group_sign_having_expected AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,SUM(x)+1 a FROM group_sign_source GROUP BY k,v HAVING SUM(x)>0;
+
+statement ok
+CREATE MATERIALIZED VIEW group_sign_count AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,COUNT(*)+1 a FROM group_sign_source GROUP BY k,v;
+
+statement ok
+CREATE VIEW group_sign_count_expected AS SELECT k,v,CASE WHEN isnan(v) THEN NULL ELSE signbit(v) END negative,COUNT(*)+1 a FROM group_sign_source GROUP BY k,v;
+
+foreach variant visible hidden multi float nested having count
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name='group_sign_{variant}' AND type IN(3,6);
+----
+0
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source WHERE id=1;
+
+statement ok
+INSERT INTO group_sign_source VALUES(10,1,'-0.0'::DOUBLE,999);
+
+statement ok
+UPDATE group_sign_source SET x=x+1 WHERE id=10;
+
+statement ok
+DELETE FROM group_sign_source WHERE id=10;
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source WHERE id=3;
+
+statement ok
+INSERT INTO group_sign_source VALUES(11,2,0::DOUBLE,30);
+
+statement ok
+DELETE FROM group_sign_source WHERE id=2;
+
+statement ok
+INSERT INTO group_sign_source VALUES(12,1,'-0.0'::DOUBLE,20);
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source;
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO group_sign_source VALUES(20,1,0::DOUBLE,4),(21,2,'-0.0'::DOUBLE,6),(22,4,-('NaN'::DOUBLE),7),(23,3,NULL,5);
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM group_sign_source WHERE id=22;
+
+statement ok
+INSERT INTO group_sign_source VALUES(24,4,'NaN'::DOUBLE,7);
+
+foreach variant visible hidden multi float nested having count
+
+statement ok
+PRAGMA refresh('group_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_sign_{variant} EXCEPT ALL SELECT * FROM group_sign_{variant}_expected) UNION ALL(SELECT * FROM group_sign_{variant}_expected EXCEPT ALL SELECT * FROM group_sign_{variant}));
+----
+0
+
+endloop
+
+# NaN signs are unspecified; numerical NaN and NULL recovery remain correct.
+statement ok
+CREATE TABLE nan_sign_source(id INT,k INT,v DOUBLE);
+
+statement ok
+INSERT INTO nan_sign_source VALUES(1,1,-('NaN'::DOUBLE)),(2,1,10),(3,2,'NaN'),(4,2,20),(5,3,-('NaN'::DOUBLE));
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_group AS SELECT k,SUM(v)+1 a FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE VIEW nan_sign_group_expected AS SELECT k,SUM(v)+1 a FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_avg AS SELECT k,SUM(v)+1 a,AVG(v) m FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE VIEW nan_sign_avg_expected AS SELECT k,SUM(v)+1 a,AVG(v) m FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_scalar AS SELECT SUM(v)+1 a FROM nan_sign_source WHERE k=1;
+
+statement ok
+CREATE VIEW nan_sign_scalar_expected AS SELECT SUM(v)+1 a FROM nan_sign_source WHERE k=1;
+
+statement ok
+CREATE MATERIALIZED VIEW nan_sign_float AS SELECT k,SUM(v::FLOAT)+1 a FROM nan_sign_source GROUP BY k;
+
+statement ok
+CREATE VIEW nan_sign_float_expected AS SELECT k,SUM(v::FLOAT)+1 a FROM nan_sign_source GROUP BY k;
+
+foreach variant group avg scalar float
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO nan_sign_source VALUES(6,1,'NaN');
+
+statement ok
+UPDATE nan_sign_source SET v=-('NaN'::DOUBLE) WHERE id=6;
+
+statement ok
+DELETE FROM nan_sign_source WHERE id=6;
+
+statement ok
+DELETE FROM nan_sign_source WHERE id IN(1,5);
+
+statement ok
+UPDATE nan_sign_source SET v=-('NaN'::DOUBLE) WHERE id=3;
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO nan_sign_source VALUES(7,1,-('NaN'::DOUBLE)),(8,3,NULL);
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM nan_sign_source;
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO nan_sign_source VALUES(9,1,'NaN'),(10,2,-('NaN'::DOUBLE)),(11,2,15);
+
+foreach variant group avg scalar float
+
+statement ok
+PRAGMA refresh('nan_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM nan_sign_{variant} EXCEPT ALL SELECT * FROM nan_sign_{variant}_expected) UNION ALL(SELECT * FROM nan_sign_{variant}_expected EXCEPT ALL SELECT * FROM nan_sign_{variant}));
+----
+0
+
+endloop
+
+# Hidden COUNT(*) remains the cardinality anchor when no computed aggregate is published.
+statement ok
+CREATE TABLE sign_count_anchor(id INT,v DOUBLE,x INT);
+
+statement ok
+INSERT INTO sign_count_anchor VALUES(1,'-0.0'::DOUBLE,NULL),(2,'-0.0'::DOUBLE,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW sign_count_anchor_mv AS SELECT v,SUM(x) s FROM sign_count_anchor GROUP BY v HAVING COUNT(*)>1;
+
+statement ok
+CREATE VIEW sign_count_anchor_expected AS SELECT v,SUM(x) s FROM sign_count_anchor GROUP BY v HAVING COUNT(*)>1;
+
+statement ok
+INSERT INTO sign_count_anchor VALUES(3,'-0.0'::DOUBLE,NULL);
+
+statement ok
+PRAGMA refresh('sign_count_anchor_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM sign_count_anchor_mv EXCEPT ALL SELECT * FROM sign_count_anchor_expected) UNION ALL(SELECT * FROM sign_count_anchor_expected EXCEPT ALL SELECT * FROM sign_count_anchor_mv));
+----
+0
+
+statement ok
+DELETE FROM sign_count_anchor;
+
+statement ok
+INSERT INTO sign_count_anchor VALUES(4,0::DOUBLE,NULL),(5,0::DOUBLE,NULL);
+
+statement ok
+PRAGMA refresh('sign_count_anchor_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM sign_count_anchor_mv EXCEPT ALL SELECT * FROM sign_count_anchor_expected) UNION ALL(SELECT * FROM sign_count_anchor_expected EXCEPT ALL SELECT * FROM sign_count_anchor_mv));
 ----
 0
 

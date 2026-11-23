@@ -344,6 +344,26 @@ public:
 		string filter;
 		string sum_arg;
 		string sum_out;
+		vector<DerivedAggregateOutput> group_inputs;
+		string sum_input_expr;
+		// Complex or limited inputs use cols/source_exprs for candidate counts. The stored selection
+		// reads openivm_topk_candidates through stable selected_source_columns aliases.
+		string selected_input_sql;
+		vector<string> selected_input_columns;
+		vector<string> selected_source_columns;
+		vector<string> sign_columns;
+		vector<string> selected_identity_exprs;
+		bool representative_input = false;
+		string selected_view_sql;
+		// Evaluated on representative transitions, after DISTINCT and before aggregation.
+		string post_filter;
+
+		// Stable across creation and refresh; separate from candidate/selection input names.
+		string InternalColumn(const string &name) const;
+
+		string SelectionTable() const {
+			return selected_input_sql.empty() || representative_input ? "" : aux_table + "_selected";
+		}
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL
@@ -499,6 +519,7 @@ public:
 	static string LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta);
 
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
+	static vector<pair<string, string>> DistinctSignCountColumns(const DistinctAuxMeta &meta);
 	static vector<string> ExpectedCountDistinctAuxColumns(const CountDistinctAuxMeta &meta);
 	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
 	static vector<string> ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta);

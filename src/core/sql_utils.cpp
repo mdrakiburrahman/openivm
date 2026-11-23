@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
@@ -28,9 +29,37 @@
 #include <cctype>
 #include <cstring>
 #include <regex>
-#include <sstream>
 
 namespace duckdb {
+
+string SqlUtils::NegativeZeroSQL(const string &value) {
+	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
+}
+
+string SqlUtils::FloatingRepresentativeSQL(const string &value, const string &negative_count,
+                                           const string &total_count) {
+	return "CASE WHEN (" + value + ") = 0 THEN CASE WHEN " + negative_count + " = 0 THEN abs(" + value + ") WHEN " +
+	       negative_count + " = " + total_count + " THEN -abs(" + value + ") ELSE " + value + " END ELSE " + value +
+	       " END";
+}
+
+string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation) {
+	if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+		return NegativeZeroSQL(value);
+	}
+	if (type.id() == LogicalTypeId::VARCHAR &&
+	    (!StringType::GetCollation(type).empty() || !default_collation.empty())) {
+		return "unhex(hex(" + value + "))";
+	}
+	return EqualityCanHideValueIdentity(type) ? "openivm_internal_value_key(" + value + ")" : "";
+}
+
+bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
+	return TypeVisitor::Contains(type, [](const LogicalType &child) {
+		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL ||
+		       child.id() == LogicalTypeId::FLOAT || child.id() == LogicalTypeId::DOUBLE;
+	});
+}
 
 void SqlUtils::CopySessionSetting(ClientContext &from, ClientContext &to, const string &name) {
 	auto &db_config = DBConfig::GetConfig(to);
@@ -443,29 +472,17 @@ string SqlUtils::EscapeSingleQuotes(const string &input) {
 	return StringUtil::Replace(input, "'", "''");
 }
 
-string SqlUtils::SQLToLowercase(const string &sql) {
-	std::stringstream lowercase_stream;
-	// Quoted identifiers carry physical catalog/schema identities. Folding them
-	// can select a different metadata catalog even though DuckDB binds the name.
-	char quote = '\0';
-	for (char c : sql) {
-		if (quote) {
-			lowercase_stream << c;
-			if (c == quote) {
-				quote = '\0';
-			}
-		} else if (c == '\'' || c == '"') {
-			quote = c;
-			lowercase_stream << c;
-		} else {
-			lowercase_stream << StringUtil::CharacterToLower(c);
-		}
+unique_ptr<SelectStatement> SqlUtils::TryParseSelect(const string &sql) {
+	auto parser = Parser::GetBuiltinParser();
+	try {
+		parser.ParseQuery(sql);
+	} catch (const ParserException &) {
+		return nullptr;
 	}
-	return lowercase_stream.str();
-}
-
-void SqlUtils::RemoveRedundantWhitespaces(string &query) {
-	query = std::regex_replace(query, std::regex("\\s+"), " ");
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return nullptr;
+	}
+	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 }
 
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
@@ -997,18 +1014,6 @@ int64_t SqlUtils::ParseRefreshInterval(const string &interval_str) {
 		throw ParserException("Unknown time unit: '" + unit + "'");
 	}
 	return seconds;
-}
-
-int64_t SqlUtils::ExtractRefreshInterval(string &query) {
-	std::regex refresh_re(R"(refresh\s+every\s+'([^']+)')", std::regex::icase);
-	std::smatch match;
-	if (!std::regex_search(query, match, refresh_re)) {
-		return -1;
-	}
-	string interval_str = match[1].str();
-	// Strip the REFRESH EVERY clause from the query
-	query = std::regex_replace(query, refresh_re, "");
-	return ParseRefreshInterval(interval_str);
 }
 
 } // namespace duckdb

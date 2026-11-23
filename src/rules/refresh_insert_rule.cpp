@@ -194,6 +194,35 @@ static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
 	return table;
 }
 
+static void PreserveGroupRepresentatives(LogicalMergeInto &merge) {
+	if (!merge.table.catalog.IsDuckCatalog() ||
+	    !StringUtil::StartsWith(merge.table.name.GetIdentifierName(), openivm::DATA_TABLE_PREFIX)) {
+		return;
+	}
+	for (auto &entry : merge.actions) {
+		for (auto &action : entry.second) {
+			if (action->action_type != MergeActionType::MERGE_UPDATE || action->update_is_del_and_insert) {
+				continue;
+			}
+			// Sign-count aliases encode the stored grouping column's position.
+			for (auto column : action->columns) {
+				auto sign_count = string(openivm::GROUP_SIGN_COUNT_COL_PREFIX) + to_string(column.index);
+				if (!merge.table.ColumnExists(Identifier(sign_count))) {
+					continue;
+				}
+				// In-place updates can discard SQL-equal -0.0/+0.0 assignments.
+				// The representative-change action supplies the complete replacement
+				// row, including unchanged keys, even when the table has no index.
+				D_ASSERT(action->columns.size() == merge.table.GetColumns().PhysicalColumnCount());
+				action->update_is_del_and_insert = true;
+				OPENIVM_DEBUG_PRINT("[INSERT RULE] replacing floating group representative in '%s'\n",
+				                    merge.table.name.GetIdentifierName().c_str());
+				break;
+			}
+		}
+	}
+}
+
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
 	if (insert.column_index_map.empty()) {
 		return;
@@ -517,6 +546,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		dml = dml_owner->get();
 	}
 
+	if (dml->type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		PreserveGroupRepresentatives(dml->Cast<LogicalMergeInto>());
+	}
 	auto table = GetNativeDMLTable(*dml);
 	if (!table) {
 		return;
@@ -555,6 +587,18 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			auto &update = dml->Cast<LogicalUpdate>();
 			const auto &table_name = update.table.name;
 			ResolveUpdateDefaults(input, update);
+			if (!update.update_is_del_and_insert &&
+			    std::any_of(update.columns.begin(), update.columns.end(), [&](PhysicalIndex column) {
+				    return SqlUtils::EqualityCanHideValueIdentity(update.table.GetColumns().GetColumn(column).Type());
+			    })) {
+				// DuckDB can skip SQL-equal storage updates: proposed SET values need
+				// not be the persisted postimages (e.g. -0.0 -> +0.0 or 1 month -> 30 days).
+				auto capture = make_uniq<LogicalTransactionalActionDeltaCapture>(update.table, *delta_table);
+				capture->children.push_back(std::move(*dml_owner));
+				*dml_owner = std::move(capture);
+				OPENIVM_DEBUG_PRINT("[INSERT RULE] native UPDATE postimage capture for '%s'\n", table_name.c_str());
+				break;
+			}
 			vector<unique_ptr<Expression>> update_expressions;
 			update_expressions.reserve(update.expressions.size());
 			for (idx_t index = 0; index < update.expressions.size(); index++) {
@@ -572,7 +616,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		case LogicalOperatorType::LOGICAL_MERGE_INTO: {
 			auto &merge = dml->Cast<LogicalMergeInto>();
 			const auto &table_name = merge.table.name;
-			auto capture = make_uniq<LogicalTransactionalMergeDeltaCapture>(merge.table, *delta_table);
+			auto capture = make_uniq<LogicalTransactionalActionDeltaCapture>(merge.table, *delta_table);
 			capture->children.push_back(std::move(*dml_owner));
 			*dml_owner = std::move(capture);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional MERGE action delta capture for '%s'\n",

@@ -33,6 +33,50 @@ Hidden helper columns keep this exact:
 
 The delta table is scanned, grouped by the same keys as the view, and consolidated into net changes per group. A `MERGE INTO` statement atomically updates existing groups and inserts new ones.
 
+### Expressions over aggregates
+
+Outputs such as `COUNT(*) + 1`, `SUM(amount) * 2`, and `COALESCE(SUM(amount), 0)`
+are evaluated over the updated raw aggregate state. Adding `COUNT(delta) + 1`
+would add the constant again on every refresh. OpenIVM retains hidden raw inputs
+when necessary and finalizes the output after combining the old state and delta.
+Group cardinality is tracked separately, so deleting a group still removes it
+even when its projected count contains a constant.
+
+Computed floating SUM inputs retain a finite subtotal and separate NaN/positive-
+infinity/negative-infinity counts. Removing the last non-finite input can then
+restore a finite result. These inputs add three count states and predicates to
+the aggregate; ordinary integer SUM inputs keep their existing state.
+
+Grouped finalization joins the affected deltas to stored MV state before MERGE;
+it does not rescan the source tables. Scalar aggregates update their raw state
+and then finalize the single output row. Plain AVG and variance outputs retain
+their existing specialized finalization.
+
+With `openivm_distinct_aux_state=true`, supported SUM outputs over an inner
+DISTINCT use the same finalization for grouped and scalar aggregates. The aux
+state emits signed tuple transitions before updating raw SUM/COUNT inputs.
+
+For supported DISTINCT inputs over one physical source, inner `ORDER BY ... LIMIT`
+and non-unary CTE inputs containing joins or `UNION ALL` use maintained candidate
+counts. Refresh updates that bag from source deltas, evaluates the next selection,
+and applies its signed difference from the persisted selection to the aggregate
+state. This includes evictions and refills when rows cross a limit boundary,
+even when the source batch only inserts rows. The child query runs over candidate
+state on refresh; joins and unions therefore add work proportional to evaluating
+that child query. One temporary selection is staged before the new snapshot is
+saved. Candidate storage includes all source columns needed by the child query.
+Unary inputs without limits retain their direct tuple-transition path.
+Projections between DISTINCT and SUM are resolved for both the SUM value and its
+non-NULL count.
+
+Candidate counts use byte keys for collated strings and lossless canonical keys
+for VARIANT values, so grouping cannot merge values whose bytes or payload types
+are observable by the selected expression. Percentage limits retain their unit
+through LPTS rendering and currently require the native DuckDB dialect.
+
+Recreate an affected MV created by an older compiler to initialize the hidden
+raw inputs required by this finalization.
+
 ## Compiled SQL
 
 ### IVM query (delta computation)

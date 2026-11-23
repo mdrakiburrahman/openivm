@@ -2105,6 +2105,12 @@ static void Fields(IO &io, typename IO::template Field<DerivedAggregateOutput> &
 }
 
 template <class IO>
+static void Fields(IO &io, typename IO::template Field<AggregateInput> &m) {
+	io.Str("column", m.output_column);
+	io.Str("aggregate", m.aggregate_type);
+}
+
+template <class IO>
 static void Fields(IO &io, typename IO::template Field<RefreshMetadata::GroupRecomputeSourceOccurrence> &m) {
 	io.Str("table", m.table_name);
 	io.Index("count", m.count);
@@ -2120,6 +2126,15 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Str("filter", m.filter, Presence::OPTIONAL); // empty without a WHERE clause
 	io.Str("sum_arg", m.sum_arg);
 	io.Str("sum_out", m.sum_out);
+	io.Str("sum_input_expr", m.sum_input_expr, Presence::OPTIONAL);
+	io.Str("selected_input_sql", m.selected_input_sql, Presence::OPTIONAL);
+	io.Arr("selected_input_columns", m.selected_input_columns, Presence::OPTIONAL);
+	io.Arr("selected_source_columns", m.selected_source_columns, Presence::OPTIONAL);
+	io.Arr("sign_columns", m.sign_columns, Presence::OPTIONAL);
+	io.Arr("selected_identity_exprs", m.selected_identity_exprs, Presence::OPTIONAL);
+	io.Bool("representative_input", m.representative_input, Presence::OPTIONAL);
+	io.Str("selected_view_sql", m.selected_view_sql, Presence::OPTIONAL);
+	io.Str("post_filter", m.post_filter, Presence::OPTIONAL);
 }
 
 template <class IO>
@@ -2293,6 +2308,18 @@ DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const str
 			info.complete = false;
 		}
 	}
+	bool parsed_inputs = false;
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "inputs", parsed_inputs)) {
+		AggregateInput input;
+		if (MetadataJson::Read(object, input) && !input.output_column.empty() && !input.aggregate_type.empty()) {
+			info.inputs.push_back(std::move(input));
+		} else {
+			info.complete = false;
+		}
+	}
+	if (json.find("\"inputs\"") != string::npos && !parsed_inputs) {
+		info.complete = false;
+	}
 	return info;
 }
 
@@ -2300,15 +2327,36 @@ string RefreshMetadata::DerivedAggregateOutputsToJson(const DerivedAggregateOutp
 	MetadataJson::Writer writer;
 	writer.Raw("complete", info.complete ? "true" : "false");
 	writer.Objects("outputs", WriteEach(info.outputs));
+	if (!info.inputs.empty()) {
+		writer.Objects("inputs", WriteEach(info.inputs));
+	}
 	return writer.Finish();
 }
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
-	return MetadataJson::Read(ReadViewString(view_name, "distinct_aux_meta_json"), out);
+	auto json = ReadViewString(view_name, "distinct_aux_meta_json");
+	if (!MetadataJson::Read(json, out)) {
+		return false;
+	}
+	if (!out.selected_input_sql.empty() && (out.selected_input_columns.empty() || out.selected_source_columns.empty() ||
+	                                        out.selected_source_columns.size() > out.cols.size())) {
+		return false;
+	}
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "group_inputs")) {
+		DerivedAggregateOutput input;
+		if (!MetadataJson::Read(object, input)) {
+			return false;
+		}
+		out.group_inputs.push_back(std::move(input));
+	}
+	return true;
 }
 
 string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
-	return MetadataJson::Write(meta);
+	MetadataJson::Writer writer;
+	Fields(writer, meta);
+	writer.Objects("group_inputs", WriteEach(meta.group_inputs));
+	return writer.Finish();
 }
 
 bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {
@@ -2481,9 +2529,38 @@ string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta 
 	return MetadataJson::Write(meta);
 }
 
+string RefreshMetadata::DistinctAuxMeta::InternalColumn(const string &name) const {
+	string result = name;
+	auto matches = [&](const string &column) {
+		return StringUtil::CIEquals(column, result);
+	};
+	while (std::any_of(cols.begin(), cols.end(), matches) ||
+	       std::any_of(selected_input_columns.begin(), selected_input_columns.end(), matches)) {
+		result += '_';
+	}
+	return result;
+}
+
+vector<pair<string, string>> RefreshMetadata::DistinctSignCountColumns(const DistinctAuxMeta &meta) {
+	vector<pair<string, string>> result;
+	for (idx_t index = 0; index < meta.cols.size(); index++) {
+		if (std::find(meta.sign_columns.begin(), meta.sign_columns.end(), meta.cols[index]) !=
+		    meta.sign_columns.end()) {
+			result.emplace_back(meta.cols[index], meta.InternalColumn("openivm_aux_sign_count_" + to_string(index)));
+		}
+	}
+	return result;
+}
+
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {
 	auto expected = meta.cols;
-	expected.push_back("_count");
+	expected.push_back(meta.InternalColumn("_count"));
+	if (meta.representative_input) {
+		expected.push_back(meta.InternalColumn("openivm_selected"));
+	}
+	for (auto &entry : DistinctSignCountColumns(meta)) {
+		expected.push_back(entry.second);
+	}
 	return expected;
 }
 
@@ -2514,6 +2591,9 @@ vector<string> RefreshMetadata::GetAuxiliaryTables(const string &view_name) {
 	DistinctAuxMeta distinct;
 	if (GetDistinctAuxMeta(view_name, distinct)) {
 		tables.push_back(distinct.aux_table);
+		if (!distinct.SelectionTable().empty()) {
+			tables.push_back(distinct.SelectionTable());
+		}
 	}
 	CountDistinctAuxMeta count_distinct;
 	if (GetCountDistinctAuxMeta(view_name, count_distinct)) {
@@ -2533,9 +2613,13 @@ vector<string> RefreshMetadata::GetAuxiliaryTables(const string &view_name) {
 bool RefreshMetadata::AuxStateNeedsRepair(const string &view_name, const string &catalog_name,
                                           const string &schema_name) {
 	DistinctAuxMeta distinct;
-	if (GetDistinctAuxMeta(view_name, distinct) &&
-	    !TableColumnsMatch(catalog_name, schema_name, distinct.aux_table, ExpectedDistinctAuxColumns(distinct))) {
-		return true;
+	if (GetDistinctAuxMeta(view_name, distinct)) {
+		if (!TableColumnsMatch(catalog_name, schema_name, distinct.aux_table, ExpectedDistinctAuxColumns(distinct)) ||
+		    (!distinct.SelectionTable().empty() &&
+		     !TableColumnsMatch(catalog_name, schema_name, distinct.SelectionTable(),
+		                        distinct.selected_input_columns))) {
+			return true;
+		}
 	}
 	CountDistinctAuxMeta count_distinct;
 	if (GetCountDistinctAuxMeta(view_name, count_distinct) &&

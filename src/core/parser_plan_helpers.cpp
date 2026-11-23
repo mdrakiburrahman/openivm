@@ -7,6 +7,17 @@
 #include "core/plan_rewrite_internal.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "lpts_expression_renderer.hpp"
+#include "lpts_pipeline.hpp"
+#include "lpts_helpers.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -58,6 +69,8 @@
 #include "storage/ducklake_table_entry.hpp"
 
 #include <set>
+#include <cmath>
+#include <limits>
 
 namespace duckdb {
 
@@ -78,6 +91,76 @@ struct SourceColumnsBindData : public TableFunctionData {
 static void RewriteSourceColumns(Binder &binder, SQLStatement &statement);
 
 } // namespace
+
+static Vector CanonicalizeNaNKeys(const Vector &input, idx_t count) {
+	if (!TypeVisitor::Contains(input.GetType(), [](const LogicalType &type) {
+		    return type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE;
+	    })) {
+		return Vector::Ref(input);
+	}
+	Vector result(input.GetType(), count);
+	result.Append(input, count);
+	switch (input.GetType().InternalType()) {
+	case PhysicalType::FLOAT: {
+		auto values = FlatVector::GetDataMutable<float>(result);
+		for (idx_t row = 0; row < count; row++) {
+			if (FlatVector::Validity(result).RowIsValid(row) && std::isnan(values[row])) {
+				values[row] = std::numeric_limits<float>::quiet_NaN();
+			}
+		}
+		break;
+	}
+	case PhysicalType::DOUBLE: {
+		auto values = FlatVector::GetDataMutable<double>(result);
+		for (idx_t row = 0; row < count; row++) {
+			if (FlatVector::Validity(result).RowIsValid(row) && std::isnan(values[row])) {
+				values[row] = std::numeric_limits<double>::quiet_NaN();
+			}
+		}
+		break;
+	}
+	case PhysicalType::STRUCT:
+		for (auto &child : StructVector::GetEntries(result)) {
+			child.Reference(CanonicalizeNaNKeys(child, count));
+		}
+		break;
+	case PhysicalType::LIST: {
+		auto &child = ListVector::GetChildMutable(result);
+		child.Reference(CanonicalizeNaNKeys(child, child.size()));
+		break;
+	}
+	case PhysicalType::ARRAY: {
+		auto &child = ArrayVector::GetChildMutable(result);
+		child.Reference(CanonicalizeNaNKeys(child, child.size()));
+		break;
+	}
+	default:
+		throw InternalException("Unexpected nested floating candidate key type");
+	}
+	return result;
+}
+
+static void CandidateValueKey(DataChunk &input, ExpressionState &, Vector &result) {
+	// SQL equality can hide payload types, interval components, and the sign of zero.
+	auto canonical = TypeContainsVariant(input.data[0].GetType())
+	                     ? CanonicalizeVariantVector(input.data[0], input.size())
+	                     : Vector::Ref(input.data[0]);
+	// NaN signs/payloads are unspecified; their state identity must survive
+	// storage canonicalization. Signed zero and VARIANT payload types stay distinct.
+	auto identity = CanonicalizeNaNKeys(canonical, input.size());
+	auto output = FlatVector::GetDataMutable<string_t>(result);
+	MemoryStream stream;
+	for (idx_t row = 0; row < input.size(); row++) {
+		stream.Rewind();
+		BinarySerializer::Serialize(identity.GetValue(row), stream);
+		output[row] =
+		    StringVector::AddStringOrBlob(result, const_char_ptr_cast(stream.GetData()), stream.GetPosition());
+	}
+}
+
+ScalarFunction CandidateValueKeyFunction() {
+	return ScalarFunction("openivm_internal_value_key", {LogicalType::ANY}, LogicalType::BLOB, CandidateValueKey);
+}
 
 TableFunction SourceColumnsFunction() {
 	TableFunction function("openivm_source_columns", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -232,8 +315,8 @@ void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement)
 	planner.CreatePlan(std::move(statement));
 }
 
-void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, string &suffix,
-                               string &ordering) {
+void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
+                               string &suffix, string &ordering) {
 	vector<LogicalProjection *> projections;
 	auto *slot = &plan;
 	while (*slot && (*slot)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*slot)->children.size() == 1) {
@@ -296,7 +379,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 		for (idx_t i = 0; i < orders->size(); i++) {
 			auto &order = (*orders)[i];
 			string expression;
-			if (!RenderPlanOutputExpression(*order.expression, *plan, facts, output_names, expression)) {
+			if (!RenderPlanOutputExpression(context, *order.expression, *plan, facts, output_names, expression)) {
 				// The outer projection hides a sort value (e.g. SELECT k ORDER BY SUM(v)).
 				// Keep it in maintenance state; only its ordinal crosses the public boundary.
 				D_ASSERT(!projections.empty());
@@ -334,7 +417,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Extracted publication modifiers: %s\n", suffix.c_str());
 }
 
-static bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
+bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
 	const auto &name = aggregate.Function().GetName().GetIdentifierName();
 	return name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" || name == "variance" ||
 	       name == "var_samp" || name == "var_pop";
@@ -634,29 +717,18 @@ static bool NormalizeCorrelatedTableFunctionCTE(unique_ptr<LogicalOperator> &can
 	// Carry every domain column through the argument projections. The table-in/out
 	// GET exposes selected child bindings through projected_input.
 	auto carried_bindings = source_bindings;
-	for (idx_t depth = projections.size(); depth > 0; depth--) {
-		auto &projection = projections[depth - 1].get();
-		vector<ColumnBinding> next;
-		next.reserve(carried_bindings.size());
-		for (idx_t i = 0; i < carried_bindings.size(); i++) {
-			optional_idx output;
-			for (idx_t expr = 0; expr < projection.expressions.size(); expr++) {
-				if (projection.expressions[expr]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    projection.expressions[expr]->Cast<BoundColumnRefExpression>().Binding() == carried_bindings[i]) {
-					output = expr;
-					break;
-				}
+	auto carry_through = [&](const vector<reference<LogicalProjection>> &path) {
+		bool appended = false;
+		for (auto it = path.rbegin(); it != path.rend(); ++it) {
+			auto &projection = it->get();
+			for (idx_t i = 0; i < carried_bindings.size(); i++) {
+				carried_bindings[i] =
+				    ExposeBindingInProjection(projection, carried_bindings[i], source_types[i], "", true, appended);
 			}
-			if (!output.IsValid()) {
-				output = projection.expressions.size();
-				projection.expressions.push_back(
-				    make_uniq<BoundColumnRefExpression>(source_types[i], carried_bindings[i]));
-			}
-			next.emplace_back(projection.table_index, ProjectionIndex(output.GetIndex()));
+			projection.ResolveOperatorTypes();
 		}
-		projection.ResolveOperatorTypes();
-		carried_bindings = std::move(next);
-	}
+	};
+	carry_through(projections);
 	auto function_input_bindings = get.children[0]->GetColumnBindings();
 	for (auto &binding : carried_bindings) {
 		auto entry = std::find(function_input_bindings.begin(), function_input_bindings.end(), binding);
@@ -669,29 +741,7 @@ static bool NormalizeCorrelatedTableFunctionCTE(unique_ptr<LogicalOperator> &can
 		}
 	}
 	get.ResolveOperatorTypes();
-	for (idx_t depth = output_projections.size(); depth > 0; depth--) {
-		auto &projection = output_projections[depth - 1].get();
-		vector<ColumnBinding> next;
-		next.reserve(carried_bindings.size());
-		for (idx_t i = 0; i < carried_bindings.size(); i++) {
-			optional_idx output;
-			for (idx_t expr = 0; expr < projection.expressions.size(); expr++) {
-				if (projection.expressions[expr]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    projection.expressions[expr]->Cast<BoundColumnRefExpression>().Binding() == carried_bindings[i]) {
-					output = expr;
-					break;
-				}
-			}
-			if (!output.IsValid()) {
-				output = projection.expressions.size();
-				projection.expressions.push_back(
-				    make_uniq<BoundColumnRefExpression>(source_types[i], carried_bindings[i]));
-			}
-			next.emplace_back(projection.table_index, ProjectionIndex(output.GetIndex()));
-		}
-		projection.ResolveOperatorTypes();
-		carried_bindings = std::move(next);
-	}
+	carry_through(output_projections);
 
 	ColumnBindingReplacer domain_replacer;
 	for (idx_t i = 0; i < domain_ref_bindings.size(); i++) {
@@ -999,12 +1049,12 @@ static void AppendUniqueValues(vector<T> &target, const vector<T> &source) {
 	}
 }
 
-static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
-                                       unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
-                                       bool under_join, const LogicalOperator *redundant_distinct,
-                                       PlanAnalysis &analysis, TableIndex internal_delim_cte = TableIndex()) {
+static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
+                                     unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
+                                     bool under_join, const LogicalOperator *redundant_distinct, PlanAnalysis &analysis,
+                                     TableIndex internal_delim_cte = TableIndex()) {
 	if (!op) {
-		return "";
+		return;
 	}
 	for (auto &binding : op->GetColumnBindings()) {
 		facts.max_table_index = std::max(facts.max_table_index, binding.table_index.index);
@@ -1030,7 +1080,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	if (redundant_distinct && op != redundant_distinct && op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		facts.has_descendant_distinct = true;
 	}
-	string first_table;
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && !internal_delim_dedup) {
 		seen_agg_above = true;
 		auto &agg = op->Cast<LogicalAggregate>();
@@ -1122,10 +1171,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		facts.has_cardinality_changing_filter =
 		    facts.has_cardinality_changing_filter || !!get.table_filters.HasFilters();
 		AddGetFacts(get, current_catalog, facts, next_occurrence);
-		auto table_ref = get.GetTable();
-		if (table_ref.get()) {
-			first_table = table_ref.get()->name.GetIdentifierName();
-		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op->Cast<LogicalCTERef>();
 		facts.cte_refs_by_table_index[cte_ref.table_index] = &cte_ref;
@@ -1143,13 +1188,10 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	vector<idx_t> child_ids;
 	child_ids.reserve(op->children.size());
 	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis, TableIndex child_delim_cte) {
-		string child_first = CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above,
-		                                              under_join, redundant_distinct, child_analysis, child_delim_cte);
+		CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above, under_join,
+		                         redundant_distinct, child_analysis, child_delim_cte);
 		D_ASSERT(!facts.plan_nodes_post_order.empty());
 		child_ids.push_back(facts.plan_nodes_post_order.size() - 1);
-		if (first_table.empty()) {
-			first_table = std::move(child_first);
-		}
 	};
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
@@ -1172,9 +1214,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		for (auto &child : op->children) {
 			collect_child(child.get(), analysis, internal_delim_cte);
 		}
-	}
-	if (!first_table.empty()) {
-		facts.first_table_name[op] = first_table;
 	}
 	CreateMVPlanNodeFacts node_facts;
 	node_facts.plan_node = op;
@@ -1216,7 +1255,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	}
 	facts.plan_node_ids[op] = node_id;
 	facts.plan_nodes_post_order.push_back(std::move(node_facts));
-	return first_table;
 }
 
 static bool IsHiddenHavingColumn(const string &name) {
@@ -1394,14 +1432,32 @@ static bool ResolvesToGroupBinding(TableIndex table_index, ProjectionIndex colum
 	return ResolvesToOutputBinding(table_index, column_index, group_index, group_count, facts, false);
 }
 
-static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
-                                   const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
+static OutputSpine ViewOutputSpine(LogicalOperator *root) {
+	return FindOutputSpine(root, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+		       op.type == LogicalOperatorType::LOGICAL_FILTER || op.type == LogicalOperatorType::LOGICAL_ORDER_BY ||
+		       op.type == LogicalOperatorType::LOGICAL_LIMIT || op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
+}
+
+LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root) {
+	return SpineAggregate(ViewOutputSpine(root));
+}
+
+static string ProjectionOutputName(const LogicalProjection &projection, idx_t expr_index,
+                                   const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                   const BoundColumnRefExpression &bcr) {
+	auto spine = ViewOutputSpine(facts.root);
+	// Stored names belong to the view's output projection, after sanitization and
+	// deduplication. A CTE body visited first can have a different output order.
+	if (!spine.projections.empty() && spine.projections.front() == &projection && expr_index < output_names.size() &&
+	    !output_names[expr_index].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
+		return output_names[expr_index];
+	}
+	auto &expr = projection.expressions[expr_index];
 	if (!expr->GetAlias().GetIdentifierName().empty()) {
 		return expr->GetAlias().GetIdentifierName();
-	}
-	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
-	    !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
-		return output_names[expr_index];
 	}
 	return bcr.GetName().GetIdentifierName();
 }
@@ -1444,7 +1500,7 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateM
 		                            facts)) {
 			continue;
 		}
-		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
+		string col_name = ProjectionOutputName(proj, expr_i, facts, output_names, bcr);
 		if (!IncrementalTableNames::IsInternalColumn(col_name) ||
 		    StringUtil::StartsWith(col_name, "openivm_group_key_")) {
 			group_names.push_back(col_name);
@@ -1497,20 +1553,6 @@ static bool FindGroupColumns(const CreateMVPlanFacts &facts, TableIndex group_in
 	return false;
 }
 
-static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFacts &facts, TableIndex group_index,
-                              size_t group_count) {
-	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		auto &column = expression.Cast<BoundColumnRefExpression>();
-		return ResolvesToGroupBinding(column.Binding().table_index, column.Binding().column_index, group_index,
-		                              group_count, facts);
-	}
-	bool valid = expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE;
-	ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) {
-		valid = valid && IsGroupExpression(child, facts, group_index, group_count);
-	});
-	return valid;
-}
-
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names) {
 	// The CTAS operator exposes its inserted row count. Its SELECT child
@@ -1521,23 +1563,303 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex
 	if (!AddGroupColumnsFromBindings(output, facts, group_index, group_count, output_names, group_names)) {
 		FindGroupColumns(facts, group_index, group_count, output_names, group_names);
 	}
-	// Expressions over keys are constant within a group, not additive aggregates.
-	// Retain the raw hidden key as well: a computed key need not be injective.
-	bool has_hidden_key = false;
-	for (auto &name : group_names) {
-		has_hidden_key |= StringUtil::StartsWith(name, "openivm_group_key_");
+	return group_names;
+}
+
+string BuildDistinctSelectedViewSQL(AstNode &node, const vector<string> &input_columns,
+                                    const vector<string> &output_columns) {
+	std::function<bool(AstNode &)> replace_input = [&](AstNode &candidate) {
+		if (candidate.NodeType() == "Aggregate") {
+			D_ASSERT(candidate.children.size() == 1);
+			auto names = candidate.children[0]->OutputColumnNames();
+			// CREATE-time DISTINCT normalization appends its support count after
+			// the original input columns; the parent aggregate does not consume it.
+			D_ASSERT(names.size() >= input_columns.size());
+			names.resize(input_columns.size());
+			candidate.children[0] =
+			    make_uniq<AstGetNode>("", vector<string>(), "openivm_distinct_selected", TableIndex(0), input_columns,
+			                          std::move(names), vector<string>());
+			return true;
+		}
+		for (auto &child : candidate.children) {
+			if (replace_input(*child)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (!replace_input(node)) {
+		throw InternalException("Missing aggregate for maintained DISTINCT selection");
 	}
-	if (has_hidden_key && facts.first_projection) {
-		auto &expressions = facts.first_projection->expressions;
-		for (idx_t i = 0; i < expressions.size() && i < output_names.size(); i++) {
-			if (expressions[i]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
-			    IsGroupExpression(*expressions[i], facts, group_index, group_count) &&
-			    std::find(group_names.begin(), group_names.end(), output_names[i]) == group_names.end()) {
-				group_names.push_back(output_names[i]);
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Reading DISTINCT aggregate input from maintained selection\n");
+	return AstToCteList(node)->ToQuery(true, output_columns);
+}
+
+static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column);
+
+void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, const CreateMVPlanFacts &facts,
+                                     const vector<string> &output_names, RefreshMetadata::DistinctAuxMeta &meta) {
+	auto *parent = FindViewOutputAggregate(facts.root);
+	D_ASSERT(parent);
+	auto &aggregate = *parent;
+	// Only a DISTINCT on this unary input path can feed direct tuple transitions.
+	// Producer CTE definitions can contain other DISTINCTs with different schemas.
+	auto input_spine = FindOutputSpine(aggregate.children[0].get(), [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_FILTER || op.type == LogicalOperatorType::LOGICAL_ORDER_BY ||
+		       op.type == LogicalOperatorType::LOGICAL_LIMIT || op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
+	auto *input = input_spine.bottom;
+	auto distinct =
+	    input && input->type == LogicalOperatorType::LOGICAL_DISTINCT ? &input->Cast<LogicalDistinct>() : nullptr;
+	vector<ColumnBinding> bindings;
+	// Resolve unary inputs directly against a physical scan. Other input shapes
+	// reuse the maintained candidate bag, whose selection preserves joins/UNIONs.
+	auto *distinct_source = distinct ? distinct->children[0].get() : nullptr;
+	vector<LogicalOperator *> filters;
+	while (distinct_source &&
+	       (distinct_source->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	        distinct_source->type == LogicalOperatorType::LOGICAL_FILTER ||
+	        distinct_source->type == LogicalOperatorType::LOGICAL_ORDER_BY) &&
+	       distinct_source->children.size() == 1) {
+		if (distinct_source->type == LogicalOperatorType::LOGICAL_FILTER) {
+			filters.push_back(distinct_source);
+		}
+		distinct_source = distinct_source->children[0].get();
+	}
+	bool candidate_input =
+	    !distinct_source || distinct_source->type != LogicalOperatorType::LOGICAL_GET ||
+	    std::any_of(facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [](const auto &node) {
+		    return node.plan_node->type == LogicalOperatorType::LOGICAL_TOP_N ||
+		           node.plan_node->type == LogicalOperatorType::LOGICAL_LIMIT;
+	    });
+	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
+	if (!candidate_input) {
+		D_ASSERT(distinct);
+		bindings = distinct->GetColumnBindings();
+		D_ASSERT(bindings.size() == meta.cols.size());
+		distinct->ResolveOperatorTypes();
+		for (idx_t index = 0; index < meta.cols.size(); index++) {
+			if (distinct->types[index].id() == LogicalTypeId::DOUBLE ||
+			    distinct->types[index].id() == LogicalTypeId::FLOAT) {
+				meta.sign_columns.push_back(meta.cols[index]);
 			}
 		}
 	}
-	return group_names;
+	if (candidate_input) {
+		// Keep the candidate bag, not just today's selected rows: deletes must refill the boundary.
+		LogicalGet *source = nullptr;
+		for (auto &node : facts.plan_nodes_post_order) {
+			if (node.plan_node->type == LogicalOperatorType::LOGICAL_GET &&
+			    node.plan_node->Cast<LogicalGet>().GetTable()) {
+				source = &node.plan_node->Cast<LogicalGet>();
+				break;
+			}
+		}
+		D_ASSERT(source);
+		auto table = source->GetTable();
+		meta.source = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+		meta.cols.clear();
+		meta.source_exprs.clear();
+		meta.filter.clear();
+		vector<LogicalType> source_types;
+		for (auto &entry : facts.gets_by_index) {
+			auto &get = *entry.second;
+			if (get.GetTable().get() != table.get()) {
+				continue;
+			}
+			for (idx_t i = 0; i < get.GetColumnIds().size(); i++) {
+				string column;
+				if (!GetLogicalGetColumnName(get, ProjectionIndex(i), column)) {
+					throw InternalException("Could not resolve DISTINCT candidate column");
+				}
+				auto expression = SqlUtils::QuoteIdentifier(column);
+				if (std::find(meta.source_exprs.begin(), meta.source_exprs.end(), expression) ==
+				    meta.source_exprs.end()) {
+					meta.cols.push_back("openivm_topk_source_" + to_string(meta.cols.size()));
+					meta.source_exprs.push_back(expression);
+					meta.selected_source_columns.push_back(column);
+					source_types.push_back(get.GetColumnType(ColumnIndex(get.GetColumnIds()[i].GetPrimaryIndex())));
+				}
+			}
+		}
+		vector<string> identity_keys;
+		for (idx_t i = 0; i < meta.selected_source_columns.size(); i++) {
+			auto &type = source_types[i];
+			auto identity = SqlUtils::ValueIdentitySQL(meta.source_exprs[i], type, default_collation);
+			if (!identity.empty()) {
+				identity_keys.push_back(std::move(identity));
+			}
+		}
+		for (auto &key : identity_keys) {
+			meta.cols.push_back("openivm_topk_identity_" + to_string(meta.cols.size()));
+			meta.source_exprs.push_back(key);
+		}
+		bindings = aggregate.children[0]->GetColumnBindings();
+		aggregate.children[0]->ResolveOperatorTypes();
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			auto column = "openivm_topk_input_" + to_string(i);
+			meta.selected_input_columns.push_back(column);
+			auto identity = SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(column),
+			                                           aggregate.children[0]->types[i], default_collation);
+			if (!identity.empty()) {
+				meta.selected_identity_exprs.push_back(std::move(identity));
+			}
+		}
+		unique_ptr<LogicalOperator> selected_plan;
+		if (facts.cte_defs_by_index.empty()) {
+			selected_plan = aggregate.children[0]->Copy(context);
+		} else {
+			// CTE_REFs need their enclosing definitions before extracting the input.
+			auto selection_context = facts.root->Copy(context);
+			InlineMaterializedCteRefs(context, binder, selection_context);
+			auto copied_aggregate = FindViewOutputAggregate(selection_context.get());
+			D_ASSERT(copied_aggregate && copied_aggregate->aggregate_index == aggregate.aggregate_index);
+			selected_plan = std::move(copied_aggregate->children[0]);
+		}
+		D_ASSERT(selected_plan->GetColumnBindings().size() == meta.selected_input_columns.size());
+		auto ast = LogicalPlanToAst(context, selected_plan, SqlDialect::DUCKDB, {},
+		                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
+		meta.selected_input_sql = AstToCteList(*ast)->ToQuery(true, meta.selected_input_columns);
+		if (!meta.selected_input_sql.empty() && meta.selected_input_sql.back() == ';') {
+			meta.selected_input_sql.pop_back();
+		}
+		// The selection keeps stable column aliases when the source is renamed.
+		meta.selected_input_sql =
+		    SqlUtils::ReplaceTableReferences(meta.selected_input_sql, meta.source, "openivm_topk_candidates");
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu candidate columns for DISTINCT input\n", meta.cols.size());
+	} else {
+		// Resolve the input through bound projections and filters. Parsed CTE names
+		// have no catalog identity, and their expressions must also apply to delta rows.
+		auto &get = distinct_source->Cast<LogicalGet>();
+		auto table = get.GetTable();
+		D_ASSERT(table);
+		meta.source = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+		LptsExpressionRenderer::BindingResolver resolve_input;
+		LptsExpressionRenderer input_renderer(
+		    context, SqlDialect::DUCKDB,
+		    [&](const ColumnBinding &binding, const char *where) { return resolve_input(binding, where); });
+		resolve_input = [&](const ColumnBinding &binding, const char *) -> string {
+			if (binding.table_index == get.table_index) {
+				string column;
+				if (!GetLogicalGetColumnName(get, binding.column_index, column)) {
+					throw InternalException("Could not resolve DISTINCT source column");
+				}
+				return SqlUtils::QuoteIdentifier(column);
+			}
+			auto projection = facts.projections_by_index.find(binding.table_index);
+			D_ASSERT(projection != facts.projections_by_index.end());
+			return input_renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
+		};
+		meta.source_exprs.clear();
+		vector<string> select_list;
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			BoundColumnRefExpression input(LogicalType::SQLNULL, bindings[i]);
+			meta.source_exprs.push_back(input_renderer.ExpressionToAliasedString(input));
+			select_list.push_back(meta.source_exprs.back() + " AS " + SqlUtils::QuoteIdentifier(meta.cols[i]));
+		}
+		auto predicates = input_renderer.ScanFiltersToSql(get);
+		for (auto *filter : filters) {
+			for (auto &expression : filter->expressions) {
+				predicates.push_back("(" + input_renderer.ExpressionToAliasedString(*expression) + ")");
+			}
+		}
+		meta.filter = StringUtil::Join(predicates, " AND ");
+		meta.input_sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + meta.source +
+		                 (meta.filter.empty() ? "" : " WHERE " + meta.filter);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Resolved DISTINCT input to bound source %s\n", meta.source.c_str());
+	}
+
+	if (!candidate_input) {
+		const auto &distinct_types = distinct->types;
+		// Per-column counters cannot preserve correlations between floating signs.
+		meta.representative_input = meta.sign_columns.size() > 1;
+		for (idx_t i = 0; i < distinct_types.size(); i++) {
+			auto &type = distinct_types[i];
+			if (type.id() != LogicalTypeId::FLOAT && type.id() != LogicalTypeId::DOUBLE &&
+			    !SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), type, default_collation).empty()) {
+				meta.representative_input = true;
+			}
+		}
+		if (meta.representative_input) {
+			meta.sign_columns.clear();
+			meta.selected_source_columns = meta.cols;
+			meta.selected_input_columns = meta.cols;
+			meta.selected_input_sql =
+			    "SELECT " + SqlUtils::JoinQuotedColumns(meta.cols) + " FROM openivm_topk_candidates";
+			for (idx_t i = 0; i < distinct_types.size(); i++) {
+				auto identity = SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), distinct_types[i],
+				                                           default_collation);
+				if (identity.empty()) {
+					continue;
+				}
+				meta.selected_identity_exprs.push_back(std::move(identity));
+				auto name = meta.InternalColumn("openivm_tuple_identity_" + to_string(i));
+				meta.cols.push_back(std::move(name));
+				meta.source_exprs.push_back(
+				    SqlUtils::ValueIdentitySQL(meta.source_exprs[i], distinct_types[i], default_collation));
+			}
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Retaining representatives for %zu DISTINCT identity keys\n",
+			                    meta.selected_identity_exprs.size());
+		}
+	}
+
+	auto group_cols = DeriveGroupColumnNames(facts, aggregate.group_index, aggregate.groups.size(), output_names);
+	// Declare recursive callbacks separately: MSVC cannot capture a renderer in its own initializer.
+	LptsExpressionRenderer::BindingResolver resolve_group;
+	LptsExpressionRenderer renderer(context, SqlDialect::DUCKDB, [&](const ColumnBinding &binding, const char *where) {
+		return resolve_group(binding, where);
+	});
+	resolve_group = [&](const ColumnBinding &binding, const char *) -> string {
+		auto match = std::find(bindings.begin(), bindings.end(), binding);
+		if (match != bindings.end()) {
+			auto &columns = meta.selected_input_sql.empty() ? meta.cols : meta.selected_input_columns;
+			return SqlUtils::QuoteIdentifier(columns[match - bindings.begin()]);
+		}
+		if (binding.table_index == aggregate.group_index) {
+			return renderer.ExpressionToAliasedString(*aggregate.groups[binding.column_index]);
+		}
+		auto projection = facts.projections_by_index.find(binding.table_index);
+		D_ASSERT(projection != facts.projections_by_index.end());
+		return renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
+	};
+	if (!candidate_input) {
+		// Maintained selections already include this path. Ordinary DISTINCT must
+		// filter its old/new representatives, rather than filtering source support.
+		vector<string> predicates;
+		for (auto *node = aggregate.children[0].get(); node != distinct && node->children.size() == 1;
+		     node = node->children[0].get()) {
+			if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
+				for (auto &expression : node->expressions) {
+					predicates.push_back("(" + renderer.ExpressionToAliasedString(*expression) + ")");
+				}
+			}
+		}
+		meta.post_filter = StringUtil::Join(predicates, " AND ");
+		OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT representative filter: %s\n", meta.post_filter.c_str());
+	}
+	for (auto &expression : aggregate.expressions) {
+		auto &input = expression->Cast<BoundAggregateExpression>();
+		if (input.Function().GetName().GetIdentifierName() != "sum") {
+			continue;
+		}
+		// Boolean SUM counts true values. Use a signed numeric input before weighting;
+		// the other SUM inputs use their accumulator type to make negation safe.
+		auto type = input.GetChildren()[0]->GetReturnType().id() == LogicalTypeId::BOOLEAN ? LogicalType::BIGINT
+		                                                                                   : input.GetReturnType();
+		meta.sum_input_expr =
+		    "CAST(" + renderer.ExpressionToAliasedString(*input.GetChildren()[0]) + " AS " + type.ToString() + ")";
+	}
+
+	auto output_spine = ViewOutputSpine(facts.root);
+	D_ASSERT(!output_spine.projections.empty());
+	for (auto &column : group_cols) {
+		auto name = std::find(output_names.begin(), output_names.end(), column);
+		D_ASSERT(name != output_names.end());
+		meta.group_inputs.push_back(
+		    {column, renderer.ExpressionToAliasedString(
+		                 *output_spine.projections.front()->expressions[name - output_names.begin()])});
+	}
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu DISTINCT aggregate group expressions\n", meta.group_inputs.size());
 }
 
 static void AddUniqueGroupName(vector<string> &group_names, const string &new_name) {
@@ -1599,8 +1921,6 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 	}
 	return group_names;
 }
-
-static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column);
 
 static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const CreateMVPlanFacts &facts) {
 	TableIndex table_index = bcr->Binding().table_index;
@@ -1822,93 +2142,66 @@ string DeriveDirectSourceGroupKey(const CreateMVPlanFacts &facts, const vector<s
 }
 
 static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
-                                      string &column) {
-	TableIndex table_index = binding.table_index;
-	ProjectionIndex column_index = binding.column_index;
+                                      string &column, ProjectionIndex *base_column = nullptr,
+                                      string *cast_type = nullptr) {
 	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = facts.gets_by_index.find(table_index);
+		auto get_it = facts.gets_by_index.find(binding.table_index);
 		if (get_it != facts.gets_by_index.end()) {
 			get = get_it->second;
-			return GetLogicalGetColumnName(*get, column_index, column);
+			if (base_column) {
+				*base_column = binding.column_index;
+			}
+			return GetLogicalGetColumnName(*get, binding.column_index, column);
 		}
-		auto proj_it = facts.projections_by_index.find(table_index);
-		if (proj_it == facts.projections_by_index.end()) {
+		auto proj_it = facts.projections_by_index.find(binding.table_index);
+		if (proj_it == facts.projections_by_index.end() ||
+		    binding.column_index >= proj_it->second->expressions.size()) {
 			return false;
 		}
-		auto *proj = proj_it->second;
-		if (column_index >= proj->expressions.size()) {
-			return false;
-		}
-		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get());
+		string projection_cast;
+		auto *next = GetColumnRefThroughCasts(proj_it->second->expressions[binding.column_index].get(),
+		                                      cast_type ? &projection_cast : nullptr);
 		if (!next) {
 			return false;
 		}
-		table_index = next->Binding().table_index;
-		column_index = next->Binding().column_index;
+		if (cast_type && !projection_cast.empty()) {
+			*cast_type = SqlUtils::ComposeCastSpecs(*cast_type, projection_cast);
+		}
+		binding = next->Binding();
 	}
 	return false;
+}
+
+static bool SetOccurrenceRef(LogicalGet &get, const CreateMVPlanFacts &facts, OccurrenceColumnRef &out) {
+	auto occurrence = facts.occurrence_by_index.find(get.table_index);
+	if (occurrence == facts.occurrence_by_index.end()) {
+		return false;
+	}
+	out.table = occurrence->second.table;
+	out.occurrence = occurrence->second.occurrence;
+	return true;
 }
 
 static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                           OccurrenceColumnRef &out) {
 	LogicalGet *get = nullptr;
-	if (!ResolveBindingToGetColumn(binding, facts, get, out.column)) {
-		return false;
-	}
-	auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
-	if (occurrence_it == facts.occurrence_by_index.end()) {
-		return false;
-	}
-	out.table = occurrence_it->second.table;
-	out.occurrence = occurrence_it->second.occurrence;
-	return true;
+	return ResolveBindingToGetColumn(binding, facts, get, out.column) && SetOccurrenceRef(*get, facts, out);
 }
 
 static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                                   OccurrenceColumnRef &out, string &cast_type,
                                                   const LogicalType &expression_type) {
-	TableIndex table_index = binding.table_index;
-	ProjectionIndex column_index = binding.column_index;
-	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = facts.gets_by_index.find(table_index);
-		if (get_it != facts.gets_by_index.end()) {
-			auto *get = get_it->second;
-			if (!GetLogicalGetColumnName(*get, column_index, out.column)) {
-				return false;
-			}
-			auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
-			if (occurrence_it == facts.occurrence_by_index.end()) {
-				return false;
-			}
-			out.table = occurrence_it->second.table;
-			out.occurrence = occurrence_it->second.occurrence;
-			LogicalType base_type;
-			if (cast_type.empty() && GetLogicalGetColumnType(*get, column_index, base_type) &&
-			    !(base_type == expression_type)) {
-				cast_type = expression_type.ToString();
-			}
-			return true;
-		}
-		auto proj_it = facts.projections_by_index.find(table_index);
-		if (proj_it == facts.projections_by_index.end()) {
-			return false;
-		}
-		auto *proj = proj_it->second;
-		if (column_index >= proj->expressions.size()) {
-			return false;
-		}
-		string projection_cast;
-		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get(), &projection_cast);
-		if (!next) {
-			return false;
-		}
-		if (!projection_cast.empty()) {
-			cast_type = SqlUtils::ComposeCastSpecs(cast_type, projection_cast);
-		}
-		table_index = next->Binding().table_index;
-		column_index = next->Binding().column_index;
+	LogicalGet *get = nullptr;
+	ProjectionIndex base_column;
+	if (!ResolveBindingToGetColumn(binding, facts, get, out.column, &base_column, &cast_type) ||
+	    !SetOccurrenceRef(*get, facts, out)) {
+		return false;
 	}
-	return false;
+	LogicalType base_type;
+	if (cast_type.empty() && GetLogicalGetColumnType(*get, base_column, base_type) && !(base_type == expression_type)) {
+		cast_type = expression_type.ToString();
+	}
+	return true;
 }
 
 static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
@@ -2162,7 +2455,7 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 		if (!ResolveBindingToOccurrenceRef(bcr->Binding(), facts, key_ref)) {
 			continue;
 		}
-		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+		string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 		if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
 			continue;
 		}
@@ -2653,7 +2946,7 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 			    !StringUtil::CIEquals(bcr->GetName().GetIdentifierName(), partition_column)) {
 				continue;
 			}
-			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+			string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 			if (!output_col.empty() && !IncrementalTableNames::IsInternalColumn(output_col)) {
 				partition_column = output_col + "=" + partition_column;
 			}
@@ -2683,7 +2976,7 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 		if (!bcr) {
 			continue;
 		}
-		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
+		string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 		if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
 			continue;
 		}

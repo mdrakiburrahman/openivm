@@ -463,7 +463,7 @@ BEGIN;
 statement error
 DROP MATERIALIZED VIEW dl."Drop.Schema"."MV.Name" CASCADE;
 ----
-single transaction can only write to a single attached database
+Cannot run DROP VIEW CASCADE inside an explicit transaction
 
 statement ok
 ROLLBACK;

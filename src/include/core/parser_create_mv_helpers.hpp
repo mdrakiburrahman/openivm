@@ -8,7 +8,6 @@ namespace duckdb {
 
 class TableCatalogEntry;
 
-string CreateMVDependenciesSQL();
 // Every OpenIVM control-metadata table; openivm_metadata_schema selects their schema.
 const vector<string> &MetadataTableNames();
 // CREATE TABLE IF NOT EXISTS for a control-metadata table. An empty target uses the unqualified table name.

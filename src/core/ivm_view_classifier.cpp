@@ -555,6 +555,12 @@ static void AttachAuxRequirements(DeltaViewModel &model, const DeltaViewModelInp
 	if (model.type == RefreshType::DISTINCT_INCREMENTAL) {
 		D_ASSERT(input.distinct_aux_candidate);
 		model.distinct_aux = *input.distinct_aux_candidate;
+		// The aux metadata describes the parent aggregate exactly. Join/group
+		// fallbacks elsewhere may refer to keys inside its DISTINCT input.
+		model.group_columns.clear();
+		for (auto &group : model.distinct_aux.group_inputs) {
+			model.group_columns.push_back(group.output_column);
+		}
 	}
 	if (model.type == RefreshType::COUNT_DISTINCT_INCREMENTAL) {
 		D_ASSERT(input.count_distinct_aux_candidate);

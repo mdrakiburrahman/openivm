@@ -15,6 +15,9 @@
 
 namespace duckdb {
 
+// Hidden indexed state companions use a published projection position as their suffix.
+const string &IndexedStateColumn(const vector<string> &columns, const string &state_column, const string &prefix);
+
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 // Precedes the synthetic timestamp of DuckLake signed delta rows, so every row in the range counts.
 constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";
@@ -101,7 +104,6 @@ struct DeltaActivityResult {
 		bool has_deletes = false;
 		bool requires_full_refresh = false;
 		int64_t pending_rows = -1;
-		int64_t pending_deletes = -1;
 		int64_t last_snapshot_id = -1;
 		int64_t current_snapshot_id = -1;
 	};
@@ -212,13 +214,15 @@ string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const strin
                                           const string &data_table, const string &view_query_sql,
                                           const string &delta_ts_filter, const string &catalog_prefix,
                                           const string &recompute_alias);
-string
-CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                         const vector<string> &delta_table_names, const string &data_table,
-                         const string &view_query_sql, const string &delta_ts_filter, const string &catalog_prefix,
-                         bool has_full_outer, bool has_left_join, bool skip_proj_delete, bool insert_only = false,
-                         const vector<string> &active_delta_table_names = {}, bool can_use_runtime_delta_shape = false,
-                         ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, string *appended_rows = nullptr);
+string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
+                                const vector<LogicalType> &column_types, const vector<string> &delta_table_names,
+                                const string &data_table, const string &view_query_sql, const string &delta_ts_filter,
+                                const string &catalog_prefix, bool has_full_outer, bool has_left_join,
+                                bool skip_proj_delete, bool insert_only = false,
+                                const vector<string> &active_delta_table_names = {},
+                                bool can_use_runtime_delta_shape = false,
+                                ProjectionDeleteRetryPlan *delete_retry_plan = nullptr,
+                                string *appended_rows = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
