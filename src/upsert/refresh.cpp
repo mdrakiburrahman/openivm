@@ -954,7 +954,8 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 
 	for (auto &advance : activity.ducklake_snapshot_advances) {
 		if (advance.snapshot_id >= 0) {
-			metadata.UpdateDuckLakeRefreshMetadata(view_name, advance.table_name, advance.snapshot_id);
+			metadata.UpdateDuckLakeRefreshMetadata(view_name, advance.table_name, advance.snapshot_id,
+			                                       advance.source_table_id);
 		}
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());

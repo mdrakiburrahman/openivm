@@ -298,16 +298,21 @@ public:
 		bool changed = false;
 	};
 
-	// Resolve the DuckLake table id recorded for a source table and repair stale/missing metadata.
+	// Compare a source at the refresh boundaries without changing the recorded identity.
 	DuckLakeSourceIdentity ResolveDuckLakeSourceIdentity(const string &view_name, const string &table_name,
-	                                                     const string &catalog_name, const string &schema_name);
+	                                                     const string &catalog_name, const string &schema_name,
+	                                                     int64_t last_snapshot_id, int64_t current_snapshot_id);
 	// The DuckLake table id that `catalog.schema.table` named at `snapshot_id`; -1 if unknown.
 	int64_t GetDuckLakeTableIdAt(const string &catalog_name, const string &schema_name, const string &table_name,
 	                             int64_t snapshot_id);
 
+	static string BuildDuckLakeTableIdAtSQL(const string &catalog_name, const string &schema_name,
+	                                        const string &table_name, const string &snapshot_expr);
 	static string BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
-	                                              const string &snapshot_expr, const string &delta_metadata_table = "");
-	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id);
+	                                              const string &snapshot_expr, const string &delta_metadata_table = "",
+	                                              const string &source_table_id_expr = "");
+	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id,
+	                                   int64_t source_table_id = -1);
 
 	// --- Refresh history (learned cost model) ---
 

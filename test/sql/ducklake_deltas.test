@@ -907,3 +907,67 @@ query II
 SELECT last_outcome, committed_count FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake_cast' AND operation = 'refresh';
 ----
 unknown	0
+
+# #28: a compile-only refresh must leave a source replacement pending.
+statement ok
+CREATE TABLE dl.replaced_source(k INT, v INT);
+
+statement ok
+INSERT INTO dl.replaced_source VALUES (1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW replaced_source_mv AS
+    SELECT k, SUM(v) AS total FROM dl.replaced_source GROUP BY k;
+
+statement ok
+CREATE TEMP TABLE replaced_source_before AS
+SELECT d.source_table_id, d.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'replaced_source_mv';
+
+statement ok
+DROP TABLE dl.replaced_source;
+
+statement ok
+CREATE TABLE dl.replaced_source(k INT, v INT);
+
+statement ok
+INSERT INTO dl.replaced_source VALUES (3,30),(3,10),(4,20);
+
+statement ok
+UPDATE dl.replaced_source SET v = 5 WHERE k = 3 AND v = 10;
+
+statement ok
+DELETE FROM dl.replaced_source WHERE k = 4;
+
+query I
+SELECT COUNT(*) > 0
+FROM openivm_compile_with_facts('replaced_source_mv', '{"target_dialect":"duckdb","compile_only":true}');
+----
+true
+
+query II
+SELECT d.source_table_id = b.source_table_id, d.last_snapshot_id = b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), replaced_source_before b
+WHERE v.view_sql_name = 'replaced_source_mv';
+----
+true	true
+
+statement ok
+PRAGMA refresh('replaced_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM replaced_source_mv EXCEPT ALL SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k)
+    UNION ALL
+    (SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k EXCEPT ALL SELECT * FROM replaced_source_mv)
+);
+----
+0
+
+query II
+SELECT d.source_table_id <> b.source_table_id, d.last_snapshot_id > b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), replaced_source_before b
+WHERE v.view_sql_name = 'replaced_source_mv';
+----
+true	true

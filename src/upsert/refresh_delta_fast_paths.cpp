@@ -39,9 +39,13 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
 		return activity;
 	}
 
-	auto identity = metadata.ResolveDuckLakeSourceIdentity(view_name, table_name, catalog_name, schema_name);
+	auto identity = metadata.ResolveDuckLakeSourceIdentity(view_name, table_name, catalog_name, schema_name,
+	                                                       last_snapshot_id, current_snapshot_id);
 	if (!identity.resolved || identity.current_table_id < 0) {
 		return activity;
+	}
+	if (identity.stored_table_id < 0) {
+		activity.source_table_id_to_backfill = identity.current_table_id;
 	}
 	if (identity.changed) {
 		activity.ok = true;
@@ -151,6 +155,7 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 	}
 	auto metadata_activity = ProbeDuckLakeSnapshotActivity(metadata, con, view_name, delta_table, loc.catalog_name,
 	                                                       loc.schema_name, last_snap, cur_snap);
+	source.backfill_source_table_id = metadata_activity.source_table_id_to_backfill >= 0;
 	if (metadata_activity.ok) {
 		source.ok = true;
 		source.has_changes = metadata_activity.has_changes;
@@ -161,7 +166,8 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 	}
 	if (source.ok && !source.has_changes) {
 		// Nothing in the range touched this table; consume the unrelated snapshots.
-		summary.ducklake_snapshot_advances.push_back({delta_table, cur_snap});
+		summary.ducklake_snapshot_advances.emplace_back(delta_table, cur_snap,
+		                                                metadata_activity.source_table_id_to_backfill);
 	}
 	AddDeltaSource(summary, std::move(source));
 }

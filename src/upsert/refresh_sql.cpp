@@ -1792,8 +1792,22 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			string dl_snapshot_expr =
 			    cross_system ? DuckLakeSnapshotPlaceholder(catalog_name)
 			                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot())";
-			snapshot_update_query +=
-			    RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, dl_snapshot_expr, delta_metadata_table);
+			bool backfill_source_table_id =
+			    refresh_delta_activity && std::any_of(refresh_delta_activity->sources.begin(),
+			                                          refresh_delta_activity->sources.end(), [&](const auto &activity) {
+				                                          return activity.delta_table_name == dt &&
+				                                                 activity.backfill_source_table_id;
+			                                          });
+			string source_table_id;
+			if (dispatch_refresh_type == RefreshType::FULL_REFRESH || backfill_source_table_id) {
+				auto source_name = RefreshMetadata::SourceTableName(dt, catalog_name, source.schema_name);
+				source_table_id = "(" +
+				                  RefreshMetadata::BuildDuckLakeTableIdAtSQL(catalog_name, source.schema_name,
+				                                                             source_name, dl_snapshot_expr) +
+				                  ")";
+			}
+			snapshot_update_query += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(
+			    view_name, dt, dl_snapshot_expr, delta_metadata_table, source_table_id);
 			continue;
 		}
 		string catalog_name = source.catalog_name.empty() ? view_catalog_name : source.catalog_name;

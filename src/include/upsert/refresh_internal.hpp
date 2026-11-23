@@ -77,12 +77,13 @@ struct DuckLakeSnapshotAdvance {
 	DuckLakeSnapshotAdvance() {
 	}
 
-	DuckLakeSnapshotAdvance(string table_name_p, int64_t snapshot_id_p)
-	    : table_name(std::move(table_name_p)), snapshot_id(snapshot_id_p) {
+	DuckLakeSnapshotAdvance(string table_name_p, int64_t snapshot_id_p, int64_t source_table_id_p)
+	    : table_name(std::move(table_name_p)), snapshot_id(snapshot_id_p), source_table_id(source_table_id_p) {
 	}
 
 	string table_name;
 	int64_t snapshot_id = -1;
+	int64_t source_table_id = -1;
 };
 
 struct DeltaActivityResult {
@@ -106,6 +107,7 @@ struct DeltaActivityResult {
 		int64_t pending_rows = -1;
 		int64_t last_snapshot_id = -1;
 		int64_t current_snapshot_id = -1;
+		bool backfill_source_table_id = false;
 	};
 	vector<Source> sources;
 };
@@ -115,6 +117,7 @@ struct DuckLakeTableActivity {
 	bool has_changes = false;
 	bool has_deletes = false;
 	bool requires_full_refresh = false;
+	int64_t source_table_id_to_backfill = -1;
 };
 
 struct RefreshCostEstimate;

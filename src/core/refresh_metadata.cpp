@@ -1946,10 +1946,10 @@ int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string
 	return value.IsNull() ? -1 : value.GetValue<int64_t>();
 }
 
-RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name,
-                                                                                       const string &table_name,
-                                                                                       const string &catalog_name,
-                                                                                       const string &schema_name) {
+RefreshMetadata::DuckLakeSourceIdentity
+RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name, const string &table_name,
+                                               const string &catalog_name, const string &schema_name,
+                                               int64_t last_snapshot_id, int64_t current_snapshot_id) {
 	DuckLakeSourceIdentity identity;
 	auto result =
 	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
@@ -1961,37 +1961,20 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	if (result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->Collection().GetValue(0, 0).GetValue<int64_t>();
 	}
-	if (catalog_name.empty()) {
-		return identity;
-	}
-
-	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
-	string schema_filter = schema_name.empty() ? "main" : schema_name;
-	auto current_result = con.Query(
-	    "SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	    "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
-	    "t.end_snapshot IS NULL AND "
-	    "s.end_snapshot IS NULL AND t.table_name = '" +
-	    SqlUtils::EscapeValue(SourceTableName(table_name, catalog_name, schema_name)) + "' AND s.schema_name = '" +
-	    SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1");
-	if (current_result->HasError() || current_result->RowCount() == 0 ||
-	    current_result->Collection().GetValue(0, 0).IsNull()) {
-		return identity;
-	}
-
-	identity.resolved = true;
-	identity.current_table_id = current_result->Collection().GetValue(0, 0).GetValue<int64_t>();
-	identity.changed = identity.stored_table_id >= 0 && identity.stored_table_id != identity.current_table_id;
-	if (identity.stored_table_id == identity.current_table_id) {
-		return identity;
-	}
-	auto update =
-	    con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-	              " SET source_table_id = " + to_string(identity.current_table_id) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
-	if (update->HasError()) {
-		OPENIVM_DEBUG_PRINT("[DuckLake] Could not backfill source_table_id for %s.%s: %s\n", view_name.c_str(),
-		                    table_name.c_str(), update->GetError().c_str());
+	auto source_name = SourceTableName(table_name, catalog_name, schema_name);
+	identity.current_table_id = GetDuckLakeTableIdAt(catalog_name, schema_name, source_name, current_snapshot_id);
+	identity.resolved = identity.current_table_id >= 0;
+	if (identity.resolved) {
+		auto previous_id = identity.stored_table_id;
+		if (previous_id < 0) {
+			// A legacy view can still refresh incrementally if its previous snapshot
+			// establishes the identity that the missing metadata would have stored.
+			previous_id = GetDuckLakeTableIdAt(catalog_name, schema_name, source_name, last_snapshot_id);
+		}
+		identity.changed = previous_id != identity.current_table_id;
+		OPENIVM_DEBUG_PRINT("[DuckLake] Probed source identity for %s.%s: %lld -> %lld\n", view_name.c_str(),
+		                    table_name.c_str(), static_cast<long long>(previous_id),
+		                    static_cast<long long>(identity.current_table_id));
 	}
 	return identity;
 }
@@ -2001,37 +1984,42 @@ int64_t RefreshMetadata::GetDuckLakeTableIdAt(const string &catalog_name, const 
 	if (catalog_name.empty() || table_name.empty() || snapshot_id < 0) {
 		return -1;
 	}
-	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
-	string schema_filter = schema_name.empty() ? "main" : schema_name;
-	string snapshot = to_string(snapshot_id);
-	auto visible = [&](const string &alias) {
-		return alias + ".begin_snapshot <= " + snapshot + " AND (" + alias + ".end_snapshot IS NULL OR " + alias +
-		       ".end_snapshot > " + snapshot + ")";
-	};
-	auto result =
-	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE " + visible("t") + " AND " + visible("s") +
-	              " AND t.table_name = '" + SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" +
-	              SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1");
+	auto result = con.Query(BuildDuckLakeTableIdAtSQL(catalog_name, schema_name, table_name, to_string(snapshot_id)));
 	if (result->HasError() || result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->Collection().GetValue(0, 0).GetValue<int64_t>();
 }
 
+string RefreshMetadata::BuildDuckLakeTableIdAtSQL(const string &catalog_name, const string &schema_name,
+                                                  const string &table_name, const string &snapshot_expr) {
+	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
+	string schema_filter = schema_name.empty() ? "main" : schema_name;
+	auto visible = [&](const string &alias) {
+		return alias + ".begin_snapshot <= " + snapshot_expr + " AND (" + alias + ".end_snapshot IS NULL OR " + alias +
+		       ".end_snapshot > " + snapshot_expr + ")";
+	};
+	return "SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	       "ducklake_schema s ON t.schema_id = s.schema_id WHERE " + visible("t") + " AND " + visible("s") +
+	       " AND t.table_name = '" + SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" +
+	       SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1";
+}
+
 string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
-                                                        const string &snapshot_expr,
-                                                        const string &delta_metadata_table) {
+                                                        const string &snapshot_expr, const string &delta_metadata_table,
+                                                        const string &source_table_id_expr) {
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
-	return "UPDATE " + metadata_table + " SET last_snapshot_id = " + snapshot_expr +
+	string identity_assignment = source_table_id_expr.empty() ? "" : ", source_table_id = " + source_table_id_expr;
+	return "UPDATE " + metadata_table + " SET last_snapshot_id = " + snapshot_expr + identity_assignment +
 	       ", last_update = " + string(openivm::UTC_NOW_SQL) + ", last_refresh_ts = " + string(openivm::UTC_NOW_SQL) +
 	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 	       SqlUtils::EscapeValue(table_name) + "';\n";
 }
 
 void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name,
-                                                    int64_t snapshot_id) {
-	auto result = con.Query(BuildDuckLakeRefreshMetadataSQL(view_name, table_name, to_string(snapshot_id)));
+                                                    int64_t snapshot_id, int64_t source_table_id) {
+	auto result = con.Query(BuildDuckLakeRefreshMetadataSQL(view_name, table_name, to_string(snapshot_id), "",
+	                                                        source_table_id < 0 ? "" : to_string(source_table_id)));
 	if (result->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake refresh metadata: " + result->GetError());
 	}

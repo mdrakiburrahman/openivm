@@ -982,8 +982,10 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 		string snapshot_expr =
 		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
 		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
-		update_ts_sql +=
-		    RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr, delta_metadata_table);
+		auto source_table_id = RefreshMetadata::BuildDuckLakeTableIdAtSQL(loc.catalog_name, loc.schema_name,
+		                                                                  loc.table_name, snapshot_expr);
+		update_ts_sql += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(
+		    view_name, dt, snapshot_expr, delta_metadata_table, "(" + source_table_id + ")");
 	}
 	string update_ts;
 	if (!cross_system) {
