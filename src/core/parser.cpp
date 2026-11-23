@@ -27,10 +27,8 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
-#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
@@ -179,11 +177,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Native programs retain this gate until commit/rollback; the staged executor acquires
 	// its re-entrant guard before suspending the caller transaction.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
-	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
-	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
-	// whole execution path on DuckDB's lower-memory unordered mode.
-	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
-	                                                              Value::BOOLEAN(false));
 	auto &parse_data_ref = dynamic_cast<MaterializedViewParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(parse_data_ref.statement.get());
 
