@@ -141,9 +141,8 @@ static bool IsPositiveJoinInput(const TableRef &ref) {
 }
 
 static bool IsPositiveJoinSelect(const SelectNode &select) {
-	return select.from_table && IsPositiveJoinInput(*select.from_table) && select.modifiers.empty() &&
-	       !select.having && !select.qualify && !select.sample &&
-	       (!select.where_clause || !select.where_clause->HasSubquery());
+	return select.from_table && IsPositiveJoinInput(*select.from_table) && select.modifiers.empty() && !select.having &&
+	       !select.qualify && !select.sample && (!select.where_clause || !select.where_clause->HasSubquery());
 }
 
 static bool CanIncludeDeletedJoinRows(const string &sql, const vector<string> &group_columns) {
@@ -180,9 +179,8 @@ static bool CanIncludeDeletedJoinRows(const string &sql, const vector<string> &g
 		}
 		auto &input = node.Cast<SelectNode>();
 		if (!IsPositiveJoinSelect(input) || !input.groups.group_expressions.empty() ||
-		    std::any_of(input.select_list.begin(), input.select_list.end(), [](const auto &expr) {
-			    return expr->GetExpressionClass() != ExpressionClass::COLUMN_REF;
-		    })) {
+		    std::any_of(input.select_list.begin(), input.select_list.end(),
+		                [](const auto &expr) { return expr->GetExpressionClass() != ExpressionClass::COLUMN_REF; })) {
 			return false;
 		}
 	}
@@ -1381,7 +1379,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
                              bool emit_cascade_delta, GroupRecomputeAffectedMode affected_mode,
                              const string &additional_affected_groups, const string &affected_query_sql,
-                             bool insert_only) {
+                             bool has_source_deletes) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -1419,7 +1417,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	}
 
 	const bool include_deleted_join_rows =
-	    !insert_only && affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA && affected_query_sql.empty() &&
+	    has_source_deletes && affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA && affected_query_sql.empty() &&
 	    EstimateGroupRecomputeAffectedVariants(delta_table_specs) > 1 &&
 	    CanIncludeDeletedJoinRows(affected_view_query_sql, group_columns);
 	if (include_deleted_join_rows) {
