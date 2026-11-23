@@ -6,7 +6,10 @@
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_internal.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -145,7 +148,7 @@ static bool IsPositiveJoinSelect(const SelectNode &select) {
 	       !select.qualify && !select.sample && (!select.where_clause || !select.where_clause->HasSubquery());
 }
 
-static bool CanIncludeDeletedJoinRows(const string &sql, const vector<string> &group_columns) {
+static bool CanIncludeDeletedJoinRows(ClientContext &context, const string &sql, const vector<string> &group_columns) {
 	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(sql);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
@@ -164,27 +167,50 @@ static bool CanIncludeDeletedJoinRows(const string &sql, const vector<string> &g
 		auto key = std::find_if(select.select_list.begin(), select.select_list.end(), [&](const auto &expr) {
 			return StringUtil::CIEquals(expr->GetName().GetIdentifierName(), name);
 		});
-		if (key == select.select_list.end() || (*key)->GetExpressionClass() != ExpressionClass::COLUMN_REF ||
+		// The same row-local expression yields the same key on an old joined tuple.
+		if (key == select.select_list.end() || (*key)->HasSubquery() ||
 		    std::none_of(groups.begin(), groups.end(), [&](const auto &group) { return (*key)->Equals(*group); })) {
 			return false;
 		}
 	}
-	// In rendered SQL, scans and joins usually live in CTEs. Only accept
-	// pass-through inputs, since widening rows below a nested aggregate, limit
-	// or window can change the keys computed above it.
+	// A lower projection may compute a key before the join. Its expressions must
+	// be row-local: an ungrouped aggregate changes when its input is widened.
+	vector<reference<const FunctionExpression>> functions;
 	for (auto &cte : root.cte_map.map) {
 		auto &node = *cte.second->query_node;
 		if (node.type != QueryNodeType::SELECT_NODE || !node.cte_map.map.empty()) {
 			return false;
 		}
 		auto &input = node.Cast<SelectNode>();
-		if (!IsPositiveJoinSelect(input) || !input.groups.group_expressions.empty() ||
-		    std::any_of(input.select_list.begin(), input.select_list.end(),
-		                [](const auto &expr) { return expr->GetExpressionClass() != ExpressionClass::COLUMN_REF; })) {
+		if (!IsPositiveJoinSelect(input) || !input.groups.group_expressions.empty()) {
 			return false;
 		}
+		for (auto &expr : input.select_list) {
+			if (expr->IsWindow() || expr->HasSubquery() || expr->GetExpressionClass() == ExpressionClass::STAR) {
+				return false;
+			}
+			ParsedExpressionIterator::VisitExpression<FunctionExpression>(
+			    *expr, [&](const FunctionExpression &function) { functions.emplace_back(function); });
+		}
 	}
-	return true;
+	if (functions.empty()) {
+		return true;
+	}
+	bool scalar_projections = false;
+	context.RunFunctionInTransaction([&] {
+		scalar_projections = std::all_of(functions.begin(), functions.end(), [&](const FunctionExpression &function) {
+			EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, function.GetQualifiedName());
+			auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+			if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+				return false;
+			}
+			auto &overloads = entry->Cast<ScalarFunctionCatalogEntry>().functions.functions;
+			return std::all_of(overloads.begin(), overloads.end(), [](const auto &overload) {
+				return overload->GetStability() == FunctionStability::CONSISTENT;
+			});
+		});
+	});
+	return scalar_projections;
 }
 
 static string AffectedGroupFilter(const string &affected_temp, const vector<string> &group_columns) {
@@ -715,8 +741,10 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			if (outcome) {
 				outcome->handled_cascade_delta = true;
 			}
-			return CompileGroupRecompute(view_name, options.view_query_sql, options.group_column_names,
-			                             *options.cascade_delta_specs, options.catalog_prefix,
+			D_ASSERT(options.cascade_context);
+			return CompileGroupRecompute(*options.cascade_context, view_name, options.view_query_sql,
+			                             options.group_column_names, *options.cascade_delta_specs,
+			                             options.catalog_prefix,
 			                             /*emit_cascade_delta=*/true, GroupRecomputeAffectedMode::SOURCE_DELTA);
 		}
 		// Group-recompute strategy: delete affected groups, re-insert from original query.
@@ -1375,7 +1403,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 	return sql;
 }
 
-string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
+string CompileGroupRecompute(ClientContext &context, const string &view_name, const string &view_query_sql,
+                             const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
                              bool emit_cascade_delta, GroupRecomputeAffectedMode affected_mode,
                              const string &additional_affected_groups, const string &affected_query_sql,
@@ -1419,7 +1448,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	const bool include_deleted_join_rows =
 	    has_source_deletes && affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA && affected_query_sql.empty() &&
 	    EstimateGroupRecomputeAffectedVariants(delta_table_specs) > 1 &&
-	    CanIncludeDeletedJoinRows(affected_view_query_sql, group_columns);
+	    CanIncludeDeletedJoinRows(context, affected_view_query_sql, group_columns);
 	if (include_deleted_join_rows) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] Including deleted rows in join key discovery for %s\n",
 		                    view_name.c_str());
