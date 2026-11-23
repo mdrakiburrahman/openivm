@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "core/parser_create_mv_helpers.hpp"
+#include "core/refresh_metadata.hpp"
 
 #include "core/compiled_sql_archive.hpp"
 #include "core/metadata_location.hpp"
@@ -19,11 +20,28 @@
 
 namespace duckdb {
 
-string SqlCsvLiteralOrNull(const vector<string> &values) {
+bool CanCreateGroupIndex(const vector<string> &groups, const vector<string> &names, const vector<LogicalType> &types) {
+	D_ASSERT(names.size() == types.size());
+	for (auto &group : groups) {
+		auto name = std::find_if(names.begin(), names.end(),
+		                         [&](const string &candidate) { return StringUtil::CIEquals(candidate, group); });
+		if (name == names.end()) {
+			throw InternalException("Missing output type for materialized-view group column '%s'", group);
+		}
+		auto type = types[name - names.begin()].InternalType();
+		if (type != PhysicalType::BOOL && !TypeIsNumeric(type) && type != PhysicalType::VARCHAR) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Skipping ART index for unsupported group column '%s'\n", group.c_str());
+			return false;
+		}
+	}
+	return true;
+}
+
+string ViewListSqlLiteralOrNull(const vector<string> &values) {
 	if (values.empty()) {
 		return "null";
 	}
-	return "'" + StringUtil::Join(values, values.size(), ",", SqlUtils::EscapeSingleQuotes) + "'";
+	return Value(RefreshMetadata::SerializeViewList(values)).ToSQLString();
 }
 
 // Read the caller's snapshot, including metadata inserted earlier in this
@@ -113,6 +131,7 @@ static const vector<std::pair<string, vector<MetadataColumn>>> &MetadataTableDef
 	      {"derived_aggregate_outputs_json varchar default null", ADDED},
 	      "having_predicate varchar default null",
 	      {"group_recompute_affected_mode varchar default null", ADDED},
+	      {"group_recompute_affected_query varchar default null", ADDED},
 	      {"group_recompute_source_occurrences_json varchar default null", ADDED},
 	      "has_full_outer boolean default false, full_outer_join_cols varchar default null",
 	      {"signature_hash ubigint default null", ADDED, MetadataStore::LOCAL},

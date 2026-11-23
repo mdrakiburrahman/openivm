@@ -27,10 +27,8 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
-#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
@@ -179,11 +177,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Native programs retain this gate until commit/rollback; the staged executor acquires
 	// its re-entrant guard before suspending the caller transaction.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
-	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
-	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
-	// whole execution path on DuckDB's lower-memory unordered mode.
-	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
-	                                                              Value::BOOLEAN(false));
 	auto &parse_data_ref = dynamic_cast<MaterializedViewParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(parse_data_ref.statement.get());
 
@@ -469,6 +462,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	vector<LogicalType> output_types;
 	unique_ptr<AstNode> initial_load_ast;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
+	string group_recompute_affected_query;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 	bool stored_query_has_aggregate_filter = false;
@@ -491,15 +485,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                             select_planner.properties.always_require_rebind);
 		auto select_output_names = IdentifiersToStrings(select_planner.names);
 		visible_output_count = select_output_names.size();
-		for (auto &name : select_output_names) {
-			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
-			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
-			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
-			    StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX) ||
-			    StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX)) {
-				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
-			}
-		}
 		add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
 		// Inline CTEs without running the full optimizer, which can reshape plans
@@ -526,6 +511,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		InjectSumNonNullCounts(context, select_plan);
 		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
+		ValidateMaterializedViewOutputNames(select_output_names, output_names, visible_output_count);
+		output_types = select_plan->types;
 
 		select_plan->ResolveOperatorTypes();
 		output_types = select_plan->types;
@@ -555,6 +542,15 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			initial_load_ast = std::move(ast);
 			return sql;
 		};
+		if (post_rewrite_facts.analysis.found_distinct_on && !has_query_dependent_binding) {
+			auto affected_plan = select_plan->Copy(context);
+			if (RemoveDistinctOnWinnerFilters(affected_plan)) {
+				group_recompute_affected_query = serialize_plan(affected_plan);
+				if (!group_recompute_affected_query.empty() && group_recompute_affected_query.back() == ';') {
+					group_recompute_affected_query.pop_back();
+				}
+			}
+		}
 		auto serialize_original = [&]() {
 			try {
 				view_query = serialize_plan(select_plan);
@@ -972,7 +968,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	RefreshMetadata::LeftJoinSecondaryMeta leftjoin_secondary;
 	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
 		leftjoin_secondary =
-		    BuildLeftJoinSecondaryDeltaSQL(context, facts, output_names, view_name, internal_catalog_prefix);
+		    BuildLeftJoinSecondaryDeltaSQL(*planner.binder, facts, output_names, view_name, internal_catalog_prefix);
 		if (leftjoin_secondary.sql.empty()) {
 			// The aggregate MERGE requires the Larson & Zhou correction for null-padded row
 			// transitions. An incomplete correction is not optional: recompute only the groups
@@ -1240,9 +1236,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
-	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
-	string window_order_cols_val = SqlCsvLiteralOrNull(window_order_columns);
-	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
+	string group_cols_val = ViewListSqlLiteralOrNull(cols_to_store);
+	string window_order_cols_val = ViewListSqlLiteralOrNull(window_order_columns);
+	string agg_types_val = ViewListSqlLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)
 	                        ? "null"
 	                        : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
@@ -1283,6 +1279,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		metadata_ddl.push_back(statement);
 	}
 
+	if (!group_recompute_affected_query.empty()) {
+		aux_metadata_ddl.push_back(
+		    BuildUpdateViewJsonSQL("group_recompute_affected_query", group_recompute_affected_query, view_name));
+	}
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
 	}
@@ -1859,7 +1859,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// the index up in every native view catalog; its full recompute upserts against it.
 	bool explicit_native = metadata_location.explicit_placement && metadata.IsNativeCatalog(view_target_catalog);
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native)) {
+	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native) &&
+	    CanCreateGroupIndex(aggregate_columns, output_names, output_types)) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = SqlUtils::QuoteIdentifier(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +

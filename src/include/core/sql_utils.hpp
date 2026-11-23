@@ -91,6 +91,9 @@ public:
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
 	// Repeat each input row count times, preserving an empty result for nonpositive counts.
 	static string BuildRowRepetitionSQL(const string &count, const string &alias, SqlDialect dialect);
+	// Reconstruct a previous native bag, optionally projecting and restricting all inputs before subtraction.
+	static string BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter,
+	                                         const vector<string> &columns = {}, const string &candidate_join = "");
 	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
 	                                        const string &right_prefix);
 	/// Cast specs retain the legacy single-target-type representation while encoding nested/TRY_CAST expressions.

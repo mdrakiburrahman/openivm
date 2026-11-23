@@ -173,3 +173,137 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Issue #114: a newly inserted preserved row needs a NULL pad when the batch
+# removes its pre-existing last match. The reverse transition must still avoid
+# retracting a pad for a brand-new preserved key. Include duplicate preserved rows.
+foreach direction down up
+
+foreach old_count 0 1 2
+
+foreach new_count 1 2
+
+statement ok
+CREATE TABLE dl.new_pad_c(id INT NOT NULL);
+CREATE TABLE dl.new_pad_o(oid INT,cid INT,v INT);
+INSERT INTO dl.new_pad_c SELECT 58 FROM range({old_count});
+INSERT INTO dl.new_pad_o SELECT 102,58,10 WHERE '{direction}'='down';
+CREATE MATERIALIZED VIEW dl.new_pad_mv AS
+SELECT c.id,COUNT(o.oid) n,COUNT(*) rows,COUNT(c.id) preserved,SUM(o.v) total
+FROM dl.new_pad_c c LEFT JOIN dl.new_pad_o o ON c.id=o.cid GROUP BY c.id;
+CREATE VIEW new_pad_expected AS
+SELECT c.id,COUNT(o.oid) n,COUNT(*) rows,COUNT(c.id) preserved,SUM(o.v) total
+FROM dl.new_pad_c c LEFT JOIN dl.new_pad_o o ON c.id=o.cid GROUP BY c.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='new_pad_mv';
+----
+0
+
+statement ok
+INSERT INTO dl.new_pad_c SELECT 58 FROM range({new_count});
+INSERT INTO dl.new_pad_c VALUES(99);
+UPDATE dl.new_pad_c SET id=100 WHERE id=99;
+DELETE FROM dl.new_pad_c WHERE id=100;
+INSERT INTO dl.new_pad_o VALUES(999,58,999);
+UPDATE dl.new_pad_o SET cid=99 WHERE oid=999;
+DELETE FROM dl.new_pad_o WHERE oid IN(102,999);
+INSERT INTO dl.new_pad_o SELECT 103,58,20 WHERE '{direction}'='up';
+PRAGMA refresh('new_pad_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM dl.new_pad_mv EXCEPT ALL SELECT * FROM new_pad_expected)
+UNION ALL(SELECT * FROM new_pad_expected EXCEPT ALL SELECT * FROM dl.new_pad_mv));
+----
+0
+
+statement ok
+INSERT INTO dl.new_pad_o VALUES(104,58,30),(999,58,50);
+UPDATE dl.new_pad_o SET v=40 WHERE oid=104;
+DELETE FROM dl.new_pad_o WHERE oid=999;
+PRAGMA refresh('new_pad_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM dl.new_pad_mv EXCEPT ALL SELECT * FROM new_pad_expected)
+UNION ALL(SELECT * FROM new_pad_expected EXCEPT ALL SELECT * FROM dl.new_pad_mv));
+----
+0
+
+statement ok
+INSERT INTO dl.new_pad_c VALUES(99);
+UPDATE dl.new_pad_c SET id=100 WHERE id=99;
+DELETE FROM dl.new_pad_c;
+INSERT INTO dl.new_pad_o VALUES(999,58,50);
+UPDATE dl.new_pad_o SET v=100 WHERE oid=999;
+DELETE FROM dl.new_pad_o;
+PRAGMA refresh('new_pad_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM dl.new_pad_mv EXCEPT ALL SELECT * FROM new_pad_expected)
+UNION ALL(SELECT * FROM new_pad_expected EXCEPT ALL SELECT * FROM dl.new_pad_mv));
+----
+0
+
+statement ok
+INSERT INTO dl.new_pad_c VALUES(58),(99);
+UPDATE dl.new_pad_c SET id=100 WHERE id=99;
+DELETE FROM dl.new_pad_c WHERE id=100;
+INSERT INTO dl.new_pad_o VALUES(105,58,60),(999,58,50);
+UPDATE dl.new_pad_o SET v=100 WHERE oid=999;
+DELETE FROM dl.new_pad_o WHERE oid=999;
+PRAGMA refresh('new_pad_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM dl.new_pad_mv EXCEPT ALL SELECT * FROM new_pad_expected)
+UNION ALL(SELECT * FROM new_pad_expected EXCEPT ALL SELECT * FROM dl.new_pad_mv));
+----
+0
+
+statement ok
+DROP VIEW new_pad_expected;
+DROP VIEW dl.new_pad_mv;
+DROP TABLE dl.new_pad_o;
+DROP TABLE dl.new_pad_c;
+
+endloop
+
+endloop
+
+endloop
+
+
+# A payload UPDATE preserves match support even when new left rows use that key.
+statement ok
+CREATE TABLE dl.payload_left(id INT NOT NULL,grp INT);
+CREATE TABLE dl.payload_right(oid INT,cid INT,v INT);
+INSERT INTO dl.payload_left VALUES(1,10),(3,20);
+INSERT INTO dl.payload_right VALUES(1,1,4),(2,3,4);
+CREATE MATERIALIZED VIEW dl.payload_mv AS
+    SELECT c.grp,COUNT(o.oid)n,COUNT(*)rows,COUNT(c.id)preserved,SUM(o.v)total
+    FROM dl.payload_left c LEFT JOIN dl.payload_right o ON c.id=o.cid GROUP BY c.grp;
+CREATE VIEW payload_expected AS
+    SELECT c.grp,COUNT(o.oid)n,COUNT(*)rows,COUNT(c.id)preserved,SUM(o.v)total
+    FROM dl.payload_left c LEFT JOIN dl.payload_right o ON c.id=o.cid GROUP BY c.grp;
+
+statement ok
+UPDATE dl.payload_left SET id=3 WHERE id=1;
+INSERT INTO dl.payload_left VALUES(3,30),(99,99);
+UPDATE dl.payload_left SET id=100 WHERE id=99;
+DELETE FROM dl.payload_left WHERE id=100;
+UPDATE dl.payload_right SET v=2 WHERE cid=3;
+INSERT INTO dl.payload_right VALUES(999,3,50);
+UPDATE dl.payload_right SET v=60 WHERE oid=999;
+DELETE FROM dl.payload_right WHERE oid=999;
+PRAGMA refresh('payload_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM dl.payload_mv EXCEPT ALL SELECT * FROM payload_expected)
+UNION ALL(SELECT * FROM payload_expected EXCEPT ALL SELECT * FROM dl.payload_mv));
+----
+0
+
+statement ok
+DROP VIEW payload_expected;
+DROP VIEW dl.payload_mv;
+DROP TABLE dl.payload_right;
+DROP TABLE dl.payload_left;

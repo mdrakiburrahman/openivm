@@ -551,7 +551,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
 	optional_ptr<CatalogEntry> index_delta_view_catalog_entry;
-	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || split_native_metadata) {
+	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || target_is_native) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    planning_context,
@@ -741,10 +741,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                                             active_facts.target_dialect, view_time_travel_pins);
 		}
 		auto aux_rebuild = rebuild_distinct_aux(source_sql);
-		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql, cross_system,
-		                                               attached_db_catalog_name, attached_db_schema_name,
-		                                               internal_catalog_prefix, metadata_prefix, out_post_meta,
-		                                               deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
+		auto query = aux_rebuild + BuildRecomputeQuery(
+		                               metadata, view_name, source_sql,
+		                               index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB,
+		                               cross_system, attached_db_catalog_name, attached_db_schema_name,
+		                               internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup,
+		                               delta_metadata_tables, cleanup_data_catalog);
 		if (cross_system && out_pre_meta && out_post_meta) {
 			*out_pre_meta = in_progress_sql(true);
 			*out_post_meta += in_progress_sql(false);
@@ -1147,8 +1149,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						               SqlUtils::EscapeValue(delta_name) + "')";
 					}
 					// Insertions carry weight +1 and deletions -1.
-					string result = "(SELECT " + qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) +
-					                " AS __m FROM " + relation + where_clause + ")";
+					string projection =
+					    key_col.empty() ? "*" : qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) + " AS __m";
+					string result = "(SELECT " + projection + " FROM " + relation + where_clause + ")";
 					lj_delta_source_cache[cache_key] = result;
 					return result;
 				};
@@ -1176,6 +1179,42 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
 					                                            pres_src);
 				}
+				unordered_map<string, string> previous_sources;
+				ljsec.sql = SqlUtils::RewriteTableReferences(ljsec.sql, [&](const vector<string> &parts) -> string {
+					if (parts.size() != 1) {
+						return "";
+					}
+					if (StringUtil::StartsWith(parts[0], openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX)) {
+						auto source = parts[0].substr(string(openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX).size());
+						auto delta = build_ljsec_delta_source(source, "");
+						lj_ok = lj_ok && !delta.empty();
+						return delta;
+					}
+					if (!StringUtil::StartsWith(parts[0], openivm::LJSEC_OLD_SOURCE_PREFIX)) {
+						return "";
+					}
+					auto source = parts[0].substr(string(openivm::LJSEC_OLD_SOURCE_PREFIX).size());
+					auto cached = previous_sources.find(source);
+					if (cached != previous_sources.end()) {
+						return cached->second;
+					}
+					auto key = ResolveDeltaMetadataKey(metadata, view_name, source, delta_table_names);
+					if (metadata.IsDuckLakeTable(view_name, key)) {
+						auto snapshot = metadata.GetLastSnapshotId(view_name, key);
+						if (snapshot < 0) {
+							throw CatalogException("Missing previous LEFT JOIN snapshot for '%s'", source);
+						}
+						return previous_sources[source] = source + " AT (VERSION => " + to_string(snapshot) + ")";
+					}
+					auto input = ResolveTrackedSourceInput(metadata, con, view_name, source, delta_table_names,
+					                                       view_catalog_name, view_schema_name,
+					                                       attached_db_catalog_name, attached_db_schema_name);
+					return previous_sources[source] = SqlUtils::BuildPreviousSourceRowsSQL(
+					           input.table_sql, input.delta_sql,
+					           string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(input.last_update) +
+					               "'::TIMESTAMP");
+				});
+
 				if (!lj_ok) {
 					// Could not resolve a row source (e.g. missing snapshot metadata). Emitting the SQL with
 					// placeholders intact would be a syntax error. The primary MERGE is not correct without
@@ -1423,9 +1462,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_cols,
 			                                                 view_query_sql, delta_specs);
 		}
-		upsert_query =
-		    CompileGroupRecompute(view_name, view_query_sql, group_cols, delta_specs, internal_catalog_prefix,
-		                          emit_cascade_delta_for_recompute, affected_mode, unmatched_groups);
+		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_cols, delta_specs,
+		                                     internal_catalog_prefix, emit_cascade_delta_for_recompute, affected_mode,
+		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name));
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE "
 		                    "(%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
@@ -1452,7 +1491,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// Restricted to DuckDB output: the safe form emits INSERT OR REPLACE, which other dialects do
 		// not share. DuckLake output also has no unique indexes for ON CONFLICT.
 		vector<string> recompute_unique_keys;
-		if (!target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
+		if (index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = group_cols;
 		}

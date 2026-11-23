@@ -716,6 +716,25 @@ string SqlUtils::BuildRowRepetitionSQL(const string &count, const string &alias,
 	return " CROSS JOIN range(" + bound + ") " + quoted_alias;
 }
 
+string SqlUtils::BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter,
+                                            const vector<string> &columns, const string &candidate_join) {
+	const string alias = "openivm_scope_source";
+	const string weight = alias + "." + openivm::MULTIPLICITY_COL;
+	const string projection = columns.empty() ? alias + ".*" : JoinQualifiedQuotedColumns(columns, alias);
+	auto delta_projection = projection;
+	if (columns.empty()) {
+		delta_projection += " EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " + openivm::TIMESTAMP_COL + ")";
+	}
+	auto weighted_delta = [&](const string &comparison) {
+		return "SELECT " + delta_projection + " FROM " + delta + " " + alias + candidate_join +
+		       BuildRowRepetitionSQL("abs(" + weight + ")", "openivm_scope_weights", SqlDialect::DUCKDB) + " WHERE " +
+		       (delta_ts_filter.empty() ? "" : "(" + delta_ts_filter + ") AND ") + weight + comparison;
+	};
+	// Add deletions before subtracting insertions, including rows inserted and deleted in the same batch.
+	return "((SELECT " + projection + " FROM " + current + " " + alias + candidate_join + " UNION ALL " +
+	       weighted_delta(" < 0") + ") EXCEPT ALL " + weighted_delta(" > 0") + ")";
+}
+
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
 	return BuildNullSafeKeyPredicate(columns, lhs_alias + ".", rhs_alias + ".");
 }

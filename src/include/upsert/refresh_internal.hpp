@@ -203,10 +203,11 @@ string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &vi
                                      const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
-                           const string &catalog_prefix = "", const string &metadata_prefix = "",
-                           string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
-                           const vector<string> &delta_metadata_tables = {}, const string &data_catalog = "");
+                           bool has_unique_index, bool cross_system, const string &attached_catalog = "",
+                           const string &attached_schema = "", const string &catalog_prefix = "",
+                           const string &metadata_prefix = "", string *out_post_meta = nullptr,
+                           vector<string> *deferred_cleanup = nullptr, const vector<string> &delta_metadata_tables = {},
+                           const string &data_catalog = "");
 
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,

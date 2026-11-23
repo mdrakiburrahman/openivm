@@ -4,6 +4,12 @@
 
 require openivm
 
+# Loading OpenIVM must retain DuckDB's insertion-order default.
+query I
+SELECT current_setting('preserve_insertion_order')::INT;
+----
+1
+
 statement ok
 SET openivm_files_path='__TEST_DIR__';
 
@@ -306,3 +312,106 @@ SELECT count(*) FROM (
 
 statement ok
 SET openivm_stateful_auxstate = false;
+
+# Issue #92: CREATE and refresh, including failures, retain caller settings.
+foreach insertion_order true false
+
+foreach refresh_mode incremental full
+
+statement ok
+SET preserve_insertion_order={insertion_order};
+SET openivm_refresh_mode='{refresh_mode}';
+CREATE TABLE order_setting_src(id INT,v INT);
+INSERT INTO order_setting_src VALUES(1,10),(2,20);
+CREATE MATERIALIZED VIEW order_setting_mv AS
+    SELECT id,SUM(v) total,COUNT(*) n FROM order_setting_src GROUP BY id;
+CREATE VIEW order_setting_expected AS
+    SELECT id,SUM(v) total,COUNT(*) n FROM order_setting_src GROUP BY id;
+
+query I
+SELECT (current_setting('preserve_insertion_order')=CAST('{insertion_order}' AS BOOLEAN))::INT;
+----
+1
+
+statement error
+CREATE MATERIALIZED VIEW order_setting_mv AS SELECT * FROM order_setting_src;
+----
+already exists
+
+query I
+SELECT (current_setting('preserve_insertion_order')=CAST('{insertion_order}' AS BOOLEAN))::INT;
+----
+1
+
+statement ok
+INSERT INTO order_setting_src VALUES(1,5),(3,30),(99,100);
+UPDATE order_setting_src SET v=25 WHERE id=2;
+UPDATE order_setting_src SET id=100 WHERE id=99;
+DELETE FROM order_setting_src WHERE id=100;
+PRAGMA refresh('order_setting_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM order_setting_mv EXCEPT ALL SELECT * FROM order_setting_expected)
+UNION ALL(SELECT * FROM order_setting_expected EXCEPT ALL SELECT * FROM order_setting_mv));
+----
+0
+
+query I
+SELECT (current_setting('preserve_insertion_order')=CAST('{insertion_order}' AS BOOLEAN))::INT;
+----
+1
+
+statement ok
+BEGIN;
+INSERT INTO order_setting_src VALUES(1,2),(99,500);
+UPDATE order_setting_src SET v=v+1 WHERE id=1;
+DELETE FROM order_setting_src WHERE id=99;
+PRAGMA refresh('order_setting_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM order_setting_mv EXCEPT ALL SELECT * FROM order_setting_expected)
+UNION ALL(SELECT * FROM order_setting_expected EXCEPT ALL SELECT * FROM order_setting_mv));
+----
+0
+
+query I
+SELECT (current_setting('preserve_insertion_order')=CAST('{insertion_order}' AS BOOLEAN))::INT;
+----
+1
+
+statement ok
+COMMIT;
+
+query I
+SELECT (current_setting('preserve_insertion_order')=CAST('{insertion_order}' AS BOOLEAN))::INT;
+----
+1
+
+statement error
+PRAGMA refresh('missing_order_setting_mv');
+----
+does not exist in IVM metadata
+
+query I
+SELECT (current_setting('preserve_insertion_order')=CAST('{insertion_order}' AS BOOLEAN))::INT;
+----
+1
+
+query I
+SELECT count(*) FROM((SELECT * FROM order_setting_mv EXCEPT ALL SELECT * FROM order_setting_expected)
+UNION ALL(SELECT * FROM order_setting_expected EXCEPT ALL SELECT * FROM order_setting_mv));
+----
+0
+
+statement ok
+DROP VIEW order_setting_expected;
+DROP VIEW order_setting_mv;
+DROP TABLE order_setting_src;
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+SET preserve_insertion_order=true;

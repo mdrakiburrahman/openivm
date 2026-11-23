@@ -95,6 +95,9 @@ constexpr const char *INDEX_SUFFIX = "openivm_index";
 constexpr const char *LJSEC_INNER_DELTA_PREFIX = "__OPENIVM_LJSEC_INNER_DELTA_";
 constexpr const char *LJSEC_PRES_DELTA_PREFIX = "__OPENIVM_LJSEC_PRES_DELTA_";
 constexpr const char *LJSEC_PLACEHOLDER_SUFFIX = "__";
+// Quoted relation placeholder followed by the qualified source identity.
+constexpr const char *LJSEC_OLD_SOURCE_PREFIX = "__OPENIVM_LJSEC_OLD_SOURCE_";
+constexpr const char *LJSEC_OLD_NATIVE_DELTA_PREFIX = "__OPENIVM_LJSEC_OLD_NATIVE_DELTA_";
 
 // Temporary table prefix for companion row snapshots
 constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
@@ -104,7 +107,9 @@ static constexpr idx_t MAX_JOIN_TABLES = 16;
 
 // Data-dependent optimizers disabled when planning a view query into a delta-maintenance template.
 // column_lifetime is structural/data-independent and stays enabled.
-constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation";
+// Partial aggregate pushdown introduces opaque EXPORT_STATE aggregates below joins.
+// Rewrite the original aggregates first; native final-plan optimization can still push them down.
+constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation,partial_aggregate_pushdown";
 constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 
 // Disabled wherever the deeply-nested generated refresh SQL is planned/executed. deliminator

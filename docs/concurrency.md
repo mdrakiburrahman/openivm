@@ -94,10 +94,9 @@ or one multi-statement client call): DuckDB prepares the `PRAGMA` before the vie
 
 ## Side effects of loading OpenIVM
 
-- **`preserve_insertion_order` is turned off for the whole database**, and `PRAGMA refresh` resets it to `false` even
-  if a session set it back to `true` ([#92](https://github.com/ila/openivm/issues/92)). Queries and exports that rely
-  on insertion order without an `ORDER BY` can return rows in a different order: reading a 5M-row CSV returned every
-  row out of file order. Use `ORDER BY` where order matters.
+OpenIVM respects the caller's `preserve_insertion_order` setting and DuckDB's database default. Internal helper
+connections use unordered execution for materialization and refresh without changing the caller's setting.
+
 - **`disabled_optimizers` is overwritten by refresh** ([#89](https://github.com/ila/openivm/issues/89)). If you set it
   yourself, set it again after refreshing.
 

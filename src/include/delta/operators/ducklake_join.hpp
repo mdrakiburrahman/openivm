@@ -7,6 +7,8 @@
 
 namespace duckdb {
 
+using DuckLakeNullPaddingGuard = std::function<void(unique_ptr<LogicalOperator> &, uint64_t, uint64_t)>;
+
 /// Build N join delta terms using DuckLake time-travel (AT VERSION).
 ///
 /// Instead of inclusion-exclusion (2^N - 1 terms), produces exactly N terms
@@ -20,7 +22,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
                                                            bool has_left_join, bool flattened_leaves,
                                                            const vector<vector<DeltaJoinKeyProbe>> &key_probes,
-                                                           DeltaSourceCache &source_cache);
+                                                           DeltaSourceCache &source_cache,
+                                                           const DuckLakeNullPaddingGuard &guard);
 
 } // namespace duckdb
 
