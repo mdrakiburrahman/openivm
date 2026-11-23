@@ -741,12 +741,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                                             active_facts.target_dialect, view_time_travel_pins);
 		}
 		auto aux_rebuild = rebuild_distinct_aux(source_sql);
-		auto query = aux_rebuild + BuildRecomputeQuery(
-		                               metadata, view_name, source_sql,
-		                               index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB,
-		                               cross_system, attached_db_catalog_name, attached_db_schema_name,
-		                               internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup,
-		                               delta_metadata_tables, cleanup_data_catalog);
+		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql,
+		                                               index_delta_view_catalog_entry &&
+		                                                   active_facts.target_dialect == SqlDialect::DUCKDB,
+		                                               cross_system, attached_db_catalog_name, attached_db_schema_name,
+		                                               internal_catalog_prefix, metadata_prefix, out_post_meta,
+		                                               deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
 		if (cross_system && out_pre_meta && out_post_meta) {
 			*out_pre_meta = in_progress_sql(true);
 			*out_post_meta += in_progress_sql(false);
