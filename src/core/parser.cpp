@@ -27,10 +27,8 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
-#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
@@ -179,11 +177,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Native programs retain this gate until commit/rollback; the staged executor acquires
 	// its re-entrant guard before suspending the caller transaction.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
-	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
-	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
-	// whole execution path on DuckDB's lower-memory unordered mode.
-	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
-	                                                              Value::BOOLEAN(false));
 	auto &parse_data_ref = dynamic_cast<MaterializedViewParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(parse_data_ref.statement.get());
 
@@ -466,7 +459,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
+	vector<LogicalType> output_types;
+	unique_ptr<AstNode> initial_load_ast;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
+	string group_recompute_affected_query;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 	bool stored_query_has_aggregate_filter = false;
@@ -490,15 +486,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                             select_planner.properties.always_require_rebind);
 		auto select_output_names = IdentifiersToStrings(select_planner.names);
 		visible_output_count = select_output_names.size();
-		for (auto &name : select_output_names) {
-			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
-			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
-			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
-			    StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX) ||
-			    StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX)) {
-				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
-			}
-		}
 		add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
 		// Inline CTEs without running the full optimizer, which can reshape plans
@@ -506,19 +493,29 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		auto select_rewrite_start = create_profile_now();
 		auto select_rewrite_needs = InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 		pre_rewrite_has_aggregate_filter = select_rewrite_needs.aggregate_filters;
+		auto decomposed_outputs = DirectDecomposedAggregateOutputs(*select_plan, select_output_names);
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_output_names, select_rewrite_needs);
 
+		// Hidden sort outputs need the same aggregate state as visible outputs.
+		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
+		StripPublicationModifiers(context, select_plan, output_names, top_k_suffix, top_k_order_suffix);
+		RewriteNonFiniteSumInputs(context, *select_planner.binder, select_plan);
+		// HAVING must reuse these state bindings without replacing their semantic aliases.
+		InjectDerivedAggregateInputs(select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
-		having_predicate = StripHavingFilter(select_plan, output_names);
-		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
+		having_predicate = StripHavingFilter(context, select_plan, output_names);
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
+		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
+		ValidateMaterializedViewOutputNames(select_output_names, output_names, visible_output_count);
 
+		select_plan->ResolveOperatorTypes();
+		output_types = select_plan->types;
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
 		if (select_rewrite_needs.distinct && !post_rewrite_facts.aggregates.empty()) {
 			auto &aggregate = *post_rewrite_facts.aggregates.front();
@@ -539,7 +536,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
 		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 		if (select_plan) {
-			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, post_rewrite_facts, output_names);
+			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(context, *select_plan, post_rewrite_facts,
+			                                                           output_names, decomposed_outputs);
+			has_computed_sum_aggregate_projection &= !derived_aggregate_outputs.complete;
 		}
 		add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
 		                        "output_cols=" + to_string(output_names.size()));
@@ -552,8 +551,19 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto ast = LogicalPlanToAst(context, candidate, dialect, time_travel_pins.Resolver(),
 			                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 			auto cte_list = AstToCteList(*ast, dialect);
-			return cte_list->ToQuery(true, output_names);
+			auto sql = cte_list->ToQuery(true, output_names);
+			initial_load_ast = std::move(ast);
+			return sql;
 		};
+		if (post_rewrite_facts.analysis.found_distinct_on && !has_query_dependent_binding) {
+			auto affected_plan = select_plan->Copy(context);
+			if (RemoveDistinctOnWinnerFilters(affected_plan)) {
+				group_recompute_affected_query = serialize_plan(affected_plan);
+				if (!group_recompute_affected_query.empty() && group_recompute_affected_query.back() == ';') {
+					group_recompute_affected_query.pop_back();
+				}
+			}
+		}
 		auto serialize_original = [&]() {
 			try {
 				view_query = serialize_plan(select_plan);
@@ -633,7 +643,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		auto &analysis_query = plan->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? plan->children[0] : plan;
 		auto analysis_names = output_names;
 		string analysis_suffix, analysis_order;
-		StripPublicationModifiers(analysis_query, analysis_names, analysis_suffix, analysis_order);
+		StripPublicationModifiers(context, analysis_query, analysis_names, analysis_suffix, analysis_order);
 	}
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (has_query_dependent_binding) {
@@ -734,7 +744,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// `sum_out` names the stored raw SUM state, including hidden state for cast outputs.
 	string distinct_sum_arg;
 	string distinct_sum_out;
-	vector<DerivedAggregateOutput> distinct_group_inputs;
 	SemiAntiExtract semi_anti_extract;
 	FilteredGroupCountExtract filtered_group_count_extract;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
@@ -876,7 +885,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
 		// demotes back to GROUP_RECOMPUTE.
 		if (!distinct_extracted_cols.empty()) {
-			LogicalAggregate *outer_agg = facts.aggregates.empty() ? nullptr : facts.aggregates.front();
+			auto outer_agg = FindViewOutputAggregate(facts.root);
 			int sum_count = 0;
 			bool unsupported_agg = false;
 			if (outer_agg) {
@@ -896,14 +905,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 						unsupported_agg = true;
 						break;
 					}
-					if (bound.GetChildren().empty() ||
-					    bound.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					auto bcr =
+					    bound.GetChildren().empty() ? nullptr : GetColumnRefThroughCasts(bound.GetChildren()[0].get());
+					if (!bcr) {
 						unsupported_agg = true;
 						break;
 					}
-					auto &bcr = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>();
-					distinct_sum_arg =
-					    bcr.GetAlias().empty() ? bcr.GetName().GetIdentifierName() : bcr.GetAlias().GetIdentifierName();
+					distinct_sum_arg = bcr->GetAlias().empty() ? bcr->GetName().GetIdentifierName()
+					                                           : bcr->GetAlias().GetIdentifierName();
 					distinct_sum_out =
 					    ResolvePlanOutputColumn(ColumnBinding(outer_agg->aggregate_index, ProjectionIndex(agg_index)),
 					                            output_plan, facts, output_names);
@@ -914,27 +923,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 						distinct_sum_out = bound.GetAlias().GetIdentifierName();
 					}
 					sum_count++;
-				}
-				for (auto &node : facts.plan_nodes_post_order) {
-					auto *candidate = node.plan_node;
-					if (candidate->type != LogicalOperatorType::LOGICAL_DISTINCT ||
-					    candidate->GetColumnBindings().size() != distinct_extracted_cols.size()) {
-						continue;
-					}
-					for (idx_t group_index = 0; group_index < outer_agg->groups.size(); group_index++) {
-						auto names = ResolvePlanOutputColumns(
-						    ColumnBinding(outer_agg->group_index, ProjectionIndex(group_index)), output_plan, facts,
-						    output_names);
-						string expression;
-						if (names.empty() || !RenderPlanOutputExpression(*outer_agg->groups[group_index], *candidate,
-						                                                 facts, distinct_extracted_cols, expression)) {
-							throw InternalException("Could not resolve DISTINCT aggregate group input");
-						}
-						for (auto &name : names) {
-							distinct_group_inputs.push_back({std::move(name), expression});
-						}
-					}
-					break;
 				}
 			}
 			if (!outer_agg || unsupported_agg || sum_count != 1) {
@@ -965,8 +953,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                          distinct_extracted_source,
 		                          distinct_extracted_filter,
 		                          distinct_sum_arg,
-		                          distinct_sum_out,
-		                          distinct_group_inputs};
+		                          distinct_sum_out};
+		PopulateDistinctAggregateInputs(context, *planner.binder, facts, output_names, distinct_aux_candidate);
+		if (!distinct_aux_candidate.SelectionTable().empty()) {
+			D_ASSERT(initial_load_ast);
+			distinct_aux_candidate.selected_view_sql = BuildDistinctSelectedViewSQL(
+			    *initial_load_ast, distinct_aux_candidate.selected_input_columns, output_names);
+		}
 		model_input.distinct_aux_candidate = &distinct_aux_candidate;
 	}
 	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux_candidate;
@@ -999,7 +992,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	RefreshMetadata::LeftJoinSecondaryMeta leftjoin_secondary;
 	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
 		leftjoin_secondary =
-		    BuildLeftJoinSecondaryDeltaSQL(context, facts, output_names, view_name, internal_catalog_prefix);
+		    BuildLeftJoinSecondaryDeltaSQL(*planner.binder, facts, output_names, view_name, internal_catalog_prefix);
 		if (leftjoin_secondary.sql.empty()) {
 			// The aggregate MERGE requires the Larson & Zhou correction for null-padded row
 			// transitions. An incomplete correction is not optional: recompute only the groups
@@ -1267,9 +1260,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
-	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
-	string window_order_cols_val = SqlCsvLiteralOrNull(window_order_columns);
-	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
+	string group_cols_val = ViewListSqlLiteralOrNull(cols_to_store);
+	string window_order_cols_val = ViewListSqlLiteralOrNull(window_order_columns);
+	string agg_types_val = ViewListSqlLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)
 	                        ? "null"
 	                        : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
@@ -1310,6 +1303,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		metadata_ddl.push_back(statement);
 	}
 
+	if (!group_recompute_affected_query.empty()) {
+		aux_metadata_ddl.push_back(
+		    BuildUpdateViewJsonSQL("group_recompute_affected_query", group_recompute_affected_query, view_name));
+	}
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
 	}
@@ -1360,9 +1357,15 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		const auto &meta = view_model.distinct_aux;
 		emit_aux("create_mv_distinct_aux", meta.aux_table, "distinct_aux_meta_json",
 		         RefreshMetadata::DistinctAuxMetaToJson(meta), [&](const string &aux_target) {
-			         return BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs,
-			                                               "(" + meta.input_sql + ")", "", replace_aux);
+			         return BuildDistinctAuxStateCreateSQL(aux_target, meta, meta.source, replace_aux);
 		         });
+		if (!meta.SelectionTable().empty()) {
+			add_profile_marker("create_mv_distinct_selection");
+			ddl.push_back(BuildDistinctSelectionCreateSQL(get_aux_state_target(meta.SelectionTable()), meta,
+			                                              get_aux_state_target(meta.aux_table)));
+			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
+			            SqlUtils::QuoteIdentifier(meta.SelectionTable()));
+		}
 	}
 	if (view_model.HasCountDistinctAux()) {
 		const auto &meta = view_model.count_distinct_aux;
@@ -1622,7 +1625,17 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		ddl.push_back(BuildSemiAntiInitialDataSQL(initial_load_target, aux_target, meta.join_type, meta.left_cols,
 		                                          meta.output_cols, meta.null_aware, meta.null_aware_left_col));
 	} else {
-		ddl.push_back("create table " + initial_load_target + " as " + time_travel_pins.StripFrom(context, view_query));
+		auto initial_query = time_travel_pins.StripFrom(context, view_query);
+		if (view_model.HasDistinctAux() &&
+		    (view_model.distinct_aux.representative_input || !view_model.distinct_aux.sign_columns.empty())) {
+			const auto &meta = view_model.distinct_aux;
+			initial_query = UseDistinctRepresentatives(initial_query, meta, get_aux_state_target(meta.aux_table));
+		} else if (view_model.HasDistinctAux() && !view_model.distinct_aux.SelectionTable().empty()) {
+			const auto &meta = view_model.distinct_aux;
+			initial_query = SqlUtils::ReplaceTableReferences(meta.selected_view_sql, "openivm_distinct_selected",
+			                                                 get_aux_state_target(meta.SelectionTable()));
+		}
+		ddl.push_back("create table " + initial_load_target + " as " + initial_query);
 	}
 	if (staged_cross_catalog_replace) {
 		// DuckDB cannot make the DuckLake objects and native metadata atomic
@@ -1713,12 +1726,16 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		auto published_delta =
 		    internal_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name)));
 		vector<string> visible_columns;
-		for (auto &name : output_names) {
+		vector<LogicalType> visible_types;
+		for (idx_t index = 0; index < output_names.size(); index++) {
+			auto &name = output_names[index];
 			if (!IncrementalTableNames::IsInternalColumn(name)) {
 				visible_columns.push_back(name);
+				visible_types.push_back(output_types[index]);
 			}
 		}
 		visible_columns.push_back(openivm::PUBLISHED_ORDINAL_COL);
+		visible_types.push_back(LogicalType::BIGINT);
 		if (parse_data_ref.is_replace && !has_downstream_views && !target_is_ducklake) {
 			ddl.push_back("DROP TABLE IF EXISTS " + published);
 			ddl.push_back("DROP TABLE IF EXISTS " + published_delta);
@@ -1752,7 +1769,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		if (parse_data_ref.is_replace) {
 			ddl.push_back(BuildPublishViewSQL(
-			    view_name, internal_catalog_prefix, published_query, visible_columns, target_is_ducklake,
+			    view_name, internal_catalog_prefix, published_query, visible_columns, visible_types, target_is_ducklake,
 			    SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {}, creation_timestamp,
 			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)));
 		}
@@ -1866,7 +1883,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// the index up in every native view catalog; its full recompute upserts against it.
 	bool explicit_native = metadata_location.explicit_placement && metadata.IsNativeCatalog(view_target_catalog);
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native)) {
+	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native) &&
+	    CanCreateGroupIndex(aggregate_columns, output_names, output_types)) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = SqlUtils::QuoteIdentifier(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +

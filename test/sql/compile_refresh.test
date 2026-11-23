@@ -309,7 +309,9 @@ SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f77617463686573_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%status = case when%removed_at%'
+                 LIKE '%case when%removed_at%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%status = d.status%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_watches',
@@ -325,8 +327,7 @@ FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6
 ----
 1
 
-# Unsupported scalar functions are recorded as incomplete, so even a caller-
-# proven insert-only MIN/MAX batch must use exact affected-group recompute.
+# Scalar functions can now be evaluated from the updated MIN/MAX state.
 statement ok
 CREATE TABLE compile_only_round_events(grp INTEGER, value DOUBLE);
 
@@ -339,7 +340,7 @@ WITH grouped AS (
 SELECT grp, min_value, ROUND(min_value / 3.0, 2) AS rounded_value FROM grouped;
 
 query I
-SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%' THEN 1 ELSE 0 END
+SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":true%' THEN 1 ELSE 0 END
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_';
 ----
 1
@@ -360,6 +361,12 @@ SELECT grp,
        '"complete":true' AS marker,
        ROUND(min_value / 3.0, 2) AS rounded_value
 FROM grouped;
+
+statement ok
+UPDATE openivm_views
+SET derived_aggregate_outputs_json = replace(derived_aggregate_outputs_json,
+    '{"complete":true,', '{"complete":false,')
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f657363617065645f6d65746164617461_';
 
 query I
 SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%'
@@ -412,7 +419,9 @@ SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f6e6573746564_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%high_flag = case when%'
+                 LIKE '%case when%max_value%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%high_flag = d.high_flag%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_nested',
@@ -424,11 +433,11 @@ WHERE stmt_kind = 'data';
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 NOT LIKE '%merge into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
+                 LIKE '%merge into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
+                 NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%insert into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
+                 LIKE '%round(%min_value%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_round',

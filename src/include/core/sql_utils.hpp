@@ -16,6 +16,7 @@ namespace duckdb {
 // Originally from the compiler extension; inlined here to remove the external dependency.
 
 class BaseTableRef;
+class SelectStatement;
 
 struct SessionLocation {
 	string catalog;
@@ -24,6 +25,12 @@ struct SessionLocation {
 
 class SqlUtils {
 public:
+	// SQL equality can merge observably different values, including nested ones.
+	static bool EqualityCanHideValueIdentity(const LogicalType &type);
+	static string NegativeZeroSQL(const string &value);
+	static string FloatingRepresentativeSQL(const string &value, const string &negative_count,
+	                                        const string &total_count);
+	static string ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation = "");
 	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
 	                                     const Identifier &schema) {
 		return EntryLookupInfo(lookup, QualifiedName(catalog, schema, lookup.GetEntryIdentifier()));
@@ -34,8 +41,8 @@ public:
 	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string EscapeSingleQuotes(const string &input);
-	static string SQLToLowercase(const string &sql);
-	static void RemoveRedundantWhitespaces(string &query);
+	// Null for a parse error, multiple statements, or a statement other than SELECT.
+	static unique_ptr<SelectStatement> TryParseSelect(const string &sql);
 	static vector<string> SplitSQLStatements(const string &sql);
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
@@ -84,6 +91,9 @@ public:
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
 	// Repeat each input row count times, preserving an empty result for nonpositive counts.
 	static string BuildRowRepetitionSQL(const string &count, const string &alias, SqlDialect dialect);
+	// Reconstruct a previous native bag, optionally projecting and restricting all inputs before subtraction.
+	static string BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter,
+	                                         const vector<string> &columns = {}, const string &candidate_join = "");
 	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
 	                                        const string &right_prefix);
 	/// Cast specs retain the legacy single-target-type representation while encoding nested/TRY_CAST expressions.
@@ -112,10 +122,6 @@ public:
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.
 	static int64_t ParseRefreshInterval(const string &interval_str);
-
-	/// Extract and strip the REFRESH EVERY clause from a CREATE MATERIALIZED VIEW query.
-	/// Returns the parsed interval in seconds, or -1 if not present.
-	static int64_t ExtractRefreshInterval(string &query);
 
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
 	template <class T>

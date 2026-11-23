@@ -1,7 +1,6 @@
 #include "core/parser_sql_extractors.hpp"
 #include "core/sql_utils.hpp"
 #include "core/openivm_debug.hpp"
-#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
@@ -19,19 +18,6 @@
 
 namespace duckdb {
 namespace {
-
-static unique_ptr<SelectStatement> ParseSelect(const string &sql) {
-	auto parser = Parser::GetBuiltinParser();
-	try {
-		parser.ParseQuery(sql);
-	} catch (const ParserException &) {
-		return nullptr;
-	}
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		return nullptr;
-	}
-	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-}
 
 static SelectNode *AsSelect(QueryNode &node) {
 	return node.type == QueryNodeType::SELECT_NODE ? &node.Cast<SelectNode>() : nullptr;
@@ -150,7 +136,7 @@ static string RenameQualifier(ParsedExpression &expression, const string &table,
 
 bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &out_input_sql, string &out_source,
                           string &out_filter_sql) {
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	if (!statement) {
 		return false;
 	}
@@ -165,17 +151,30 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 			}
 		}
 	}
+	if (!distinct || !distinct->groups.group_expressions.empty() || distinct->having) {
+		return false;
+	}
+	// The bound input resolver handles projections, filters and limits in unary
+	// source subqueries too; do not reject them before it can inspect the plan.
+	auto source = distinct->from_table.get();
+	while (source->type == TableReferenceType::SUBQUERY) {
+		auto select = AsSelect(*source->Cast<SubqueryRef>().subquery->node);
+		if (!select) {
+			return false;
+		}
+		source = select->from_table.get();
+	}
 	string alias;
-	if (!distinct || !ReadSource(*distinct->from_table, out_source, alias) ||
-	    !distinct->groups.group_expressions.empty() || distinct->having) {
+	if (!ReadSource(*source, out_source, alias)) {
 		return false;
 	}
 	for (auto &expression : distinct->select_list) {
 		if (expression->GetExpressionClass() == ExpressionClass::STAR) {
 			return false;
 		}
-		out_cols.push_back(expression->ToString());
+		out_cols.push_back(expression->GetName().GetIdentifierName());
 	}
+	QueryResult::DeduplicateColumns(out_cols);
 	out_filter_sql = ExprSQL(distinct->where_clause);
 	auto input = distinct->Copy();
 	input->modifiers.clear();
@@ -184,9 +183,80 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 	return !out_cols.empty();
 }
 
+string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::DistinctAuxMeta &meta,
+                                  const string &aux_table) {
+	const auto count_column = SqlUtils::QuoteIdentifier(meta.InternalColumn("_count"));
+	const auto &columns = meta.representative_input ? meta.selected_source_columns : meta.cols;
+	auto statement = SqlUtils::TryParseSelect(sql);
+	D_ASSERT(statement);
+	SelectNode *distinct = nullptr;
+	for (auto select : Selects(*statement->node)) {
+		// Repeated DISTINCT expressions retain separate output positions, while
+		// the parser deduplicates GROUP BY keys. A hidden count_star may follow.
+		if (select->select_list.size() < columns.size()) {
+			continue;
+		}
+		bool groups_only = true;
+		for (idx_t i = 0; i < columns.size(); i++) {
+			auto &expression = select->select_list[i];
+			groups_only &= std::any_of(select->groups.group_expressions.begin(), select->groups.group_expressions.end(),
+			                           [&](const auto &group) { return expression->Equals(*group); });
+		}
+		for (auto &group : select->groups.group_expressions) {
+			bool projected = false;
+			for (idx_t i = 0; i < columns.size(); i++) {
+				projected |= select->select_list[i]->Equals(*group);
+			}
+			groups_only &= projected;
+		}
+		for (idx_t i = columns.size(); i < select->select_list.size(); i++) {
+			auto count = MatchFunction(*select->select_list[i], "count_star");
+			groups_only &= count && count->GetArguments().empty() && !count->Filter();
+		}
+		if (!groups_only) {
+			continue;
+		}
+		if (distinct) {
+			throw InternalException("Ambiguous DISTINCT representative input");
+		}
+		distinct = select;
+	}
+	if (!distinct) {
+		throw InternalException("Missing DISTINCT representative input");
+	}
+	vector<string> outputs;
+	auto sign_counts = RefreshMetadata::DistinctSignCountColumns(meta);
+	for (idx_t i = 0; i < columns.size(); i++) {
+		auto value = SqlUtils::QuoteIdentifier(columns[i]);
+		for (const auto &entry : sign_counts) {
+			if (entry.first == columns[i]) {
+				value =
+				    SqlUtils::FloatingRepresentativeSQL(value, SqlUtils::QuoteIdentifier(entry.second), count_column);
+			}
+		}
+		outputs.push_back(value + " AS " +
+		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
+	}
+	for (idx_t i = columns.size(); i < distinct->select_list.size(); i++) {
+		outputs.push_back(count_column + " AS " +
+		                  SqlUtils::QuoteIdentifier(distinct->select_list[i]->GetName().GetIdentifierName()));
+	}
+	auto replacement = SqlUtils::TryParseSelect(
+	    "SELECT " + StringUtil::Join(outputs, ", ") + " FROM " + aux_table + " WHERE " + count_column + " > 0" +
+	    (meta.representative_input ? " AND " + SqlUtils::QuoteIdentifier(meta.InternalColumn("openivm_selected"))
+	                               : ""));
+	auto &selected = replacement->node->Cast<SelectNode>();
+	distinct->select_list = std::move(selected.select_list);
+	distinct->from_table = std::move(selected.from_table);
+	distinct->where_clause = std::move(selected.where_clause);
+	distinct->groups = std::move(selected.groups);
+	OPENIVM_DEBUG_PRINT("[CREATE/REFRESH] Reading DISTINCT representatives from %s\n", aux_table.c_str());
+	return statement->ToString();
+}
+
 bool ExtractCountDistinctAggregate(const string &sql, const vector<string> &group_columns,
                                    const vector<string> &output_names, CountDistinctExtract &out) {
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	auto select = statement ? AsSelect(*statement->node) : nullptr;
 	string alias;
 	if (!select || group_columns.empty() || select->groups.group_expressions.size() != group_columns.size() ||
@@ -222,7 +292,7 @@ bool ExtractCountDistinctAggregate(const string &sql, const vector<string> &grou
 }
 
 bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_names, FilteredGroupCountExtract &out) {
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	if (!statement || output_names.size() != 1) {
 		return false;
 	}
@@ -284,7 +354,7 @@ bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_n
 
 bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	auto &meta = out.meta;
-	auto statement = ParseSelect(sql);
+	auto statement = SqlUtils::TryParseSelect(sql);
 	auto select = statement ? AsSelect(*statement->node) : nullptr;
 	if (!select || !ReadOutputs(*select, meta.output_cols, out.output_exprs, out.output_refs)) {
 		return false;

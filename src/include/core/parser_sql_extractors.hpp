@@ -42,6 +42,8 @@ struct CountDistinctExtract {
 
 bool ExtractInnerDistinct(const string &original_sql, vector<string> &out_cols, string &out_input_sql,
                           string &out_source, string &out_filter_sql);
+string UseDistinctRepresentatives(const string &sql, const RefreshMetadata::DistinctAuxMeta &meta,
+                                  const string &aux_table);
 bool ExtractCountDistinctAggregate(const string &original_sql, const vector<string> &group_columns,
                                    const vector<string> &output_names, CountDistinctExtract &out);
 bool ExtractFilteredGroupCount(const string &original_sql, const vector<string> &output_names,

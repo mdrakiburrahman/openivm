@@ -17,13 +17,12 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
-#include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/parser.hpp"
 #include <chrono>
@@ -381,7 +380,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
-		exec_con.Query("SET preserve_insertion_order=false");
+		Settings::Set<PreserveInsertionOrderSetting>(*exec_con.context, SetScope::SESSION, Value::BOOLEAN(false));
 		// The archive lives in the metadata location exec_con selected (catalog and schema).
 		string archive_catalog;
 		string archive_schema;
@@ -1104,11 +1103,6 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 
 static void RefreshViewsLocked(ClientContext &context, const FunctionParameters &parameters, bool pipeline) {
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
-	// PRAGMA refresh refreshes relational state, not ordered output. Force the
-	// OpenIVM entry point onto DuckDB's unordered execution mode even if this
-	// connection previously had a local preserve_insertion_order=true setting.
-	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
-	                                                              Value::BOOLEAN(false));
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;
@@ -1485,7 +1479,7 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 			program +=
 			    BuildTransactionalRefreshViewSQL(context, metadata_con, location.catalog_name, location.schema_name,
 			                                     node, attached_db_catalog_name, attached_db_schema_name);
-			program += "\n";
+			program += '\n';
 		}
 		if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
 			program += hook_sql + ";\n";

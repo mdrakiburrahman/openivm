@@ -152,7 +152,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
                                                            bool has_left_join, bool flattened_leaves,
                                                            const vector<vector<DeltaJoinKeyProbe>> &key_probes,
-                                                           DeltaSourceCache &source_cache) {
+                                                           DeltaSourceCache &source_cache,
+                                                           const DuckLakeNullPaddingGuard &guard) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -276,6 +277,12 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves, flattened=%s)\n", N,
 	                    flattened_leaves ? "true" : "false");
 
+	uint64_t active_mask = 0;
+	for (size_t leaf = 0; leaf < N; leaf++) {
+		if (!empty_table_delta[leaf]) {
+			active_mask |= 1ULL << leaf;
+		}
+	}
 	for (size_t i = 0; i < N; i++) {
 		// Skip term if this table has no changes since last refresh.
 		if (skip_empty_enabled && empty_table_delta[i]) {
@@ -324,7 +331,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// term's delta. Preserved joins elsewhere in a left-deep star must remain
 		// outer joins so unmatched rows continue to flow to later dimensions.
 		if (has_left_join) {
-			if (flattened_leaves || input.context.model.type == RefreshType::SIMPLE_PROJECTION) {
+			if (flattened_leaves || guard || input.context.model.type == RefreshType::SIMPLE_PROJECTION) {
 				DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << i), input.context.model.type);
 			} else if (leaves[i].is_right_of_left_join) {
 				DemoteLeftJoins(term.get());
@@ -354,9 +361,14 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			    old_get->function.function_info) {
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);
+				func_info.include_local_changes = false;
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned leaf %zu (table_index=%lu) to old snapshot %ld\n", j,
 				                    (unsigned long)old_get->table_index.index, (long)old_snapshots[j]);
 			}
+		}
+
+		if (guard) {
+			guard(term, active_mask, ((1ULL << N) - 1) & ~((1ULL << (i + 1)) - 1));
 		}
 
 		terms.push_back(FinalizeJoinTerm(binder, std::move(term), {}, {mul_binding}, input.mul_type, false));

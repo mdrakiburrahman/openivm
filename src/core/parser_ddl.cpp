@@ -447,10 +447,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	string current_profile_step = "create_mv_unclassified";
 	string current_profile_detail;
 	vector<string> pending_ddl;
-	auto preserve_result = conn->Query("SET preserve_insertion_order=false");
-	if (preserve_result->HasError()) {
-		throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
-	}
+	// SQL SET uses this setting's GLOBAL_DEFAULT scope; keep the helper override private.
+	Settings::Set<PreserveInsertionOrderSetting>(*conn->context, SetScope::SESSION, Value::BOOLEAN(false));
 	auto depth_result = conn->Query("SET max_expression_depth=10000");
 	if (depth_result->HasError()) {
 		throw CatalogException("Failed to configure OpenIVM DDL connection: " + depth_result->GetError());
@@ -1657,9 +1655,9 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 		}
 		sql += statement;
 		if (statement.back() != ';') {
-			sql += ";";
+			sql += ';';
 		}
-		sql += "\n";
+		sql += '\n';
 		if (logical_statement) {
 			logical_statement_count++;
 		}

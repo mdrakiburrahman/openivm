@@ -1,17 +1,21 @@
 #ifndef REFRESH_COMPILER_HPP
 #define REFRESH_COMPILER_HPP
 
-#include "core/openivm_constants.hpp"
+#include "core/derived_aggregate_output.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
+#include <functional>
 #include <unordered_map>
 
 namespace duckdb {
+
+using DerivedAggregateOutputRenderer = std::function<string(const string &, const unordered_map<string, string> &)>;
 
 struct GroupRecomputeDeltaSpec {
 	string base_table;
@@ -41,11 +45,10 @@ struct AggregateGroupsOptions {
 	string delta_ts_filter;
 	vector<string> group_column_names;
 	string catalog_prefix;
-	//! Optional relation SQL supplying the signed aggregate inputs.
-	string delta_source_sql;
 	bool insert_only = false;
 	bool use_ducklake_rowid_upsert = false;
 	vector<string> aggregate_types;
+	vector<AggregateInput> aggregate_inputs;
 	vector<LogicalType> column_types;
 	bool use_current_diff_affected_keys = false;
 	//! Non-null requests a cascade delta from the group-recompute fallback.
@@ -53,6 +56,7 @@ struct AggregateGroupsOptions {
 	//! Replace the compact inline companion with an exact affected-group multiset.
 	bool inline_cascade_delta = false;
 	unordered_map<string, string> derived_output_expressions;
+	DerivedAggregateOutputRenderer render_derived_output;
 	bool derived_output_expressions_complete = false;
 	vector<string> preserved_side_cols;
 	bool force_group_recompute = false;
@@ -63,21 +67,21 @@ struct AggregateGroupsOutcome {
 	bool used_group_recompute = false;
 };
 
-/// Map SQL-quoted SUM output names to their injected non-NULL count columns.
-unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns);
-
 string CompileAggregateGroups(const string &view_name, const vector<string> &column_names,
                               const AggregateGroupsOptions &options, AggregateGroupsOutcome *outcome = nullptr);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
-                               const vector<LogicalType> &column_types = {});
+                               const vector<LogicalType> &column_types = {},
+                               const DerivedAggregateOutputInfo &derived_outputs = {},
+                               const DerivedAggregateOutputRenderer &render_derived_output = {});
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const string &delta_ts_filter = "", const string &catalog_prefix = "",
-                                 bool insert_only = false, string *appended_rows = nullptr);
+                                 const vector<LogicalType> &column_types, const string &delta_ts_filter = "",
+                                 const string &catalog_prefix = "", bool insert_only = false,
+                                 string *appended_rows = nullptr);
 string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
-                              const string &delta_ts_filter = "", bool insert_only = false,
-                              string *appended_rows = nullptr);
+                              const vector<LogicalType> &column_types, const string &delta_ts_filter = "",
+                              bool insert_only = false, string *appended_rows = nullptr);
 vector<string> PartitionOutputColumns(const vector<string> &partition_columns);
 
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",
@@ -108,7 +112,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
                              const string &catalog_prefix = "", bool emit_cascade_delta = false,
                              GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF,
-                             const string &additional_affected_groups = "");
+                             const string &additional_affected_groups = "", const string &affected_query_sql = "");
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM
 /// aggregate. Generates a multi-statement SQL batch:
@@ -123,17 +127,23 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 ///   4. MERGE Δinput into the aux table (count = count + dmult); DELETE rows
 ///   with count ≤ 0.
 ///
-/// `meta` carries the DISTINCT source, tuple columns, filter, SUM state, and group-input lineage.
-/// Emit signed DISTINCT rows for the shared aggregate compiler, which owns NULL
-/// finalization, derived outputs, MERGE, and empty-group cleanup. `column_names`
-/// identifies the injected non-NULL count state for the SUM.
+/// `aux_table`, `distinct_cols`, `delta_source` (the `delta_<source>` table
+/// name), and `last_update` come from `openivm_views.distinct_aux_meta_json`.
+/// `filter_sql` is the WHERE predicate of the DISTINCT body (empty if none) —
+/// applied to both Δinput (filters delta rows that wouldn't have entered the
+/// DISTINCT) and the aux MERGE source. Signed tuple transitions are projected
+/// onto raw SUM/COUNT inputs and integrated by the shared aggregate compilers.
+/// `sum_out` identifies the raw SUM output when metadata has no input lineage.
 string CompileDistinctIncremental(const string &view_name, const RefreshMetadata::DistinctAuxMeta &meta,
                                   const string &delta_source, const string &last_update,
-                                  const vector<string> &group_columns, const vector<string> &column_names,
-                                  const DerivedAggregateOutputInfo &derived_outputs, const string &catalog_prefix = "");
-string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
-                                      const vector<string> &source_exprs, const string &source_relation,
-                                      const string &filter_sql, bool replace);
+                                  const vector<string> &column_names, const AggregateGroupsOptions &options,
+                                  const DerivedAggregateOutputInfo &derived_outputs,
+                                  const std::function<string(const string &)> &render_input_expression = {});
+string DistinctSelectionInputSQL(const RefreshMetadata::DistinctAuxMeta &meta, const string &candidate_table);
+string BuildDistinctSelectionCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
+                                       const string &candidate_table);
+string BuildDistinctAuxStateCreateSQL(const string &target_table, const RefreshMetadata::DistinctAuxMeta &meta,
+                                      const string &source_relation, bool replace);
 string CompileCountDistinctIncremental(const string &view_name, const string &aux_table, const string &delta_source,
                                        const string &last_update, const vector<string> &group_cols,
                                        const vector<string> &group_source_exprs, const string &distinct_col,
