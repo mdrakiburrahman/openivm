@@ -1002,3 +1002,50 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# DuckDB resolves a replacement table even when its stored spelling changes case.
+statement ok
+CREATE TABLE dl.same_b."Case_Source"(k INT, v INT);
+
+statement ok
+INSERT INTO dl.same_b."Case_Source" VALUES (1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW case_source_mv AS
+    SELECT k, SUM(v) AS total FROM dl.same_b."Case_Source" GROUP BY k;
+
+statement ok
+DROP TABLE dl.same_b."Case_Source";
+
+statement ok
+CREATE TABLE dl.same_b.case_source(k INT, v INT);
+
+statement ok
+INSERT INTO dl.same_b.case_source VALUES (3,30),(3,10),(4,20);
+UPDATE dl.same_b.case_source SET v = 5 WHERE k = 3 AND v = 10;
+DELETE FROM dl.same_b.case_source WHERE k = 4;
+
+statement ok
+PRAGMA refresh('case_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM case_source_mv EXCEPT ALL SELECT k, SUM(v) FROM dl.same_b.case_source GROUP BY k)
+    UNION ALL
+    (SELECT k, SUM(v) FROM dl.same_b.case_source GROUP BY k EXCEPT ALL SELECT * FROM case_source_mv)
+);
+----
+0
+
+query I
+SELECT d.source_table_id = (
+    SELECT t.table_id
+    FROM __ducklake_metadata_dl.ducklake_table t
+    JOIN __ducklake_metadata_dl.ducklake_schema s ON t.schema_id = s.schema_id
+    WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL
+      AND t.table_name = 'case_source' AND s.schema_name = 'same_b'
+)
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'case_source_mv';
+----
+true

@@ -1955,9 +1955,10 @@ static string BuildDuckLakeTableAtSQL(const string &catalog_name, const string &
 		       ".end_snapshot > " + snapshot_expr + ")";
 	};
 	return string("SELECT ") + projection + " FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	       "ducklake_schema s ON t.schema_id = s.schema_id WHERE " + visible("t") + " AND " + visible("s") +
-	       " AND t.table_name = '" + SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" +
-	       SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1";
+	       "ducklake_schema s ON t.schema_id = s.schema_id WHERE " + visible("t") + " AND " + visible("s") + " AND " +
+	       SqlUtils::IdentifierEqualsSQL("t.table_name", Value(table_name).ToSQLString()) + " AND " +
+	       SqlUtils::IdentifierEqualsSQL("s.schema_name", Value(schema_filter).ToSQLString()) +
+	       " ORDER BY t.table_id DESC LIMIT 1";
 }
 
 struct DuckLakeTableVersion {
