@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <bitset>
+#include <tuple>
 
 namespace duckdb {
 
@@ -501,6 +502,8 @@ struct TransitioningKeyCTEDefinition {
 	vector<string> names;
 };
 
+using TransitionKeyCTEIndexes = map<std::tuple<size_t, idx_t, bool>, idx_t>;
+
 // Build the set of DISTINCT key values (from base_get's column at key_pos) whose match-count within
 // base_get's own rows ACTUALLY transitions across zero between old (pre-delta) and new (current,
 // post-delta) state -- i.e. old_count>0 && new_count==0, or old_count==0 && new_count>0. A key merely
@@ -509,8 +512,8 @@ struct TransitioningKeyCTEDefinition {
 // still match.
 static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContext &context, Connection &con,
                                                                     Binder &binder, LogicalGet *base_get, idx_t key_pos,
-                                                                    const string &view_name) {
-	auto delta_result = CreateDeltaGetNode(context, con, binder, base_get, view_name);
+                                                                    const string &view_name, bool old_state) {
+	auto delta_result = CreateDeltaGetNode(context, con, binder, base_get, view_name, nullptr, true);
 	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.node), binder);
 	auto delta_bindings = delta_renumbered.op->GetColumnBindings();
 	auto delta_types = delta_renumbered.op->types;
@@ -520,25 +523,27 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 		                        delta_bindings.empty() ? 0 : delta_bindings.size() - 1); // mull-ignore: cxx_sub_to_add
 	}
 	idx_t mul_pos = delta_bindings.size() - 1; // CreateDeltaGetNode/CompactDeltaNode appends multiplicity last.
-	ColumnBinding delta_key_binding = delta_bindings[key_pos];
-	ColumnBinding delta_mul_binding = delta_bindings[mul_pos];
 	LogicalType key_type = delta_types[key_pos];
-	LogicalType mul_type = delta_types[mul_pos];
+	vector<unique_ptr<Expression>> delta_groups;
+	delta_groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, delta_bindings[key_pos]));
+	vector<unique_ptr<Expression>> delta_aggregates;
+	delta_aggregates.push_back(MakeAggregate(
+	    context, "sum", make_uniq<BoundColumnRefExpression>(delta_types[mul_pos], delta_bindings[mul_pos]),
+	    "net_multiplicity"));
+	// A payload UPDATE emits distinct old/new tuples with the same join key.
+	// Only their net weight can establish a key's zero-support transition.
+	delta_renumbered.op = MakeGroupedAggregate(binder, std::move(delta_groups), std::move(delta_aggregates),
+	                                           std::move(delta_renumbered.op));
+	delta_bindings = delta_renumbered.op->GetColumnBindings();
+	ColumnBinding delta_key_binding = delta_bindings[0];
+	ColumnBinding delta_mul_binding = delta_bindings[1];
+	LogicalType mul_type = delta_renumbered.op->types[1];
 
-	// Restrict the current-state count to keys present in this delta before
-	// aggregating. Without this join, every inclusion-exclusion term hashes every
-	// key in the nullable base table even when only one key changed.
+	// Restrict the current-state count to keys present in the delta before
+	// aggregating, rather than hashing every key in the nullable base table.
 	auto affected_delta = renumber_and_rebind_subtree(delta_renumbered.op->Copy(context), binder);
-	auto affected_bindings = affected_delta.op->GetColumnBindings();
-	// Equality is the first impossible binding index and is handled by this exception.
-	if (key_pos >= affected_bindings.size()) { // mull-ignore: cxx_ge_to_gt
-		throw InternalException("DeltaJoin: affected-key position %llu is outside %llu bindings", key_pos,
-		                        affected_bindings.size());
-	}
-	vector<unique_ptr<Expression>> affected_groups;
-	affected_groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, affected_bindings[key_pos]));
-	auto affected_keys = MakeGroupedAggregate(binder, std::move(affected_groups), {}, std::move(affected_delta.op));
-	ColumnBinding affected_key_binding = affected_keys->GetColumnBindings()[0];
+	ColumnBinding affected_key_binding = affected_delta.op->GetColumnBindings()[0];
+	auto affected_keys = std::move(affected_delta.op);
 
 	// Fresh scan of the SAME base table (current/post-delta state), filtered to
 	// affected keys and grouped by key with COUNT(*).
@@ -602,19 +607,18 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 	if (!old_count_expr) {
 		throw InternalException("DeltaJoin: failed to bind '-' for transition check: %s", sub_err.RawMessage());
 	}
-	// Only the DOWNWARD transition (old>0, new=0) is a phantom-NULL-pad risk here: the "other" side
-	// row is LEFT JOINed against base_get's CURRENT (already-merged) state, so a key that just LOST
-	// its last match reads as unmatched in "current" even though it was genuinely matched pre-batch --
-	// that phantom dangling row must be excluded (the higher-order term supplies the real removal row
-	// instead). A key that just GAINED its first match (old=0, new>0) is the opposite: "current"
-	// already reflects that real, new match, so this term's row IS the correct contribution and must
-	// NOT be excluded -- excluding it would drop the row entirely, since no other term re-adds it.
-	auto old_gt_zero = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, std::move(old_count_expr),
-	                                                     make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
-	auto new_eq_zero = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, build_new_count(),
-	                                                     make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
-	auto transition_expr = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
-	                                                             std::move(old_gt_zero), std::move(new_eq_zero));
+	// A kept outer join can invent a NULL pad only at its empty endpoint.
+	// Native terms read current state, so suppress downward transitions. A
+	// DuckLake term pinned to old state instead suppresses upward transitions.
+
+	auto old_support_check = BoundComparisonExpression::Create(
+	    old_state ? ExpressionType::COMPARE_EQUAL : ExpressionType::COMPARE_GREATERTHAN, std::move(old_count_expr),
+	    make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
+	auto new_support_check = BoundComparisonExpression::Create(
+	    old_state ? ExpressionType::COMPARE_GREATERTHAN : ExpressionType::COMPARE_EQUAL, build_new_count(),
+	    make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
+	auto transition_expr = make_uniq<BoundConjunctionExpression>(
+	    ExpressionType::CONJUNCTION_AND, std::move(old_support_check), std::move(new_support_check));
 	auto filter = make_uniq<LogicalFilter>(std::move(transition_expr));
 	filter->children.push_back(std::move(joined));
 	filter->ResolveOperatorTypes();
@@ -636,14 +640,15 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 
 static unique_ptr<TransitioningKeySet>
 GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binder, LogicalGet *base_get, idx_t key_pos,
-                          size_t leaf_index, const string &view_name,
-                          map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                          size_t leaf_index, const string &view_name, bool old_state,
+                          TransitionKeyCTEIndexes &transition_cte_indexes,
                           vector<TransitioningKeyCTEDefinition> &transition_ctes) {
-	auto cache_key = make_pair(leaf_index, key_pos);
+	auto cache_key = std::make_tuple(leaf_index, key_pos, old_state);
 	auto existing = transition_cte_indexes.find(cache_key);
 	idx_t definition_index;
 	if (existing == transition_cte_indexes.end()) {
-		auto transitioning_keys = BuildTransitioningKeySetImpl(context, con, binder, base_get, key_pos, view_name);
+		auto transitioning_keys =
+		    BuildTransitioningKeySetImpl(context, con, binder, base_get, key_pos, view_name, old_state);
 		D_ASSERT(transitioning_keys->node->types.size() == 1);
 		TransitioningKeyCTEDefinition definition;
 		definition.cte_index = binder.GenerateTableIndex();
@@ -685,11 +690,22 @@ GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binde
 // its own delta table on the join key, excluding any key present there. Only applies when the
 // null-supplying side is a single, unwrapped base-table leaf directly under the join (bails
 // silently otherwise, matching this file's existing unsupported-shape convention).
-static void
-GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &binder, LogicalOperator *node,
-                              const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask, const string &view_name,
-                              bool portable_anti_guard, map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
-                              vector<TransitioningKeyCTEDefinition> &transition_ctes, vector<size_t> &path) {
+static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &binder,
+                                          LogicalOperator *node, const vector<JoinLeafInfo> &leaves,
+                                          uint64_t leaf_has_delta_mask, uint64_t old_state_mask,
+                                          const string &view_name, bool portable_anti_guard,
+                                          TransitionKeyCTEIndexes &transition_cte_indexes,
+                                          vector<TransitioningKeyCTEDefinition> &transition_ctes,
+                                          vector<size_t> &path) {
+	// Guard children before wrapping the preserved subtree in an anti-join.
+	// The leaf paths describe the original tree and would be shifted by that wrapper.
+	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
+		path.push_back(ci);
+		GuardKeptOuterJoinsForMaskRec(context, con, binder, node->children[ci].get(), leaves, leaf_has_delta_mask,
+		                              old_state_mask, view_name, portable_anti_guard, transition_cte_indexes,
+		                              transition_ctes, path);
+		path.pop_back();
+	}
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
 		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT) && !j->conditions.empty()) {
@@ -699,18 +715,24 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 			// resolution below must use j->children[null_side_child] directly -- that subtree lives
 			// in `term`'s OWN freshly-renumbered copy, whereas leaves[i].node/.get are stale pointers
 			// into the ORIGINAL (pre-copy) plan and carry different table indices entirely.
-			path.push_back(null_side_child);
+			idx_t other_child = 1 - null_side_child;
+			vector<LogicalOperator *> null_side_chain;
+			LogicalGet *current_null_side_get = FindGetInSubtree(j->children[null_side_child].get(), &null_side_chain);
+			auto null_path = path;
+			null_path.push_back(null_side_child);
 			size_t null_leaf_idx = SIZE_MAX;
 			for (size_t i = 0; i < leaves.size(); i++) {
-				if (leaves[i].path == path) {
+				// Legacy leaves stop at the wrapper; flattened leaves end at its GET.
+				if (leaves[i].path == null_path ||
+				    (leaves[i].path.size() == null_path.size() + null_side_chain.size() &&
+				     std::equal(null_path.begin(), null_path.end(), leaves[i].path.begin()) &&
+				     std::all_of(std::next(leaves[i].path.begin(), static_cast<int64_t>(null_path.size())),
+				                 leaves[i].path.end(), [](size_t child) { return child == 0; }))) {
 					null_leaf_idx = i;
 					break;
 				}
 			}
-			path.pop_back();
-			idx_t other_child = 1 - null_side_child;
-			vector<LogicalOperator *> null_side_chain;
-			LogicalGet *current_null_side_get = FindGetInSubtree(j->children[null_side_child].get(), &null_side_chain);
+
 			if (current_null_side_get && null_leaf_idx != SIZE_MAX && (leaf_has_delta_mask & (1ULL << null_leaf_idx))) {
 				auto &cond = j->conditions[0];
 				// null_key_expr references the null-supplying side (used to size/position the Δ-scan probe
@@ -743,9 +765,12 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 					// transition means "this key's presence here is fully owned by the higher-order
 					// term" -- matching the same match-count-transition principle as the secondary-delta
 					// fix, just applied here to avoid a double-count instead of to add a missing row.
-					auto transitioning_keys =
-					    GetTransitioningKeySetRef(context, con, binder, current_null_side_get, key_pos, null_leaf_idx,
-					                              view_name, transition_cte_indexes, transition_ctes);
+					auto transitioning_keys = GetTransitioningKeySetRef(
+					    context, con, binder,
+					    old_state_mask & (1ULL << null_leaf_idx) ? GetLeafScan(leaves[null_leaf_idx])
+					                                             : current_null_side_get,
+					    key_pos, null_leaf_idx, view_name, (old_state_mask & (1ULL << null_leaf_idx)) != 0,
+					    transition_cte_indexes, transition_ctes);
 					auto &other_bcr = other_key_expr->Cast<BoundColumnRefExpression>();
 					auto left_expr =
 					    make_uniq<BoundColumnRefExpression>(other_bcr.GetReturnType(), other_bcr.Binding());
@@ -791,22 +816,15 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 			}
 		}
 	}
-	// Recursing over every child is required by the validated join tree; the >= mutant only skips descendants.
-	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
-		path.push_back(ci);
-		GuardKeptOuterJoinsForMaskRec(context, con, binder, node->children[ci].get(), leaves, leaf_has_delta_mask,
-		                              view_name, portable_anti_guard, transition_cte_indexes, transition_ctes, path);
-		path.pop_back();
-	}
 }
 
 static void GuardKeptOuterJoinsForMask(ClientContext &context, Connection &con, Binder &binder, LogicalOperator *node,
                                        const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
-                                       const string &view_name, bool portable_anti_guard,
-                                       map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                                       uint64_t old_state_mask, const string &view_name, bool portable_anti_guard,
+                                       TransitionKeyCTEIndexes &transition_cte_indexes,
                                        vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	vector<size_t> path;
-	GuardKeptOuterJoinsForMaskRec(context, con, binder, node, leaves, leaf_has_delta_mask, view_name,
+	GuardKeptOuterJoinsForMaskRec(context, con, binder, node, leaves, leaf_has_delta_mask, old_state_mask, view_name,
 	                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
 }
 
@@ -1460,7 +1478,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	}
 
 	uint64_t pruned_count = 0;
-	map<pair<size_t, idx_t>, idx_t> transition_cte_indexes;
+	TransitionKeyCTEIndexes transition_cte_indexes;
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu, "
 	                    "known_empty_mask=%lu)\n",
 	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask,
@@ -1557,7 +1575,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 			if (leaf_has_delta_mask) {
 				bool portable_anti_guard = compile_facts.target_dialect != SqlDialect::DUCKDB;
 				GuardKeptOuterJoinsForMask(context, input.context.metadata_con, binder, term.get(), leaves,
-				                           leaf_has_delta_mask, input.context.view, portable_anti_guard,
+				                           leaf_has_delta_mask, 0, input.context.view, portable_anti_guard,
 				                           transition_cte_indexes, transition_ctes);
 			}
 		}
@@ -1905,8 +1923,25 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	// Source watermarks and delta tables are read once per compile, not once per term and leaf.
 	DeltaSourceCache source_cache;
 	if (all_ducklake) {
+		TransitionKeyCTEIndexes transition_cte_indexes;
+		DuckLakeNullPaddingGuard guard;
+		if (!input.context.model.group_columns.empty() && !input.context.model.aggregate_types.empty()) {
+			RefreshMetadata metadata(input.context.metadata_con);
+			RefreshMetadata::LeftJoinSecondaryMeta secondary;
+			// Old stored correction programs use the previous primary-delta convention.
+			if (metadata.GetLeftJoinSecondaryMeta(input.context.view, secondary) &&
+			    (secondary.sql.find(openivm::LJSEC_OLD_SOURCE_PREFIX) != string::npos ||
+			     secondary.sql.find(openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX) != string::npos)) {
+				guard = [&](unique_ptr<LogicalOperator> &term, uint64_t active_mask, uint64_t old_mask) {
+					GuardKeptOuterJoinsForMask(context, input.context.metadata_con, binder, term.get(), leaves,
+					                           active_mask, old_mask, input.context.view,
+					                           compile_facts.target_dialect != SqlDialect::DUCKDB,
+					                           transition_cte_indexes, transition_ctes);
+				};
+			}
+		}
 		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake, key_probes,
-		                               source_cache);
+		                               source_cache, guard);
 	} else if (regular_nterm) {
 		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask, has_left_join,
 		                              join_facts.existing_multiplicity_bindings, source_cache);

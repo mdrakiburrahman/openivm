@@ -1047,8 +1047,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						               SqlUtils::EscapeValue(delta_name) + "')";
 					}
 					// Insertions carry weight +1 and deletions -1.
-					string result = "(SELECT " + qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) +
-					                " AS __m FROM " + relation + where_clause + ")";
+					string projection =
+					    key_col.empty() ? "*" : qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) + " AS __m";
+					string result = "(SELECT " + projection + " FROM " + relation + where_clause + ")";
 					lj_delta_source_cache[cache_key] = result;
 					return result;
 				};
@@ -1076,6 +1077,42 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
 					                                            pres_src);
 				}
+				unordered_map<string, string> previous_sources;
+				ljsec.sql = SqlUtils::RewriteTableReferences(ljsec.sql, [&](const vector<string> &parts) -> string {
+					if (parts.size() != 1) {
+						return "";
+					}
+					if (StringUtil::StartsWith(parts[0], openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX)) {
+						auto source = parts[0].substr(string(openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX).size());
+						auto delta = build_ljsec_delta_source(source, "");
+						lj_ok = lj_ok && !delta.empty();
+						return delta;
+					}
+					if (!StringUtil::StartsWith(parts[0], openivm::LJSEC_OLD_SOURCE_PREFIX)) {
+						return "";
+					}
+					auto source = parts[0].substr(string(openivm::LJSEC_OLD_SOURCE_PREFIX).size());
+					auto cached = previous_sources.find(source);
+					if (cached != previous_sources.end()) {
+						return cached->second;
+					}
+					auto key = ResolveDeltaMetadataKey(metadata, view_name, source, delta_table_names);
+					if (metadata.IsDuckLakeTable(view_name, key)) {
+						auto snapshot = metadata.GetLastSnapshotId(view_name, key);
+						if (snapshot < 0) {
+							throw CatalogException("Missing previous LEFT JOIN snapshot for '%s'", source);
+						}
+						return previous_sources[source] = source + " AT (VERSION => " + to_string(snapshot) + ")";
+					}
+					auto input = ResolveTrackedSourceInput(metadata, con, view_name, source, delta_table_names,
+					                                       view_catalog_name, view_schema_name,
+					                                       attached_db_catalog_name, attached_db_schema_name);
+					return previous_sources[source] = SqlUtils::BuildPreviousSourceRowsSQL(
+					           input.table_sql, input.delta_sql,
+					           string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(input.last_update) +
+					               "'::TIMESTAMP");
+				});
+
 				if (!lj_ok) {
 					// Could not resolve a row source (e.g. missing snapshot metadata). Emitting the SQL with
 					// placeholders intact would be a syntax error. The primary MERGE is not correct without

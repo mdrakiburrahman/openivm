@@ -951,7 +951,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	RefreshMetadata::LeftJoinSecondaryMeta leftjoin_secondary;
 	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
 		leftjoin_secondary =
-		    BuildLeftJoinSecondaryDeltaSQL(context, facts, output_names, view_name, internal_catalog_prefix);
+		    BuildLeftJoinSecondaryDeltaSQL(*planner.binder, facts, output_names, view_name, internal_catalog_prefix);
 		if (leftjoin_secondary.sql.empty()) {
 			// The aggregate MERGE requires the Larson & Zhou correction for null-padded row
 			// transitions. An incomplete correction is not optional: recompute only the groups

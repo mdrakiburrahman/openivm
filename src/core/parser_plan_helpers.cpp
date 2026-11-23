@@ -33,6 +33,7 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/remove_unused_columns.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -3201,8 +3202,107 @@ static string ResolveSourceBase(const CreateMVPlanFacts &facts, LogicalGet &get)
 	return facts.source_table_info.count(identity) ? identity : string();
 }
 
+// A match-key filter can travel down joins and direct projections to its source.
+static bool CanFilterPreviousSourceKey(LogicalOperator &node, ColumnBinding key, const LogicalGet &source) {
+	switch (node.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
+		if (&node != &source || key.table_index != source.table_index) {
+			return false;
+		}
+		auto &ids = source.GetColumnIds();
+		return key.column_index < ids.size() && !ids[key.column_index].IsVirtualColumn() &&
+		       !ids[key.column_index].HasChildren();
+	}
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto &projection = node.Cast<LogicalProjection>();
+		if (key.table_index != projection.table_index || key.column_index >= projection.expressions.size()) {
+			return false;
+		}
+		auto &expr = *projection.expressions[key.column_index];
+		return expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		       CanFilterPreviousSourceKey(*node.children[0], expr.Cast<BoundColumnRefExpression>().Binding(), source);
+	}
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_FILTER:
+		for (auto &child : node.children) {
+			auto bindings = child->GetColumnBindings();
+			if (std::find(bindings.begin(), bindings.end(), key) != bindings.end()) {
+				return CanFilterPreviousSourceKey(*child, key, source);
+			}
+		}
+		return false;
+	default:
+		return false;
+	}
+}
+
+static string BuildLeftJoinPreviousPreservedSQL(const string &sql, const CreateMVPlanFacts &facts,
+                                                LogicalOperator &plan, const string &key_source,
+                                                const string &filter_key) {
+	struct PreviousSource {
+		std::set<string> columns;
+		idx_t occurrences = 0;
+	};
+	unordered_map<string, PreviousSource> sources;
+	vector<LogicalOperator *> pending {&plan};
+	while (!pending.empty()) {
+		auto &node = *pending.back();
+		pending.pop_back();
+		for (auto &child : node.children) {
+			pending.push_back(child.get());
+		}
+		if (node.type != LogicalOperatorType::LOGICAL_GET) {
+			continue;
+		}
+		auto &get = node.Cast<LogicalGet>();
+		auto identity = ResolveSourceBase(facts, get);
+		if (identity.empty()) {
+			continue;
+		}
+		auto &source = sources[identity];
+		source.occurrences++;
+		for (auto &column : get.GetColumnIds()) {
+			auto index = column.GetPrimaryIndex();
+			if (!column.IsVirtualColumn() && index < get.names.size()) {
+				source.columns.insert(get.names[index].GetIdentifierName());
+			}
+		}
+	}
+
+	return SqlUtils::RewriteTableReferences(sql, [&](const vector<string> &parts) -> string {
+		if (parts.size() != 3) {
+			return "";
+		}
+		auto identity = SqlUtils::FullName(parts[0], parts[1], parts[2]);
+		if (facts.source_table_info.count(identity) == 0) {
+			return "";
+		}
+		auto previous = SqlUtils::QuoteIdentifier(string(openivm::LJSEC_OLD_SOURCE_PREFIX) + identity);
+		if (facts.ducklake_table_info.count(identity) != 0) {
+			return previous;
+		}
+		auto source = sources.find(identity);
+		if (source == sources.end() || source->second.columns.empty()) {
+			return previous;
+		}
+		// A repeated table can play several roles. Restrict it by key only when the
+		// key originates from a single occurrence through direct bindings.
+		const bool keyed = !filter_key.empty() && identity == key_source && source->second.occurrences == 1;
+		string candidates =
+		    keyed ? " SEMI JOIN (SELECT __k FROM __transitions WHERE __newc > 0) openivm_first_match ON "
+		            "openivm_scope_source." +
+		                SqlUtils::QuoteIdentifier(filter_key) + " = openivm_first_match.__k"
+		          : " SEMI JOIN (SELECT 1 FROM __transitions WHERE __newc > 0 LIMIT 1) openivm_first_match "
+		            "ON TRUE";
+		auto delta = SqlUtils::QuoteIdentifier(string(openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX) + identity);
+		vector<string> columns(source->second.columns.begin(), source->second.columns.end());
+		return SqlUtils::BuildPreviousSourceRowsSQL(identity, delta, "", columns, candidates);
+	});
+}
+
 // Appends this level's SQL and source identities to `meta`; false when the level is unsupported.
-static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
+static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFacts &facts,
                                            const vector<string> &output_names, const string &view_name,
                                            LogicalComparisonJoin *oj, size_t level,
                                            const std::set<TableIndex> &null_tables,
@@ -3261,12 +3361,9 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 	}
 	string qcol = SqlUtils::QuoteIdentifier(inner_col);
 
-	// The correction below assumes a dangling (null-padded) row for this key is ALREADY materialized
-	// in the view -- true only if the preserved-side row (e.g. the order) existed before this refresh
-	// batch. If the preserved-side row is itself brand new in this same batch (e.g. a freshly inserted
-	// order that immediately gets its first line), no dangling row was ever materialized, and applying
-	// this correction would spuriously subtract a row that never existed. Resolve the preserved side's
-	// own base table/column so we can gate on "did this key exist before this batch's delta."
+	// Losing the last inner match creates a NULL-padded row for every current preserved row,
+	// including rows inserted in this batch. Gaining the first match must retract a NULL pad
+	// for old preserved rows; new rows never materialized that pad.
 	LogicalGet *pres_get = nullptr;
 	string pres_col;
 	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get) {
@@ -3277,13 +3374,9 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 		return false;
 	}
 	if (pres_get->table_index == inner_get->table_index || StringUtil::CIEquals(pres_identity, inner_identity)) {
-		// Self-referencing deepest join (preserved and inner sides are the same base table): the
-		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
-		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
-		// shape.
+		// This transition program assumes independently tracked preserved and nullable inputs.
 		return false;
 	}
-	string pres_qcol = SqlUtils::QuoteIdentifier(pres_col);
 
 	// Classify each aggregate output column's contribution to a null-padded row of the deepest join.
 	// output_names layout: [group cols (G)] [visible aggregates (agg.expressions, in order)] [hidden helpers].
@@ -3345,61 +3438,54 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 		}
 	}
 
-	// Build the preserved-side subquery X via LPTS, naming the join key "__k" and each group col "__g<i>".
+	// The secondary delta consumes only group keys and the join key. Prune the
+	// copied subtree so unused source columns do not enter old-row matching.
+	auto &context = binder.context;
 	auto x_plan = oj->children[0]->Copy(context);
 	x_plan->ResolveOperatorTypes();
 	auto x_bindings = x_plan->GetColumnBindings();
-	vector<ColumnBinding> group_bindings;
-	for (auto &ge : agg.groups) {
-		auto *gr = GetColumnRefThroughCasts(ge.get());
-		if (!gr) {
+	vector<unique_ptr<Expression>> expressions;
+	vector<string> x_names;
+	auto add_output = [&](ColumnBinding binding, const string &name) {
+		auto pos = std::find(x_bindings.begin(), x_bindings.end(), binding);
+		if (pos == x_bindings.end()) {
 			return false;
 		}
-		group_bindings.push_back(gr->Binding());
-	}
-	vector<string> x_names(x_bindings.size());
-	int key_pos = -1;
-	vector<int> group_pos(G, -1);
-	// A column can carry only ONE alias in the emitted column list. When the join key IS also a group
-	// column (e.g. GROUP BY the same column the deepest join uses -- common in star schemas), the group
-	// alias wins and no "__k" column exists, so referencing X."__k" failed to bind. Track the alias the
-	// key actually ended up with and use that instead of assuming "__k".
-	string key_alias = "__k";
-	for (size_t i = 0; i < x_bindings.size(); i++) {
-		x_names[i] = "__x" + std::to_string(i);
-		if (x_bindings[i] == key_pres) {
-			x_names[i] = "__k";
-			key_pos = static_cast<int>(i);
-		}
-		for (size_t gi = 0; gi < G; gi++) {
-			if (x_bindings[i] == group_bindings[gi]) {
-				x_names[i] = "__g" + std::to_string(gi);
-				group_pos[gi] = static_cast<int>(i);
-				if (key_pos == static_cast<int>(i)) {
-					key_alias = x_names[i];
-				}
-			}
+		expressions.push_back(make_uniq<BoundColumnRefExpression>(x_plan->types[pos - x_bindings.begin()], binding));
+		x_names.push_back(name);
+		return true;
+	};
+	for (idx_t i = 0; i < G; i++) {
+		auto *group = GetColumnRefThroughCasts(agg.groups[i].get());
+		if (!group || !add_output(group->Binding(), "__g" + to_string(i))) {
+			return false;
 		}
 	}
-	if (key_pos < 0) {
+	if (!add_output(key_pres, "__k")) {
 		return false;
 	}
-	for (size_t gi = 0; gi < G; gi++) {
-		if (group_pos[gi] < 0) {
-			return false;
-		}
-	}
-	string x_sql;
-	SqlDialect dialect = SqlDialect::DUCKDB;
-	auto ast = LogicalPlanToAst(context, x_plan, dialect, {}, CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
-	auto cte_list = AstToCteList(*ast, dialect);
-	x_sql = cte_list->ToQuery(true, x_names);
+	auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(expressions));
+	projection->children.push_back(std::move(x_plan));
+	x_plan = std::move(projection);
+	Optimizer optimizer(binder, context);
+	RemoveUnusedColumns(optimizer).VisitOperator(x_plan);
+	x_plan->ResolveOperatorTypes();
+
+	auto ast = LogicalPlanToAst(context, x_plan, SqlDialect::DUCKDB, {},
+	                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
+	auto cte_list = AstToCteList(*ast, SqlDialect::DUCKDB);
+	auto x_sql = cte_list->ToQuery(true, x_names);
 	if (!x_sql.empty() && x_sql.back() == ';') {
 		x_sql.pop_back();
 	}
 	if (x_sql.empty()) {
 		return false;
 	}
+
+	// Project the scan inputs before restoring their bags. Unused columns can be
+	// volatile generated values and must not participate in row matching.
+	auto filter_key = CanFilterPreviousSourceKey(*oj->children[0], key_pres, *pres_get) ? pres_col : string();
+	auto old_x_sql = BuildLeftJoinPreviousPreservedSQL(x_sql, facts, *x_plan, pres_identity, filter_key);
 
 	// delta_mv columns: group cols + aggregate cols + openivm_multiplicity (matches the primary INSERT).
 	string col_list;
@@ -3413,29 +3499,29 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 		sel += contribs[j] + ", ";
 	}
 	col_list += "openivm_multiplicity";
-	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
 	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
 	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
 	string dmv = delta_view_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
-	// The two delta row sources are placeholders resolved at refresh: a regular table reads its
+	// The inner delta row source is resolved at refresh: a regular table reads its
 	// openivm_delta_<table>, a DuckLake table reads ducklake_table_insertions/deletions between
-	// snapshots (whose IDs only exist at refresh time). Both substitutions yield columns (__k, __m).
+	// snapshots (whose IDs only exist at refresh time). It yields columns (__k, __m).
 	string inner_delta_src =
 	    string(openivm::LJSEC_INNER_DELTA_PREFIX) + std::to_string(level) + string(openivm::LJSEC_PLACEHOLDER_SUFFIX);
-	string pres_delta_src =
-	    string(openivm::LJSEC_PRES_DELTA_PREFIX) + std::to_string(level) + string(openivm::LJSEC_PLACEHOLDER_SUFFIX);
-	// The correlated LATERAL form is deliberate: rewriting these as pre-aggregated CTEs restricted to
-	// the delta keys measured ~40% SLOWER at TPC-H SF50 (DuckDB already decorrelates them well).
-	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel +
-	             "\nFROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src + " GROUP BY __k) __t\nJOIN (" + x_sql +
-	             ") X ON X.\"" + key_alias + "\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_identity +
-	             " ib WHERE ib." + qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " +
-	             pres_identity + " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " +
-	             pres_delta_src +
-	             " __pd WHERE __pd.__k = __t.__k), 0) AS __old_pres_count) __op"
-	             "\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND __old_pres_count > 0;";
+	// Share right-side transition counts between the current and old preserved inputs.
+	// Keep the correlated count: DuckDB decorrelates it efficiently without an
+	// additional full GROUP BY over the right table.
+	string transitions = "SELECT __t.__k, __newc FROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src +
+	                     " GROUP BY __k) __t, LATERAL (SELECT (SELECT COUNT(*) FROM " + inner_identity +
+	                     " ib WHERE ib." + qcol +
+	                     " = __t.__k) AS __newc) __n WHERE (__newc > 0) <> ((__newc - __t.dsum) > 0)";
+	string sql = "INSERT INTO " + dmv + " (" + col_list + ") WITH __transitions AS (" + transitions + ") SELECT " +
+	             sel + "1 FROM __transitions __t JOIN (" + x_sql +
+	             ") X ON X.__k = __t.__k WHERE __t.__newc = 0 UNION ALL SELECT " + sel +
+	             "-1 FROM __transitions __t JOIN (" + old_x_sql + ") X ON X.__k = __t.__k WHERE __t.__newc > 0;";
+	OPENIVM_DEBUG_PRINT("[CREATE] LEFT JOIN secondary level %zu uses current/previous preserved rows\n", level);
+
 	meta.sql += (meta.sql.empty() ? "" : "\n") + sql;
 	meta.inner_tables.push_back(inner_identity);
 	meta.inner_keys.push_back(inner_col);
@@ -3459,8 +3545,7 @@ static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateM
 // The per-level SQL fragments are concatenated and the two source identities per level are stored as
 // index-aligned arrays, so refresh can resolve each level's placeholders independently (a regular
 // table reads its delta table, a DuckLake table reads snapshot insertions/deletions).
-RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientContext &context,
-                                                                      const CreateMVPlanFacts &facts,
+RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(Binder &binder, const CreateMVPlanFacts &facts,
                                                                       const vector<string> &output_names,
                                                                       const string &view_name,
                                                                       const string &delta_view_catalog_prefix) {
@@ -3486,7 +3571,7 @@ RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientCont
 		// bare table -- see the note in BuildLeftJoinSecondaryForLevel for why the primary delta does
 		// NOT cover that case.
 		auto null_tables = ComputeNullTablesForLevel(facts, oj, join_inner_tables);
-		if (!BuildLeftJoinSecondaryForLevel(context, facts, output_names, view_name, oj, level, null_tables,
+		if (!BuildLeftJoinSecondaryForLevel(binder, facts, output_names, view_name, oj, level, null_tables,
 		                                    delta_view_catalog_prefix, meta)) {
 			// An unsupported level makes the whole correction incomplete, and a partial correction is
 			// worse than none (it would double-count the levels it does cover). Bail entirely.
