@@ -2033,7 +2033,9 @@ RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name, const st
 		if (previous_id < 0 || (previous_id == current.table_id && current.begin_snapshot > last_snapshot_id)) {
 			// An older build could store the replacement ID before refreshing. A
 			// table version that starts after the watermark cannot verify that ID.
-			previous_id = GetDuckLakeTableIdAt(catalog_name, schema_name, source_name, last_snapshot_id);
+			previous_id = last_snapshot_id == current_snapshot_id
+			                  ? current.table_id
+			                  : GetDuckLakeTableIdAt(catalog_name, schema_name, source_name, last_snapshot_id);
 		}
 		identity.changed = previous_id != identity.current_table_id;
 		OPENIVM_DEBUG_PRINT("[DuckLake] Probed source identity for %s.%s: %lld -> %lld\n", view_name.c_str(),
