@@ -920,6 +920,10 @@ CREATE MATERIALIZED VIEW replaced_source_mv AS
     SELECT k, SUM(v) AS total FROM dl.replaced_source GROUP BY k;
 
 statement ok
+CREATE MATERIALIZED VIEW replaced_source_upgrade_mv AS
+    SELECT k, SUM(v) AS total FROM dl.replaced_source GROUP BY k;
+
+statement ok
 CREATE TEMP TABLE replaced_source_before AS
 SELECT d.source_table_id, d.last_snapshot_id
 FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
@@ -971,3 +975,30 @@ FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), replaced_sou
 WHERE v.view_sql_name = 'replaced_source_mv';
 ----
 true	true
+
+# Simulate an older build compiling a refresh and prematurely consuming the new table ID.
+statement ok
+UPDATE openivm_delta_tables AS pending
+SET source_table_id = completed.source_table_id
+FROM openivm_delta_tables AS completed
+WHERE pending.view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'replaced_source_upgrade_mv')
+  AND completed.view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'replaced_source_mv');
+
+query II
+SELECT d.source_table_id <> b.source_table_id, d.last_snapshot_id = b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), replaced_source_before b
+WHERE v.view_sql_name = 'replaced_source_upgrade_mv';
+----
+true	true
+
+statement ok
+PRAGMA refresh('replaced_source_upgrade_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM replaced_source_upgrade_mv EXCEPT ALL SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k)
+    UNION ALL
+    (SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k EXCEPT ALL SELECT * FROM replaced_source_upgrade_mv)
+);
+----
+0

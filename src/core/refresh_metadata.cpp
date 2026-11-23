@@ -1946,6 +1946,39 @@ int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string
 	return value.IsNull() ? -1 : value.GetValue<int64_t>();
 }
 
+static string BuildDuckLakeTableAtSQL(const string &catalog_name, const string &schema_name, const string &table_name,
+                                      const string &snapshot_expr, const char *projection) {
+	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
+	string schema_filter = schema_name.empty() ? "main" : schema_name;
+	auto visible = [&](const string &alias) {
+		return alias + ".begin_snapshot <= " + snapshot_expr + " AND (" + alias + ".end_snapshot IS NULL OR " + alias +
+		       ".end_snapshot > " + snapshot_expr + ")";
+	};
+	return string("SELECT ") + projection + " FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	       "ducklake_schema s ON t.schema_id = s.schema_id WHERE " + visible("t") + " AND " + visible("s") +
+	       " AND t.table_name = '" + SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" +
+	       SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1";
+}
+
+struct DuckLakeTableVersion {
+	int64_t table_id = -1;
+	int64_t begin_snapshot = -1;
+};
+
+static DuckLakeTableVersion ReadDuckLakeTableAt(Connection &con, const string &catalog_name, const string &schema_name,
+                                                const string &table_name, int64_t snapshot_id) {
+	if (catalog_name.empty() || table_name.empty() || snapshot_id < 0) {
+		return {};
+	}
+	auto result = con.Query(BuildDuckLakeTableAtSQL(catalog_name, schema_name, table_name, to_string(snapshot_id),
+	                                                "t.table_id, t.begin_snapshot"));
+	if (result->HasError() || result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
+		return {};
+	}
+	return {result->Collection().GetValue(0, 0).GetValue<int64_t>(),
+	        result->Collection().GetValue(1, 0).GetValue<int64_t>()};
+}
+
 RefreshMetadata::DuckLakeSourceIdentity
 RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name, const string &table_name,
                                                const string &catalog_name, const string &schema_name,
@@ -1962,13 +1995,14 @@ RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name, const st
 		identity.stored_table_id = result->Collection().GetValue(0, 0).GetValue<int64_t>();
 	}
 	auto source_name = SourceTableName(table_name, catalog_name, schema_name);
-	identity.current_table_id = GetDuckLakeTableIdAt(catalog_name, schema_name, source_name, current_snapshot_id);
+	auto current = ReadDuckLakeTableAt(con, catalog_name, schema_name, source_name, current_snapshot_id);
+	identity.current_table_id = current.table_id;
 	identity.resolved = identity.current_table_id >= 0;
 	if (identity.resolved) {
 		auto previous_id = identity.stored_table_id;
-		if (previous_id < 0) {
-			// A legacy view can still refresh incrementally if its previous snapshot
-			// establishes the identity that the missing metadata would have stored.
+		if (previous_id < 0 || (previous_id == current.table_id && current.begin_snapshot > last_snapshot_id)) {
+			// An older build could store the replacement ID before refreshing. A
+			// table version that starts after the watermark cannot verify that ID.
 			previous_id = GetDuckLakeTableIdAt(catalog_name, schema_name, source_name, last_snapshot_id);
 		}
 		identity.changed = previous_id != identity.current_table_id;
@@ -1981,28 +2015,12 @@ RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name, const st
 
 int64_t RefreshMetadata::GetDuckLakeTableIdAt(const string &catalog_name, const string &schema_name,
                                               const string &table_name, int64_t snapshot_id) {
-	if (catalog_name.empty() || table_name.empty() || snapshot_id < 0) {
-		return -1;
-	}
-	auto result = con.Query(BuildDuckLakeTableIdAtSQL(catalog_name, schema_name, table_name, to_string(snapshot_id)));
-	if (result->HasError() || result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
-		return -1;
-	}
-	return result->Collection().GetValue(0, 0).GetValue<int64_t>();
+	return ReadDuckLakeTableAt(con, catalog_name, schema_name, table_name, snapshot_id).table_id;
 }
 
 string RefreshMetadata::BuildDuckLakeTableIdAtSQL(const string &catalog_name, const string &schema_name,
                                                   const string &table_name, const string &snapshot_expr) {
-	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
-	string schema_filter = schema_name.empty() ? "main" : schema_name;
-	auto visible = [&](const string &alias) {
-		return alias + ".begin_snapshot <= " + snapshot_expr + " AND (" + alias + ".end_snapshot IS NULL OR " + alias +
-		       ".end_snapshot > " + snapshot_expr + ")";
-	};
-	return "SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	       "ducklake_schema s ON t.schema_id = s.schema_id WHERE " + visible("t") + " AND " + visible("s") +
-	       " AND t.table_name = '" + SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" +
-	       SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1";
+	return BuildDuckLakeTableAtSQL(catalog_name, schema_name, table_name, snapshot_expr, "t.table_id");
 }
 
 string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
