@@ -46,8 +46,9 @@ SELECT * FROM lake.main.product_totals ORDER BY product;
 ```
 
 The result is `('coffee', 27, 2)` and `('tea', 30, 1)`. OpenIVM creates its control
-tables in `control.openivm_demo`. On a new connection, attach both catalogs again
-under the same names and use the same metadata configuration.
+tables in `control.openivm_demo`. Connections to the same DuckDB instance share its
+attached catalogs. When you reopen DuckDB, attach both catalogs under the same
+names and use the same metadata configuration.
 
 ## Explicit catalog arguments
 
