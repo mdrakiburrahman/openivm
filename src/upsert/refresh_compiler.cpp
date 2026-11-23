@@ -14,6 +14,7 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
 #include <algorithm>
@@ -119,6 +120,71 @@ static bool TryBuildGroupRecomputeAffectedQuery(const string &view_query_sql, st
 		}
 	} catch (const std::exception &) {
 		return false;
+	}
+	return true;
+}
+
+// A joined tuple survives in a candidate superset only when the joins consume rows
+// positively. Reject subqueries, outer joins and other row-selecting join types.
+static bool IsPositiveJoinInput(const TableRef &ref) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		return true;
+	}
+	if (ref.type != TableReferenceType::JOIN) {
+		return false;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	return join.type == JoinType::INNER &&
+	       (join.ref_type == JoinRefType::REGULAR || join.ref_type == JoinRefType::CROSS) &&
+	       (!join.condition || !join.condition->HasSubquery()) && IsPositiveJoinInput(*join.left) &&
+	       IsPositiveJoinInput(*join.right);
+}
+
+static bool IsPositiveJoinSelect(const SelectNode &select) {
+	return select.from_table && IsPositiveJoinInput(*select.from_table) && select.modifiers.empty() &&
+	       !select.having && !select.qualify && !select.sample &&
+	       (!select.where_clause || !select.where_clause->HasSubquery());
+}
+
+static bool CanIncludeDeletedJoinRows(const string &sql, const vector<string> &group_columns) {
+	auto parser = Parser::GetBuiltinParser();
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return false;
+	}
+	auto &root = *parser.statements[0]->Cast<SelectStatement>().node;
+	if (root.type != QueryNodeType::SELECT_NODE) {
+		return false;
+	}
+	auto &select = root.Cast<SelectNode>();
+	auto &groups = select.groups.group_expressions;
+	if (!IsPositiveJoinSelect(select) || groups.empty() || select.groups.grouping_sets.size() != 1) {
+		return false;
+	}
+	for (auto &name : group_columns) {
+		auto key = std::find_if(select.select_list.begin(), select.select_list.end(), [&](const auto &expr) {
+			return StringUtil::CIEquals(expr->GetName().GetIdentifierName(), name);
+		});
+		if (key == select.select_list.end() || (*key)->GetExpressionClass() != ExpressionClass::COLUMN_REF ||
+		    std::none_of(groups.begin(), groups.end(), [&](const auto &group) { return (*key)->Equals(*group); })) {
+			return false;
+		}
+	}
+	// In rendered SQL, scans and joins usually live in CTEs. Only accept
+	// pass-through inputs, since widening rows below a nested aggregate, limit
+	// or window can change the keys computed above it.
+	for (auto &cte : root.cte_map.map) {
+		auto &node = *cte.second->query_node;
+		if (node.type != QueryNodeType::SELECT_NODE || !node.cte_map.map.empty()) {
+			return false;
+		}
+		auto &input = node.Cast<SelectNode>();
+		if (!IsPositiveJoinSelect(input) || !input.groups.group_expressions.empty() ||
+		    std::any_of(input.select_list.begin(), input.select_list.end(), [](const auto &expr) {
+			    return expr->GetExpressionClass() != ExpressionClass::COLUMN_REF;
+		    })) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -1314,7 +1380,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
                              bool emit_cascade_delta, GroupRecomputeAffectedMode affected_mode,
-                             const string &additional_affected_groups, const string &affected_query_sql) {
+                             const string &additional_affected_groups, const string &affected_query_sql,
+                             bool insert_only) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -1351,6 +1418,14 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		                                         emit_cascade_delta);
 	}
 
+	const bool include_deleted_join_rows =
+	    !insert_only && affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA && affected_query_sql.empty() &&
+	    EstimateGroupRecomputeAffectedVariants(delta_table_specs) > 1 &&
+	    CanIncludeDeletedJoinRows(affected_view_query_sql, group_columns);
+	if (include_deleted_join_rows) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] Including deleted rows in join key discovery for %s\n",
+		                    view_name.c_str());
+	}
 	// For each source table T_i, build a "view query restricted to T_i's delta" variant by
 	// substituting the qualified `cat.schema.<base>` reference with a delta-filtered subquery,
 	// then project DISTINCT group_columns. Union across sources gives the affected-keys set.
@@ -1392,16 +1467,17 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		}
 
 		for (idx_t occurrence = 0; occurrence < filtered_variants.size(); occurrence++) {
-			if (!affected_query_sql.empty()) {
-				// Both joined rows may have been deleted in the same batch. Remaining
-				// occurrences need current rows plus both delta images to recover old keys.
+			if (!affected_query_sql.empty() || include_deleted_join_rows) {
+				// A deleted join tuple can need deleted rows on several source occurrences.
+				// Current rows already contain new images; a DISTINCT ON discovery query
+				// retains its existing wider support for finding candidate winners.
 				for (const auto &other : delta_table_specs) {
 					string source_ref = SqlUtils::FindTableReference(filtered_variants[occurrence], other.source_sql);
 					if (source_ref.empty()) {
 						continue;
 					}
 					string candidates = "(SELECT * FROM " + source_ref + " UNION ALL SELECT * FROM " +
-					                    BuildGroupRecomputeDeltaRowsSQL(other) + ")";
+					                    BuildGroupRecomputeDeltaRowsSQL(other, include_deleted_join_rows) + ")";
 					filtered_variants[occurrence] =
 					    SqlUtils::ReplaceTableReferences(filtered_variants[occurrence], source_ref, candidates);
 				}

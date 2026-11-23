@@ -281,14 +281,15 @@ static string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const str
 	       ") FROM " + delta_table_sql + where_clause + ")";
 }
 
-string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec) {
+string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec, bool deleted_only) {
+	string predicate = deleted_only ? string(openivm::MULTIPLICITY_COL) + " < 0" : "";
 	if (!spec.is_ducklake) {
-		return BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update);
+		return BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update, predicate);
 	}
 	return BuildStandardDeltaRowsSQL(
 	    BuildDuckLakeSignedDeltaRelation({spec.ducklake_catalog, spec.ducklake_schema, spec.base_table},
 	                                     spec.last_snapshot_id, spec.current_snapshot_id),
-	    "");
+	    "", predicate);
 }
 
 // Delta substitution finds matched groups, but not the null-extended groups that

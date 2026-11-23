@@ -1464,7 +1464,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_cols, delta_specs,
 		                                     internal_catalog_prefix, emit_cascade_delta_for_recompute, affected_mode,
-		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name));
+		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name),
+		                                     insert_only);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE "
 		                    "(%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
