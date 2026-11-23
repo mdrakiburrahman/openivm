@@ -951,9 +951,9 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 }
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           bool has_unique_index, bool cross_system, const string &attached_catalog,
-                           const string &attached_schema, const string &catalog_prefix, const string &metadata_prefix,
-                           string *out_post_meta, vector<string> *deferred_cleanup,
+                           const string &ducklake_checkpoints, bool has_unique_index, bool cross_system,
+                           const string &attached_catalog, const string &attached_schema, const string &catalog_prefix,
+                           const string &metadata_prefix, string *out_post_meta, vector<string> *deferred_cleanup,
                            const vector<string> &delta_metadata_tables, const string &data_catalog) {
 	string qdt = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	// Indexed keys cannot be deleted and reinserted in the same on-disk transaction.
@@ -970,23 +970,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
 	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = " + string(openivm::UTC_NOW_SQL) +
 	                       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
-	auto delta_tables = metadata.GetDeltaTables(view_name);
-	for (auto &dt : delta_tables) {
-		if (!metadata.IsDuckLakeTable(view_name, dt)) {
-			continue;
-		}
-		auto loc = metadata.GetSourceLocation(view_name, dt, attached_catalog, attached_schema);
-		if (loc.catalog_name.empty()) {
-			continue;
-		}
-		string snapshot_expr =
-		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
-		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
-		auto source_table_id = RefreshMetadata::BuildDuckLakeTableIdAtSQL(loc.catalog_name, loc.schema_name,
-		                                                                  loc.table_name, snapshot_expr);
-		update_ts_sql += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(
-		    view_name, dt, snapshot_expr, delta_metadata_table, "(" + source_table_id + ")");
-	}
+	update_ts_sql += ducklake_checkpoints;
 	string update_ts;
 	if (!cross_system) {
 		update_ts = update_ts_sql;
@@ -995,7 +979,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	}
 
 	string delta_cleanup;
-	for (auto &dt : delta_tables) {
+	for (auto &dt : metadata.GetDeltaTables(view_name)) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			continue;
 		}
