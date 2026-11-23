@@ -1132,3 +1132,87 @@ WHERE v.view_sql_name = 'legacy_totals' AND p.step_name = 'generate_refresh_sql.
 
 statement ok
 RESET openivm_profile_refresh;
+
+# A native MV can recover a replaced DuckLake source inside an explicit transaction.
+statement ok
+CREATE TABLE dl.transactional_source(k INT, v INT);
+INSERT INTO dl.transactional_source VALUES (1,10),(2,20);
+CREATE MATERIALIZED VIEW transactional_source_mv AS
+    SELECT k, SUM(v) AS total FROM dl.transactional_source GROUP BY k;
+CREATE VIEW transactional_source_expected AS SELECT k, SUM(v) AS total FROM dl.transactional_source GROUP BY k;
+
+statement ok
+CREATE TEMP TABLE transactional_source_before AS
+SELECT d.source_table_id, d.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'transactional_source_mv';
+
+statement ok
+DROP TABLE dl.transactional_source;
+CREATE TABLE dl.transactional_source(k INT, v INT);
+INSERT INTO dl.transactional_source VALUES (3,30),(3,10),(4,20);
+UPDATE dl.transactional_source SET v = 5 WHERE v = 10;
+DELETE FROM dl.transactional_source WHERE k = 4;
+
+# Roll back both the recovered rows and the new identity checkpoint.
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('transactional_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM transactional_source_mv EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM transactional_source_mv)
+);
+----
+0
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT d.source_table_id = b.source_table_id, d.last_snapshot_id = b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), transactional_source_before b
+WHERE v.view_sql_name = 'transactional_source_mv';
+----
+true	true
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('transactional_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM transactional_source_mv EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM transactional_source_mv)
+);
+----
+0
+
+statement ok
+COMMIT;
+
+query II
+SELECT d.source_table_id <> b.source_table_id, d.last_snapshot_id > b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), transactional_source_before b
+WHERE v.view_sql_name = 'transactional_source_mv';
+----
+true	true
+
+statement ok
+PRAGMA refresh('transactional_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM transactional_source_mv EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM transactional_source_mv)
+);
+----
+0

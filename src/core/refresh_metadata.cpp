@@ -18,6 +18,8 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -1926,9 +1928,36 @@ bool RefreshMetadata::IsNativeCatalog(const string &catalog_name) {
 	return MetadataLocator::IsNativeCatalog(con, catalog_name);
 }
 
+// Bind and read DuckLake's snapshot function directly so the query pragma can use
+// the caller's transaction without re-entering the locked SQL query interface.
+static int64_t GetTransactionalDuckLakeSnapshot(ClientContext &context, const string &catalog_name) {
+	auto &entry = Catalog::GetEntry<TableFunctionCatalogEntry>(
+	    context,
+	    QualifiedName(Identifier(SYSTEM_CATALOG), Identifier(DEFAULT_SCHEMA), Identifier("ducklake_current_snapshot")));
+	BoundTableFunction function(*entry.functions.GetFunctionByOffset(0));
+	vector<Value> arguments {Value(catalog_name)};
+	named_argument_map_t named_arguments;
+	vector<LogicalType> input_types, result_types;
+	vector<Identifier> input_names, result_names;
+	TableFunctionRef ref;
+	TableFunctionBindInput bind_input(arguments, named_arguments, input_types, input_names,
+	                                  function.function_info.get(), nullptr, function, ref);
+	auto bind_data = function.bind(context, bind_input, result_types, result_names);
+	TableFunctionInitInput init_input(bind_data.get(), vector<column_t> {0}, {}, nullptr);
+	auto global_state = function.init_global(context, init_input);
+	TableFunctionInput scan_input(bind_data.get(), nullptr, global_state.get());
+	DataChunk result;
+	result.Initialize(Allocator::Get(context), result_types);
+	function.function(context, scan_input, result);
+	return result.size() == 0 || result.GetValue(0, 0).IsNull() ? -1 : result.GetValue(0, 0).GetValue<int64_t>();
+}
+
 int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) {
 	if (catalog_name.empty()) {
 		return -1;
+	}
+	if (snapshot_context) {
+		return GetTransactionalDuckLakeSnapshot(*snapshot_context, catalog_name);
 	}
 	auto result = con.Query("SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot()");
 	if (result->HasError()) {

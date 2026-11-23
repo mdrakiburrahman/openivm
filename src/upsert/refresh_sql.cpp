@@ -517,7 +517,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string internal_schema_name = view_schema_name;
 	string internal_catalog_prefix = catalog_prefix;
 	auto metadata_start = profile_now();
-	RefreshMetadata metadata(con);
+	RefreshMetadata metadata(con, owned_connection ? nullptr : &context);
 	auto delta_metadata_tables = active_facts.target_dialect == SqlDialect::DUCKDB
 	                                 ? RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)
 	                                 : vector<string>();

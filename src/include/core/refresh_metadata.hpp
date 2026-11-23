@@ -17,6 +17,8 @@ class TransactionalMVMetadataState;
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class RefreshMetadata {
 	Connection &con;
+	// Explicit refreshes plan using a helper but execute at the caller's DuckLake snapshot.
+	optional_ptr<ClientContext> snapshot_context;
 	Value ReadViewValue(const string &view_name, const string &column);
 	string ReadViewString(const string &view_name, const string &column);
 	bool ReadViewBool(const string &view_name, const string &column);
@@ -25,7 +27,8 @@ class RefreshMetadata {
 	vector<string> ReadViewList(const string &view_name, const string &column);
 
 public:
-	explicit RefreshMetadata(Connection &con) : con(con) {
+	explicit RefreshMetadata(Connection &con, optional_ptr<ClientContext> snapshot_context = nullptr)
+	    : con(con), snapshot_context(snapshot_context) {
 	}
 
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.

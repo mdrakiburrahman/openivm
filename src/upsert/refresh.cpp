@@ -1225,14 +1225,36 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
                                                const string &view_catalog_name, const string &view_schema_name,
                                                const string &view_name, const string &attached_db_catalog_name,
                                                const string &attached_db_schema_name) {
-	RefreshMetadata metadata(metadata_con);
-	auto delta_tables = metadata.GetDeltaTables(view_name);
+	RefreshMetadata metadata(metadata_con, &context);
+	auto sources = metadata.GetDeltaSources(view_name);
 	DeltaActivityResult conservative_activity;
-	conservative_activity.has_join = metadata.HasJoin(view_name) || delta_tables.size() > 1;
-	conservative_activity.tables_with_changes = delta_tables.size();
+	conservative_activity.has_join = metadata.HasJoin(view_name) || sources.size() > 1;
+	conservative_activity.tables_with_changes = sources.size();
 	conservative_activity.any_has_deletes = true;
 	conservative_activity.all_ducklake = false;
-	conservative_activity.active_delta_table_names = delta_tables;
+	for (auto &source : sources) {
+		conservative_activity.active_delta_table_names.push_back(source.table_name);
+		if (!StringUtil::CIEquals(source.catalog_type, "ducklake")) {
+			continue;
+		}
+		auto loc = ResolveDuckLakeSourceLocation(metadata_con, view_name, source.table_name, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		auto last_snapshot = metadata.GetLastSnapshotId(view_name, source.table_name);
+		auto snapshot = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
+		if (snapshot < last_snapshot) {
+			throw TransactionException("DuckLake snapshot for '%s' predates the refresh watermark of '%s'",
+			                           source.table_name, DisplayViewName(metadata, view_schema_name, view_name));
+		}
+		auto activity = ProbeDuckLakeSnapshotActivity(metadata, metadata_con, view_name, source.table_name,
+		                                              loc.catalog_name, loc.schema_name, last_snapshot, snapshot);
+		conservative_activity.requires_full_refresh |= activity.requires_full_refresh;
+		DeltaActivityResult::Source source_activity;
+		source_activity.delta_table_name = source.table_name;
+		source_activity.backfill_source_table_id = activity.source_table_id_to_backfill >= 0;
+		conservative_activity.sources.push_back(std::move(source_activity));
+	}
+	OPENIVM_DEBUG_PRINT("[REFRESH] Checked %zu DuckLake sources in the caller transaction for %s\n",
+	                    conservative_activity.sources.size(), view_name.c_str());
 
 	// The planning connection cannot see transaction-local delta rows. Compile all
 	// registered native sources conservatively; the returned SQL executes through
