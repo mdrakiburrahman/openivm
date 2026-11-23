@@ -44,6 +44,9 @@ struct PlanRewriteNeeds {
 	bool running_window_state = false;
 };
 
+/// Turn a copy of the stored DISTINCT ON plan into candidate-key discovery input.
+bool RemoveDistinctOnWinnerFilters(unique_ptr<LogicalOperator> &plan);
+
 /// Convert FILTER to a NULL-masked argument only for known NULL-ignoring unary
 /// aggregates and COUNT(*). Retain native FILTER for all other signatures.
 /// Apply to both the SELECT serialization plan and the full CREATE analysis plan.
