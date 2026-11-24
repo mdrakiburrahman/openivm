@@ -3487,7 +3487,6 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
                                            const std::set<TableIndex> &null_tables,
                                            const string &delta_view_catalog_prefix,
                                            RefreshMetadata::LeftJoinSecondaryMeta &meta) {
-	vector<string> preserved_cols;
 	if (facts.aggregates.size() != 1) {
 		return false;
 	}
@@ -3583,9 +3582,12 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 					return false;
 				}
 				contribs.push_back(is_inner ? "0" : "1");
-				if (!is_inner) {
-					// Preserved-side COUNT: the MERGE must NOT gate it by the (inner-side) match_count.
-					preserved_cols.push_back(output_names[G + j]);
+				// Preserved-side COUNT: the MERGE must NOT gate it by the (inner-side) match_count.
+				// A failed level discards `meta`, so partial additions never escape.
+				auto &preserved = meta.preserved_cols;
+				if (!is_inner &&
+				    std::find(preserved.begin(), preserved.end(), output_names[G + j]) == preserved.end()) {
+					preserved.push_back(output_names[G + j]);
 				}
 			} else if (fn == "sum" && is_inner) {
 				contribs.push_back("0"); // preserved-side SUM needs the value; unsupported
@@ -3684,11 +3686,6 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 	meta.sql += (meta.sql.empty() ? "" : "\n") + sql;
 	meta.inner_tables.push_back(inner_identity);
 	meta.inner_keys.push_back(inner_col);
-	for (auto &col : preserved_cols) {
-		if (std::find(meta.preserved_cols.begin(), meta.preserved_cols.end(), col) == meta.preserved_cols.end()) {
-			meta.preserved_cols.push_back(col);
-		}
-	}
 	return true;
 }
 
