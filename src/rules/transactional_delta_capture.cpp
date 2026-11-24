@@ -442,6 +442,9 @@ public:
 	                                                           std::move(generated_expressions_p))),
 	      row_fetcher(base_table_p) {
 		D_ASSERT(old_row_columns.empty() || old_row_columns.size() == row_fetcher.Types().size());
+		for (idx_t column = 0; column < types.size(); column++) {
+			output_columns.push_back(column);
+		}
 		children.push_back(child);
 	}
 
@@ -470,10 +473,7 @@ public:
 			chunk.Reference(input);
 		} else {
 			// Drop the preimage columns appended for capture; the DML expects its original input.
-			for (idx_t column = 0; column < chunk.ColumnCount(); column++) {
-				chunk.data[column].Reference(input.data[column]);
-			}
-			chunk.SetCardinality(input.size());
+			chunk.ReferenceColumns(input, output_columns);
 		}
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
@@ -521,11 +521,7 @@ private:
 				return;
 			}
 			state.selected_input.Reference(input);
-			state.old_rows.Reset();
-			for (idx_t column = 0; column < old_row_columns.size(); column++) {
-				state.old_rows.data[column].Reference(input.data[old_row_columns[column]]);
-			}
-			state.old_rows.SetCardinality(input.size());
+			state.old_rows.ReferenceColumns(input, old_row_columns);
 		}
 		appender->Append(context.client, state.old_rows, -1, state.append_state);
 
@@ -549,7 +545,8 @@ private:
 	vector<unique_ptr<Expression>> update_expressions;
 	vector<PhysicalIndex> update_columns;
 	optional_idx row_id_index;
-	vector<idx_t> old_row_columns;
+	vector<column_t> old_row_columns;
+	vector<column_t> output_columns;
 	shared_ptr<TransactionalDeltaAppender> appender;
 	TransactionalBaseRowFetcher row_fetcher;
 };
