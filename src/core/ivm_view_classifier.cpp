@@ -61,10 +61,6 @@ static idx_t GetVisibleOutputCount(const vector<string> &output_names, idx_t vis
 	return visible_count;
 }
 
-static bool HasCaseInsensitiveName(const unordered_set<string> &names, const string &name) {
-	return names.count(StringUtil::Lower(name)) > 0;
-}
-
 static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts, const vector<ColumnBinding> &bindings,
                                                   idx_t output_idx) {
 	if (facts.root) {
@@ -88,42 +84,9 @@ static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const
 	return facts.first_projection && output_idx < facts.first_projection->expressions.size();
 }
 
-static bool HasVisibleNonGroupNonAggregateOutput(const DeltaViewModel &model, const CreateMVPlanFacts &facts,
-                                                 const vector<string> &output_names, idx_t visible_output_count) {
-	unordered_set<string> group_outputs;
-	for (auto &group_col : model.group_columns) {
-		group_outputs.insert(StringUtil::Lower(group_col));
-	}
-	unordered_set<string> aggregate_outputs;
-	for (auto &name : facts.analysis.aggregate_columns) {
-		aggregate_outputs.insert(StringUtil::Lower(name));
-	}
-	auto visible_count = GetVisibleOutputCount(output_names, visible_output_count);
-	auto bindings = facts.root ? facts.root->GetColumnBindings() : vector<ColumnBinding>();
-	for (idx_t output_idx = 0; output_idx < visible_count; output_idx++) {
-		auto &name = output_names[output_idx];
-		if (IncrementalTableNames::IsInternalColumn(name) || HasCaseInsensitiveName(group_outputs, name)) {
-			continue;
-		}
-		if (VisibleOutputResolvesToAggregateValue(facts, bindings, output_idx)) {
-			continue;
-		}
-		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) &&
-		    HasCaseInsensitiveName(aggregate_outputs, name)) {
-			continue;
-		}
-		return true;
-	}
-	return false;
-}
-
 static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, const CreateMVPlanFacts &facts,
                                               const vector<string> &output_names, idx_t visible_output_count,
                                               const vector<string> &aggregate_columns) {
-	unordered_set<string> aggregate_outputs;
-	for (auto &name : aggregate_columns) {
-		aggregate_outputs.insert(StringUtil::Lower(name));
-	}
 	idx_t visible_count = GetVisibleOutputCount(output_names, visible_output_count);
 	auto bindings = facts.root ? facts.root->GetColumnBindings() : vector<ColumnBinding>();
 	for (idx_t output_idx = 0; output_idx < visible_count; output_idx++) {
@@ -132,12 +95,24 @@ static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, con
 		    VisibleOutputResolvesToAggregateValue(facts, bindings, output_idx)) {
 			continue;
 		}
-		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) &&
-		    HasCaseInsensitiveName(aggregate_outputs, name)) {
+		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) && ContainsCI(aggregate_columns, name)) {
 			continue;
 		}
 		group_columns.push_back(name);
 	}
+}
+
+static bool HasVisibleNonGroupNonAggregateOutput(const DeltaViewModel &model, const CreateMVPlanFacts &facts,
+                                                 const vector<string> &output_names, idx_t visible_output_count) {
+	vector<string> non_aggregate_outputs;
+	AddVisibleNonAggregateOutputNames(non_aggregate_outputs, facts, output_names, visible_output_count,
+	                                  facts.analysis.aggregate_columns);
+	for (auto &name : non_aggregate_outputs) {
+		if (!ContainsCI(model.group_columns, name)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static bool GroupColumnsAreVisibleOutputs(const vector<string> &group_columns, const vector<string> &output_names,
