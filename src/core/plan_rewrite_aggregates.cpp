@@ -137,17 +137,6 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 		return;
 	}
 	auto &agg = plan->Cast<LogicalAggregate>();
-	bool any_filter = false;
-	for (auto &expr : agg.expressions) {
-		if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE &&
-		    expr->Cast<BoundAggregateExpression>().GetFilter()) {
-			any_filter = true;
-			break;
-		}
-	}
-	if (!any_filter) {
-		return;
-	}
 	bool rewritten = false;
 	for (auto &expr : agg.expressions) {
 		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
@@ -169,14 +158,13 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 			auto case_expr =
 			    make_uniq<BoundCaseExpression>(std::move(filter_expr), std::move(then_expr), std::move(else_expr));
 			expr = MakeAggregate(context, "count", std::move(case_expr), bound.GetAlias().GetIdentifierName());
-			rewritten = true;
 		} else {
 			auto arg_type = bound.GetChildren()[0]->GetReturnType();
 			auto else_expr = make_uniq<BoundConstantExpression>(Value(arg_type)); // NULL of same type
 			bound.GetChildrenMutable()[0] = make_uniq<BoundCaseExpression>(
 			    std::move(filter_expr), std::move(bound.GetChildrenMutable()[0]), std::move(else_expr));
-			rewritten = true;
 		}
+		rewritten = true;
 	}
 	if (!rewritten) {
 		return;
