@@ -6,6 +6,7 @@
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
@@ -688,6 +689,15 @@ string SqlUtils::DuckLakeChangesSQL(const string &select_list, const string &cat
 string SqlUtils::CurrentDatabase(Connection &con) {
 	// current_database() without planning a statement; empty when no database is attached.
 	return DatabaseManager::TryGetDefaultDatabase(*con.context).GetIdentifierName();
+}
+
+string SqlUtils::RequireCurrentDatabase(Connection &con, const string &format) {
+	try {
+		return DatabaseManager::GetDefaultDatabase(*con.context).GetIdentifierName();
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		throw CatalogException(format, error.RawMessage());
+	}
 }
 
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {

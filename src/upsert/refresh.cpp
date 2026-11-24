@@ -992,8 +992,7 @@ static vector<string> PipelineTargets(const FunctionParameters &parameters) {
 static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const string &view_catalog) {
 	auto catalog = view_catalog;
 	if (catalog.empty()) {
-		auto result = SqlUtils::QueryOrThrow(con, "SELECT current_database()", "Cannot resolve after-hook catalog: %s");
-		catalog = result->Collection().GetValue(0, 0).ToString();
+		catalog = SqlUtils::RequireCurrentDatabase(con, "Cannot resolve after-hook catalog: %s");
 	}
 	for (auto &statement : con.ExtractStatements(hook_sql)) {
 		auto prepared = con.Prepare(std::move(statement));
@@ -1112,10 +1111,8 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	RefreshMetadata::PrepareMetadataSchema(context, target.view_catalog_name, false);
 	RefreshMetadata::UseCatalog(context, con, target.view_catalog_name);
 	// Only external data catalogs need a separate native metadata transaction.
-	auto metadata_catalog =
-	    SqlUtils::QueryOrThrow(con, "SELECT current_database()", "OpenIVM could not resolve metadata catalog: %s");
-	target.cross_system = !target.view_catalog_name.empty() &&
-	                      metadata_catalog->Collection().GetValue(0, 0).ToString() != target.view_catalog_name;
+	auto metadata_catalog = SqlUtils::RequireCurrentDatabase(con, "OpenIVM could not resolve metadata catalog: %s");
+	target.cross_system = !target.view_catalog_name.empty() && metadata_catalog != target.view_catalog_name;
 
 	// Check cascade mode
 	auto cascade_mode = StringUtil::Lower(SqlUtils::GetStringSetting(context, "openivm_cascade_refresh", "downstream"));

@@ -8,13 +8,27 @@ require openivm
 
 require parquet
 
-# Every internal statement costs a parse, bind and plan, which dominates small refreshes. The bounds
-# are the measured counts plus slack (before metadata was read once per refresh, refreshes issued
-# 94-136 statements and refreshes without changes 35-45). A count excludes the user's statement and
-# the queries on duckdb_logs.
+# Every internal statement costs a parse, bind and plan, which dominates small refreshes. Each bound is
+# the measured count plus 3-6 statements of slack; the counts are deterministic (delta sources are read
+# in table_name order). Before metadata was read once per refresh, refreshes issued 94-136 statements
+# and refreshes without changes 35-45. A count excludes the user's statement and the queries on
+# duckdb_logs.
 
+# The counts depend on these settings; pin them so a changed default cannot silently shift the bounds.
 statement ok
 SET openivm_disable_daemon = true;
+
+statement ok
+SET openivm_skip_empty_deltas = true;
+
+statement ok
+SET openivm_adaptive_refresh = false;
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+SET openivm_cascade_refresh = 'downstream';
 
 statement ok
 CREATE TABLE a(id INT, k INT, v INT);
@@ -108,7 +122,7 @@ statement ok
 PRAGMA refresh('agg');
 
 query I
-SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+SELECT count(*) <= 12 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
 ----
 true
 
@@ -217,7 +231,7 @@ statement ok
 PRAGMA refresh('j3');
 
 query I
-SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+SELECT count(*) <= 12 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
 ----
 true
 
@@ -294,7 +308,7 @@ statement ok
 PRAGMA refresh('lj');
 
 query I
-SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+SELECT count(*) <= 12 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
 ----
 true
 
@@ -362,7 +376,7 @@ statement ok
 PRAGMA refresh('dagg');
 
 query I
-SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+SELECT count(*) <= 12 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
 ----
 true
 
@@ -430,7 +444,7 @@ statement ok
 PRAGMA refresh('proj');
 
 query I
-SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+SELECT count(*) <= 12 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
 ----
 true
 

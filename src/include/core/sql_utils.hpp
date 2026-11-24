@@ -100,6 +100,9 @@ public:
 	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
 	/// The connection's current_database(), or empty when it cannot be read.
 	static string CurrentDatabase(Connection &con);
+	/// The connection's current_database(), read without a statement; throws CatalogException(format, error)
+	/// when there is none (for example, the default database was detached).
+	static string RequireCurrentDatabase(Connection &con, const string &format);
 	/// The caller's default catalog and schema; an unset session catalog is the default database.
 	static SessionLocation SessionDefaultLocation(ClientContext &context);
 	/// Rows in a native table's storage, without a COUNT(*) statement. An estimate: it includes deleted

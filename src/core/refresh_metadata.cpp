@@ -632,10 +632,10 @@ class PlanningHelperState : public ClientContextState {};
 shared_ptr<const RefreshMetadata::ViewRecord> RefreshMetadata::LoadView(const string &view_name) {
 	view_record.reset();
 	// One statement for the row and its sources. canonical_plan_blob is matcher-only and can be large.
-	auto result = con.Query("SELECT COLUMNS(lambda c: c <> 'canonical_plan_blob'), (SELECT list(d) FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) + " d WHERE d.view_name = v.view_name) AS " +
-	                        RECORD_DELTAS_COLUMN + " FROM " + string(openivm::VIEWS_TABLE) +
-	                        " v WHERE v.view_name = " + Value(view_name).ToSQLString());
+	auto result = con.Query(
+	    "SELECT COLUMNS(lambda c: c <> 'canonical_plan_blob'), (SELECT list(d ORDER BY d.table_name) FROM " +
+	    string(openivm::DELTA_TABLES_TABLE) + " d WHERE d.view_name = v.view_name) AS " + RECORD_DELTAS_COLUMN +
+	    " FROM " + string(openivm::VIEWS_TABLE) + " v WHERE v.view_name = " + Value(view_name).ToSQLString());
 	if (result->HasError() || result->RowCount() != 1) {
 		// Per-column reads report the specific error, or the missing view.
 		OPENIVM_DEBUG_PRINT("[METADATA] No view record for %s: %s\n", view_name.c_str(),
@@ -664,6 +664,13 @@ shared_ptr<const RefreshMetadata::ViewRecord> RefreshMetadata::LoadView(const st
 	                    record->view.size(), record->deltas.size());
 	view_record = std::move(record);
 	return view_record;
+}
+
+void RefreshMetadata::InvalidateView() {
+	// Every holder of the record (the refresh attempt, SQL generation, planning) stops serving it.
+	if (view_record) {
+		view_record->invalidated = true;
+	}
 }
 
 void RefreshMetadata::UseView(shared_ptr<const ViewRecord> record) {
@@ -878,7 +885,7 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 		return tables;
 	}
 	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
+	                        SqlUtils::EscapeValue(view_name) + "' ORDER BY table_name");
 	vector<string> tables;
 	if (result->HasError()) {
 		throw InvalidInputException("Could not read IVM delta table metadata for materialized view '%s': %s", view_name,
@@ -1481,7 +1488,7 @@ vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const stri
 		auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
 		    con,
 		    "SELECT " + StringUtil::Join(COLUMNS, ", ") + " FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
+		        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' ORDER BY table_name",
 		    "Could not read IVM delta source metadata for materialized view '%s': %s", view_name);
 		rows.assign(result->RowCount(), vector<Value>());
 		for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -1984,6 +1991,7 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 }
 
 void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_progress) {
+	// refresh_in_progress is volatile: a ViewRecord never serves it, so the record stays valid.
 	con.Query("UPDATE " + string(openivm::VIEWS_TABLE) + " SET refresh_in_progress = " +
 	          (in_progress ? "true" : "false") + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 }
@@ -2192,11 +2200,7 @@ string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name,
 
 void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name,
                                                     int64_t snapshot_id, int64_t source_table_id) {
-	// Every holder of the record (the refresh attempt, SQL generation, planning) must stop serving the
-	// watermark this write replaces.
-	if (view_record) {
-		view_record->invalidated = true;
-	}
+	InvalidateView();
 	auto result = con.Query(BuildDuckLakeRefreshMetadataSQL(view_name, table_name, to_string(snapshot_id), "",
 	                                                        source_table_id < 0 ? "" : to_string(source_table_id)));
 	if (result->HasError()) {
