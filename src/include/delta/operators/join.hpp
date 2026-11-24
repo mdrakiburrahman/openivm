@@ -81,8 +81,11 @@ unique_ptr<LogicalOperator> FinalizeJoinTerm(Binder &binder, unique_ptr<LogicalO
 unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                  const vector<LogicalType> &types, Binder &binder);
 
-ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bindings,
-                                        unique_ptr<LogicalOperator> &result, LogicalOperator &root);
+// Rebind references above `replaced` (not inside it) from original_bindings to replacement_bindings,
+// whose extra last binding is the multiplicity, which is returned.
+ColumnBinding ReplaceJoinOutputBindings(LogicalOperator &root, LogicalOperator &replaced,
+                                        const vector<ColumnBinding> &original_bindings,
+                                        const vector<ColumnBinding> &replacement_bindings);
 
 // Position of `binding` among op's output bindings; throws when op does not expose it.
 idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label);

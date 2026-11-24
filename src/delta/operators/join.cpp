@@ -1637,22 +1637,6 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	        ColumnBinding(TableIndex(output_table_index), ProjectionIndex(current_bindings.size()))};
 }
 
-static void RebindRegularLeafParent(LogicalOperator &root, LogicalOperator &leaf,
-                                    const vector<ColumnBinding> &original_bindings,
-                                    const vector<ColumnBinding> &replacement_bindings) {
-	if (replacement_bindings.size() != original_bindings.size() + 1) {
-		throw InternalException("DeltaJoin: replacement leaf produced %zu bindings for %zu source columns",
-		                        replacement_bindings.size(), original_bindings.size());
-	}
-	OPENIVM_DEBUG_PRINT("[DeltaJoin] Rebinding %zu regular-leaf parent columns\n", original_bindings.size());
-	ColumnBindingReplacer replacer;
-	for (idx_t i = 0; i < original_bindings.size(); i++) {
-		replacer.replacement_bindings.emplace_back(original_bindings[i], replacement_bindings[i]);
-	}
-	replacer.stop_operator = &leaf;
-	replacer.VisitOperator(root);
-}
-
 DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context, Binder &binder,
                                           unique_ptr<LogicalOperator> &leaf_node, LogicalOperator *&term_root,
                                           DeltaSourceCache &source_cache) {
@@ -1669,7 +1653,7 @@ DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, Clien
 		// compaction emits contiguous bindings. Rebind conditions and expressions
 		// above the leaf before replacing it; join projection maps are positional and
 		// remain the responsibility of UpdateParentProjectionMap.
-		RebindRegularLeafParent(*term_root, *leaf_node, original_bindings, delta_bindings);
+		ReplaceJoinOutputBindings(*term_root, *leaf_node, original_bindings, delta_bindings);
 		return delta;
 	}
 	return input.CompileCopiedSubtree(leaf_node, term_root);
@@ -1748,7 +1732,7 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 			leaf_node = std::move(old.op);
 			// The old-state UNION compacts sparse scan bindings, including scans with
 			// filter-only columns. Rebind parent conditions to the new positions.
-			RebindRegularLeafParent(*term_root, *leaf_node, original_leaf_bindings, leaf_node->GetColumnBindings());
+			ReplaceJoinOutputBindings(*term_root, *leaf_node, original_leaf_bindings, leaf_node->GetColumnBindings());
 			UpdateParentProjectionMap(term, leaves[leaf], old.mul_binding, original_leaf_width);
 		}
 
@@ -1934,7 +1918,8 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	}
 
 	// 5. Rebind parent references
-	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);
+	ColumnBinding new_mul_binding =
+	    ReplaceJoinOutputBindings(*input.root, *result, original_bindings, result->GetColumnBindings());
 
 	input.plan = std::move(result);
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
