@@ -494,7 +494,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// no pending deltas.
 	auto inner_facts_slot_facts = make_shared_ptr<openivm::CompileFacts>(active_facts);
 	openivm::CompileFactsContextSlot inner_facts_slot(planning_context, inner_facts_slot_facts);
-	con.Query("SET max_expression_depth = 10000");
+	Settings::Set<MaxExpressionDepthSetting>(*con.context, SetScope::SESSION, Value::UBIGINT(10000));
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	// Control metadata has its own schema; internal objects never follow it.
 	auto metadata_location = RefreshMetadata::CurrentLocation(con);

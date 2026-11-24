@@ -884,11 +884,11 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 			return view_catalog_name;
 		}
 	}
-	auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
-	if (probe && !probe->HasError() && probe->RowCount() == 1 && !probe->Collection().GetValue(0, 0).IsNull()) {
-		return probe->Collection().GetValue(0, 0).ToString();
+	auto ducklake_catalogs = MetadataLocator::AttachedCatalogs(*con.context->db, "ducklake");
+	if (ducklake_catalogs.size() == 1) {
+		return ducklake_catalogs[0].name;
 	}
-	if (probe && !probe->HasError() && probe->RowCount() > 1) {
+	if (ducklake_catalogs.size() > 1) {
 		throw Exception(ExceptionType::CATALOG,
 		                "Could not resolve DuckLake catalog unambiguously; pass the materialized view catalog "
 		                "explicitly or use PRAGMA refresh_options");

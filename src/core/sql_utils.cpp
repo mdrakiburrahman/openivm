@@ -295,6 +295,24 @@ string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
 	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
 	// fold only A-Z. Preserve every other code point, including quoted identifiers.
 	auto fold = [](const string &expression) {
+		// A string literal (Value::ToSQLString) folds here instead of in every evaluation; quotes
+		// inside it are doubled, so folding the SQL text folds exactly the literal's value.
+		bool literal = expression.size() >= 2 && expression.front() == '\'' && expression.back() == '\'';
+		for (idx_t i = 1; literal && i + 1 < expression.size(); i++) {
+			if (expression[i] == '\'') {
+				literal = i + 2 < expression.size() && expression[i + 1] == '\'';
+				i++;
+			}
+		}
+		if (literal) {
+			string folded = expression;
+			for (auto &c : folded) {
+				if (c >= 'A' && c <= 'Z') {
+					c = static_cast<char>(c - 'A' + 'a');
+				}
+			}
+			return folded;
+		}
 		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
 	};
 	// An application collation must not widen physical identifier equality either.
@@ -666,11 +684,8 @@ string SqlUtils::DuckLakeChangesSQL(const string &select_list, const string &cat
 }
 
 string SqlUtils::CurrentDatabase(Connection &con) {
-	auto result = con.Query("SELECT current_database()");
-	if (!result->HasError() && result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull()) {
-		return result->Collection().GetValue(0, 0).ToString();
-	}
-	return "";
+	// current_database() without planning a statement; empty when no database is attached.
+	return DatabaseManager::TryGetDefaultDatabase(*con.context).GetIdentifierName();
 }
 
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {

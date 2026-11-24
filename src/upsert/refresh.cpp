@@ -85,15 +85,8 @@ static DuckLakeSourcePins PinDuckLakeSources(Connection &con, RefreshMetadata &m
 		return pins;
 	}
 	// Watermark placeholders may name any attached DuckLake catalog, so pin all of them.
-	auto catalogs = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
-	if (catalogs->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "OpenIVM could not list DuckLake catalogs: " + catalogs->GetError());
-	}
-	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-		if (!catalogs->Collection().GetValue(0, row).IsNull()) {
-			auto catalog = catalogs->Collection().GetValue(0, row).ToString();
-			pins.snapshots[catalog] = metadata.GetCurrentDuckLakeSnapshot(catalog);
-		}
+	for (auto &catalog : MetadataLocator::AttachedCatalogs(*con.context->db, "ducklake")) {
+		pins.snapshots[catalog.name] = metadata.GetCurrentDuckLakeSnapshot(catalog.name);
 	}
 	// Resolved after the snapshots, so a drop or recreate after the pin shows up as a change.
 	for (auto &source : pins.sources) {
@@ -376,7 +369,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs. Keep the
 		// established guard while rejecting unexpectedly recursive generated plans.
-		exec_con.Query("SET max_expression_depth = 10000");
+		Settings::Set<MaxExpressionDepthSetting>(*exec_con.context, SetScope::SESSION, Value::UBIGINT(10000));
 		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
 		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
 		// overflow in the optimizer before the refresh query runs.

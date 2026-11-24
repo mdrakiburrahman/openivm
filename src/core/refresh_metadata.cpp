@@ -128,12 +128,25 @@ bool SchemaExists(Connection &con, const string &catalog, const string &schema) 
 }
 
 void SelectMetadataLocation(Connection &con, const MetadataLocation &location) {
-	auto selected = SchemaExists(con, location.catalog, location.schema) ? location.schema : string(DEFAULT_SCHEMA);
-	auto target = SqlUtils::QualifiedPrefix(location.catalog, selected);
-	target.pop_back();
-	SqlUtils::QueryOrThrow(con, "USE " + target, "OpenIVM could not select metadata catalog: %s");
+	string selected;
+	// The equivalent of USE catalog.schema, without planning a statement per helper connection.
+	con.context->RunFunctionInTransaction([&]() {
+		selected = Catalog::GetSchema(*con.context, Identifier(location.catalog), Identifier(location.schema),
+		                              OnEntryNotFound::RETURN_NULL)
+		               ? location.schema
+		               : string(DEFAULT_SCHEMA);
+		try {
+			ClientData::Get(*con.context)
+			    .catalog_search_path->Set(CatalogSearchEntry(Identifier(location.catalog), Identifier(selected)),
+			                              CatalogSetPathType::SET_SCHEMA);
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			throw CatalogException("OpenIVM could not select metadata catalog: %s", error.RawMessage());
+		}
+	});
 	con.context->registered_state->GetOrCreate<MetadataLocationState>(METADATA_LOCATION_STATE)->location = location;
-	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for metadata schema '%s'\n", target.c_str(), location.schema.c_str());
+	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s.%s for metadata schema '%s'\n", location.catalog.c_str(),
+	                    selected.c_str(), location.schema.c_str());
 }
 
 string SelectMetadataSchema(const vector<string> &schemas, const string &catalog, const string &preferred) {
@@ -288,13 +301,8 @@ MetadataLocation RefreshMetadata::CurrentLocation(Connection &con) {
 	if (state && !state->location.catalog.empty()) {
 		return state->location;
 	}
-	auto result = con.Query("SELECT current_database(), current_schema()");
-	if (result->HasError() || result->RowCount() == 0) {
-		throw CatalogException("OpenIVM could not resolve its metadata location: %s",
-		                       result->HasError() ? result->GetError() : string("no current schema"));
-	}
-	return MetadataLocator::At(con, result->Collection().GetValue(0, 0).ToString(),
-	                           result->Collection().GetValue(1, 0).ToString());
+	auto session = SqlUtils::SessionDefaultLocation(*con.context);
+	return MetadataLocator::At(con, session.catalog, session.schema);
 }
 
 string RefreshMetadata::MetadataTable(Connection &con, const string &table) {
@@ -1789,16 +1797,7 @@ bool RefreshMetadata::IsDuckLakeTable(const string &view_name, const string &tab
 }
 
 bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
-	if (catalog_name.empty()) {
-		return false;
-	}
-	auto result = SqlUtils::QueryOrThrow(
-	    con,
-	    "SELECT type FROM duckdb_databases() WHERE " +
-	        SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog_name).ToSQLString()) + " LIMIT 1",
-	    "OpenIVM could not resolve the type of catalog '%s': %s", catalog_name);
-	return result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull() &&
-	       StringUtil::CIEquals(result->Collection().GetValue(0, 0).ToString(), "ducklake");
+	return MetadataLocator::IsCatalogType(con, catalog_name, "ducklake");
 }
 
 bool RefreshMetadata::IsNativeCatalog(const string &catalog_name) {
