@@ -199,13 +199,6 @@ void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts,
 
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                    const vector<string> &output_names) {
-	model.window_lineage_ops.clear();
-	model.has_projection_lineage = false;
-	model.has_left_join_key_source = false;
-	model.has_left_join_nullable = false;
-	model.projection_lineage = RefreshMetadata::ProjectionKeyLineage();
-	model.left_join_key_source = RefreshMetadata::LeftJoinKeySource();
-	model.left_join_nullable_sources = RefreshMetadata::LeftJoinNullableSources();
 	const auto &analysis = facts.analysis;
 	if (model.type == RefreshType::WINDOW_PARTITION) {
 		const auto lineage_partition_columns = model.window_partition_columns;
@@ -232,7 +225,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	model.has_left_join_nullable = BuildLeftJoinNullableSources(facts, model.left_join_nullable_sources);
 }
 
-string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
+string BuildDeltaViewModelLineageJson(const DeltaViewModel &model, idx_t &entry_count) {
 	vector<string> entries;
 	if (!model.window_lineage_ops.empty()) {
 		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(model.window_lineage_ops));
@@ -249,16 +242,17 @@ string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	if (model.has_left_join_nullable) {
 		entries.push_back(RefreshMetadata::LeftJoinNullableSourcesToJson(model.left_join_nullable_sources));
 	}
+	entry_count = entries.size();
 	return BuildRefreshLineageJson(entries);
 }
 
-string BuildDeltaViewModelProfileDetail(const DeltaViewModel &model) {
+string BuildDeltaViewModelProfileDetail(const DeltaViewModel &model, idx_t lineage_entry_count) {
 	auto &counts = model.profile_counts;
 	return "refresh_type=" + string(RefreshTypeName(model.type)) +
 	       "; group_cols=" + to_string(model.group_columns.size()) + "; model_nodes=" + to_string(model.nodes.size()) +
 	       "; group_recompute_mode=" + string(GroupRecomputeAffectedModeName(model.group_recompute_affected_mode)) +
 	       "; scan_occurrences=" + to_string(counts.scan_occurrences) +
-	       "; lineage_entries=" + to_string(model.LineageEntryCount()) +
+	       "; lineage_entries=" + to_string(lineage_entry_count) +
 	       "; node_semantics=" + to_string(counts.node_semantics) +
 	       "; delta_only_nodes=" + to_string(counts.delta_only_nodes) +
 	       "; delta_state_nodes=" + to_string(counts.delta_state_nodes);

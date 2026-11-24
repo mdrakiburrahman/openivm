@@ -986,11 +986,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	auto lineage_start = create_profile_now();
 	PopulateDeltaViewModelLineage(view_model, facts, output_names);
-	string lineage_json = BuildDeltaViewModelLineageJson(view_model);
+	idx_t lineage_entry_count = 0;
+	string lineage_json = BuildDeltaViewModelLineageJson(view_model, lineage_entry_count);
 	int64_t lineage_duration_ms =
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lineage_start).count();
-	idx_t lineage_entry_count = view_model.LineageEntryCount();
-	string model_profile_detail = create_profile_enabled ? BuildDeltaViewModelProfileDetail(view_model) : string();
+	string model_profile_detail =
+	    create_profile_enabled ? BuildDeltaViewModelProfileDetail(view_model, lineage_entry_count) : string();
 	RefreshType refresh_type = view_model.type;
 	// A full-refresh fallback stores the user's ordered query, including LIMIT.
 	// Its hidden ORDER BY expressions are unavailable from that query's output.

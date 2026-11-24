@@ -565,23 +565,6 @@ const char *DeltaModelNodeKindName(DeltaModelNodeKind kind) {
 
 #undef OPENIVM_ENUM_NAME_CASE
 
-idx_t DeltaViewModel::LineageEntryCount() const {
-	idx_t count = 0;
-	if (!window_lineage_ops.empty()) {
-		count++;
-	}
-	if (has_projection_lineage) {
-		count++;
-	}
-	if (has_left_join_key_source) {
-		count++;
-	}
-	if (!full_outer_scopes.empty()) {
-		count++;
-	}
-	return count;
-}
-
 bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
 	if (!facts.analysis.found_distinct) {
 		return false;
