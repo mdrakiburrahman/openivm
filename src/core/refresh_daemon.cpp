@@ -81,11 +81,8 @@ void RefreshDaemon::Run() {
 			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Woke up\n");
 
 			// Read cascade setting from the DB config
-			string cascade_mode = "downstream";
-			Value cascade_val;
-			if (con.context->TryGetCurrentSetting("openivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
-				cascade_mode = StringUtil::Lower(cascade_val.ToString());
-			}
+			auto cascade_mode =
+			    StringUtil::Lower(SqlUtils::GetStringSetting(*con.context, "openivm_cascade_refresh", "downstream"));
 
 			// Read adaptive backoff setting
 			adaptive_backoff_ = SqlUtils::GetBoolSetting(*con.context, "openivm_adaptive_backoff", adaptive_backoff_);

@@ -13,9 +13,7 @@
 namespace duckdb {
 
 bool CompiledSQLArchiveEnabled(ClientContext &context) {
-	Value value;
-	return context.TryGetCurrentSetting(Identifier("openivm_archive_compiled_sql"), value) && !value.IsNull() &&
-	       value.GetValue<bool>();
+	return SqlUtils::GetBoolSetting(context, "openivm_archive_compiled_sql", false);
 }
 
 const char *CompiledProgramOutcomeName(CompiledProgramOutcome outcome) {

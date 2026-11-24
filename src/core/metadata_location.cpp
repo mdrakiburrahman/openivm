@@ -83,14 +83,6 @@ AttachedCatalog DescribeCatalog(Connection &con, const string &catalog) {
 	return info;
 }
 
-string SettingText(ClientContext &context, const char *name) {
-	Value value;
-	if (!context.TryGetCurrentSetting(Identifier(name), value) || value.IsNull()) {
-		return "";
-	}
-	return value.ToString();
-}
-
 void RequireSupportedType(const AttachedCatalog &info) {
 	if (StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE) ||
 	    StringUtil::CIEquals(info.type, POSTGRES_CATALOG_TYPE)) {
@@ -188,8 +180,8 @@ MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &co
 	}
 	MetadataLocation marked;
 	bool has_marker = info.found && ReadMarker(con, info.name, marked);
-	auto configured_catalog = SettingText(context, openivm::METADATA_CATALOG_SETTING);
-	auto configured_schema = SettingText(context, openivm::METADATA_SCHEMA_SETTING);
+	auto configured_catalog = SqlUtils::GetStringSetting(context, openivm::METADATA_CATALOG_SETTING);
+	auto configured_schema = SqlUtils::GetStringSetting(context, openivm::METADATA_SCHEMA_SETTING);
 	if (!configured_catalog.empty()) {
 		if (has_marker && !StringUtil::CIEquals(marked.catalog, configured_catalog)) {
 			throw CatalogException("OpenIVM metadata for catalog '%s' is recorded in %s, but openivm_metadata_catalog "
@@ -374,7 +366,7 @@ int64_t MetadataLocator::LeaseSeconds(ClientContext &context) {
 }
 
 bool MetadataLocator::TestPoint(ClientContext &context, const string &point) {
-	return StringUtil::CIEquals(SettingText(context, openivm::TEST_FAIL_POINT_SETTING), point);
+	return StringUtil::CIEquals(SqlUtils::GetStringSetting(context, openivm::TEST_FAIL_POINT_SETTING), point);
 }
 
 void MetadataLocator::FailPoint(ClientContext &context, const string &point) {

@@ -83,6 +83,15 @@ public:
 		}
 		return default_value;
 	}
+	/// The setting's text, or default_value when it is unset or NULL.
+	static string GetStringSetting(ClientContext &context, const string &setting_name,
+	                               const string &default_value = "") {
+		Value setting_value;
+		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {
+			return setting_value.ToString();
+		}
+		return default_value;
+	}
 	// Copy a registered extension setting to a helper connection without changing the database default.
 	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
 	/// The caller's default catalog and schema; an unset session catalog is the default database.

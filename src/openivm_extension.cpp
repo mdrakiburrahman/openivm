@@ -373,9 +373,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    Connection con(*context.db);
 		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 		    RefreshMetadata(con).GetViewType(view_name);
-		    Value directory;
-		    bool enabled =
-		        context.TryGetCurrentSetting(Identifier("openivm_files_path"), directory) && !directory.IsNull();
+		    auto directory = SqlUtils::GetStringSetting(context, "openivm_files_path");
+		    bool enabled = !directory.empty();
 		    auto &fs = FileSystem::GetFileSystem(context);
 		    auto cwd = FileSystem::GetWorkingDirectory();
 		    vector<string> rows;
@@ -390,7 +389,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    string status =
 			        "disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh";
 			    if (enabled) {
-				    path = directory.ToString() + "/" + file.second;
+				    path = directory + "/" + file.second;
 				    if (!fs.IsPathAbsolute(path)) {
 					    path = fs.JoinPath(cwd, path);
 				    }

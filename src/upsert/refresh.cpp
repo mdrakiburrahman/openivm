@@ -752,12 +752,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			if (cost_estimate.ShouldRecompute()) {
 				method = "full";
 			}
-			Value mode_val;
-			if (context.TryGetCurrentSetting(Identifier("openivm_refresh_mode"), mode_val) && !mode_val.IsNull()) {
-				auto mode = StringUtil::Lower(mode_val.ToString());
-				if (mode == "full") {
-					method = "full";
-				}
+			if (StringUtil::CIEquals(SqlUtils::GetStringSetting(context, "openivm_refresh_mode"), "full")) {
+				method = "full";
 			}
 
 			RefreshMetadata(exec_con).RecordRefreshHistory(
@@ -1134,11 +1130,7 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	    !view_catalog_name.empty() && metadata_catalog->Collection().GetValue(0, 0).ToString() != view_catalog_name;
 
 	// Check cascade mode
-	string cascade_mode = "downstream";
-	Value cascade_val;
-	if (context.TryGetCurrentSetting(Identifier("openivm_cascade_refresh"), cascade_val) && !cascade_val.IsNull()) {
-		cascade_mode = StringUtil::Lower(cascade_val.ToString());
-	}
+	auto cascade_mode = StringUtil::Lower(SqlUtils::GetStringSetting(context, "openivm_cascade_refresh", "downstream"));
 
 	RefreshMetadata metadata(con);
 	if (!pipeline && parameters.values.size() > 1) {
@@ -1423,11 +1415,7 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		return "SELECT true AS Success";
 	}
 	RefreshMetadata metadata(metadata_con);
-	string cascade_mode = "downstream";
-	Value cascade_value;
-	if (context.TryGetCurrentSetting(Identifier("openivm_cascade_refresh"), cascade_value) && !cascade_value.IsNull()) {
-		cascade_mode = StringUtil::Lower(cascade_value.ToString());
-	}
+	auto cascade_mode = StringUtil::Lower(SqlUtils::GetStringSetting(context, "openivm_cascade_refresh", "downstream"));
 
 	vector<string> refresh_order;
 	if (pipeline) {

@@ -237,11 +237,7 @@ bool AnyMetadataOwnership(Connection &con, const string &table,
 } // namespace
 
 string RefreshMetadata::ConfiguredMetadataSchema(ClientContext &context) {
-	Value value;
-	if (context.TryGetCurrentSetting(Identifier(openivm::METADATA_SCHEMA_SETTING), value) && !value.IsNull()) {
-		return value.ToString();
-	}
-	return "";
+	return SqlUtils::GetStringSetting(context, openivm::METADATA_SCHEMA_SETTING);
 }
 
 vector<string> RefreshMetadata::FindMetadataSchemas(Connection &con, const string &catalog, const string &table) {

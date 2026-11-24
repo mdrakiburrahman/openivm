@@ -341,14 +341,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Internal maintenance tables stay beside the MV unless openivm_internal_schema selects a
 	// schema of the MV's own catalog (the lake for DuckLake MVs). A replaced view keeps the
 	// placement of its existing tables, so dependants keep reading the same relations.
-	string internal_schema_setting;
-	{
-		Value internal_value;
-		if (context.TryGetCurrentSetting(Identifier(openivm::INTERNAL_SCHEMA_SETTING), internal_value) &&
-		    !internal_value.IsNull()) {
-			internal_schema_setting = internal_value.ToString();
-		}
-	}
+	auto internal_schema_setting = SqlUtils::GetStringSetting(context, openivm::INTERNAL_SCHEMA_SETTING);
 	string internal_schema = internal_schema_setting;
 	if (parse_data_ref.is_replace && !metadata.GetViewQuery(view_name).empty()) {
 		internal_schema = metadata.GetInternalSchema(view_name);
@@ -1557,10 +1550,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    "view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'");
 	}
 
-	Value files_path_val;
-	const bool has_files_path =
-	    context.TryGetCurrentSetting(Identifier("openivm_files_path"), files_path_val) && !files_path_val.IsNull();
-	const string files_path = has_files_path ? files_path_val.ToString() : string();
+	const string files_path = SqlUtils::GetStringSetting(context, "openivm_files_path");
+	const bool has_files_path = !files_path.empty();
 	// --- Compiled DDL (MV creation, delta tables, delta view) ---
 	// Physical data table stores all columns (including openivm_* internal cols).
 	// DuckLake-targeted MVs store the data/delta tables in DuckLake and keep only
