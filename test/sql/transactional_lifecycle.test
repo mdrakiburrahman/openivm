@@ -1919,3 +1919,272 @@ query I
 SELECT count(*) FROM ((SELECT * FROM "profile.target"."observation.data".mv EXCEPT ALL SELECT i FROM "profile.target"."observation.data".source WHERE i>0) UNION ALL (SELECT i FROM "profile.target"."observation.data".source WHERE i>0 EXCEPT ALL SELECT * FROM "profile.target"."observation.data".mv));
 ----
 0
+
+# ==========================================
+# Cached source-delta ownership lookups
+# ==========================================
+# Tracked-DML admission caches ownership per source and catalog snapshot until
+# an ownership change: lifecycle work under the mutation gate (also later in a
+# transaction that already wrote tracked rows), or a direct registry write.
+# Statements run on fresh connections in this file's default catalog.
+
+# Untracked lookups cached on one connection; another connection then creates
+# the first consumer. Later writes on the first connection must be captured.
+statement ok con1
+CREATE TABLE oc_src (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);
+
+statement ok con1
+INSERT INTO oc_src SELECT i, i % 5, i FROM range(20) r(i);
+
+statement ok con1
+UPDATE oc_src SET v = v + 1 WHERE k = 1;
+
+statement ok con2
+CREATE MATERIALIZED VIEW oc_mv AS SELECT k, SUM(v) AS sv, COUNT(*) AS c FROM oc_src GROUP BY k;
+
+statement ok con1
+INSERT INTO oc_src VALUES (100, 1, 1000), (101, 2, 1010);
+
+statement ok con1
+UPDATE oc_src SET v = v * 2 WHERE k = 2;
+
+statement ok con1
+DELETE FROM oc_src WHERE id = 100;
+
+query I con1
+SELECT count(*) > 0 FROM openivm_delta_oc_src;
+----
+true
+
+statement ok con2
+PRAGMA refresh('oc_mv');
+
+query I con1
+SELECT count(*) FROM (SELECT * FROM oc_mv EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM oc_src GROUP BY k);
+----
+0
+
+query I con1
+SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM oc_src GROUP BY k EXCEPT ALL SELECT * FROM oc_mv);
+----
+0
+
+# One transaction drops the final consumer after tracked writes, writes
+# untracked, then creates a new consumer and writes tracked again.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+INSERT INTO oc_src VALUES (200, 3, 3);
+
+statement ok con1
+DROP MATERIALIZED VIEW oc_mv;
+
+statement ok con1
+INSERT INTO oc_src VALUES (201, 3, 4);
+
+statement ok con1
+UPDATE oc_src SET v = v + 5 WHERE id = 200;
+
+statement ok con1
+CREATE MATERIALIZED VIEW oc_mv2 AS SELECT k, SUM(v) AS sv, COUNT(*) AS c FROM oc_src GROUP BY k;
+
+statement ok con1
+INSERT INTO oc_src VALUES (202, 4, 5), (203, 4, 6);
+
+statement ok con1
+UPDATE oc_src SET v = v - 1 WHERE k = 4;
+
+statement ok con1
+DELETE FROM oc_src WHERE id = 201;
+
+statement ok con1
+COMMIT;
+
+statement ok con2
+INSERT INTO oc_src VALUES (204, 0, 7);
+
+statement ok con2
+PRAGMA refresh('oc_mv2');
+
+query I con1
+SELECT count(*) FROM (SELECT * FROM oc_mv2 EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM oc_src GROUP BY k);
+----
+0
+
+query I con1
+SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM oc_src GROUP BY k EXCEPT ALL SELECT * FROM oc_mv2);
+----
+0
+
+# A rolled-back CREATE leaves the source untracked; its in-transaction writes were
+# captured, later ones are not, and a committed CREATE tracks it again.
+statement ok con1
+CREATE TABLE oc_plain (id INTEGER, v INTEGER);
+
+statement ok con1
+INSERT INTO oc_plain VALUES (1, 1);
+
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+INSERT INTO oc_plain VALUES (2, 2);
+
+statement ok con1
+CREATE MATERIALIZED VIEW oc_plain_mv AS SELECT id, v FROM oc_plain;
+
+statement ok con1
+INSERT INTO oc_plain VALUES (3, 3);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_plain;
+----
+1
+
+statement ok con1
+ROLLBACK;
+
+statement ok con1
+INSERT INTO oc_plain VALUES (4, 4);
+
+statement ok con2
+UPDATE oc_plain SET v = v + 1;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_oc_plain';
+----
+0
+
+statement ok con2
+CREATE MATERIALIZED VIEW oc_plain_mv AS SELECT id, v FROM oc_plain;
+
+statement ok con1
+INSERT INTO oc_plain VALUES (5, 5);
+
+statement ok con1
+DELETE FROM oc_plain WHERE id = 1;
+
+statement ok con2
+PRAGMA refresh('oc_plain_mv');
+
+query I con1
+SELECT count(*) FROM (SELECT * FROM oc_plain_mv EXCEPT ALL SELECT id, v FROM oc_plain);
+----
+0
+
+query I con1
+SELECT count(*) FROM (SELECT id, v FROM oc_plain EXCEPT ALL SELECT * FROM oc_plain_mv);
+----
+0
+
+# A cached untracked lookup must not hide a consumer created after this
+# transaction's snapshot.
+statement ok con1
+CREATE TABLE oc_late (id INTEGER, v INTEGER);
+
+statement ok con1
+INSERT INTO oc_late VALUES (1, 1);
+
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM oc_late;
+----
+1
+
+statement ok con2
+CREATE MATERIALIZED VIEW oc_late_mv AS SELECT id, v FROM oc_late;
+
+statement error con1
+INSERT INTO oc_late VALUES (2, 2);
+----
+is not visible; retry the transaction
+
+statement ok con1
+ROLLBACK;
+
+# Direct ownership-registry edits (no DDL, no gate) invalidate cached lookups.
+# This must stay last: it leaves oc_reg_mv without ownership rows.
+statement ok con1
+CREATE TABLE oc_reg (id INTEGER, v INTEGER);
+
+statement ok con1
+CREATE MATERIALIZED VIEW oc_reg_mv AS SELECT id, v FROM oc_reg;
+
+statement ok con1
+INSERT INTO oc_reg VALUES (1, 1);
+
+statement ok con1
+INSERT INTO oc_reg VALUES (2, 2);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+2
+
+statement ok con2
+CREATE TABLE oc_reg_saved AS SELECT * FROM openivm_source_deltas WHERE table_name = 'openivm_delta_oc_reg';
+
+# Restores the mapping later from a cached plan (a batch insert): the optimizer
+# rule does not see it, but the write must still invalidate cached lookups.
+statement ok con2
+PREPARE oc_reg_restore AS INSERT INTO openivm_source_deltas SELECT * FROM oc_reg_saved;
+
+statement ok con2
+DELETE FROM openivm_source_deltas WHERE table_name = 'openivm_delta_oc_reg';
+
+statement ok con2
+DELETE FROM openivm_delta_tables WHERE table_name = 'openivm_delta_oc_reg';
+
+statement ok con1
+INSERT INTO oc_reg VALUES (3, 3);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+2
+
+statement ok con2
+EXECUTE oc_reg_restore;
+
+statement ok con1
+INSERT INTO oc_reg VALUES (4, 4);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+3
+
+query IIII con2
+SELECT source_schema, table_name, delta_schema, delta_table_name FROM oc_reg_saved;
+----
+main	openivm_delta_oc_reg	main	openivm_delta_oc_reg
+
+# A cached VALUES insert runs without rebinding, so only plan admission sees it.
+statement ok con2
+PREPARE oc_reg_restore_values AS INSERT INTO openivm_source_deltas
+VALUES ('main', 'openivm_delta_oc_reg', 'main', 'openivm_delta_oc_reg');
+
+statement ok con2
+DELETE FROM openivm_source_deltas WHERE table_name = 'openivm_delta_oc_reg';
+
+statement ok con1
+INSERT INTO oc_reg VALUES (5, 5);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+3
+
+statement ok con2
+EXECUTE oc_reg_restore_values;
+
+statement ok con1
+INSERT INTO oc_reg VALUES (6, 6);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+4

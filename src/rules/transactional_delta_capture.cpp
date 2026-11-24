@@ -12,6 +12,7 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/operator/persistent/physical_batch_insert.hpp"
 #include "duckdb/execution/operator/persistent/physical_delete.hpp"
 #include "duckdb/execution/operator/persistent/physical_insert.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
@@ -114,7 +115,7 @@ private:
 static void EnterDeltaWritePhase(ClientContext &context) {
 	// Normally a no-op: the statement already took the gate before execution (see
 	// RefreshInsertRule and TransactionalMVLockState::OnExecutePrepared).
-	TransactionalMVLockState::Get(context).AcquireMutationLock();
+	TransactionalMVLockState::Get(context).AcquireMutationLock(true);
 }
 
 class TransactionalDeltaAppendState {
@@ -426,17 +427,24 @@ public:
 class PhysicalTransactionalDeltaCapture : public PhysicalOperator {
 public:
 	PhysicalTransactionalDeltaCapture(PhysicalPlan &physical_plan, PhysicalOperator &child,
-	                                  TableCatalogEntry &base_table_p, TableCatalogEntry &delta_table_p,
-	                                  DeltaCaptureMode mode_p, vector<unique_ptr<Expression>> update_expressions_p,
+	                                  vector<LogicalType> output_types, TableCatalogEntry &base_table_p,
+	                                  TableCatalogEntry &delta_table_p, DeltaCaptureMode mode_p,
+	                                  vector<unique_ptr<Expression>> update_expressions_p,
 	                                  vector<unique_ptr<Expression>> generated_expressions_p,
 	                                  vector<PhysicalIndex> update_columns_p, optional_idx row_id_index_p,
-	                                  idx_t estimated_cardinality)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, child.GetTypes(), estimated_cardinality),
+	                                  vector<idx_t> old_row_columns_p, idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(output_types),
+	                       estimated_cardinality),
 	      mode(mode_p), update_expressions(std::move(update_expressions_p)),
 	      update_columns(std::move(update_columns_p)), row_id_index(row_id_index_p),
+	      old_row_columns(std::move(old_row_columns_p)),
 	      appender(make_shared_ptr<TransactionalDeltaAppender>(base_table_p, delta_table_p,
 	                                                           std::move(generated_expressions_p))),
 	      row_fetcher(base_table_p) {
+		D_ASSERT(old_row_columns.empty() || old_row_columns.size() == row_fetcher.Types().size());
+		for (idx_t column = 0; column < types.size(); column++) {
+			output_columns.push_back(column);
+		}
 		children.push_back(child);
 	}
 
@@ -461,7 +469,12 @@ public:
 		} else {
 			CaptureDeleteOrUpdate(context, input, gstate, state);
 		}
-		chunk.Reference(input);
+		if (chunk.ColumnCount() == input.ColumnCount()) {
+			chunk.Reference(input);
+		} else {
+			// Drop the preimage columns appended for capture; the DML expects its original input.
+			chunk.ReferenceColumns(input, output_columns);
+		}
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
@@ -490,18 +503,26 @@ private:
 	                           TransactionalDeltaCaptureLocalState &state) const {
 		D_ASSERT(row_id_index.IsValid());
 		state.selected_input.Reset();
-		idx_t selected_count;
-		// Only row-id deduplication is shared. Sharding keeps disjoint chunks from
-		// serializing behind one global mutex; preimage fetch and expression work
-		// remain parallel.
-		selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.shards, state.dedup_candidates,
-		                                  state.selection, state.selected_input);
-		if (selected_count == 0) {
-			return;
+		if (old_row_columns.empty()) {
+			// Only row-id deduplication is shared. Sharding keeps disjoint chunks from
+			// serializing behind one global mutex; preimage fetch and expression work
+			// remain parallel.
+			auto selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.shards,
+			                                       state.dedup_candidates, state.selection, state.selected_input);
+			if (selected_count == 0) {
+				return;
+			}
+			row_fetcher.Fetch(context.client, state.selected_input.data[row_id_index.GetIndex()], selected_count,
+			                  state.old_rows, state.fetch_state);
+		} else {
+			// The child is a single scan of the target table: each row arrives once,
+			// carrying its preimage, so neither deduplication nor a row-id fetch is needed.
+			if (input.size() == 0) {
+				return;
+			}
+			state.selected_input.Reference(input);
+			state.old_rows.ReferenceColumns(input, old_row_columns);
 		}
-
-		row_fetcher.Fetch(context.client, state.selected_input.data[row_id_index.GetIndex()], selected_count,
-		                  state.old_rows, state.fetch_state);
 		appender->Append(context.client, state.old_rows, -1, state.append_state);
 
 		if (mode != DeltaCaptureMode::UPDATE) {
@@ -524,6 +545,8 @@ private:
 	vector<unique_ptr<Expression>> update_expressions;
 	vector<PhysicalIndex> update_columns;
 	optional_idx row_id_index;
+	vector<column_t> old_row_columns;
+	vector<column_t> output_columns;
 	shared_ptr<TransactionalDeltaAppender> appender;
 	TransactionalBaseRowFetcher row_fetcher;
 };
@@ -1154,8 +1177,22 @@ void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op) {
 		return;
 	}
 	if (dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op) || dynamic_cast<PhysicalActionDeltaCapture *>(&op)) {
-		TransactionalMVLockState::Get(context).AcquireMutationLock();
+		TransactionalMVLockState::Get(context).AcquireMutationLock(true);
 		return;
+	}
+	optional_ptr<TableCatalogEntry> target;
+	if (op.type == PhysicalOperatorType::INSERT) {
+		target = op.Cast<PhysicalInsert>().insert_table.get();
+	} else if (op.type == PhysicalOperatorType::BATCH_INSERT) {
+		target = op.Cast<PhysicalBatchInsert>().insert_table.get();
+	} else if (op.type == PhysicalOperatorType::UPDATE) {
+		target = op.Cast<PhysicalUpdate>().tableref;
+	} else if (op.type == PhysicalOperatorType::DELETE_OPERATOR) {
+		target = op.Cast<PhysicalDelete>().tableref;
+	}
+	if (target && TransactionalMVLockState::IsOwnershipRegistry(target->name.GetIdentifierName())) {
+		// A cached plan writing an ownership registry runs without the optimizer rule.
+		TransactionalMVLockState::Get(context).MarkOwnershipMetadataWrite();
 	}
 	if (op.type == PhysicalOperatorType::MERGE_INTO) {
 		for (auto &action : op.Cast<PhysicalMergeInto>().actions) {
@@ -1282,14 +1319,18 @@ PhysicalOperator &LogicalTransactionalDeltaCapture::CreatePlan(ClientContext &co
 	planner.dependencies.AddDependency(delta_table);
 
 	auto generated_expressions = BindGeneratedExpressions(context, base_table, delta_table);
-	return planner.Make<PhysicalTransactionalDeltaCapture>(child, base_table, delta_table, mode, std::move(expressions),
-	                                                       std::move(generated_expressions), std::move(update_columns),
-	                                                       row_id_index, estimated_cardinality);
+	return planner.Make<PhysicalTransactionalDeltaCapture>(
+	    child, types, base_table, delta_table, mode, std::move(expressions), std::move(generated_expressions),
+	    std::move(update_columns), row_id_index, std::move(old_row_columns), estimated_cardinality);
 }
 
 vector<ColumnBinding> LogicalTransactionalDeltaCapture::GetColumnBindings() {
 	D_ASSERT(children.size() == 1);
-	return children[0]->GetColumnBindings();
+	auto bindings = children[0]->GetColumnBindings();
+	if (output_column_count.IsValid()) {
+		bindings.resize(output_column_count.GetIndex());
+	}
+	return bindings;
 }
 
 string LogicalTransactionalDeltaCapture::GetName() const {
@@ -1303,6 +1344,9 @@ string LogicalTransactionalDeltaCapture::GetExtensionName() const {
 void LogicalTransactionalDeltaCapture::ResolveTypes() {
 	D_ASSERT(children.size() == 1);
 	types = children[0]->types;
+	if (output_column_count.IsValid()) {
+		types.resize(output_column_count.GetIndex());
+	}
 }
 
 LogicalTransactionalActionDeltaCapture::LogicalTransactionalActionDeltaCapture(TableCatalogEntry &base_table_p,

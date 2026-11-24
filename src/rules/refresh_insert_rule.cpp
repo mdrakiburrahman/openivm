@@ -18,6 +18,7 @@
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_execute.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -165,7 +166,7 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
 	catalog.Alter(context, *delta_alter);
 }
 
-static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
+static TableCatalogEntry &GetDMLTarget(LogicalOperator &dml) {
 	optional_ptr<TableCatalogEntry> table;
 	switch (dml.type) {
 	case LogicalOperatorType::LOGICAL_INSERT:
@@ -183,6 +184,30 @@ static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
 	default:
 		throw InternalException("OpenIVM expected a source DML operator");
 	}
+	return *table;
+}
+
+// Registry writes anywhere in a plan, not only the statement's top-level DML.
+static void MarkOwnershipRegistryWrites(ClientContext &context, LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_DELETE:
+	case LogicalOperatorType::LOGICAL_UPDATE:
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		if (TransactionalMVLockState::IsOwnershipRegistry(GetDMLTarget(op).name.GetIdentifierName())) {
+			TransactionalMVLockState::Get(context).MarkOwnershipMetadataWrite();
+		}
+		break;
+	default:
+		break;
+	}
+	for (auto &child : op.children) {
+		MarkOwnershipRegistryWrites(context, *child);
+	}
+}
+
+static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
+	optional_ptr<TableCatalogEntry> table = GetDMLTarget(dml);
 	if (table->name.GetIdentifierName().empty() ||
 	    IncrementalTableNames::IsMaintenanceTable(table->name.GetIdentifierName()) || !table->catalog.IsDuckCatalog()) {
 		return nullptr;
@@ -235,18 +260,172 @@ static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert 
 	insert.expected_types = insert.table.GetTypes();
 }
 
+static idx_t FindBindingIndex(const vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
+	for (idx_t index = 0; index < bindings.size(); index++) {
+		if (bindings[index] == binding) {
+			return index;
+		}
+	}
+	throw InternalException("OpenIVM could not resolve a DML input binding");
+}
+
 static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression &expression) {
 	if (expression.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		throw InternalException("OpenIVM expected a bound row-id column reference");
 	}
-	auto &column_ref = expression.Cast<BoundColumnRefExpression>();
-	auto bindings = child.GetColumnBindings();
-	for (idx_t index = 0; index < bindings.size(); index++) {
-		if (bindings[index] == column_ref.Binding()) {
+	return FindBindingIndex(child.GetColumnBindings(), expression.Cast<BoundColumnRefExpression>().Binding());
+}
+
+// The target-table scan feeding an UPDATE/DELETE through projections only.
+// Joins (e.g. UPDATE ... FROM) can repeat target rows, and a residual filter
+// would make the scan read added columns for rows the DML never touches.
+static optional_ptr<LogicalGet> FindTargetScan(LogicalOperator &op, TableCatalogEntry &table) {
+	reference<LogicalOperator> current(op);
+	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION && current.get().children.size() == 1) {
+		current = *current.get().children[0];
+	}
+	if (current.get().type != LogicalOperatorType::LOGICAL_GET) {
+		return nullptr;
+	}
+	auto &get = current.get().Cast<LogicalGet>();
+	if (get.GetTable().get() != &table || !get.children.empty() || !get.projected_input.empty()) {
+		return nullptr;
+	}
+	for (auto &column_id : get.GetColumnIds()) {
+		// A struct-pushdown or retyped scan column is not the stored value.
+		if (!column_id.IsVirtualColumn() &&
+		    (column_id.HasChildren() || column_id.HasType() || column_id.IsPushdownExtract())) {
+			return nullptr;
+		}
+	}
+	return &get;
+}
+
+static optional_idx FindScannedColumn(LogicalGet &get, idx_t logical_index) {
+	auto &column_ids = get.GetColumnIds();
+	for (idx_t index = 0; index < column_ids.size(); index++) {
+		if (!column_ids[index].IsVirtualColumn() && column_ids[index].GetPrimaryIndex() == logical_index) {
 			return index;
 		}
 	}
-	throw InternalException("OpenIVM could not resolve the DML row-id binding");
+	return optional_idx();
+}
+
+// Scanning the missing columns beats one row-id fetch per target row only when
+// every scanned row is a target (no pushed-down filter). A filtered scan decodes
+// each added column for every vector holding a single target, which loses to
+// the fetch for sparse targets, and estimates cannot bound how sparse they are.
+static bool ScannedPreimageIsCheap(LogicalGet &get, TableCatalogEntry &table) {
+	if (!get.table_filters.HasFilters()) {
+		return true;
+	}
+	for (auto &column : table.GetColumns().Physical()) {
+		if (!FindScannedColumn(get, column.Logical().index).IsValid()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Make every physical column of the scanned table an output of `op` by appending
+// to the scan and to projections. Scan column positions (and so all bindings)
+// stay fixed. Returns the bindings in physical column order.
+static vector<ColumnBinding> ExposeTargetColumns(LogicalOperator &op, LogicalGet &get, TableCatalogEntry &table) {
+	if (&op == &get) {
+		vector<ColumnBinding> bindings;
+		for (auto &column : table.GetColumns().Physical()) {
+			auto position = FindScannedColumn(get, column.Logical().index);
+			if (!position.IsValid()) {
+				position = get.AddColumnId(column.Logical().index).GetIndex();
+			}
+			ProjectionIndex projection(position.GetIndex());
+			if (!get.projection_ids.empty() && std::find(get.projection_ids.begin(), get.projection_ids.end(),
+			                                             projection) == get.projection_ids.end()) {
+				get.projection_ids.push_back(projection);
+			}
+			bindings.emplace_back(get.table_index, projection);
+		}
+		if (get.projection_ids.size() == get.GetColumnIds().size()) {
+			// Table scans treat a full-size projection list as the identity order.
+			// Bindings name scan columns, so outputting all of them in order is equivalent.
+			get.projection_ids.clear();
+		}
+		return bindings;
+	}
+	D_ASSERT(op.type == LogicalOperatorType::LOGICAL_PROJECTION);
+	auto child_bindings = ExposeTargetColumns(*op.children[0], get, table);
+	auto &projection = op.Cast<LogicalProjection>();
+	auto types = table.GetTypes();
+	vector<ColumnBinding> bindings;
+	for (idx_t column = 0; column < child_bindings.size(); column++) {
+		optional_idx position;
+		for (idx_t index = 0; index < projection.expressions.size(); index++) {
+			auto &expression = *projection.expressions[index];
+			if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+			    expression.Cast<BoundColumnRefExpression>().Binding() == child_bindings[column]) {
+				position = index;
+				break;
+			}
+		}
+		if (!position.IsValid()) {
+			position = projection.expressions.size();
+			projection.expressions.push_back(
+			    make_uniq<BoundColumnRefExpression>(types[column], child_bindings[column]));
+		}
+		bindings.emplace_back(projection.table_index, ProjectionIndex(position.GetIndex()));
+	}
+	return bindings;
+}
+
+static bool IsIdentityPrefix(const vector<ProjectionIndex> &projection_ids) {
+	for (idx_t index = 0; index < projection_ids.size(); index++) {
+		if (projection_ids[index].GetIndex() != index) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Capture fetches each UPDATE/DELETE preimage by row id unless its input is a
+// plain target scan that can carry the whole row cheaply.
+static void CaptureScannedPreimages(LogicalTransactionalDeltaCapture &capture) {
+	auto &child = *capture.children[0];
+	auto get = FindTargetScan(child, capture.base_table);
+	// Capture consumes its input by position (row id, output count). Completing a
+	// scan's projection list resets it to scan order, so a scan feeding capture
+	// directly must already output a prefix of that order.
+	if (!get || !ScannedPreimageIsCheap(*get, capture.base_table) ||
+	    (&child == get.get() && !IsIdentityPrefix(get->projection_ids))) {
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] '%s' capture fetches preimages by row id\n",
+		                    capture.base_table.name.GetIdentifierName().c_str());
+		return;
+	}
+	auto original_bindings = child.GetColumnBindings();
+#ifdef DEBUG
+	auto original_scan_bindings = get->GetColumnBindings();
+	auto original_scan_columns = get->GetColumnIds();
+#endif
+	auto exposed = ExposeTargetColumns(child, *get, capture.base_table);
+	auto bindings = child.GetColumnBindings();
+#ifdef DEBUG
+	// Widening only appends: existing outputs keep their positions and the scan
+	// keeps every column position its bindings name.
+	D_ASSERT(bindings.size() >= original_bindings.size());
+	D_ASSERT(std::equal(original_bindings.begin(), original_bindings.end(), bindings.begin()));
+	auto scan_bindings = get->GetColumnBindings();
+	for (auto &binding : original_scan_bindings) {
+		D_ASSERT(std::find(scan_bindings.begin(), scan_bindings.end(), binding) != scan_bindings.end());
+	}
+	for (idx_t index = 0; index < original_scan_columns.size(); index++) {
+		D_ASSERT(get->GetColumnIds()[index] == original_scan_columns[index]);
+	}
+#endif
+	for (auto &binding : exposed) {
+		capture.old_row_columns.push_back(FindBindingIndex(bindings, binding));
+	}
+	capture.output_column_count = original_bindings.size();
+	OPENIVM_DEBUG_PRINT("[INSERT RULE] '%s' capture reads %zu preimage columns from its scan\n",
+	                    capture.base_table.name.GetIdentifierName().c_str(), exposed.size());
 }
 
 static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate &update) {
@@ -412,6 +591,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			wrap_generation();
 			return;
 		}
+		// Schema evolution rewrites the delta: an ownership change until commit. The
+		// tracked lookup above already holds the gate, so this never waits.
+		TransactionalMVLockState::Get(input.context).MarkOwnershipMetadataWrite();
 		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
 		auto delta_locus =
 		    std::make_pair(delta_entry->schema.name.GetIdentifierName(), delta_entry->name.GetIdentifierName());
@@ -522,11 +704,18 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	if (plan->children.empty()) {
 		return;
 	}
+	MarkOwnershipRegistryWrites(input.context, *plan);
 
 	auto dml_owner = &plan;
 	auto dml = dml_owner->get();
 	while (dml->type != LogicalOperatorType::LOGICAL_INSERT && dml->type != LogicalOperatorType::LOGICAL_DELETE &&
 	       dml->type != LogicalOperatorType::LOGICAL_UPDATE && dml->type != LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		if (dml->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && dml->children.size() == 2) {
+			// WITH ... AS MATERIALIZED: the statement's DML is in the consumer side.
+			dml_owner = &dml->children[1];
+			dml = dml_owner->get();
+			continue;
+		}
 		if (dml->children.size() != 1) {
 			return;
 		}
@@ -567,6 +756,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
 			    vector<PhysicalIndex> {}, optional_idx(row_id_index));
 			capture->children.push_back(std::move(delete_op.children[0]));
+			CaptureScannedPreimages(*capture);
 			delete_op.children[0] = std::move(capture);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
 			break;
@@ -597,6 +787,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			    update.table, *delta_table, DeltaCaptureMode::UPDATE, std::move(update_expressions), update.columns,
 			    optional_idx(row_id_index));
 			capture->children.push_back(std::move(update.children[0]));
+			CaptureScannedPreimages(*capture);
 			update.children[0] = std::move(capture);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
 			break;
