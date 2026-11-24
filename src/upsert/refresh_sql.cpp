@@ -265,11 +265,7 @@ static string RenderStoredViewQueryForDialect(Connection &con, const string &vie
 		auto cte_list = AstToCteList(*ast, dialect);
 		rendered = cte_list->ToQuery(true, output_names);
 	});
-	if (!rendered.empty() && rendered.back() == ';') {
-		rendered.pop_back();
-	}
-	StringUtil::Trim(rendered);
-	return rendered;
+	return SqlUtils::StripTrailingSemicolon(rendered);
 }
 
 struct TrackedSourceInput {
@@ -1679,10 +1675,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				raw_refresh_sql = cte_list->ToQuery(false);
 				if (use_transient_mv_delta && ast->NodeType() == "Insert" && ast->children.size() == 1) {
 					auto inline_cte_list = AstToCteList(*ast->children[0], dialect, emit_spark_hints);
-					inline_delta_select_query = inline_cte_list->ToQuery(false, column_names);
-					if (!inline_delta_select_query.empty() && inline_delta_select_query.back() == ';') {
-						inline_delta_select_query.pop_back();
-					}
+					inline_delta_select_query =
+					    SqlUtils::StripTrailingSemicolon(inline_cte_list->ToQuery(false, column_names));
 				}
 				add_profile_step("generate_refresh_sql.lpts", lpts_start,
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));

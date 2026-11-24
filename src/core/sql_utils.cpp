@@ -837,6 +837,15 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	return sql;
 }
 
+string SqlUtils::StripTrailingSemicolon(string sql) {
+	StringUtil::Trim(sql);
+	if (!sql.empty() && sql.back() == ';') {
+		sql.pop_back();
+		StringUtil::Trim(sql);
+	}
+	return sql;
+}
+
 string SqlUtils::ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
 	return needle.empty() ? haystack : StringUtil::Replace(std::move(haystack), needle, replacement);
 }

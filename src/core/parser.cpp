@@ -534,7 +534,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto ast = LogicalPlanToAst(context, candidate, dialect, time_travel_pins.Resolver(),
 			                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 			auto cte_list = AstToCteList(*ast, dialect);
-			auto sql = cte_list->ToQuery(true, output_names);
+			auto sql = SqlUtils::StripTrailingSemicolon(cte_list->ToQuery(true, output_names));
 			initial_load_ast = std::move(ast);
 			return sql;
 		};
@@ -542,18 +542,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto affected_plan = select_plan->Copy(context);
 			if (RemoveDistinctOnWinnerFilters(affected_plan)) {
 				group_recompute_affected_query = serialize_plan(affected_plan);
-				if (!group_recompute_affected_query.empty() && group_recompute_affected_query.back() == ';') {
-					group_recompute_affected_query.pop_back();
-				}
 			}
 		}
 		auto serialize_original = [&]() {
 			try {
 				view_query = serialize_plan(select_plan);
-				if (!view_query.empty() && view_query.back() == ';') {
-					view_query.pop_back();
-				}
-				StringUtil::Trim(view_query);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query without common-subplan compaction: %s\n",
 				                    view_query.c_str());
 			} catch (std::exception &) {
@@ -571,10 +564,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				compacted_plan = CompactCommonSubplans(context, *select_planner.binder, std::move(compacted_plan),
 				                                       CommonSubplanCompactionMode::SERIALIZATION_SIZE);
 				view_query = serialize_plan(compacted_plan);
-				if (!view_query.empty() && view_query.back() == ';') {
-					view_query.pop_back();
-				}
-				StringUtil::Trim(view_query);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
 			} catch (std::exception &) {
 				// Common-subplan compaction is an optional size optimization. Some

@@ -846,6 +846,13 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
 	       table_name;
 }
 
+// LPTS rendering of a plan in DuckDB's dialect, without the trailing ';'.
+static string RenderPlanSQL(ClientContext &context, unique_ptr<LogicalOperator> &plan, const vector<string> &columns) {
+	auto ast =
+	    LogicalPlanToAst(context, plan, SqlDialect::DUCKDB, {}, CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
+	return SqlUtils::StripTrailingSemicolon(AstToCteList(*ast, SqlDialect::DUCKDB)->ToQuery(true, columns));
+}
+
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
                       unordered_map<TableIndex, unordered_set<ProjectionIndex>> &join_key_cols) {
 	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
@@ -1660,12 +1667,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 			selected_plan = std::move(copied_aggregate->children[0]);
 		}
 		D_ASSERT(selected_plan->GetColumnBindings().size() == meta.selected_input_columns.size());
-		auto ast = LogicalPlanToAst(context, selected_plan, SqlDialect::DUCKDB, {},
-		                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
-		meta.selected_input_sql = AstToCteList(*ast)->ToQuery(true, meta.selected_input_columns);
-		if (!meta.selected_input_sql.empty() && meta.selected_input_sql.back() == ';') {
-			meta.selected_input_sql.pop_back();
-		}
+		meta.selected_input_sql = RenderPlanSQL(context, selected_plan, meta.selected_input_columns);
 		// The selection keeps stable column aliases when the source is renamed.
 		meta.selected_input_sql =
 		    SqlUtils::ReplaceTableReferences(meta.selected_input_sql, meta.source, "openivm_topk_candidates");
@@ -3728,13 +3730,7 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 	RemoveUnusedColumns(optimizer).VisitOperator(x_plan);
 	x_plan->ResolveOperatorTypes();
 
-	auto ast = LogicalPlanToAst(context, x_plan, SqlDialect::DUCKDB, {},
-	                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
-	auto cte_list = AstToCteList(*ast, SqlDialect::DUCKDB);
-	auto x_sql = cte_list->ToQuery(true, x_names);
-	if (!x_sql.empty() && x_sql.back() == ';') {
-		x_sql.pop_back();
-	}
+	auto x_sql = RenderPlanSQL(context, x_plan, x_names);
 	if (x_sql.empty()) {
 		return false;
 	}
