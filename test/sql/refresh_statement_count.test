@@ -1,0 +1,767 @@
+# name: test/sql/refresh_statement_count.test
+# description: Upper bounds on the internal SQL statements OpenIVM issues per CREATE MATERIALIZED VIEW and
+# group: [sql]
+
+#              refresh, and correctness of the once-per-refresh metadata reads those bounds rely on
+
+require openivm
+
+require parquet
+
+# Every internal statement costs a parse, bind and plan, which dominates small refreshes. The bounds
+# are the measured counts plus slack (before metadata was read once per refresh, refreshes issued
+# 94-136 statements and refreshes without changes 35-45). A count excludes the user's statement and
+# the queries on duckdb_logs.
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE a(id INT, k INT, v INT);
+
+statement ok
+CREATE TABLE b(id INT, k INT, w INT);
+
+statement ok
+CREATE TABLE c(id INT, k INT, z INT);
+
+statement ok
+CREATE TABLE l(id INT, k INT, v INT);
+
+statement ok
+CREATE TABLE r(id INT, w INT);
+
+statement ok
+INSERT INTO a SELECT i, i % 10, i FROM range(100) t(i);
+
+statement ok
+INSERT INTO b SELECT i, i % 10, i FROM range(100) t(i);
+
+statement ok
+INSERT INTO c SELECT i, i % 10, i FROM range(100) t(i);
+
+statement ok
+INSERT INTO l SELECT i, i % 10, i FROM range(100) t(i);
+
+statement ok
+INSERT INTO r SELECT i, i FROM range(50) t(i);
+
+# The first CREATE also creates the metadata tables; the bounds below are for later CREATEs.
+
+statement ok
+CREATE MATERIALIZED VIEW warmup AS SELECT k, COUNT(*) AS c FROM a GROUP BY k;
+
+statement ok
+CALL enable_logging('QueryLog', storage='memory');
+
+# ==========================================
+# Grouped aggregate
+# ==========================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE MATERIALIZED VIEW agg AS SELECT k, SUM(v) AS s, COUNT(*) AS c FROM a GROUP BY k;
+
+query I
+SELECT count(*) <= 8 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'CREATE MATERIALIZED VIEW%';
+----
+true
+
+statement ok
+INSERT INTO a SELECT i, i % 7, i * 3 FROM range(1000, 1020) t(i);
+
+statement ok
+DELETE FROM a WHERE id % 9 = 0;
+
+statement ok
+UPDATE a SET v = v + 1 WHERE id % 4 = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('agg');
+
+query I
+SELECT count(*) <= 35 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM agg EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM a GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM a GROUP BY k EXCEPT ALL SELECT * FROM agg);
+----
+0
+
+# Without pending changes the refresh stops after the delta activity check.
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('agg');
+
+query I
+SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM agg EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM a GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM a GROUP BY k EXCEPT ALL SELECT * FROM agg);
+----
+0
+
+# ==========================================
+# 3-way join aggregate
+# ==========================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE MATERIALIZED VIEW j3 AS SELECT a.k, SUM(a.v) AS s, COUNT(*) AS c FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k;
+
+query I
+SELECT count(*) <= 26 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'CREATE MATERIALIZED VIEW%';
+----
+true
+
+statement ok
+INSERT INTO a SELECT i, i % 7, i * 3 FROM range(50, 60) t(i);
+
+statement ok
+DELETE FROM a WHERE id % 11 = 0;
+
+statement ok
+UPDATE a SET v = v + 2 WHERE id % 5 = 2;
+
+statement ok
+INSERT INTO b SELECT i, i % 7, i FROM range(1000, 1010) t(i);
+
+statement ok
+DELETE FROM b WHERE id % 13 = 0;
+
+statement ok
+UPDATE c SET z = z + 1 WHERE id % 3 = 0;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('j3');
+
+query I
+SELECT count(*) <= 40 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM j3 EXCEPT ALL SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k EXCEPT ALL SELECT * FROM j3);
+----
+0
+
+# Only one join input changed: join compilation reuses the counted activity of every leaf.
+
+statement ok
+INSERT INTO c VALUES (1, 1, 1), (2, 2, 2);
+
+statement ok
+DELETE FROM c WHERE id = 3;
+
+statement ok
+UPDATE c SET id = 4 WHERE id = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('j3');
+
+query I
+SELECT count(*) <= 40 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM j3 EXCEPT ALL SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k EXCEPT ALL SELECT * FROM j3);
+----
+0
+
+# Without pending changes the refresh stops after the delta activity check.
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('j3');
+
+query I
+SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM j3 EXCEPT ALL SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k EXCEPT ALL SELECT * FROM j3);
+----
+0
+
+# ==========================================
+# LEFT JOIN aggregate
+# ==========================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE MATERIALIZED VIEW lj AS SELECT l.k, SUM(r.w) AS s, COUNT(*) AS c FROM l LEFT JOIN r ON l.id = r.id GROUP BY l.k;
+
+query I
+SELECT count(*) <= 22 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'CREATE MATERIALIZED VIEW%';
+----
+true
+
+statement ok
+INSERT INTO l SELECT i, i % 7, i * 3 FROM range(1000, 1020) t(i);
+
+statement ok
+DELETE FROM l WHERE id % 9 = 0;
+
+statement ok
+UPDATE l SET k = k + 1 WHERE id % 4 = 1;
+
+statement ok
+INSERT INTO r SELECT i, i * 2 FROM range(60, 80) t(i);
+
+statement ok
+DELETE FROM r WHERE id % 6 = 0;
+
+statement ok
+UPDATE r SET w = w + 5 WHERE id % 5 = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('lj');
+
+query I
+SELECT count(*) <= 40 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM lj EXCEPT ALL SELECT l.k, SUM(r.w), COUNT(*) FROM l LEFT JOIN r ON l.id = r.id GROUP BY l.k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.k, SUM(r.w), COUNT(*) FROM l LEFT JOIN r ON l.id = r.id GROUP BY l.k EXCEPT ALL SELECT * FROM lj);
+----
+0
+
+# Without pending changes the refresh stops after the delta activity check.
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('lj');
+
+query I
+SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM lj EXCEPT ALL SELECT l.k, SUM(r.w), COUNT(*) FROM l LEFT JOIN r ON l.id = r.id GROUP BY l.k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.k, SUM(r.w), COUNT(*) FROM l LEFT JOIN r ON l.id = r.id GROUP BY l.k EXCEPT ALL SELECT * FROM lj);
+----
+0
+
+# ==========================================
+# DISTINCT aggregate
+# ==========================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE MATERIALIZED VIEW dagg AS SELECT k, SUM(DISTINCT v) AS sd, COUNT(*) AS c FROM a GROUP BY k;
+
+query I
+SELECT count(*) <= 8 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'CREATE MATERIALIZED VIEW%';
+----
+true
+
+statement ok
+INSERT INTO a SELECT i, i % 7, i % 5 FROM range(2000, 2020) t(i);
+
+statement ok
+DELETE FROM a WHERE id % 8 = 0;
+
+statement ok
+UPDATE a SET v = v % 3 WHERE id % 6 = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('dagg');
+
+query I
+SELECT count(*) <= 35 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM dagg EXCEPT ALL SELECT k, SUM(DISTINCT v), COUNT(*) FROM a GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, SUM(DISTINCT v), COUNT(*) FROM a GROUP BY k EXCEPT ALL SELECT * FROM dagg);
+----
+0
+
+# Without pending changes the refresh stops after the delta activity check.
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('dagg');
+
+query I
+SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM dagg EXCEPT ALL SELECT k, SUM(DISTINCT v), COUNT(*) FROM a GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, SUM(DISTINCT v), COUNT(*) FROM a GROUP BY k EXCEPT ALL SELECT * FROM dagg);
+----
+0
+
+# ==========================================
+# Projection
+# ==========================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE MATERIALIZED VIEW proj AS SELECT id, k, w FROM b WHERE w > 3;
+
+query I
+SELECT count(*) <= 8 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'CREATE MATERIALIZED VIEW%';
+----
+true
+
+statement ok
+INSERT INTO b SELECT i, i % 7, i * 3 FROM range(3000, 3020) t(i);
+
+statement ok
+DELETE FROM b WHERE id % 9 = 0;
+
+statement ok
+UPDATE b SET w = w + 1 WHERE id % 4 = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('proj');
+
+query I
+SELECT count(*) <= 35 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM proj EXCEPT ALL SELECT id, k, w FROM b WHERE w > 3);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, k, w FROM b WHERE w > 3 EXCEPT ALL SELECT * FROM proj);
+----
+0
+
+# Without pending changes the refresh stops after the delta activity check.
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+PRAGMA refresh('proj');
+
+query I
+SELECT count(*) <= 10 FROM duckdb_logs WHERE type = 'QueryLog' AND message NOT LIKE '%duckdb_logs%' AND message NOT LIKE 'PRAGMA refresh%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM proj EXCEPT ALL SELECT id, k, w FROM b WHERE w > 3);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, k, w FROM b WHERE w > 3 EXCEPT ALL SELECT * FROM proj);
+----
+0
+
+statement ok
+CALL disable_logging();
+
+# ==========================================
+# Metadata changed between refreshes is read again: CREATE OR REPLACE, ALTER, DROP of a dependent
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW agg_child AS SELECT k % 2 AS parity, SUM(s) AS s FROM agg GROUP BY k % 2;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW agg AS SELECT k, SUM(v + 1) AS s, COUNT(*) AS c FROM a GROUP BY k;
+
+statement ok
+ALTER MATERIALIZED VIEW agg SET REFRESH EVERY '10 minutes';
+
+statement ok
+INSERT INTO a SELECT i, i % 10, i FROM range(4000, 4010) t(i);
+
+statement ok
+DELETE FROM a WHERE id % 7 = 3;
+
+statement ok
+UPDATE a SET v = v - 1, id = id + 5000 WHERE id % 10 = 4;
+
+statement ok
+PRAGMA refresh('agg');
+
+query I
+SELECT count(*) FROM (SELECT * FROM agg EXCEPT ALL SELECT k, SUM(v + 1), COUNT(*) FROM a GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, SUM(v + 1), COUNT(*) FROM a GROUP BY k EXCEPT ALL SELECT * FROM agg);
+----
+0
+
+# The dependent view was refreshed by the downstream cascade.
+query I
+SELECT count(*) FROM (SELECT * FROM agg_child EXCEPT ALL SELECT k % 2, SUM(s) FROM agg GROUP BY k % 2);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k % 2, SUM(s) FROM agg GROUP BY k % 2 EXCEPT ALL SELECT * FROM agg_child);
+----
+0
+
+statement ok
+DROP VIEW IF EXISTS agg_child;
+
+statement ok
+INSERT INTO a VALUES (5, 5, 5), (6, 6, 6);
+
+statement ok
+DELETE FROM a WHERE id = 5;
+
+statement ok
+UPDATE a SET v = 60 WHERE id = 6;
+
+statement ok
+PRAGMA refresh('agg');
+
+query I
+SELECT count(*) FROM (SELECT * FROM agg EXCEPT ALL SELECT k, SUM(v + 1), COUNT(*) FROM a GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, SUM(v + 1), COUNT(*) FROM a GROUP BY k EXCEPT ALL SELECT * FROM agg);
+----
+0
+
+# ==========================================
+# A view created and refreshed in one open transaction reads the caller's uncommitted metadata
+# ==========================================
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE TABLE tx_src(id INT, g INT, v INT);
+
+statement ok
+INSERT INTO tx_src SELECT i, i % 3, i FROM range(10) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW tx_mv AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM tx_src GROUP BY g;
+
+statement ok
+INSERT INTO tx_src VALUES (20, 1, 20), (21, 2, 21);
+
+statement ok
+DELETE FROM tx_src WHERE id = 4;
+
+statement ok
+UPDATE tx_src SET v = v * 10 WHERE id = 21 OR id = 5;
+
+statement ok
+PRAGMA refresh('tx_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM tx_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM tx_src GROUP BY g);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT g, SUM(v), COUNT(*) FROM tx_src GROUP BY g EXCEPT ALL SELECT * FROM tx_mv);
+----
+0
+
+statement ok
+COMMIT;
+
+statement ok
+INSERT INTO tx_src VALUES (30, 0, 30);
+
+statement ok
+DELETE FROM tx_src WHERE id = 20;
+
+statement ok
+UPDATE tx_src SET g = 2 WHERE id = 30;
+
+statement ok
+PRAGMA refresh('tx_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM tx_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM tx_src GROUP BY g);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT g, SUM(v), COUNT(*) FROM tx_src GROUP BY g EXCEPT ALL SELECT * FROM tx_mv);
+----
+0
+
+# An explicit-transaction refresh of a committed join view
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO b VALUES (7, 7, 70), (8, 8, 80);
+
+statement ok
+DELETE FROM a WHERE id = 8;
+
+statement ok
+UPDATE c SET z = z + 100 WHERE id = 7;
+
+statement ok
+PRAGMA refresh('j3');
+
+query I
+SELECT count(*) FROM (SELECT * FROM j3 EXCEPT ALL SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k EXCEPT ALL SELECT * FROM j3);
+----
+0
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM (SELECT * FROM j3 EXCEPT ALL SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT a.k, SUM(a.v), COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id GROUP BY a.k EXCEPT ALL SELECT * FROM j3);
+----
+0
+
+# ==========================================
+# Attached catalog with mixed-case catalog, schema and view names
+# ==========================================
+
+statement ok
+ATTACH ':memory:' AS "MixedCat";
+
+statement ok
+CREATE SCHEMA "MixedCat"."MixedSch";
+
+statement ok
+CREATE TABLE "MixedCat"."MixedSch"."Orders"(id INT, "Grp" INT, amount INT);
+
+statement ok
+CREATE TABLE "MixedCat"."MixedSch"."Items"(id INT, price INT);
+
+statement ok
+INSERT INTO "MixedCat"."MixedSch"."Orders" SELECT i, i % 4, i FROM range(40) t(i);
+
+statement ok
+INSERT INTO "MixedCat"."MixedSch"."Items" SELECT i, i * 2 FROM range(40) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW "MixedCat"."MixedSch"."OrderTotals" AS SELECT o."Grp", SUM(o.amount + i.price) AS total, COUNT(*) AS n FROM "MixedCat"."MixedSch"."Orders" o JOIN "MixedCat"."MixedSch"."Items" i ON o.id = i.id GROUP BY o."Grp";
+
+statement ok
+INSERT INTO "MixedCat"."MixedSch"."Orders" SELECT i, i % 5, i FROM range(40, 50) t(i);
+
+statement ok
+INSERT INTO "MixedCat"."MixedSch"."Items" SELECT i, i FROM range(40, 45) t(i);
+
+statement ok
+DELETE FROM "MixedCat"."MixedSch"."Orders" WHERE id % 6 = 0;
+
+statement ok
+UPDATE "MixedCat"."MixedSch"."Items" SET price = price + 1 WHERE id % 3 = 0;
+
+statement ok
+PRAGMA refresh('"MixedCat"."MixedSch"."OrderTotals"');
+
+query I
+SELECT count(*) FROM (SELECT * FROM "MixedCat"."MixedSch"."OrderTotals" EXCEPT ALL SELECT o."Grp", SUM(o.amount + i.price), COUNT(*) FROM "MixedCat"."MixedSch"."Orders" o JOIN "MixedCat"."MixedSch"."Items" i ON o.id = i.id GROUP BY o."Grp");
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT o."Grp", SUM(o.amount + i.price), COUNT(*) FROM "MixedCat"."MixedSch"."Orders" o JOIN "MixedCat"."MixedSch"."Items" i ON o.id = i.id GROUP BY o."Grp" EXCEPT ALL SELECT * FROM "MixedCat"."MixedSch"."OrderTotals");
+----
+0
+
+# The same view, named with different case.
+
+statement ok
+INSERT INTO "MixedCat"."MixedSch"."Orders" VALUES (1, 1, 100);
+
+statement ok
+DELETE FROM "MixedCat"."MixedSch"."Items" WHERE id = 2;
+
+statement ok
+UPDATE "MixedCat"."MixedSch"."Orders" SET amount = amount * 2 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mixedcat.mixedsch.ordertotals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM "MixedCat"."MixedSch"."OrderTotals" EXCEPT ALL SELECT o."Grp", SUM(o.amount + i.price), COUNT(*) FROM "MixedCat"."MixedSch"."Orders" o JOIN "MixedCat"."MixedSch"."Items" i ON o.id = i.id GROUP BY o."Grp");
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT o."Grp", SUM(o.amount + i.price), COUNT(*) FROM "MixedCat"."MixedSch"."Orders" o JOIN "MixedCat"."MixedSch"."Items" i ON o.id = i.id GROUP BY o."Grp" EXCEPT ALL SELECT * FROM "MixedCat"."MixedSch"."OrderTotals");
+----
+0
+
+# ==========================================
+# DuckLake join view
+# ==========================================
+
+statement ok
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '{TEST_DIR}/refresh_statement_count_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+CREATE TABLE dl.customers (id INT, region INT);
+
+statement ok
+CREATE TABLE dl.purchases (cust_id INT, price INT);
+
+statement ok
+INSERT INTO dl.customers SELECT i, i % 3 FROM range(20) t(i);
+
+statement ok
+INSERT INTO dl.purchases SELECT i % 20, i FROM range(60) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.region_sales AS SELECT c.region, SUM(p.price) AS total, COUNT(*) AS n FROM dl.customers c JOIN dl.purchases p ON c.id = p.cust_id GROUP BY c.region;
+
+statement ok
+INSERT INTO dl.purchases SELECT i % 25, i FROM range(100, 120) t(i);
+
+statement ok
+INSERT INTO dl.customers SELECT i, i % 4 FROM range(20, 25) t(i);
+
+statement ok
+DELETE FROM dl.purchases WHERE price % 7 = 0;
+
+statement ok
+UPDATE dl.customers SET region = region + 1 WHERE id % 5 = 0;
+
+statement ok
+PRAGMA refresh('dl.region_sales');
+
+query I
+SELECT count(*) FROM (SELECT * FROM dl.region_sales EXCEPT ALL SELECT c.region, SUM(p.price), COUNT(*) FROM dl.customers c JOIN dl.purchases p ON c.id = p.cust_id GROUP BY c.region);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT c.region, SUM(p.price), COUNT(*) FROM dl.customers c JOIN dl.purchases p ON c.id = p.cust_id GROUP BY c.region EXCEPT ALL SELECT * FROM dl.region_sales);
+----
+0
+
+# Without pending DuckLake changes the refresh is skipped and the view stays correct.
+
+statement ok
+PRAGMA refresh('dl.region_sales');
+
+query I
+SELECT count(*) FROM (SELECT * FROM dl.region_sales EXCEPT ALL SELECT c.region, SUM(p.price), COUNT(*) FROM dl.customers c JOIN dl.purchases p ON c.id = p.cust_id GROUP BY c.region);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT c.region, SUM(p.price), COUNT(*) FROM dl.customers c JOIN dl.purchases p ON c.id = p.cust_id GROUP BY c.region EXCEPT ALL SELECT * FROM dl.region_sales);
+----
+0
