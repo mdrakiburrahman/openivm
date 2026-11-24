@@ -197,8 +197,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	metadata_location = RefreshMetadata::UseCatalog(context, con, target.catalog_name);
 	bool remote_metadata = metadata_location.explicit_placement && !metadata_location.IsNative();
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	vector<MVProfileStep> create_profile_steps;
 	bool create_profile_enabled = SqlUtils::GetBoolSetting(context, "openivm_profile_refresh", false);
 	auto create_profile_now = []() {
@@ -2257,8 +2256,7 @@ static void AppendUnusedSourceDropProgram(ClientContext &context, Connection &co
 using TrackedDropView = pair<MetadataLocation, string>;
 
 static void SelectDropMetadata(ClientContext &context, Connection &con, const MetadataLocation &location) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	RefreshMetadata::UseLocation(con, location);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
@@ -2467,8 +2465,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	    Catalog::GetCatalog(context, Identifier(drop_info.GetQualifiedName().Catalog().GetIdentifierName()))
 	            .GetCatalogType() == "ducklake";
 	Connection con(*context.db);
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	RefreshMetadata::UseCatalog(context, con, drop_info.GetQualifiedName().Catalog().GetIdentifierName());
 	auto locations = RefreshMetadata::MetadataLocations(context, openivm::VIEWS_TABLE);
 	vector<TrackedDropView> roots;

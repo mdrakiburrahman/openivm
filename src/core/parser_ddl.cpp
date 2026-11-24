@@ -428,8 +428,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
 	SqlUtils::CopySessionSetting(context, *conn->context, "TimeZone");
-	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
-	helper_lock_state.SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *conn->context);
 	MutationLockGuard mutation_guard(context);
 	StagedSourceDeltaCleanup source_delta_cleanup(context);
 	bool suspended_autocommit_transaction = false;
@@ -815,8 +814,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	// Replayed ALTER statements enter the maintenance optimizer. Every replay
 	// helper, including ownership-inventory readers, belongs to the caller that
 	// already holds the mutation gate, rather than a competing transaction.
-	TransactionalMVLockState::Get(*connection.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(owner).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(owner, *connection.context);
 	// Seed from the durable tables in the connection's metadata schema.
 	auto metadata_location = RefreshMetadata::CurrentLocation(connection);
 	vector<string> local_statements;

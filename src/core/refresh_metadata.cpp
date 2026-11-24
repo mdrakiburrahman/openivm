@@ -263,16 +263,14 @@ MetadataLocation RefreshMetadata::ResolveLocation(ClientContext &context, Connec
 }
 
 MetadataLocation RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	auto location = ResolveLocation(context, con, view_catalog);
 	SelectMetadataLocation(con, location);
 	return location;
 }
 
 void RefreshMetadata::UseSameLocation(ClientContext &context, Connection &con) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	auto state = TryGetLocationState(context);
 	if (!state || state->location.catalog.empty()) {
 		UseCatalog(context, con);
@@ -313,8 +311,7 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 	}
 	Connection con(*context.db);
 	// Metadata INSERTs still enter the maintenance optimizer on this helper.
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	MutationLockGuard guard(context);
 	auto location = MetadataLocator::Resolve(context, con, view_catalog);
 	MetadataLocator::RequireWritable(location, "move metadata schema");

@@ -52,8 +52,7 @@ public:
 		OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] restoring %zu metadata snapshots\n", restore_sql.size());
 		try {
 			Connection con(*context.db);
-			TransactionalMVLockState::Get(*con.context)
-			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+			TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 			for (auto it = restore_sql.rbegin(); it != restore_sql.rend(); ++it) {
 				con.BeginTransaction();
 				auto result = con.Query(*it);
@@ -148,8 +147,7 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
 }
 
 static void SnapshotSchemaEvolutionMetadata(ClientContext &context, Connection &con, const MetadataLocation &location) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	RefreshMetadata::UseLocation(con, location);
 	RefreshMetadata(con).SnapshotTransaction(context);
 	if (auto state = TransactionalMVMetadataState::TryGet(context)) {

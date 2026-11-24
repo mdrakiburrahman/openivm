@@ -156,8 +156,7 @@ static void InjectConcurrentCommit(ClientContext &context, const string &point, 
 		throw InvalidInputException("openivm_test_fail_point '%s' requires openivm_test_concurrent_sql", point);
 	}
 	Connection writer(*context.db.get());
-	TransactionalMVLockState::Get(*writer.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *writer.context);
 	SqlUtils::QueryOrThrow<InvalidInputException>(writer, sql.ToString(), "openivm_test_concurrent_sql failed: %s");
 }
 
@@ -262,8 +261,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
 	Connection exec_con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *exec_con.context, "TimeZone");
-	TransactionalMVLockState::Get(*exec_con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *exec_con.context);
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;
 	bool intent_recorded = false;
@@ -271,8 +269,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// Returns the error, or an empty string once committed.
 	auto run_metadata = [&](const string &statements) -> string {
 		Connection meta_con(*context.db.get());
-		TransactionalMVLockState::Get(*meta_con.context)
-		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+		TransactionalMVLockState::ShareMutationOwner(context, *meta_con.context);
 		if (!split_protocol) {
 			auto result = meta_con.Query(statements);
 			return result->HasError() ? result->GetError() : string();
@@ -730,8 +727,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// Housekeeping after the watermarks advanced: delete delta rows every consumer
 			// has committed. Failures only retain rows that later refreshes exclude.
 			Connection cleanup_con(*context.db.get());
-			TransactionalMVLockState::Get(*cleanup_con.context)
-			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+			TransactionalMVLockState::ShareMutationOwner(context, *cleanup_con.context);
 			for (auto &cleanup : post_watermark_cleanup) {
 				auto cleaned = cleanup_con.Query(cleanup);
 				if (cleaned->HasError()) {
@@ -1095,8 +1091,7 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	// Hooks run through this helper connection while the caller owns the
 	// database-wide mutation gate. Give tracked DML in the hook the same logical
 	// owner so delta capture re-enters the gate instead of waiting on its caller.
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 
 	if (!pipeline && parameters.values.size() == 3) {
 		view_catalog_name = StringValue::Get(parameters.values[0]);

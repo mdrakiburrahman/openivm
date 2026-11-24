@@ -150,6 +150,10 @@ public:
 	// Reused replay helpers may reassert the same owner while their guard is held.
 	void SetMutationOwner(const void *owner_token);
 	const void *GetMutationOwner();
+	// Let a helper connection act under the caller's mutation ownership.
+	static void ShareMutationOwner(ClientContext &from, ClientContext &to) {
+		Get(to).SetMutationOwner(Get(from).GetMutationOwner());
+	}
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;

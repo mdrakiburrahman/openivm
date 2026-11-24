@@ -256,8 +256,7 @@ string RecordCompiledProgram(ClientContext &context, const string &view_catalog,
 	try {
 		Connection con(*context.db);
 		// The caller owns the database-wide mutation gate; let tracked writes re-enter it.
-		TransactionalMVLockState::Get(*con.context)
-		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+		TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 		// The archive belongs to the view's metadata location (openivm_metadata_catalog/_schema).
 		RefreshMetadata::UseCatalog(context, con, view_catalog);
 		auto location = RefreshMetadata::CurrentLocation(con);
