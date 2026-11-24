@@ -9,6 +9,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
@@ -976,7 +977,11 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 			idx_t end = i;
 			vector<IdentifierSegmentSpan> parts;
 			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
-				if (expect_table && matches_table(parts)) {
+				// `FROM (SELECT ...` / `FROM (WITH ...`: an unquoted reserved word is never a table name.
+				bool reserved_word =
+				    parts.size() == 1 && sql[start] != '"' &&
+				    KeywordHelper::KeywordCategoryType(parts[0].value) == KeywordCategory::KEYWORD_RESERVED;
+				if (expect_table && !reserved_word && matches_table(parts)) {
 					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
 					i = matches.back().end;
 					expect_table = false;
@@ -987,7 +992,8 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 				continue;
 			}
 		}
-		if (!std::isspace(static_cast<unsigned char>(c))) {
+		// A parenthesized join tree (`FROM (t AS a LEFT JOIN ...`) still starts with a table reference.
+		if (!std::isspace(static_cast<unsigned char>(c)) && c != '(') {
 			expect_table = false;
 		}
 		i++;
