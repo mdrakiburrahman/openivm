@@ -53,18 +53,10 @@ namespace duckdb {
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
 /// Returns whether a DISTINCT state aggregate replaced `node` itself.
 static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node) {
-	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
-		// A projection can drop DISTINCT keys or map them to duplicate output rows.
-		// Its child's count is internal state, not an output of the outer query.
-		for (auto &child : node->children) {
-			RewriteDistinct(context, binder, child);
-		}
-		return false;
-	}
-
-	auto &distinct = node->Cast<LogicalDistinct>();
-	if (distinct.distinct_type == DistinctType::DISTINCT_ON) {
-		// Winner selection depends on ORDER BY, not full-row multiplicity.
+	// A projection can drop DISTINCT keys or map them to duplicate output rows, so a child's count is
+	// internal state. DISTINCT ON picks winners by ORDER BY, not by full-row multiplicity.
+	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT ||
+	    node->Cast<LogicalDistinct>().distinct_type == DistinctType::DISTINCT_ON) {
 		for (auto &child : node->children) {
 			RewriteDistinct(context, binder, child);
 		}
@@ -74,14 +66,8 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 		OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT has no children — skipping\n");
 		return false;
 	}
-	if (ProducesAtMostOneRow(*node->children[0])) {
-		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over scalar aggregate\n");
-		node = std::move(node->children[0]);
-		RewriteDistinct(context, binder, node);
-		return false;
-	}
-	if (IsRedundantDistinctOverGroupKeys(*node)) {
-		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over aggregate group keys\n");
+	if (ProducesAtMostOneRow(*node->children[0]) || IsRedundantDistinctOverGroupKeys(*node)) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over a single row or group keys\n");
 		node = std::move(node->children[0]);
 		RewriteDistinct(context, binder, node);
 		return false;
