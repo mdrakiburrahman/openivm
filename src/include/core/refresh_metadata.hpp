@@ -65,6 +65,10 @@ public:
 	// connection OpenIVM owns for one refresh), and look it up there.
 	static void RegisterPlanningView(ClientContext &context, shared_ptr<const ViewRecord> record);
 	static shared_ptr<const ViewRecord> PlanningView(ClientContext &context, const string &view_name);
+	// Whether the transaction of `context` can hold metadata changes a fresh helper connection cannot see.
+	// A helper connection OpenIVM opened to plan a refresh only reads committed metadata.
+	static bool TransactionMayHoldMetadata(ClientContext &context);
+	static void MarkPlanningHelper(ClientContext &context);
 	// The stored publication query, or NULL when the view has none or it cannot be read.
 	Value GetPublishedQuery(const string &view_name);
 

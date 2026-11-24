@@ -483,6 +483,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto &planning_context = owned_connection ? *con.context : context;
 	if (owned_connection) {
 		RefreshMetadata::UseCatalog(context, con, view_catalog_name);
+		// Its planning transactions only read committed metadata: no caller snapshot to copy.
+		RefreshMetadata::MarkPlanningHelper(planning_context);
 	}
 	PropagateRefreshPlanningSettings(context, planning_context);
 	// Mirror the active CompileFacts onto the inner connection's ClientContext

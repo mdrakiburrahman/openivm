@@ -60,7 +60,7 @@ unique_ptr<SQLStatement> IncrementalRewriteRule::LoadStoredViewStatement(ClientC
                                                                          const string &view_catalog, const string &view,
                                                                          const string &missing_error) {
 	RefreshMetadata::UseCatalog(context, con, view_catalog);
-	if (!context.transaction.IsAutoCommit()) {
+	if (RefreshMetadata::TransactionMayHoldMetadata(context)) {
 		RefreshMetadata(con).SnapshotTransaction(context);
 	}
 	RefreshMetadata metadata(con);

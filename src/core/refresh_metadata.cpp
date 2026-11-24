@@ -618,11 +618,14 @@ bool IsVolatileDeltaColumn(const string &column) {
 
 constexpr const char *RECORD_DELTAS_COLUMN = "openivm_record_deltas";
 constexpr const char *PLANNING_VIEW_STATE = "openivm_planning_view";
+constexpr const char *PLANNING_HELPER_STATE = "openivm_planning_helper";
 
 class PlanningViewState : public ClientContextState {
 public:
 	shared_ptr<const RefreshMetadata::ViewRecord> record;
 };
+
+class PlanningHelperState : public ClientContextState {};
 
 } // namespace
 
@@ -678,6 +681,15 @@ shared_ptr<const RefreshMetadata::ViewRecord> RefreshMetadata::PlanningView(Clie
 		return nullptr;
 	}
 	return state->record;
+}
+
+bool RefreshMetadata::TransactionMayHoldMetadata(ClientContext &context) {
+	return !context.transaction.IsAutoCommit() &&
+	       !context.registered_state->Get<PlanningHelperState>(PLANNING_HELPER_STATE);
+}
+
+void RefreshMetadata::MarkPlanningHelper(ClientContext &context) {
+	context.registered_state->GetOrCreate<PlanningHelperState>(PLANNING_HELPER_STATE);
 }
 
 const RefreshMetadata::ViewRecord *RefreshMetadata::Record(const string &view_name) const {
