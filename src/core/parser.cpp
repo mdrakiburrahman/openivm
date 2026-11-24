@@ -2452,13 +2452,15 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		}
 	}
 
+	// The resolved target: a schema drop names its schema in the name slot.
+	const auto target_catalog = drop_info.GetQualifiedName().Catalog().GetIdentifierName();
+	const auto target_schema = drop_info.GetQualifiedName().Schema().GetIdentifierName();
+	const auto target_name = drop_info.GetQualifiedName().Name().GetIdentifierName();
 	const bool ducklake =
-	    !schema_drop &&
-	    Catalog::GetCatalog(context, Identifier(drop_info.GetQualifiedName().Catalog().GetIdentifierName()))
-	            .GetCatalogType() == "ducklake";
+	    !schema_drop && Catalog::GetCatalog(context, Identifier(target_catalog)).GetCatalogType() == "ducklake";
 	Connection con(*context.db);
 	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
-	RefreshMetadata::UseCatalog(context, con, drop_info.GetQualifiedName().Catalog().GetIdentifierName());
+	RefreshMetadata::UseCatalog(context, con, target_catalog);
 	auto locations = RefreshMetadata::MetadataLocations(context, openivm::VIEWS_TABLE);
 	vector<TrackedDropView> roots;
 	vector<string> dependent_views;
@@ -2468,20 +2470,17 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		if (!schema_drop) {
 			LifecycleLeaseState::Get(context).Acquire(
 			    context, RefreshMetadata::CurrentLocation(con),
-			    {LifecycleLeaseState::SourceKey(drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
-			                                    drop_info.GetQualifiedName().Schema().GetIdentifierName(),
-			                                    drop_info.GetQualifiedName().Name().GetIdentifierName())});
+			    {LifecycleLeaseState::SourceKey(target_catalog, target_schema, target_name)});
 		}
 		if (schema_drop) {
 			auto namespace_matches = [&](const string &catalog_name, const string &schema_name) {
-				return StringUtil::CIEquals(catalog_name, drop_info.GetQualifiedName().Catalog().GetIdentifierName()) &&
-				       StringUtil::CIEquals(schema_name, drop_info.GetQualifiedName().Name().GetIdentifierName());
+				return StringUtil::CIEquals(catalog_name, target_catalog) &&
+				       StringUtil::CIEquals(schema_name, target_name);
 			};
 			auto metadata_location = RefreshMetadata::CurrentLocation(con);
 			auto rows = SqlUtils::QueryOrThrow(
 			    con, "SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " ORDER BY view_name",
-			    "OpenIVM could not resolve schema ownership for '%s': %s",
-			    drop_info.GetQualifiedName().Name().GetIdentifierName());
+			    "OpenIVM could not resolve schema ownership for '%s': %s", target_name);
 			RefreshMetadata metadata(con);
 			for (idx_t row = 0; row < rows->RowCount(); row++) {
 				auto key = rows->Collection().GetValue(0, row).ToString();
@@ -2504,16 +2503,13 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			}
 			continue;
 		}
-		auto owners = RefreshMetadata::SourceOwnerPredicate(drop_info.GetQualifiedName().Name().GetIdentifierName(),
-		                                                    drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
-		                                                    drop_info.GetQualifiedName().Schema().GetIdentifierName(),
-		                                                    ducklake, registry.catalog);
+		auto owners = RefreshMetadata::SourceOwnerPredicate(target_name, target_catalog, target_schema, ducklake,
+		                                                    registry.catalog);
 		auto dependent_rows =
 		    SqlUtils::QueryOrThrow(con,
 		                           "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 		                               owners + " ORDER BY view_name",
-		                           "OpenIVM could not resolve materialized views depending on '%s': %s",
-		                           drop_info.GetQualifiedName().Name().GetIdentifierName());
+		                           "OpenIVM could not resolve materialized views depending on '%s': %s", target_name);
 		if (!dependent_rows->RowCount()) {
 			continue;
 		}
@@ -2521,37 +2517,29 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			// DuckLake sources have no OpenIVM delta buffer to retract into. Retained MVs
 			// observe the drop through their recorded DuckLake table id: a same-named
 			// replacement has a new id, which forces a full recompute on refresh.
-			OPENIVM_DEBUG_PRINT("[DROP] Retaining MVs of DuckLake source '%s'\n",
-			                    drop_info.GetQualifiedName().Name().GetIdentifierName().c_str());
+			OPENIVM_DEBUG_PRINT("[DROP] Retaining MVs of DuckLake source '%s'\n", target_name.c_str());
 			return drop_statement();
 		}
 		if (!drop_info.cascade) {
 			// Retained MVs must observe removal before a same-named replacement.
-			auto source = SqlUtils::FullName(drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
-			                                 drop_info.GetQualifiedName().Schema().GetIdentifierName(),
-			                                 drop_info.GetQualifiedName().Name().GetIdentifierName());
+			auto source = SqlUtils::FullName(target_catalog, target_schema, target_name);
 			return "DELETE FROM " + source + ";\n" + BuildDropStatement(drop_info) + ";\n";
 		}
 		if (ducklake && !context.transaction.IsAutoCommit()) {
 			throw CatalogException("Cannot run DROP TABLE %s CASCADE inside an explicit transaction: its materialized "
 			                       "views keep OpenIVM metadata in native catalog '%s', and DuckDB cannot write both "
 			                       "catalogs in one transaction. Run the DROP in autocommit mode.",
-			                       SqlUtils::FullName(drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
-			                                          drop_info.GetQualifiedName().Schema().GetIdentifierName(),
-			                                          drop_info.GetQualifiedName().Name().GetIdentifierName()),
-			                       registry.catalog);
+			                       SqlUtils::FullName(target_catalog, target_schema, target_name), registry.catalog);
 		}
 		for (idx_t row = 0; row < dependent_rows->RowCount(); row++) {
 			roots.emplace_back(registry, dependent_rows->Collection().GetValue(0, row).ToString());
 		}
 	}
 	auto drop_views = LeaseTrackedViewDropOrder(context, con, locations, roots);
-	RejectCrossCatalogDropInTransaction(context, con, drop_views,
-	                                    drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
+	RejectCrossCatalogDropInTransaction(context, con, drop_views, target_catalog,
 	                                    schema_drop ? "DROP SCHEMA CASCADE" : "DROP TABLE CASCADE");
 	for (auto &view : drop_views) {
-		program.Append(context, con, view, drop_info.GetQualifiedName().Catalog().GetIdentifierName(), true,
-		               OnEntryNotFound::RETURN_NULL);
+		program.Append(context, con, view, target_catalog, true, OnEntryNotFound::RETURN_NULL);
 		TransactionalMVMetadataState::Get(context).RegisterViewDrop(view.second);
 		dependent_views.push_back(view.second);
 	}
@@ -2560,16 +2548,14 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	}
 	AppendUnusedSourceDropProgram(context, con, program.sources, program.sql, program.excluded_consumers);
 	for (auto &source : program.sources) {
-		program.staged |=
-		    !StringUtil::CIEquals(source.catalog_name, drop_info.GetQualifiedName().Catalog().GetIdentifierName());
+		program.staged |= !StringUtil::CIEquals(source.catalog_name, target_catalog);
 	}
 	if (ducklake) {
 		drop_info.cascade = false;
 	}
 	program.sql += drop_statement();
-	OPENIVM_DEBUG_PRINT(
-	    "[DROP] Compiled %s cleanup for '%s', views=%zu, staged=%d\n", schema_drop ? "schema" : "source",
-	    drop_info.GetQualifiedName().Name().GetIdentifierName().c_str(), dependent_views.size(), program.staged);
+	OPENIVM_DEBUG_PRINT("[DROP] Compiled %s cleanup for '%s', views=%zu, staged=%d\n",
+	                    schema_drop ? "schema" : "source", target_name.c_str(), dependent_views.size(), program.staged);
 	if (context.transaction.IsAutoCommit() && program.staged) {
 		ExecuteStagedDDL(context, {Value(program.sql)});
 		return "SELECT true AS Success";
