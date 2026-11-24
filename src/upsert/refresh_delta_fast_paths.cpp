@@ -231,48 +231,33 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
                                              const string &attached_db_schema_name,
                                              const DeltaActivityResult *precomputed_delta_activity,
                                              const openivm::CompileFacts *facts) {
-	if (facts && facts->compile_only) {
-		DeltaFastPathFlags flags;
-		flags.active_delta_table_names = delta_table_names;
-		// When an external classifier has PROVEN this batch is append-only,
-		// re-enable the insert-only fast paths even under compile_only (they are
-		// otherwise disabled because compile_only sees empty tables and cannot
-		// detect insert-only itself). Honor the same per-setting kill switches as
-		// the normal path. Without the flag we keep the conservative all-delta SQL.
-		if (facts->assume_insert_only) {
-			flags.insert_only = true;
-			flags.skip_agg_delete = SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true);
-			flags.skip_proj_delete = SqlUtils::GetBoolSetting(context, "openivm_skip_projection_delete", true);
-			flags.minmax_incremental = SqlUtils::GetBoolSetting(context, "openivm_minmax_incremental", true);
-		}
-		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: assume_insert_only=%d insert_only=%d skip_agg_delete=%d "
-		                    "skip_proj_delete=%d minmax_incremental=%d active_sources=%zu\n",
-		                    facts->assume_insert_only, flags.insert_only, flags.skip_agg_delete, flags.skip_proj_delete,
-		                    flags.minmax_incremental, flags.active_delta_table_names.size());
-		return flags;
-	}
-	auto summary = precomputed_delta_activity
-	                   ? *precomputed_delta_activity
-	                   : BuildDeltaActivityResult(metadata, con, view_name, delta_table_names, view_catalog_name,
-	                                              view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 	DeltaFastPathFlags flags;
-	flags.insert_only = IsInsertOnlyDeltaSummary(summary, delta_table_names);
-	flags.skip_agg_delete = flags.insert_only;
-	flags.skip_proj_delete = flags.insert_only;
-	flags.minmax_incremental = flags.insert_only;
-	flags.active_delta_table_names = summary.active_delta_table_names;
-
-	if (!SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true)) {
-		flags.skip_agg_delete = false;
+	if (facts && facts->compile_only) {
+		// compile_only sees empty tables and cannot detect insert-only itself, so the insert-only fast paths
+		// run only when an external classifier has PROVEN this batch is append-only. Without that flag we keep
+		// the conservative all-delta SQL.
+		flags.active_delta_table_names = delta_table_names;
+		flags.insert_only = facts->assume_insert_only;
+	} else {
+		auto summary =
+		    precomputed_delta_activity
+		        ? *precomputed_delta_activity
+		        : BuildDeltaActivityResult(metadata, con, view_name, delta_table_names, view_catalog_name,
+		                                   view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		flags.insert_only = IsInsertOnlyDeltaSummary(summary, delta_table_names);
+		flags.active_delta_table_names = summary.active_delta_table_names;
 	}
-	if (!SqlUtils::GetBoolSetting(context, "openivm_skip_projection_delete", true)) {
-		flags.skip_proj_delete = false;
-	}
-	if (!SqlUtils::GetBoolSetting(context, "openivm_minmax_incremental", true)) {
-		flags.minmax_incremental = false;
-	}
-	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d, skip_agg_delete=%d, skip_proj_delete=%d, minmax_incremental=%d\n",
-	                    flags.insert_only, flags.skip_agg_delete, flags.skip_proj_delete, flags.minmax_incremental);
+	// Each insert-only fast path has its own kill switch.
+	flags.skip_agg_delete =
+	    flags.insert_only && SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true);
+	flags.skip_proj_delete =
+	    flags.insert_only && SqlUtils::GetBoolSetting(context, "openivm_skip_projection_delete", true);
+	flags.minmax_incremental =
+	    flags.insert_only && SqlUtils::GetBoolSetting(context, "openivm_minmax_incremental", true);
+	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d, skip_agg_delete=%d, skip_proj_delete=%d, minmax_incremental=%d "
+	                    "active_sources=%zu\n",
+	                    flags.insert_only, flags.skip_agg_delete, flags.skip_proj_delete, flags.minmax_incremental,
+	                    flags.active_delta_table_names.size());
 	return flags;
 }
 
