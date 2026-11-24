@@ -66,6 +66,16 @@ public:
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
+	/// Run sql and throw EXCEPTION(format, args..., error) when it fails; format's last %s receives the error.
+	template <class EXCEPTION = CatalogException, class... ARGS>
+	static unique_ptr<QueryResult> QueryOrThrow(Connection &con, const string &sql, const string &format,
+	                                            ARGS... args) {
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			throw EXCEPTION(format, args..., result->GetError());
+		}
+		return result;
+	}
 	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
 		Value setting_value;
 		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {

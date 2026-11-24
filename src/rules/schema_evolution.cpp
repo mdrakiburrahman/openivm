@@ -702,10 +702,7 @@ static void PersistRenamedViewMetadata(ClientContext &context, Connection &con, 
 		} else {
 			// A different native catalog cannot join the caller's ALTER transaction.
 			// Its durable preimage is retained by TransactionalHelperUndoState.
-			auto result = con.Query(sql);
-			if (result->HasError()) {
-				throw CatalogException("Cannot persist renamed materialized view metadata: %s", result->GetError());
-			}
+			SqlUtils::QueryOrThrow(con, sql, "Cannot persist renamed materialized view metadata: %s");
 		}
 		TransactionalMVMetadataState::Get(context).RegisterSQL(sql, key.ToString());
 		OPENIVM_DEBUG_PRINT("[SCHEMA EVOLUTION] Rewrote metadata for '%s' in %s.%s\n", key.ToString().c_str(),
@@ -723,10 +720,8 @@ void RewriteDependentViewMetadataForRename(ClientContext &context, Connection &c
 	try {
 		con.BeginTransaction();
 		tx_open = true;
-		auto before = con.Query("SELECT * FROM openivm_views ORDER BY view_name");
-		if (before->HasError()) {
-			throw CatalogException("Cannot snapshot materialized view rename metadata: %s", before->GetError());
-		}
+		auto before = SqlUtils::QueryOrThrow(con, "SELECT * FROM openivm_views ORDER BY view_name",
+		                                     "Cannot snapshot materialized view rename metadata: %s");
 		for (auto &view : views) {
 			RewriteStoredViewQuery(context, con, metadata, view.name, qualified_source, old_name, new_name,
 			                       /*persist=*/true);
@@ -736,10 +731,8 @@ void RewriteDependentViewMetadataForRename(ClientContext &context, Connection &c
 			RewriteLineageMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
 		}
-		auto after = con.Query("SELECT * FROM openivm_views ORDER BY view_name");
-		if (after->HasError()) {
-			throw CatalogException("Cannot read materialized view rename metadata: %s", after->GetError());
-		}
+		auto after = SqlUtils::QueryOrThrow(con, "SELECT * FROM openivm_views ORDER BY view_name",
+		                                    "Cannot read materialized view rename metadata: %s");
 		PersistRenamedViewMetadata(context, con, source_catalog, *before, *after);
 		con.Commit();
 		tx_open = false;

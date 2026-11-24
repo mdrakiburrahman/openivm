@@ -158,10 +158,7 @@ static void InjectConcurrentCommit(ClientContext &context, const string &point, 
 	Connection writer(*context.db.get());
 	TransactionalMVLockState::Get(*writer.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-	auto result = writer.Query(sql.ToString());
-	if (result->HasError()) {
-		throw InvalidInputException("openivm_test_concurrent_sql failed: %s", result->GetError());
-	}
+	SqlUtils::QueryOrThrow<InvalidInputException>(writer, sql.ToString(), "openivm_test_concurrent_sql failed: %s");
 }
 
 // Test-only: whether a refresh statement inserts into the view's own delta table (delta_<mv>).
@@ -572,10 +569,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                    SqlUtils::ReplaceAllOccurrences(error, vn, probe_meta.GetViewSQLName(vn)));
 		}
 		if (!after_hook.empty()) {
-			auto hook_result = exec_con.Query(after_hook);
-			if (hook_result->HasError()) {
-				throw InvalidInputException("after-hook for '%s' failed: %s", display_name, hook_result->GetError());
-			}
+			SqlUtils::QueryOrThrow<InvalidInputException>(exec_con, after_hook, "after-hook for '%s' failed: %s",
+			                                              display_name);
 		}
 
 		// Transactional DuckLake reads all happened before this point, so verify before
@@ -655,11 +650,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			    publication->Collection().GetValue(0, 0).ToString());
 			set_archived_program();
 			data_may_be_committed = true;
-			auto published = exec_con.Query(publish_sql);
-			if (published->HasError()) {
-				throw CatalogException("Could not advance snapshot publication for '%s': %s", vn,
-				                       published->GetError());
-			}
+			SqlUtils::QueryOrThrow(exec_con, publish_sql, "Could not advance snapshot publication for '%s': %s", vn);
 			profiler.AddStep("publish_snapshot", publication_start, "no physical publication copy");
 		}
 		if (cross_system && !meta_post_sql.empty()) {
@@ -978,10 +969,7 @@ static vector<string> PipelineTargets(const FunctionParameters &parameters) {
 static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const string &view_catalog) {
 	auto catalog = view_catalog;
 	if (catalog.empty()) {
-		auto result = con.Query("SELECT current_database()");
-		if (result->HasError()) {
-			throw CatalogException("Cannot resolve after-hook catalog: %s", result->GetError());
-		}
+		auto result = SqlUtils::QueryOrThrow(con, "SELECT current_database()", "Cannot resolve after-hook catalog: %s");
 		catalog = result->Collection().GetValue(0, 0).ToString();
 	}
 	for (auto &statement : con.ExtractStatements(hook_sql)) {
@@ -1028,16 +1016,13 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 	                         (cross_system || AfterHookNeedsStaging(con, hook_sql, view_catalog_name));
 	if (hook_mode == "after" && has_refresh_hook) {
 		// Attached controllers may predate this column and were not present at LOAD.
-		auto migrated =
-		    con.Query("ALTER TABLE openivm_views ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL");
-		if (migrated->HasError()) {
-			throw CatalogException("Cannot initialize after-hook state: %s", migrated->GetError());
-		}
-		auto pending = con.Query("SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
-		                         SqlUtils::EscapeValue(view_name) + "'");
-		if (pending->HasError()) {
-			throw CatalogException("Cannot read pending after-hook for '%s': %s", display_name, pending->GetError());
-		}
+		SqlUtils::QueryOrThrow(
+		    con, "ALTER TABLE openivm_views ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL",
+		    "Cannot initialize after-hook state: %s");
+		auto pending = SqlUtils::QueryOrThrow(con,
+		                                      "SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
+		                                          SqlUtils::EscapeValue(view_name) + "'",
+		                                      "Cannot read pending after-hook for '%s': %s", display_name);
 		pending_after_hook = pending->RowCount() && !pending->Collection().GetValue(0, 0).IsNull() &&
 		                     pending->Collection().GetValue(0, 0).GetValue<bool>();
 		// A repaired hook can change its target catalog while a committed
@@ -1047,11 +1032,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		                    pending_after_hook);
 	}
 	auto mark_after_hook = [&](bool pending) {
-		auto result = con.Query("UPDATE openivm_views SET pending_after_hook = " + string(pending ? "true" : "false") +
-		                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-		if (result->HasError()) {
-			throw CatalogException("Cannot record after-hook state for '%s': %s", display_name, result->GetError());
-		}
+		SqlUtils::QueryOrThrow(con,
+		                       "UPDATE openivm_views SET pending_after_hook = " + string(pending ? "true" : "false") +
+		                           " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
+		                       "Cannot record after-hook state for '%s': %s", display_name);
 	};
 
 	// Hook-bearing refreshes keep the old pre-hook empty skip semantics. Hook-free refreshes
@@ -1144,10 +1128,8 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	RefreshMetadata::PrepareMetadataSchema(context, view_catalog_name, false);
 	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
 	// Only external data catalogs need a separate native metadata transaction.
-	auto metadata_catalog = con.Query("SELECT current_database()");
-	if (metadata_catalog->HasError()) {
-		throw CatalogException("OpenIVM could not resolve metadata catalog: %s", metadata_catalog->GetError());
-	}
+	auto metadata_catalog =
+	    SqlUtils::QueryOrThrow(con, "SELECT current_database()", "OpenIVM could not resolve metadata catalog: %s");
 	cross_system =
 	    !view_catalog_name.empty() && metadata_catalog->Collection().GetValue(0, 0).ToString() != view_catalog_name;
 
@@ -1175,11 +1157,9 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 			for (auto &query : {metadata.GetViewQuery(node),
 			                    "SELECT * FROM " + SqlUtils::FullName(location.catalog_name, location.schema_name,
 			                                                          metadata.GetViewSQLName(node))}) {
-				auto bound = con.Query("EXPLAIN " + query);
-				if (bound->HasError()) {
-					throw CatalogException("refresh_pipeline: cannot bind materialized view '%s': %s",
-					                       DisplayViewName(metadata, location.schema_name, node), bound->GetError());
-				}
+				SqlUtils::QueryOrThrow(con, "EXPLAIN " + query,
+				                       "refresh_pipeline: cannot bind materialized view '%s': %s",
+				                       DisplayViewName(metadata, location.schema_name, node));
 			}
 		}
 		for (auto &node : order) {

@@ -366,11 +366,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Shared source-delta allocation may create this same schema on a helper.
 		// Create it before source planning opens the caller's native catalog snapshot,
 		// so the caller can also create its backing/publication tables there.
-		auto created = con.Query("CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(internal_target_catalog) +
-		                         "." + SqlUtils::QuoteIdentifier(internal_target_schema));
-		if (created->HasError()) {
-			throw CatalogException("OpenIVM could not initialize its internal schema: %s", created->GetError());
-		}
+		SqlUtils::QueryOrThrow(con,
+		                       "CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(internal_target_catalog) +
+		                           "." + SqlUtils::QuoteIdentifier(internal_target_schema),
+		                       "OpenIVM could not initialize its internal schema: %s");
 	}
 	// Keep the user's AS-query body as the source of truth for original-SQL fallback,
 	// qualifying its public source identities while the caller's search path is active.
@@ -661,11 +660,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			candidates.push_back(Value(PublishedSourceViewName(table)).ToSQLString());
 		}
 		Connection dependency_con(*context.db);
-		auto parents = dependency_con.Query("SELECT view_name FROM " + metadata_location.Table(openivm::VIEWS_TABLE) +
-		                                    " WHERE view_name IN (" + StringUtil::Join(candidates, ", ") + ")");
-		if (parents->HasError()) {
-			throw CatalogException("Cannot resolve CREATE lifecycle dependencies: %s", parents->GetError());
-		}
+		auto parents = SqlUtils::QueryOrThrow(dependency_con,
+		                                      "SELECT view_name FROM " + metadata_location.Table(openivm::VIEWS_TABLE) +
+		                                          " WHERE view_name IN (" + StringUtil::Join(candidates, ", ") + ")",
+		                                      "Cannot resolve CREATE lifecycle dependencies: %s");
 		vector<string> parent_keys;
 		for (idx_t row = 0; row < parents->RowCount(); row++) {
 			parent_keys.push_back(parents->Collection().GetValue(0, row).ToString());
@@ -2304,12 +2302,11 @@ static vector<TrackedDropView> CollectTrackedViewDropOrder(ClientContext &contex
 				                                              location.catalog, DEFAULT_SCHEMA) +
 				             ")";
 			}
-			auto rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-			                      predicate + " ORDER BY view_name");
-			if (rows->HasError()) {
-				throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view.second,
-				                       rows->GetError());
-			}
+			auto rows =
+			    SqlUtils::QueryOrThrow(con,
+			                           "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+			                               " WHERE " + predicate + " ORDER BY view_name",
+			                           "OpenIVM could not resolve downstream dependencies for '%s': %s", view.second);
 			for (idx_t row = 0; row < rows->RowCount(); row++) {
 				children.emplace_back(location, rows->Collection().GetValue(0, row).ToString());
 			}
@@ -2501,11 +2498,10 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 				       StringUtil::CIEquals(schema_name, drop_info.GetQualifiedName().Name().GetIdentifierName());
 			};
 			auto metadata_location = RefreshMetadata::CurrentLocation(con);
-			auto rows = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " ORDER BY view_name");
-			if (rows->HasError()) {
-				throw CatalogException("OpenIVM could not resolve schema ownership for '%s': %s",
-				                       drop_info.GetQualifiedName().Name().GetIdentifierName(), rows->GetError());
-			}
+			auto rows = SqlUtils::QueryOrThrow(
+			    con, "SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " ORDER BY view_name",
+			    "OpenIVM could not resolve schema ownership for '%s': %s",
+			    drop_info.GetQualifiedName().Name().GetIdentifierName());
 			RefreshMetadata metadata(con);
 			for (idx_t row = 0; row < rows->RowCount(); row++) {
 				auto key = rows->Collection().GetValue(0, row).ToString();
@@ -2532,12 +2528,12 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		                                                    drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
 		                                                    drop_info.GetQualifiedName().Schema().GetIdentifierName(),
 		                                                    ducklake, registry.catalog);
-		auto dependent_rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		                                " WHERE " + owners + " ORDER BY view_name");
-		if (dependent_rows->HasError()) {
-			throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s",
-			                       drop_info.GetQualifiedName().Name().GetIdentifierName(), dependent_rows->GetError());
-		}
+		auto dependent_rows =
+		    SqlUtils::QueryOrThrow(con,
+		                           "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
+		                               owners + " ORDER BY view_name",
+		                           "OpenIVM could not resolve materialized views depending on '%s': %s",
+		                           drop_info.GetQualifiedName().Name().GetIdentifierName());
 		if (!dependent_rows->RowCount()) {
 			continue;
 		}

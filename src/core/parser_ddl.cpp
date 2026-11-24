@@ -851,11 +851,8 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		if (!IsMetadataSchemaStatement(statement)) {
 			continue;
 		}
-		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
-		if (result->HasError()) {
-			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata schema: %s",
-			                       result->GetError());
-		}
+		SqlUtils::QueryOrThrow(connection, MakeTemporaryMetadataDDL(statement),
+		                       "Could not reconstruct transaction-local OpenIVM metadata schema: %s");
 	}
 	auto seed_table = [&](const string &table, const string &filter) {
 		bool has_constrained_schema = false;
@@ -880,10 +877,8 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		}
 	};
 	auto replay_statement = [&](const string &statement) {
-		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
-		if (result->HasError()) {
-			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata: %s", result->GetError());
-		}
+		SqlUtils::QueryOrThrow(connection, MakeTemporaryMetadataDDL(statement),
+		                       "Could not reconstruct transaction-local OpenIVM metadata: %s");
 	};
 
 	// Cascade dependencies are recorded both explicitly for view matching and

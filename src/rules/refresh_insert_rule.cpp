@@ -139,10 +139,8 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
                                     const string &predicate) {
 	auto location = RefreshMetadata::CurrentLocation(con);
 	auto target = SqlUtils::FullName(location.catalog, location.schema, table_name);
-	auto rows = con.Query("SELECT * FROM " + target + " WHERE " + predicate);
-	if (rows->HasError()) {
-		throw CatalogException("OpenIVM could not snapshot helper metadata: %s", rows->GetError());
-	}
+	auto rows = SqlUtils::QueryOrThrow(con, "SELECT * FROM " + target + " WHERE " + predicate,
+	                                   "OpenIVM could not snapshot helper metadata: %s");
 	auto restore = BuildRestoreRowsSQL(*rows, target, {"view_name"}, location.IsNative());
 	if (!restore.empty()) {
 		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
