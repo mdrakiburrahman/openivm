@@ -756,18 +756,6 @@ static string CreateAuxTablePrefix(const string &target_table, bool replace) {
 	return string(replace ? "CREATE OR REPLACE TABLE " : "CREATE TABLE IF NOT EXISTS ") + target_table;
 }
 
-static string SourceExprForColumn(const vector<string> &cols, const vector<string> &source_exprs, idx_t column_idx,
-                                  const string &fallback_alias = string()) {
-	if (column_idx < source_exprs.size() && !source_exprs[column_idx].empty()) {
-		return source_exprs[column_idx];
-	}
-	string col = SqlUtils::QuoteIdentifier(cols[column_idx]);
-	if (!fallback_alias.empty()) {
-		return fallback_alias + "." + col;
-	}
-	return cols[column_idx];
-}
-
 static void BuildAliasedSourceLists(const vector<string> &cols, const vector<string> &source_exprs, string &select_list,
                                     string &group_list, const string &fallback_alias = string()) {
 	select_list.clear();
@@ -777,7 +765,10 @@ static void BuildAliasedSourceLists(const vector<string> &cols, const vector<str
 			select_list += ", ";
 			group_list += ", ";
 		}
-		string expr = SourceExprForColumn(cols, source_exprs, i, fallback_alias);
+		// Without a source expression, use the column itself (qualified and quoted under an alias).
+		string expr = i < source_exprs.size() && !source_exprs[i].empty() ? source_exprs[i]
+		              : fallback_alias.empty()                            ? cols[i]
+		                                       : fallback_alias + "." + SqlUtils::QuoteIdentifier(cols[i]);
 		select_list += expr + " AS " + SqlUtils::QuoteIdentifier(cols[i]);
 		group_list += expr;
 	}
