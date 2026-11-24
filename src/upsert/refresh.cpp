@@ -965,8 +965,7 @@ static vector<string> PipelineTargets(const FunctionParameters &parameters) {
 static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const string &view_catalog) {
 	auto catalog = view_catalog;
 	if (catalog.empty()) {
-		auto result = SqlUtils::QueryOrThrow(con, "SELECT current_database()", "Cannot resolve after-hook catalog: %s");
-		catalog = result->Collection().GetValue(0, 0).ToString();
+		catalog = SqlUtils::CurrentDatabase(con);
 	}
 	for (auto &statement : con.ExtractStatements(hook_sql)) {
 		auto prepared = con.Prepare(std::move(statement));
@@ -1124,10 +1123,7 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	RefreshMetadata::PrepareMetadataSchema(context, view_catalog_name, false);
 	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
 	// Only external data catalogs need a separate native metadata transaction.
-	auto metadata_catalog =
-	    SqlUtils::QueryOrThrow(con, "SELECT current_database()", "OpenIVM could not resolve metadata catalog: %s");
-	cross_system =
-	    !view_catalog_name.empty() && metadata_catalog->Collection().GetValue(0, 0).ToString() != view_catalog_name;
+	cross_system = !view_catalog_name.empty() && SqlUtils::CurrentDatabase(con) != view_catalog_name;
 
 	// Check cascade mode
 	auto cascade_mode = StringUtil::Lower(SqlUtils::GetStringSetting(context, "openivm_cascade_refresh", "downstream"));
@@ -1387,12 +1383,8 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 	}
 
 	if (!view_catalog_name.empty()) {
-		auto default_result = metadata_con.Query("SELECT current_database()");
-		if (!default_result->HasError() && default_result->RowCount() > 0 &&
-		    !default_result->Collection().GetValue(0, 0).IsNull() &&
-		    default_result->Collection().GetValue(0, 0).ToString() != view_catalog_name) {
-			cross_system = true;
-		}
+		auto current_database = SqlUtils::CurrentDatabase(metadata_con);
+		cross_system = cross_system || (!current_database.empty() && current_database != view_catalog_name);
 	}
 	{
 		// The staged cross-catalog path below commits outside the caller's transaction.

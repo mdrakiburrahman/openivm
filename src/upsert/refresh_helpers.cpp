@@ -1661,14 +1661,6 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 	                                 skip_proj_delete, appended_rows);
 }
 
-static string CurrentDatabase(Connection &con) {
-	auto res = con.Query("SELECT current_database()");
-	if (!res->HasError() && res->RowCount() > 0 && !res->Collection().GetValue(0, 0).IsNull()) {
-		return res->Collection().GetValue(0, 0).ToString();
-	}
-	return "";
-}
-
 ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name) {
 	ResolvedViewCatalog resolved;
 	auto parts = SqlUtils::ParseQualifiedIdentifier(view_name);
@@ -1732,7 +1724,7 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	resolved.view_catalog_name = location.catalog_name;
 	resolved.view_schema_name = location.schema_name;
 	resolved.view_name = key;
-	resolved.cross_system = resolved.view_catalog_name != CurrentDatabase(con);
+	resolved.cross_system = resolved.view_catalog_name != SqlUtils::CurrentDatabase(con);
 	return resolved;
 }
 
@@ -1741,7 +1733,7 @@ ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const
 	auto location = RefreshMetadata(con).GetStoredViewLocation(view_name, fallback_catalog, fallback_schema);
 	auto &catalog_name = location.catalog_name;
 	auto &schema_name = location.schema_name;
-	auto current_database = CurrentDatabase(con);
+	auto current_database = SqlUtils::CurrentDatabase(con);
 	bool cross_system = !catalog_name.empty() && !current_database.empty() && catalog_name != current_database;
 	return {catalog_name, schema_name, cross_system};
 }

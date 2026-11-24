@@ -1302,10 +1302,7 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 		}
 	}
 	if (loc.catalog_name.empty()) {
-		auto current = con.Query("SELECT current_database()");
-		if (!current->HasError() && current->RowCount() > 0 && !current->Collection().GetValue(0, 0).IsNull()) {
-			loc.catalog_name = current->Collection().GetValue(0, 0).ToString();
-		}
+		loc.catalog_name = SqlUtils::CurrentDatabase(con);
 	}
 	if (loc.schema_name.empty()) {
 		loc.schema_name = DEFAULT_SCHEMA;

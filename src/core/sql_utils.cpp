@@ -656,6 +656,14 @@ string SqlUtils::DuckLakeTableFunction(const string &function_name, const string
 	       "', " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 }
 
+string SqlUtils::CurrentDatabase(Connection &con) {
+	auto result = con.Query("SELECT current_database()");
+	if (!result->HasError() && result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull()) {
+		return result->Collection().GetValue(0, 0).ToString();
+	}
+	return "";
+}
+
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
 	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
 	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()

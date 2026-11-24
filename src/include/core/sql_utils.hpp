@@ -94,6 +94,8 @@ public:
 	}
 	// Copy a registered extension setting to a helper connection without changing the database default.
 	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
+	/// The connection's current_database(), or empty when it cannot be read.
+	static string CurrentDatabase(Connection &con);
 	/// The caller's default catalog and schema; an unset session catalog is the default database.
 	static SessionLocation SessionDefaultLocation(ClientContext &context);
 	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.
