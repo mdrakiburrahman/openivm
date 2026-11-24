@@ -18,7 +18,6 @@
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_execute.hpp"
@@ -258,15 +257,12 @@ static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression
 	return FindBindingIndex(child.GetColumnBindings(), expression.Cast<BoundColumnRefExpression>().Binding());
 }
 
-// The target-table scan feeding an UPDATE/DELETE through projections and filters
-// only. Other inputs (e.g. UPDATE ... FROM joins) can repeat target rows.
+// The target-table scan feeding an UPDATE/DELETE through projections only.
+// Joins (e.g. UPDATE ... FROM) can repeat target rows, and a residual filter
+// would make the scan read added columns for rows the DML never touches.
 static optional_ptr<LogicalGet> FindTargetScan(LogicalOperator &op, TableCatalogEntry &table) {
 	reference<LogicalOperator> current(op);
-	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION ||
-	       current.get().type == LogicalOperatorType::LOGICAL_FILTER) {
-		if (current.get().children.size() != 1) {
-			return nullptr;
-		}
+	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION && current.get().children.size() == 1) {
 		current = *current.get().children[0];
 	}
 	if (current.get().type != LogicalOperatorType::LOGICAL_GET) {
@@ -286,24 +282,43 @@ static optional_ptr<LogicalGet> FindTargetScan(LogicalOperator &op, TableCatalog
 	return &get;
 }
 
-// Make every physical column of the scanned table an output of `op`, appending
-// to scans, filter projection maps and projections without moving existing
-// outputs. Returns the bindings in physical column order.
+static optional_idx FindScannedColumn(LogicalGet &get, idx_t logical_index) {
+	auto &column_ids = get.GetColumnIds();
+	for (idx_t index = 0; index < column_ids.size(); index++) {
+		if (!column_ids[index].IsVirtualColumn() && column_ids[index].GetPrimaryIndex() == logical_index) {
+			return index;
+		}
+	}
+	return optional_idx();
+}
+
+// Scanning the missing columns beats one row-id fetch per target row when every
+// scanned row is a target (no pushed-down filter), or when the columns are
+// fixed-width: filtered scans then decode only vectors holding targets, cheaply.
+// Wide variable-size columns under a selective filter keep the row-id fetch.
+static bool ScannedPreimageIsCheap(LogicalGet &get, TableCatalogEntry &table) {
+	if (!get.table_filters.HasFilters()) {
+		return true;
+	}
+	for (auto &column : table.GetColumns().Physical()) {
+		if (!FindScannedColumn(get, column.Logical().index).IsValid() &&
+		    !TypeIsConstantSize(column.Type().InternalType())) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Make every physical column of the scanned table an output of `op` by appending
+// to the scan and to projections. Scan column positions (and so all bindings)
+// stay fixed. Returns the bindings in physical column order.
 static vector<ColumnBinding> ExposeTargetColumns(LogicalOperator &op, LogicalGet &get, TableCatalogEntry &table) {
 	if (&op == &get) {
 		vector<ColumnBinding> bindings;
 		for (auto &column : table.GetColumns().Physical()) {
-			auto logical_index = column.Logical().index;
-			optional_idx position;
-			auto &column_ids = get.GetColumnIds();
-			for (idx_t index = 0; index < column_ids.size(); index++) {
-				if (!column_ids[index].IsVirtualColumn() && column_ids[index].GetPrimaryIndex() == logical_index) {
-					position = index;
-					break;
-				}
-			}
+			auto position = FindScannedColumn(get, column.Logical().index);
 			if (!position.IsValid()) {
-				position = get.AddColumnId(logical_index).GetIndex();
+				position = get.AddColumnId(column.Logical().index).GetIndex();
 			}
 			ProjectionIndex projection(position.GetIndex());
 			if (!get.projection_ids.empty() && std::find(get.projection_ids.begin(), get.projection_ids.end(),
@@ -319,22 +334,8 @@ static vector<ColumnBinding> ExposeTargetColumns(LogicalOperator &op, LogicalGet
 		}
 		return bindings;
 	}
-	auto child_bindings = ExposeTargetColumns(*op.children[0], get, table);
-	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
-		auto &filter = op.Cast<LogicalFilter>();
-		if (!filter.projection_map.empty()) {
-			auto all_bindings = op.children[0]->GetColumnBindings();
-			for (auto &binding : child_bindings) {
-				ProjectionIndex child_index(FindBindingIndex(all_bindings, binding));
-				if (std::find(filter.projection_map.begin(), filter.projection_map.end(), child_index) ==
-				    filter.projection_map.end()) {
-					filter.projection_map.push_back(child_index);
-				}
-			}
-		}
-		return child_bindings;
-	}
 	D_ASSERT(op.type == LogicalOperatorType::LOGICAL_PROJECTION);
+	auto child_bindings = ExposeTargetColumns(*op.children[0], get, table);
 	auto &projection = op.Cast<LogicalProjection>();
 	auto types = table.GetTypes();
 	vector<ColumnBinding> bindings;
@@ -358,23 +359,53 @@ static vector<ColumnBinding> ExposeTargetColumns(LogicalOperator &op, LogicalGet
 	return bindings;
 }
 
+static bool IsIdentityPrefix(const vector<ProjectionIndex> &projection_ids) {
+	for (idx_t index = 0; index < projection_ids.size(); index++) {
+		if (projection_ids[index].GetIndex() != index) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // Capture fetches each UPDATE/DELETE preimage by row id unless its input is a
-// plain target scan, which can carry the whole row at columnar scan cost.
+// plain target scan that can carry the whole row cheaply.
 static void CaptureScannedPreimages(LogicalTransactionalDeltaCapture &capture) {
 	auto &child = *capture.children[0];
 	auto get = FindTargetScan(child, capture.base_table);
-	if (!get) {
+	// Capture consumes its input by position (row id, output count). Completing a
+	// scan's projection list resets it to scan order, so a scan feeding capture
+	// directly must already output a prefix of that order.
+	if (!get || !ScannedPreimageIsCheap(*get, capture.base_table) ||
+	    (&child == get.get() && !IsIdentityPrefix(get->projection_ids))) {
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] '%s' capture fetches preimages by row id\n",
 		                    capture.base_table.name.GetIdentifierName().c_str());
 		return;
 	}
-	auto output_column_count = child.GetColumnBindings().size();
+	auto original_bindings = child.GetColumnBindings();
+#ifdef DEBUG
+	auto original_scan_bindings = get->GetColumnBindings();
+	auto original_scan_columns = get->GetColumnIds();
+#endif
 	auto exposed = ExposeTargetColumns(child, *get, capture.base_table);
 	auto bindings = child.GetColumnBindings();
+#ifdef DEBUG
+	// Widening only appends: existing outputs keep their positions and the scan
+	// keeps every column position its bindings name.
+	D_ASSERT(bindings.size() >= original_bindings.size());
+	D_ASSERT(std::equal(original_bindings.begin(), original_bindings.end(), bindings.begin()));
+	auto scan_bindings = get->GetColumnBindings();
+	for (auto &binding : original_scan_bindings) {
+		D_ASSERT(std::find(scan_bindings.begin(), scan_bindings.end(), binding) != scan_bindings.end());
+	}
+	for (idx_t index = 0; index < original_scan_columns.size(); index++) {
+		D_ASSERT(get->GetColumnIds()[index] == original_scan_columns[index]);
+	}
+#endif
 	for (auto &binding : exposed) {
 		capture.old_row_columns.push_back(FindBindingIndex(bindings, binding));
 	}
-	capture.output_column_count = output_column_count;
+	capture.output_column_count = original_bindings.size();
 	OPENIVM_DEBUG_PRINT("[INSERT RULE] '%s' capture reads %zu preimage columns from its scan\n",
 	                    capture.base_table.name.GetIdentifierName().c_str(), exposed.size());
 }
@@ -659,6 +690,12 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	auto dml = dml_owner->get();
 	while (dml->type != LogicalOperatorType::LOGICAL_INSERT && dml->type != LogicalOperatorType::LOGICAL_DELETE &&
 	       dml->type != LogicalOperatorType::LOGICAL_UPDATE && dml->type != LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		if (dml->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && dml->children.size() == 2) {
+			// WITH ... AS MATERIALIZED: the statement's DML is in the consumer side.
+			dml_owner = &dml->children[1];
+			dml = dml_owner->get();
+			continue;
+		}
 		if (dml->children.size() != 1) {
 			return;
 		}

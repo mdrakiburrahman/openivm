@@ -2066,6 +2066,9 @@ statement ok
 EXECUTE scan_pre_bump(-2, 2);
 
 statement ok
+UPDATE scan_pre_src SET v = v + 2;
+
+statement ok
 UPDATE scan_pre_src SET name = upper(name) WHERE id IN (SELECT id FROM scan_pre_lookup);
 
 statement ok
@@ -2115,6 +2118,107 @@ SELECT count(*) FROM (
     SELECT k, SUM(v), SUM(g), COUNT(*), MAX(name), SUM(s.a) FROM scan_pre_src GROUP BY k
     EXCEPT ALL
     SELECT * FROM scan_pre_agg
+);
+----
+0
+
+# Fixed-width tables read preimages from filtered scans too; DML under a
+# MATERIALIZED CTE is captured like any other statement.
+statement ok
+CREATE TABLE scan_pre_narrow (id INTEGER PRIMARY KEY, k INTEGER, v BIGINT, d DATE);
+
+statement ok
+INSERT INTO scan_pre_narrow SELECT i, i % 10, i * 7, DATE '2020-01-01' + (i % 400)::INTEGER FROM range(30000) r(i);
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_narrow_agg AS
+SELECT k, SUM(v) AS sv, COUNT(*) AS c, MAX(d) AS md FROM scan_pre_narrow GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_narrow_rows AS
+SELECT id, k, v, d FROM scan_pre_narrow WHERE v % 2 = 0;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE scan_pre_narrow SET v = v + 1 WHERE k < 3;
+
+statement ok
+UPDATE scan_pre_narrow SET d = d + 1 WHERE hash(id) % 50 = 7;
+
+statement ok
+DELETE FROM scan_pre_narrow WHERE k = 4;
+
+statement ok
+DELETE FROM scan_pre_narrow WHERE id % 1000 = 1 RETURNING v;
+
+statement ok
+UPDATE scan_pre_narrow SET id = id + 100000 WHERE id % 777 = 0;
+
+statement ok
+INSERT INTO scan_pre_narrow SELECT 200000 + i, i % 10, i, DATE '2021-01-01' FROM range(500) r(i);
+
+statement ok
+UPDATE scan_pre_narrow SET v = v * 3 WHERE id >= 200000 AND k = 5;
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT 300000 + i AS id FROM range(50) r(i))
+INSERT INTO scan_pre_narrow SELECT id, id % 10, id, DATE '2022-02-02' FROM picked;
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT i * 3 AS id FROM range(200) r(i))
+UPDATE scan_pre_narrow SET v = -v WHERE id IN (SELECT id FROM picked);
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT 300000 + i AS id FROM range(0, 50, 2) r(i))
+DELETE FROM scan_pre_narrow WHERE id IN (SELECT id FROM picked);
+
+statement ok
+COMMIT;
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT 6 AS k)
+UPDATE scan_pre_narrow SET v = v + 11 WHERE k IN (SELECT k FROM picked);
+
+statement ok
+PRAGMA refresh('scan_pre_narrow_agg');
+
+statement ok
+PRAGMA refresh('scan_pre_narrow_rows');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_narrow_agg
+    EXCEPT ALL
+    SELECT k, SUM(v), COUNT(*), MAX(d) FROM scan_pre_narrow GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, SUM(v), COUNT(*), MAX(d) FROM scan_pre_narrow GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM scan_pre_narrow_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_narrow_rows
+    EXCEPT ALL
+    SELECT id, k, v, d FROM scan_pre_narrow WHERE v % 2 = 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, k, v, d FROM scan_pre_narrow WHERE v % 2 = 0
+    EXCEPT ALL
+    SELECT * FROM scan_pre_narrow_rows
 );
 ----
 0
