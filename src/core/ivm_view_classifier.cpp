@@ -428,7 +428,13 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 		model.type = semi_anti_stateful ? RefreshType::SEMI_ANTI_RECOMPUTE : RefreshType::FULL_REFRESH;
-	} else if (analysis.found_retained_aggregate_filter && !model.group_columns.empty()) {
+	} else if ((analysis.found_retained_aggregate_filter ||
+	            (input.stored_query_retains_aggregate_filter && analysis.found_aggregation)) &&
+	           !model.group_columns.empty()) {
+		// A FILTER separated from its aggregate by a projection cannot be exposed on
+		// the user-facing view by StripHavingFilter. Applying that retained predicate
+		// to SUM(delta) is incorrect: a negative delta does not imply a negative new
+		// group total. Recompute only the affected groups from current base state.
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_retained_aggregate_filter) {
 		// Scalar MIN/MAX and ARG_MIN/ARG_MAX already have a native recompute path
@@ -436,13 +442,6 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = analysis.found_minmax ? RefreshType::SIMPLE_AGGREGATE : RefreshType::FULL_REFRESH;
 	} else if (input.has_computed_sum_aggregate_projection) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
-	} else if (input.stored_query_retains_aggregate_filter && analysis.found_aggregation &&
-	           !model.group_columns.empty()) {
-		// A FILTER separated from its aggregate by a projection cannot be exposed on
-		// the user-facing view by StripHavingFilter. Applying that retained predicate
-		// to SUM(delta) is incorrect: a negative delta does not imply a negative new
-		// group total. Recompute only the affected groups from current base state.
-		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && !analysis.found_union_distinct && model.distinct_at_top &&
 	           analysis.found_aggregation) {
 		// DISTINCT over multiple aggregate result rows is a second non-linear
@@ -487,18 +486,13 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 }
 
 static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaViewModelInput &input) {
-	if (model.type != RefreshType::GROUP_RECOMPUTE) {
+	if (model.type != RefreshType::GROUP_RECOMPUTE || input.facts->analysis.found_distinct_on) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 		return;
 	}
-	if (input.facts && input.facts->analysis.found_distinct_on) {
-		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
-		return;
-	}
-	bool aggregate_filter_join =
-	    input.stored_query_has_aggregate_filter && input.facts && input.facts->analysis.found_join;
-	if ((input.facts && input.facts->analysis.found_asof_join) || input.stored_query_has_top_k ||
-	    aggregate_filter_join || (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
+	bool aggregate_filter_join = input.stored_query_has_aggregate_filter && input.facts->analysis.found_join;
+	if (input.facts->analysis.found_asof_join || input.stored_query_has_top_k || aggregate_filter_join ||
+	    (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
 	} else if (HasStrategyReason(model, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK) ||
 	           HasStrategyReason(model, DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE)) {
