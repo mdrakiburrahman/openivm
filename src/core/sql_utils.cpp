@@ -11,6 +11,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
@@ -965,6 +966,8 @@ bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, cons
 struct TableReferenceMatch {
 	idx_t start;
 	idx_t end;
+	//! Last name part: the implicit alias of an unaliased reference.
+	string name;
 };
 
 static bool IsIdentifierTokenStart(char c) {
@@ -1037,8 +1040,13 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 			idx_t end = i;
 			vector<IdentifierSegmentSpan> parts;
 			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
-				if (expect_table && matches_table(parts)) {
-					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
+				// `FROM (SELECT ...` / `FROM (WITH ...`: an unquoted reserved word is never a table name.
+				bool reserved_word =
+				    parts.size() == 1 && sql[start] != '"' &&
+				    KeywordHelper::KeywordCategoryType(parts[0].value) == KeywordCategory::KEYWORD_RESERVED;
+				if (expect_table && !reserved_word && matches_table(parts)) {
+					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end,
+					                   parts.back().value});
 					i = matches.back().end;
 					expect_table = false;
 					continue;
@@ -1048,7 +1056,8 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 				continue;
 			}
 		}
-		if (!std::isspace(static_cast<unsigned char>(c))) {
+		// A parenthesized join tree (`FROM (t AS a LEFT JOIN ...`) still starts with a table reference.
+		if (!std::isspace(static_cast<unsigned char>(c)) && c != '(') {
 			expect_table = false;
 		}
 		i++;
@@ -1088,12 +1097,48 @@ string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &t
 	return sql.substr(match.start, match.end - match.start);
 }
 
+// `t AS a`, `t a` and `t "a"` carry an alias; `t ON`, `t LEFT JOIN` and `t WHERE` do not.
+static bool HasTableAlias(const string &sql, idx_t pos) {
+	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
+		pos++;
+	}
+	if (pos >= sql.size()) {
+		return false;
+	}
+	if (sql[pos] == '"') {
+		return true;
+	}
+	if (!std::isalpha(static_cast<unsigned char>(sql[pos])) && sql[pos] != '_') {
+		return false;
+	}
+	idx_t end = pos;
+	while (end < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[end])) || sql[end] == '_')) {
+		end++;
+	}
+	auto word = sql.substr(pos, end - pos);
+	if (StringUtil::CIEquals(word, "as")) {
+		return true;
+	}
+	auto category = KeywordHelper::KeywordCategoryType(word);
+	return category != KeywordCategory::KEYWORD_RESERVED && category != KeywordCategory::KEYWORD_TYPE_FUNC;
+}
+
+// A subquery in place of an unaliased table must keep the table's implicit alias,
+// or qualified references such as `t.col` no longer bind.
+static string ReplacementFor(const string &sql, const TableReferenceMatch &match, const string &replacement) {
+	if (replacement.empty() || replacement.front() != '(' || replacement.back() != ')' ||
+	    ExtendPastTimeTravelClause(sql, match.end) != match.end || HasTableAlias(sql, match.end)) {
+		return replacement;
+	}
+	return replacement + " AS " + SqlUtils::QuoteIdentifier(match.name);
+}
+
 static string ReplaceMatches(const string &sql, const vector<TableReferenceMatch> &matches, const string &replacement) {
 	string result;
 	idx_t last = 0;
 	for (auto &match : matches) {
 		result.append(sql, last, match.start - last);
-		result += replacement;
+		result += ReplacementFor(sql, match, replacement);
 		last = match.end;
 	}
 	return result.append(sql, last, string::npos);
@@ -1115,7 +1160,7 @@ vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const stri
 	vector<string> variants;
 	for (auto &match : CollectTableReferenceMatches(sql, table_name, false)) {
 		string variant = sql;
-		variant.replace(match.start, match.end - match.start, replacement);
+		variant.replace(match.start, match.end - match.start, ReplacementFor(sql, match, replacement));
 		variants.push_back(std::move(variant));
 	}
 	return variants;
