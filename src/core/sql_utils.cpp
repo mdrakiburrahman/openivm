@@ -754,8 +754,30 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 	});
 }
 
+string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
+                                     const vector<string> &columns) {
+	if (keys.empty() || columns.empty()) {
+		throw InternalException("Keyed upsert into %s needs its key and column names", data_table);
+	}
+	// DuckDB 2.0 plans INSERT OR REPLACE as a MERGE that probes with the source, so matched rows
+	// are updated in random order. An explicit MERGE keeps the target on the probe side. Only
+	// non-key columns are assigned: an indexed key assignment turns every update into delete+insert.
+	vector<string> updates;
+	for (auto &column : columns) {
+		if (std::find(keys.begin(), keys.end(), column) == keys.end()) {
+			auto quoted = QuoteIdentifier(column);
+			updates.push_back(quoted + " = d." + quoted);
+		}
+	}
+	auto matched = updates.empty() ? string("DO NOTHING") : "UPDATE SET " + StringUtil::Join(updates, ", ");
+	return "MERGE INTO " + data_table + " v USING " + source + " d ON " + BuildNullSafeKeyPredicate(keys, "v.", "d.") +
+	       "\nWHEN MATCHED THEN " + matched + "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) +
+	       ") VALUES (" + JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+}
+
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
-                                       const vector<string> &unique_keys, const string &temp_table) {
+                                       const vector<string> &unique_keys, const string &temp_table,
+                                       const vector<string> &columns) {
 	if (unique_keys.empty() || temp_table.empty()) {
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
@@ -764,13 +786,13 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	// those keys as present -- raising a spurious "Duplicate key ... violates unique constraint".
 	// Materialize the new contents once, delete only the keys that are gone, then upsert the rest, so
 	// no non-NULL key is deleted and re-inserted in the same transaction. NULL-containing keys do not
-	// conflict in a UNIQUE index, so remove them explicitly before INSERT OR REPLACE to avoid duplicates.
+	// conflict in a UNIQUE index, so remove them explicitly before the upsert to avoid duplicates.
 	string keep_match = BuildNullSafeKeyPredicate(unique_keys, "openivm_new.", "openivm_old.");
 	string nullable_key = BuildAnyNullPredicate(unique_keys, "openivm_old.");
 	string sql = "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n";
 	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE (" + nullable_key +
 	       ")\n   OR NOT EXISTS (\n  SELECT 1 FROM " + temp_table + " AS openivm_new WHERE " + keep_match + "\n);\n";
-	sql += "INSERT OR REPLACE INTO " + data_table + " SELECT * FROM " + temp_table + ";\n";
+	sql += BuildKeyedUpsertSQL(data_table, temp_table, unique_keys, columns);
 	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
 	return sql;
 }

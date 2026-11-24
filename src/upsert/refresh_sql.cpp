@@ -767,10 +767,19 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				ducklake_checkpoints += build_ducklake_checkpoint(source, true);
 			}
 		}
+		// The data table shares the delta table's columns, minus the multiplicity and timestamp.
+		vector<string> upsert_columns;
+		if (index_delta_view_catalog_entry && delta_view_catalog_entry &&
+		    active_facts.target_dialect == SqlDialect::DUCKDB) {
+			for (auto &name : delta_view_catalog_entry->GetColumns().GetColumnNames()) {
+				if (name != openivm::MULTIPLICITY_COL && name != openivm::TIMESTAMP_COL) {
+					upsert_columns.push_back(name);
+				}
+			}
+		}
 		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql, ducklake_checkpoints,
-		                                               index_delta_view_catalog_entry &&
-		                                                   active_facts.target_dialect == SqlDialect::DUCKDB,
-		                                               cross_system, attached_db_catalog_name, attached_db_schema_name,
+		                                               upsert_columns, cross_system, attached_db_catalog_name,
+		                                               attached_db_schema_name,
 		                                               internal_catalog_prefix, metadata_prefix, out_post_meta,
 		                                               deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
 		if (cross_system && out_pre_meta && out_post_meta) {
@@ -1520,15 +1529,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// "Duplicate key ... violates unique constraint". Only a persistent (reopened) database
 		// exercises this; covered by test/sql/full_refresh_cascade_unique_index.test.
 		//
-		// Restricted to DuckDB output: the safe form emits INSERT OR REPLACE, which other dialects do
-		// not share. DuckLake output also has no unique indexes for ON CONFLICT.
+		// Restricted to DuckDB output: the safe form emits a keyed MERGE upsert against the index. DuckLake output also
+		// has no unique indexes for ON CONFLICT.
 		vector<string> recompute_unique_keys;
 		if (index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = group_cols;
 		}
-		upsert_query = aux_rebuild + CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix,
-		                                                  false, recompute_unique_keys);
+		upsert_query =
+		    aux_rebuild + CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix, false,
+		                                       recompute_unique_keys, SqlUtils::WithoutMultiplicity(column_names));
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}

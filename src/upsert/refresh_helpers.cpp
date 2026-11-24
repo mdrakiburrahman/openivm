@@ -580,7 +580,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table, const vector<string> &upsert_keys,
-                                  const string &recompute_temp_table, RefreshPublicationScope *publication_scope) {
+                                  const string &recompute_temp_table, RefreshPublicationScope *publication_scope,
+                                  const vector<string> &upsert_columns) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -597,10 +598,10 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 		// the affected groups ONCE (the recompute is the expensive part), then:
 		//   1. delete only the affected groups that no longer produce a row (a group can disappear
 		//      entirely, e.g. when every preserved-side row for it is deleted), and
-		//   2. INSERT OR REPLACE the survivors.
+		//   2. upsert the survivors.
 		// The two key sets are disjoint for non-NULL keys, so those are not deleted and re-inserted
 		// in the same transaction. NULL-containing keys do not conflict in the UNIQUE index and must
-		// be removed explicitly before INSERT OR REPLACE to avoid duplicate groups.
+		// be removed explicitly before the upsert to avoid duplicate groups.
 		string keep_match = SqlUtils::BuildNullSafeKeyPredicate(upsert_keys, "openivm_keep.", target_alias + ".");
 		string nullable_key = SqlUtils::BuildAnyNullPredicate(upsert_keys, target_alias + ".");
 		result += "CREATE OR REPLACE TEMP TABLE " + recompute_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
@@ -608,7 +609,7 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + "\n  AND ((" +
 		          nullable_key + ")\n    OR NOT EXISTS (\n  SELECT 1 FROM " + recompute_temp_table +
 		          " AS openivm_keep WHERE " + keep_match + "\n));\n\n";
-		result += "INSERT OR REPLACE INTO " + data_table + "\nSELECT * FROM " + recompute_temp_table + ";\n";
+		result += SqlUtils::BuildKeyedUpsertSQL(data_table, recompute_temp_table, upsert_keys, upsert_columns);
 		result += "\nDROP TABLE IF EXISTS " + recompute_temp_table + ";\n";
 	} else {
 		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
@@ -952,22 +953,24 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 }
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           const string &ducklake_checkpoints, bool has_unique_index, bool cross_system,
-                           const string &attached_catalog, const string &attached_schema, const string &catalog_prefix,
-                           const string &metadata_prefix, string *out_post_meta, vector<string> *deferred_cleanup,
+                           const string &ducklake_checkpoints, const vector<string> &upsert_columns,
+                           bool cross_system, const string &attached_catalog, const string &attached_schema,
+                           const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta,
+                           vector<string> *deferred_cleanup,
                            const vector<string> &delta_metadata_tables, const string &data_catalog) {
 	string qdt = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	// Indexed keys cannot be deleted and reinserted in the same on-disk transaction.
 	// Non-indexable group keys use the ordinary DELETE/INSERT full-refresh form.
 	vector<string> unique_keys;
 	string recompute_temp;
-	if (has_unique_index) {
+	if (!upsert_columns.empty()) {
 		unique_keys = metadata.GetGroupColumns(view_name);
 		if (!unique_keys.empty()) {
 			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
 		}
 	}
-	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp) + "\n";
+	string query =
+	    SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp, upsert_columns) + "\n";
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
 	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = " + string(openivm::UTC_NOW_SQL) +
 	                       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";

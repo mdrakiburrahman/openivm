@@ -97,7 +97,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 /// Unscopable group/window refreshes must preserve the requested cascade delta for downstream MVs.
 /// Supply the data table's unique keys to avoid deleting and reinserting surviving indexed keys.
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "",
-                            bool emit_cascade_delta = false, const vector<string> &unique_keys = {});
+                            bool emit_cascade_delta = false, const vector<string> &unique_keys = {},
+                            const vector<string> &columns = {});
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE`
 /// (inner-DISTINCT under aggregate). For each base table T_i with a non-empty

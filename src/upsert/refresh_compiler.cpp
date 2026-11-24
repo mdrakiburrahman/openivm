@@ -422,8 +422,8 @@ static unordered_map<string, string> DetectIndexedStateColumns(const vector<stri
 	return result;
 }
 
-// SQL equality merges -0.0 and +0.0 into one group, and neither MERGE nor INSERT OR REPLACE
-// rewrites a matched key. Keep a stored zero key's sign while that sign has support and flip it
+// SQL equality merges -0.0 and +0.0 into one group, and neither the incremental MERGE nor the
+// keyed upsert rewrites a matched key. Keep a stored zero key's sign while that sign has support and flip it
 // once its last supporting row disappears. Assigning the complete row lets the insert rule turn
 // this into delete-and-insert, since an in-place update drops SQL-equal assignments.
 static string BuildGroupSignFixupSQL(const string &data_table, const vector<string> &keys,
@@ -823,17 +823,18 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		// index keeps deleted keys for constraint checking within a transaction, so the plain
 		// DELETE-then-INSERT form raises a spurious duplicate-key error for every group that survives
 		// the recompute. Use the upsert form there. Without the index (DuckLake, options.group_column_names
-		// fallback) INSERT OR REPLACE is not usable, and plain DELETE+INSERT is already safe.
+		// fallback) the keyed upsert is not usable, and plain DELETE+INSERT is already safe.
 		vector<string> upsert_keys;
 		string recompute_temp;
 		if (options.unique_index) {
 			upsert_keys = keys;
 			recompute_temp = SqlUtils::QuoteIdentifier("openivm_recompute_" + view_name);
 		}
-		// INSERT OR REPLACE never rewrites the conflict key, so the fix-up also maintains its zero sign.
+		// The keyed upsert never rewrites the matched key, so the fix-up also maintains its zero sign.
 		return BuildAffectedKeyRefreshSQL(data_table, options.view_query_sql, "  " + affected, "openivm_tgt",
 		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert,
-		                                  /*affected_temp_table=*/"", upsert_keys, recompute_temp) +
+		                                  /*affected_temp_table=*/"", upsert_keys, recompute_temp, nullptr,
+		                                  SqlUtils::WithoutMultiplicity(column_names)) +
 		       sign_fixup;
 	}
 
@@ -1386,14 +1387,14 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 }
 
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix,
-                            bool emit_cascade_delta, const vector<string> &unique_keys) {
+                            bool emit_cascade_delta, const vector<string> &unique_keys, const vector<string> &columns) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string recompute_temp;
 	if (!unique_keys.empty()) {
 		recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
 	}
 	if (!emit_cascade_delta) {
-		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
+		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp, columns);
 	}
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
@@ -1403,7 +1404,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + " openivm_old;\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
 	       ") openivm_recompute;\n\n";
-	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp);
+	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp,
+	                                       columns);
 	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";

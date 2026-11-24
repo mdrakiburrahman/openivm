@@ -157,19 +157,20 @@ string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &
                              const vector<LogicalType> &column_types, SqlDialect dialect = SqlDialect::DUCKDB);
 string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
                                 const vector<string> &column_names, const string &delta_ts_filter);
-// When `upsert_keys` and `recompute_temp_table` are supplied, emits an INSERT OR REPLACE form that
-// never deletes and re-inserts the same key inside one transaction. Required when the data table
-// carries a UNIQUE index: DuckDB's on-disk unique index keeps deleted keys for constraint checking
-// within the same transaction, so DELETE-then-INSERT of a surviving group raises a spurious
-// "Duplicate key ... violates unique constraint". Only valid when such an index exists (INSERT OR
-// REPLACE requires a UNIQUE/PK constraint); pass them empty to keep the plain DELETE+INSERT form.
+// When `upsert_keys`, `recompute_temp_table` and the data table's `upsert_columns` are supplied, emits
+// a keyed MERGE upsert that never deletes and re-inserts the same key inside one transaction. Required
+// when the data table carries a UNIQUE index: DuckDB's on-disk unique index keeps deleted keys for
+// constraint checking within the same transaction, so DELETE-then-INSERT of a surviving group raises a
+// spurious "Duplicate key ... violates unique constraint". Pass them empty to keep the plain
+// DELETE+INSERT form.
 string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
                                   const string &recompute_temp_table = "",
-                                  RefreshPublicationScope *publication_scope = nullptr);
+                                  RefreshPublicationScope *publication_scope = nullptr,
+                                  const vector<string> &upsert_columns = {});
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
 // Insert column list plus the select lists that project a row as a retraction (-1) or an insertion (+1).
@@ -205,9 +206,10 @@ string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &vi
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
                                      const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);
 
+// `upsert_columns` lists the data table's columns when it carries a unique key index.
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           const string &ducklake_checkpoints, bool has_unique_index, bool cross_system,
-                           const string &attached_catalog = "", const string &attached_schema = "",
+                           const string &ducklake_checkpoints, const vector<string> &upsert_columns,
+                           bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
                            const vector<string> &delta_metadata_tables = {}, const string &data_catalog = "");
