@@ -17,6 +17,11 @@ public:
 	                          const string &view_name, const string &view_catalog_name, const string &view_schema_name);
 
 	static void IncrementalRewriteRuleFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
+
+	// Point con at the view's metadata (snapshotting an explicit transaction's metadata) and parse its stored
+	// definition, with time-travel pins peeled off.
+	static unique_ptr<SQLStatement> LoadStoredViewStatement(ClientContext &context, Connection &con,
+	                                                        const string &view_catalog, const string &view);
 };
 
 } // namespace duckdb

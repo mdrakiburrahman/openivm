@@ -10,7 +10,6 @@
 #include "core/refresh_daemon.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
-#include "core/time_travel_pins.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
 #include "upsert/refresh_internal.hpp"
@@ -39,28 +38,14 @@ static shared_ptr<RefreshDaemon> global_daemon;
 
 static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context, TableFunctionBindInput &input,
                                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
+	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
 	string view_catalog_name = StringValue::Get(input.inputs[0]);
-	string view_schema_name = StringValue::Get(input.inputs[1]);
 	string view_name = StringValue::Get(input.inputs[2]);
 	OPENIVM_DEBUG_PRINT("View to be incrementally maintained: %s \n", view_name.c_str());
 
 	Connection con(*context.db);
-	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
-	if (!context.transaction.IsAutoCommit()) {
-		RefreshMetadata(con).SnapshotTransaction(context);
-	}
-	string view_query = RefreshMetadata(con).GetViewQuery(view_name);
-	if (view_query.empty()) {
-		throw Exception(ExceptionType::CATALOG,
-		                "IVM: materialized view '" + view_name + "' not found or its definition is missing");
-	}
-	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
-
-	auto parser = Parser::GetBuiltinParser();
-	parser.ParseQuery(view_query);
-	duckdb::openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
 	Planner planner(context);
-	planner.CreatePlan(std::move(parser.statements[0]));
+	planner.CreatePlan(IncrementalRewriteRule::LoadStoredViewStatement(context, con, view_catalog_name, view_name));
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
 	auto result = make_uniq<TableFunctionData>();

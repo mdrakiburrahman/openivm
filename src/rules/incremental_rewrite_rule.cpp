@@ -56,6 +56,28 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 	plan = std::move(insert_node);
 }
 
+unique_ptr<SQLStatement> IncrementalRewriteRule::LoadStoredViewStatement(ClientContext &context, Connection &con,
+                                                                         const string &view_catalog,
+                                                                         const string &view) {
+	RefreshMetadata::UseCatalog(context, con, view_catalog);
+	if (!context.transaction.IsAutoCommit()) {
+		RefreshMetadata(con).SnapshotTransaction(context);
+	}
+	auto view_query = RefreshMetadata(con).GetViewQuery(view);
+	if (view_query.empty()) {
+		throw Exception(ExceptionType::CATALOG,
+		                "IVM: materialized view '" + view + "' not found or its definition is missing");
+	}
+	OPENIVM_DEBUG_PRINT("[IVM] View: %s, Query: %s\n", view.c_str(), view_query.c_str());
+	auto parser = Parser::GetBuiltinParser();
+	parser.ParseQuery(view_query);
+	if (parser.statements.empty()) {
+		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
+	}
+	openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
+	return std::move(parser.statements[0]);
+}
+
 void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionInput &input,
                                                             duckdb::unique_ptr<LogicalOperator> &plan) {
 	WarnSnapshotHistoryDeletion(input.context, *plan);
@@ -72,9 +94,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		return;
 	}
 
-#if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Activating the rewrite rule\n");
-#endif
 
 	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
 	auto view_catalog = StringValue::Get(marker->parameters[0]);
@@ -82,27 +102,9 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto view = StringValue::Get(marker->parameters[2]);
 
 	Connection con(*input.context.db);
-	RefreshMetadata::UseCatalog(input.context, con, view_catalog);
-	if (!input.context.transaction.IsAutoCommit()) {
-		RefreshMetadata(con).SnapshotTransaction(input.context);
-	}
-
-	auto view_query = RefreshMetadata(con).GetViewQuery(view);
-	if (view_query.empty()) {
-		throw Exception(ExceptionType::CATALOG, "IVM: missing view definition for '" + view + "'");
-	}
-
-	auto parser = Parser::GetBuiltinParser();
 	Planner planner(input.context);
-
-	parser.ParseQuery(view_query);
-	if (parser.statements.empty()) {
-		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
-	}
-	openivm::TimeTravelPins::Peel(input.context, *parser.statements[0]);
-
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
-	PlanWithSourceColumns(planner, std::move(parser.statements[0]));
+	PlanWithSourceColumns(planner, LoadStoredViewStatement(input.context, con, view_catalog, view));
 	auto derived_outputs = RefreshMetadata(con).GetDerivedAggregateOutputs(view);
 	if (derived_outputs.complete && !derived_outputs.outputs.empty()) {
 		auto group_columns = RefreshMetadata(con).GetGroupColumns(view);
@@ -135,9 +137,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		OPENIVM_DEBUG_PRINT("[IVM Rewrite] Retained raw state inputs for derived aggregate deltas\n");
 	}
 	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
-#if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
-#endif
 	// This is still the stored base-view plan. Its scans have not been replaced with delta scans yet,
 	// so current base-table facts must never be folded into it. The user setting only controls the
 	// subsequent optimization of the finished incremental plan in GenerateRefreshSQL().
@@ -150,9 +150,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	// to generate all inclusion-exclusion terms (including delta/delta terms).
 	InlineMaterializedCteRefs(input.context, *planner.binder, optimized_plan);
 
-#if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Optimized plan: \n%s\n", optimized_plan->ToString().c_str());
-#endif
 
 	if (optimized_plan->children.empty()) {
 		throw NotImplementedException("Plan contains single node, this is not supported");
