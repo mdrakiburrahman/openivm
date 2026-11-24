@@ -36,6 +36,13 @@ string SqlUtils::NegativeZeroSQL(const string &value) {
 	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
 }
 
+string SqlUtils::NegativeZeroSQL(const string &value, SqlDialect dialect) {
+	if (dialect != SqlDialect::DUCKDB) {
+		return NegativeZeroSQL(value);
+	}
+	return "CASE WHEN (" + value + ") = 0 THEN signbit(" + value + ") ELSE FALSE END";
+}
+
 string SqlUtils::FloatingRepresentativeSQL(const string &value, const string &negative_count,
                                            const string &total_count) {
 	return "CASE WHEN (" + value + ") = 0 THEN CASE WHEN " + negative_count + " = 0 THEN abs(" + value + ") WHEN " +
@@ -764,8 +771,30 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 	});
 }
 
+string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
+                                     const vector<string> &columns) {
+	if (keys.empty() || columns.empty()) {
+		throw InternalException("Keyed upsert into %s needs its key and column names", data_table);
+	}
+	// DuckDB 2.0 plans INSERT OR REPLACE as a MERGE that probes with the source, so matched rows
+	// are updated in random order. An explicit MERGE keeps the target on the probe side. Only
+	// non-key columns are assigned: an indexed key assignment turns every update into delete+insert.
+	vector<string> updates;
+	for (auto &column : columns) {
+		if (std::find(keys.begin(), keys.end(), column) == keys.end()) {
+			auto quoted = QuoteIdentifier(column);
+			updates.push_back(quoted + " = d." + quoted);
+		}
+	}
+	auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
+	return "MERGE INTO " + data_table + " v USING " + source + " d ON " + BuildNullSafeKeyPredicate(keys, "v.", "d.") +
+	       matched + "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
+	       JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+}
+
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
-                                       const vector<string> &unique_keys, const string &temp_table) {
+                                       const vector<string> &unique_keys, const string &temp_table,
+                                       const vector<string> &columns, const vector<LogicalType> &column_types) {
 	if (unique_keys.empty() || temp_table.empty()) {
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
@@ -774,13 +803,36 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	// those keys as present -- raising a spurious "Duplicate key ... violates unique constraint".
 	// Materialize the new contents once, delete only the keys that are gone, then upsert the rest, so
 	// no non-NULL key is deleted and re-inserted in the same transaction. NULL-containing keys do not
-	// conflict in a UNIQUE index, so remove them explicitly before INSERT OR REPLACE to avoid duplicates.
+	// conflict in a UNIQUE index, so remove them explicitly before the upsert to avoid duplicates.
 	string keep_match = BuildNullSafeKeyPredicate(unique_keys, "openivm_new.", "openivm_old.");
 	string nullable_key = BuildAnyNullPredicate(unique_keys, "openivm_old.");
 	string sql = "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n";
 	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE (" + nullable_key +
 	       ")\n   OR NOT EXISTS (\n  SELECT 1 FROM " + temp_table + " AS openivm_new WHERE " + keep_match + "\n);\n";
-	sql += "INSERT OR REPLACE INTO " + data_table + " SELECT * FROM " + temp_table + ";\n";
+	sql += BuildKeyedUpsertSQL(data_table, temp_table, unique_keys, columns);
+	// The upsert never rewrites a matched key, so a floating zero key would keep a sign that
+	// the recomputed group no longer has. Adopt the recomputed representative, as the plain
+	// DELETE+INSERT form does. The indexed key makes this update a delete+insert.
+	vector<string> zero_keys;
+	vector<string> sign_changes;
+	vector<string> assignments;
+	for (idx_t index = 0; index < columns.size() && index < column_types.size(); index++) {
+		auto id = column_types[index].id();
+		if ((id != LogicalTypeId::FLOAT && id != LogicalTypeId::DOUBLE) ||
+		    std::find(unique_keys.begin(), unique_keys.end(), columns[index]) == unique_keys.end()) {
+			continue;
+		}
+		auto key = QuoteIdentifier(columns[index]);
+		zero_keys.push_back("v." + key + " = 0");
+		sign_changes.push_back(NegativeZeroSQL("v." + key, SqlDialect::DUCKDB) + " <> " +
+		                       NegativeZeroSQL("openivm_new." + key, SqlDialect::DUCKDB));
+		assignments.push_back(key + " = openivm_new." + key);
+	}
+	if (!assignments.empty()) {
+		sql += "UPDATE " + data_table + " AS v SET " + StringUtil::Join(assignments, ", ") + " FROM " + temp_table +
+		       " AS openivm_new WHERE " + BuildNullSafeKeyPredicate(unique_keys, "v.", "openivm_new.") + " AND (" +
+		       StringUtil::Join(zero_keys, " OR ") + ") AND (" + StringUtil::Join(sign_changes, " OR ") + ");\n";
+	}
 	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
 	return sql;
 }

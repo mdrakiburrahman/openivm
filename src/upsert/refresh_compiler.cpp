@@ -422,6 +422,48 @@ static unordered_map<string, string> DetectIndexedStateColumns(const vector<stri
 	return result;
 }
 
+// SQL equality merges -0.0 and +0.0 into one group, and neither the incremental MERGE nor the
+// keyed upsert rewrites a matched key. Keep a stored zero key's sign while that sign has support and
+// flip it once its last supporting row disappears. Only groups in the delta can lose support, which
+// also keeps every flipped key inside the publication scope. Assigning the complete row lets the
+// insert rule turn this into delete-and-insert, since an in-place update drops SQL-equal assignments.
+static string BuildGroupSignFixupSQL(const string &data_table, const vector<string> &keys,
+                                     const vector<string> &aggregates,
+                                     const unordered_map<string, string> &group_sign_counts,
+                                     const string &group_count_column, const string &delta_rows, SqlDialect dialect) {
+	vector<string> flips;
+	vector<string> assignments;
+	for (auto &key : keys) {
+		auto quoted_key = SqlUtils::QuoteIdentifier(key);
+		auto count = group_sign_counts.find(quoted_key);
+		if (count == group_sign_counts.end()) {
+			assignments.push_back(quoted_key + " = " + quoted_key);
+			continue;
+		}
+		if (group_count_column.empty()) {
+			throw InternalException("Floating group key %s has no group count to anchor its sign", quoted_key);
+		}
+		auto &negative = count->second;
+		auto is_negative = SqlUtils::NegativeZeroSQL(quoted_key, dialect);
+		auto flip = "(" + quoted_key + " = 0 AND CASE WHEN " + negative + " = 0 THEN " + is_negative + " ELSE " +
+		            negative + " = " + SqlUtils::QuoteIdentifier(group_count_column) + " AND NOT " + is_negative +
+		            " END)";
+		assignments.push_back(quoted_key + " = CASE WHEN " + flip + " THEN -" + quoted_key + " ELSE " + quoted_key +
+		                      " END");
+		flips.push_back(flip);
+	}
+	if (flips.empty()) {
+		return "";
+	}
+	for (auto &column : aggregates) {
+		assignments.push_back(column + " = " + column);
+	}
+	OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] maintaining zero signs of %zu floating keys\n", flips.size());
+	return "UPDATE " + data_table + " AS openivm_target SET " + StringUtil::Join(assignments, ", ") + " WHERE (" +
+	       StringUtil::Join(flips, " OR ") + ") AND EXISTS (SELECT 1 FROM " + delta_rows + " AND " +
+	       SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_target.", "openivm_touched.") + ");\n";
+}
+
 string CompileAggregateGroups(const string &view_name, const vector<string> &column_names,
                               const AggregateGroupsOptions &options, AggregateGroupsOutcome *outcome) {
 	const bool insert_only = options.insert_only;
@@ -718,6 +760,26 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		}
 	}
 
+	string group_count_column;
+	for (auto &input : col_agg_type) {
+		if (input.second == "count_star") {
+			group_count_column = aggregate_raw_names.at(input.first);
+			break;
+		}
+	}
+	if (group_count_column.empty() &&
+	    std::find(column_names.begin(), column_names.end(), openivm::COUNT_STAR_COL) != column_names.end()) {
+		group_count_column = openivm::COUNT_STAR_COL;
+	}
+	auto group_sign_counts = DetectIndexedStateColumns(column_names, openivm::GROUP_SIGN_COUNT_COL_PREFIX);
+	// Insertions only add support, so an insert-only refresh never flips a stored zero key.
+	string sign_fixup;
+	if (!insert_only) {
+		auto delta_rows = delta_view + " openivm_touched WHERE " + (delta_ts_filter.empty() ? "TRUE" : delta_ts_filter);
+		sign_fixup = BuildGroupSignFixupSQL(data_table, keys, aggregates, group_sign_counts, group_count_column,
+		                                    delta_rows, options.dialect);
+	}
+
 	if (needs_group_recompute || (has_minmax && !insert_only)) {
 		// Tell the caller this call recomputes affected groups from the base tables rather than
 		// applying delta arithmetic. Callers that inject extra delta-table rows purely to correct the
@@ -758,7 +820,7 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] using current-diff "
 			                    "affected keys for '%s'\n",
 			                    view_name.c_str());
-			return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, options.view_query_sql, keys);
+			return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, options.view_query_sql, keys) + sign_fixup;
 		}
 		string keys_tuple = SqlUtils::JoinQuotedColumns(keys);
 		string match_delete = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_tgt.");
@@ -770,16 +832,19 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		// index keeps deleted keys for constraint checking within a transaction, so the plain
 		// DELETE-then-INSERT form raises a spurious duplicate-key error for every group that survives
 		// the recompute. Use the upsert form there. Without the index (DuckLake, options.group_column_names
-		// fallback) INSERT OR REPLACE is not usable, and plain DELETE+INSERT is already safe.
+		// fallback) the keyed upsert is not usable, and plain DELETE+INSERT is already safe.
 		vector<string> upsert_keys;
 		string recompute_temp;
 		if (options.unique_index) {
 			upsert_keys = keys;
 			recompute_temp = SqlUtils::QuoteIdentifier("openivm_recompute_" + view_name);
 		}
+		// The keyed upsert never rewrites the matched key, so the fix-up also maintains its zero sign.
 		return BuildAffectedKeyRefreshSQL(data_table, options.view_query_sql, "  " + affected, "openivm_tgt",
 		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert,
-		                                  /*affected_temp_table=*/"", upsert_keys, recompute_temp);
+		                                  /*affected_temp_table=*/"", upsert_keys, recompute_temp, nullptr,
+		                                  SqlUtils::WithoutMultiplicity(column_names)) +
+		       sign_fixup;
 	}
 
 	// CTE: consolidate deltas per group
@@ -873,47 +938,20 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		}
 	}
 
-	string group_count_column;
-	for (auto &input : col_agg_type) {
-		if (input.second == "count_star") {
-			group_count_column = aggregate_raw_names.at(input.first);
-			break;
-		}
-	}
-	if (group_count_column.empty() &&
-	    std::find(column_names.begin(), column_names.end(), openivm::COUNT_STAR_COL) != column_names.end()) {
-		group_count_column = openivm::COUNT_STAR_COL;
-	}
 	string group_count = group_count_column.empty() ? "" : updated_column_expressions.at(group_count_column);
-	auto group_sign_counts = DetectIndexedStateColumns(column_names, openivm::GROUP_SIGN_COUNT_COL_PREFIX);
-	vector<string> representative_projections;
-	vector<string> representative_updates;
-	vector<string> representative_changes;
-	vector<string> key_insert_values;
 	for (auto &key : keys) {
 		auto quoted_key = SqlUtils::QuoteIdentifier(key);
 		auto count = group_sign_counts.find(quoted_key);
-		if (count == group_sign_counts.end()) {
-			key_insert_values.push_back("d." + quoted_key);
-			continue;
+		if (count != group_sign_counts.end()) {
+			// Derived outputs observe the representative the sign fix-up stores.
+			updated_column_expressions[key] = SqlUtils::FloatingRepresentativeSQL(
+			    "COALESCE(v." + quoted_key + ", d." + quoted_key + ")",
+			    updated_column_expressions.at(aggregate_raw_names.at(count->second)), group_count);
 		}
-		D_ASSERT(!group_count.empty());
-		auto negative = updated_column_expressions.at(aggregate_raw_names.at(count->second));
-		auto current = "COALESCE(v." + quoted_key + ", d." + quoted_key + ")";
-		// Keep a zero representative while its sign is present, and switch
-		// when its last supporting row disappears.
-		auto representative = SqlUtils::FloatingRepresentativeSQL(current, negative, group_count);
-		updated_column_expressions[key] = representative;
-		auto alias = SqlUtils::QuoteIdentifier("openivm_group_representative_" + to_string(key_insert_values.size()));
-		representative_projections.push_back(representative + " AS " + alias);
-		representative_updates.push_back(quoted_key + " = d." + alias);
-		representative_changes.push_back("concat(v." + quoted_key + ", '') IS DISTINCT FROM concat(d." + alias +
-		                                 ", '')");
-		key_insert_values.push_back("d." + alias);
 	}
 
 	string merge_source = "refresh_cte";
-	if (!quoted_derived_output_expressions.empty() || !representative_projections.empty()) {
+	if (!quoted_derived_output_expressions.empty()) {
 		// SUM(delta) can widen COUNT's BIGINT state to HUGEINT. Finalize with
 		// the stored input types so type-sensitive functions keep their semantics.
 		for (idx_t i = 0; i < column_names.size() && i < options.column_types.size(); i++) {
@@ -924,7 +962,6 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			}
 		}
 		vector<string> projections {"d.*"};
-		projections.insert(projections.end(), representative_projections.begin(), representative_projections.end());
 		for (auto &column : aggregates) {
 			auto derived = quoted_derived_output_expressions.find(column);
 			if (derived == quoted_derived_output_expressions.end()) {
@@ -1043,28 +1080,11 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			    "CASE WHEN d." + match_count_col + " > 0 THEN " + matched_insert + " ELSE " + null_val + " END";
 		}
 	}
-	string representative_update;
-	if (!representative_updates.empty()) {
-		// Supply a complete row for native delete-and-insert, including when
-		// there is no index to make the binder retain unchanged group keys.
-		for (auto &key : keys) {
-			auto quoted_key = SqlUtils::QuoteIdentifier(key);
-			if (!group_sign_counts.count(quoted_key)) {
-				representative_updates.push_back(quoted_key + " = v." + quoted_key);
-			}
-		}
-		// Only actual representation changes replace a row; ordinary groups keep the fast action.
-		representative_update = "WHEN MATCHED AND (" + StringUtil::Join(representative_changes, " OR ") +
-		                        ") THEN UPDATE SET " + update_set + ", " +
-		                        StringUtil::Join(representative_updates, ", ") + "\n";
-		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] Maintaining representatives for %zu floating keys\n",
-		                    representative_changes.size());
-	}
+	string key_insert_values = SqlUtils::JoinQualifiedQuotedColumns(keys, "d");
 	string merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table + " v USING " +
-	                     merge_source + " d\nON " + on_clause + "\n" + representative_update +
-	                     "WHEN MATCHED THEN UPDATE SET " + update_set + "\nWHEN NOT MATCHED THEN INSERT (" +
-	                     insert_cols + ") VALUES (" + StringUtil::Join(key_insert_values, ", ") + ", " + insert_vals +
-	                     ");\n";
+	                     merge_source + " d\nON " + on_clause + "\nWHEN MATCHED THEN UPDATE SET " + update_set +
+	                     "\nWHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (" + key_insert_values + ", " +
+	                     insert_vals + ");\n" + sign_fixup;
 
 	string upsert_query = merge_query + "\n";
 	bool rowid_available = std::none_of(column_names.begin(), column_names.end(), [](const string &column) {
@@ -1081,9 +1101,9 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		               ")\nSELECT d.*, v.rowid AS " + target_rowid + " FROM " + merge_source + " d LEFT JOIN " +
 		               data_table + " v ON " + on_clause + ";\n" + "UPDATE " + data_table + " v SET " + update_set +
 		               " FROM " + matched + " d WHERE v.rowid = d." + target_rowid + ";\n" + "INSERT INTO " +
-		               data_table + " (" + insert_cols + ") SELECT " + StringUtil::Join(key_insert_values, ", ") +
-		               ", " + insert_vals + " FROM " + matched + " d WHERE d." + target_rowid + " IS NULL;\n" +
-		               "DROP TABLE " + matched + ";\n";
+		               data_table + " (" + insert_cols + ") SELECT " + key_insert_values + ", " + insert_vals +
+		               " FROM " + matched + " d WHERE d." + target_rowid + " IS NULL;\n" + "DROP TABLE " + matched +
+		               ";\n";
 	}
 	if (insert_only && options.cascade_delta_specs && options.inline_cascade_delta) {
 		// The inline companion emitted by refresh_sql.cpp is a compact aggregate-delta
@@ -1376,14 +1396,16 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 }
 
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix,
-                            bool emit_cascade_delta, const vector<string> &unique_keys) {
+                            bool emit_cascade_delta, const vector<string> &unique_keys, const vector<string> &columns,
+                            const vector<LogicalType> &column_types) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string recompute_temp;
 	if (!unique_keys.empty()) {
 		recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
 	}
 	if (!emit_cascade_delta) {
-		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
+		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp, columns,
+		                                       column_types);
 	}
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
@@ -1393,7 +1415,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + " openivm_old;\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
 	       ") openivm_recompute;\n\n";
-	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp);
+	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp,
+	                                       columns, column_types);
 	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";

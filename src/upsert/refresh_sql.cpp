@@ -752,6 +752,25 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		return RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, source.table_name, snapshot_expr,
 		                                                        delta_metadata_table, source_table_id);
 	};
+	// A keyed recompute upsert writes the data table's own columns, and needs their types to keep
+	// floating zero keys in sync. Only indexed native data tables use that form.
+	vector<string> upsert_columns;
+	vector<LogicalType> upsert_types;
+	auto read_upsert_columns = [&]() {
+		if (!index_delta_view_catalog_entry || active_facts.target_dialect != SqlDialect::DUCKDB ||
+		    !upsert_columns.empty()) {
+			return;
+		}
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+			    *con.context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                                Identifier(data_table_bare)));
+			upsert_columns = entry.GetColumns().GetColumnNames();
+			for (auto &column : entry.GetColumns().Logical()) {
+				upsert_types.push_back(column.GetType());
+			}
+		});
+	};
 	// Recompute the whole view. A recovery also clears the interruption marker; under the split protocol
 	// the marker stays durable until the recomputed state and its watermarks have both committed.
 	auto build_full_recompute = [&](bool recovering) {
@@ -767,10 +786,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				ducklake_checkpoints += build_ducklake_checkpoint(source, true);
 			}
 		}
+		read_upsert_columns();
 		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql, ducklake_checkpoints,
-		                                               index_delta_view_catalog_entry &&
-		                                                   active_facts.target_dialect == SqlDialect::DUCKDB,
-		                                               cross_system, attached_db_catalog_name, attached_db_schema_name,
+		                                               upsert_columns, upsert_types, cross_system,
+		                                               attached_db_catalog_name, attached_db_schema_name,
 		                                               internal_catalog_prefix, metadata_prefix, out_post_meta,
 		                                               deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
 		if (cross_system && out_pre_meta && out_post_meta) {
@@ -1071,6 +1090,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		options.render_derived_output = render_derived_output;
 		options.derived_output_expressions_complete = derived_output_info.complete;
 		options.column_types = column_types;
+		options.dialect = active_facts.target_dialect;
 		return options;
 	};
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
@@ -1511,15 +1531,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// "Duplicate key ... violates unique constraint". Only a persistent (reopened) database
 		// exercises this; covered by test/sql/full_refresh_cascade_unique_index.test.
 		//
-		// Restricted to DuckDB output: the safe form emits INSERT OR REPLACE, which other dialects do
-		// not share. DuckLake output also has no unique indexes for ON CONFLICT.
+		// Restricted to DuckDB output: the safe form emits a keyed MERGE upsert against the index. DuckLake output also
+		// has no unique indexes for ON CONFLICT.
 		vector<string> recompute_unique_keys;
 		if (index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = group_cols;
+			read_upsert_columns();
 		}
 		upsert_query = aux_rebuild + CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix,
-		                                                  false, recompute_unique_keys);
+		                                                  false, recompute_unique_keys, upsert_columns, upsert_types);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}
