@@ -6692,7 +6692,8 @@ UPDATE complex_key_src SET v=200 WHERE id=99;
 DELETE FROM complex_key_src WHERE id=99;
 
 query I
-SELECT ((bool_or(contains(sql,'MERGE INTO') AND contains(sql,'openivm_full_recompute_'))=('{key}'='int_key'))
+SELECT ((bool_or(contains(sql,'MERGE INTO') AND contains(sql,'openivm_full_recompute_')
+        AND contains(sql,'openivm_target_rowid'))=('{key}'='int_key'))
     AND NOT bool_or(contains(sql,'INSERT OR REPLACE')))::INT
 FROM openivm_compile_with_facts('complex_key_mv',
     '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');

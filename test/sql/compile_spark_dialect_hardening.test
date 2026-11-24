@@ -684,3 +684,42 @@ FROM openivm_compile_with_facts(
 WHERE stmt_kind = 'data';
 ----
 1
+
+# A MIN/MAX view with deletions refreshes by group recompute. Its native data table carries the
+# group-key UNIQUE index, but only DuckDB output may use the row-id upsert: Spark and Postgres
+# have no `rowid`, so they keep the null-safe key MERGE.
+statement ok
+CREATE TABLE sph_minmax_src(g INT, h VARCHAR, v INT);
+INSERT INTO sph_minmax_src VALUES (1, 'a', 10), (1, 'a', 20), (2, 'b', 5), (NULL, 'c', 7);
+CREATE MATERIALIZED VIEW sph_minmax_mv AS
+    SELECT g, h, MIN(v) AS mn, MAX(v) AS mx FROM sph_minmax_src GROUP BY g, h;
+DELETE FROM sph_minmax_src WHERE v = 10;
+INSERT INTO sph_minmax_src VALUES (2, 'b', 1), (3, NULL, 4);
+
+query I
+SELECT count(*) FROM duckdb_indexes() i JOIN openivm_views v ON i.table_name = 'openivm_data_' || v.view_name
+WHERE v.view_sql_name = 'sph_minmax_mv';
+----
+1
+
+query III
+SELECT (SELECT (bool_or(contains(sql, 'MERGE INTO') AND contains(sql, '<=>'))
+                AND NOT bool_or(contains(lower(sql), 'rowid')))::INT
+        FROM openivm_compile_with_facts('sph_minmax_mv', '{"target_dialect":"spark","compile_only":true}')),
+       (SELECT (bool_or(contains(sql, 'MERGE INTO')) AND NOT bool_or(contains(lower(sql), 'rowid')))::INT
+        FROM openivm_compile_with_facts('sph_minmax_mv', '{"target_dialect":"postgres","compile_only":true}')),
+       (SELECT bool_or(contains(sql, 'openivm_target_rowid'))::INT
+        FROM openivm_compile_with_facts('sph_minmax_mv', '{"target_dialect":"duckdb","compile_only":true}'));
+----
+1	1	1
+
+statement ok
+PRAGMA refresh('sph_minmax_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM sph_minmax_mv
+        EXCEPT ALL SELECT g, h, MIN(v), MAX(v) FROM sph_minmax_src GROUP BY g, h)
+    UNION ALL (SELECT g, h, MIN(v), MAX(v) FROM sph_minmax_src GROUP BY g, h
+        EXCEPT ALL SELECT * FROM sph_minmax_mv));
+----
+0

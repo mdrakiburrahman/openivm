@@ -540,7 +540,7 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table, const vector<string> &upsert_keys,
                                   const string &recompute_temp_table, RefreshPublicationScope *publication_scope,
-                                  const vector<string> &upsert_columns) {
+                                  const vector<string> &upsert_columns, SqlDialect dialect) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -568,7 +568,7 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + "\n  AND ((" +
 		          nullable_key + ")\n    OR NOT EXISTS (\n  SELECT 1 FROM " + recompute_temp_table +
 		          " AS openivm_keep WHERE " + keep_match + "\n));\n\n";
-		result += SqlUtils::BuildKeyedUpsertSQL(data_table, recompute_temp_table, upsert_keys, upsert_columns);
+		result += SqlUtils::BuildKeyedUpsertSQL(data_table, recompute_temp_table, upsert_keys, upsert_columns, dialect);
 		result += "\nDROP TABLE IF EXISTS " + recompute_temp_table + ";\n";
 	} else {
 		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
