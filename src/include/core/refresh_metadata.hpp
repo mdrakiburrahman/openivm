@@ -5,6 +5,8 @@
 #include "core/metadata_location.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
+
+#include <atomic>
 #include "core/openivm_constants.hpp"
 
 namespace duckdb {
@@ -20,12 +22,15 @@ public:
 	// One view's openivm_views row (without its canonical plan) and openivm_delta_tables rows, read with a
 	// single statement. Refresh compilation reads dozens of these columns, each of which would otherwise be
 	// a planned statement. Columns written while a refresh runs (the interruption marker, the after-hook
-	// flag, the lease epoch, schedules and pending-row estimates) are always read live; writes through a
-	// RefreshMetadata that serves a record drop it.
+	// flag, the lease epoch, schedules and pending-row estimates) are always read live. One refresh attempt
+	// shares a single record between the attempt, SQL generation and the planning connection: a metadata
+	// write through any RefreshMetadata serving it invalidates it for all of them, and their later reads go
+	// to SQL. The refresh program's own writes run after the attempt's last metadata read.
 	struct ViewRecord {
 		string view_name;
 		case_insensitive_map_t<Value> view;
 		vector<case_insensitive_map_t<Value>> deltas;
+		mutable std::atomic<bool> invalidated {false};
 	};
 
 private:

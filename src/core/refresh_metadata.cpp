@@ -693,7 +693,8 @@ void RefreshMetadata::MarkPlanningHelper(ClientContext &context) {
 }
 
 const RefreshMetadata::ViewRecord *RefreshMetadata::Record(const string &view_name) const {
-	return view_record && view_record->view_name == view_name ? view_record.get() : nullptr;
+	return view_record && !view_record->invalidated && view_record->view_name == view_name ? view_record.get()
+	                                                                                       : nullptr;
 }
 
 const case_insensitive_map_t<Value> *RefreshMetadata::RecordDelta(const string &view_name, const string &table_name,
@@ -2191,8 +2192,11 @@ string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name,
 
 void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name,
                                                     int64_t snapshot_id, int64_t source_table_id) {
-	// The record holds the watermark this write replaces.
-	view_record.reset();
+	// Every holder of the record (the refresh attempt, SQL generation, planning) must stop serving the
+	// watermark this write replaces.
+	if (view_record) {
+		view_record->invalidated = true;
+	}
 	auto result = con.Query(BuildDuckLakeRefreshMetadataSQL(view_name, table_name, to_string(snapshot_id), "",
 	                                                        source_table_id < 0 ? "" : to_string(source_table_id)));
 	if (result->HasError()) {

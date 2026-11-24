@@ -180,13 +180,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	Connection probe_con(*context.db.get());
 	auto metadata_location = RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
-	// Every metadata read of this attempt, including SQL generation, is served from one read.
-	auto view_record = probe_meta.LoadView(vn);
 	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
 	MetadataLocator::RequireWritable(metadata_location, "refresh materialized view '" + display_name + "'");
-	// Before anything reads source deltas, including the empty-delta shortcut below.
-	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
-	                                      attached_db_catalog_name, attached_db_schema_name);
 	// Metadata stored outside the MV's database cannot commit with its data. The split
 	// protocol commits (1) the interruption marker, (2) the MV data, (3) the watermarks
 	// with the marker cleared. A failure at any point leaves the marker set, so the next
@@ -195,6 +190,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	bool split_native = split_protocol && probe_meta.IsNativeCatalog(view_catalog_name);
 	// Remote metadata can be shared by several clients; only the lease holder refreshes.
 	RefreshLease lease(context, metadata_location, vn);
+	// Every later metadata read of this attempt, including SQL generation, is served from one read.
+	// It follows the lease: until then another client sharing remote metadata may refresh or replace
+	// the view (cascaded nodes reach this point without a lease from RefreshNodeWithHooks).
+	auto view_record = probe_meta.LoadView(vn);
+	// Before anything reads source deltas, including the empty-delta shortcut below.
+	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
+	                                      attached_db_catalog_name, attached_db_schema_name);
 	bool was_interrupted = false;
 	int64_t refresh_epoch = 0;
 	if (split_protocol) {
