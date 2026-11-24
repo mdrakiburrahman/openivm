@@ -236,21 +236,19 @@ void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_pt
 		auto large = BoundComparisonExpression::Create(
 		    ExpressionType::COMPARE_GREATERTHANOREQUALTO, optimizer.BindScalarFunction("abs", argument->Copy()),
 		    make_uniq<BoundConstantExpression>(Value::DOUBLE(openivm::FINITE_SUM_THRESHOLD)));
-		auto zero = [] {
-			return make_uniq<BoundConstantExpression>(Value::DOUBLE(0));
-		};
-		auto scale = [] {
-			return make_uniq<BoundConstantExpression>(Value::DOUBLE(openivm::FINITE_SUM_SCALE));
+		auto constant = [](double value) {
+			return make_uniq<BoundConstantExpression>(Value::DOUBLE(value));
 		};
 		auto large_input = make_uniq<BoundCaseExpression>(
-		    large->Copy(), optimizer.BindScalarFunction("/", argument->Copy(), scale()), zero());
+		    large->Copy(), optimizer.BindScalarFunction("/", argument->Copy(), constant(openivm::FINITE_SUM_SCALE)),
+		    constant(0));
 		auto large_sum =
 		    MakeAggregate(context, "sum",
 		                  make_uniq<BoundCaseExpression>(finite->Copy(), std::move(large_input),
 		                                                 make_uniq<BoundConstantExpression>(Value(argument_type))),
 		                  string(openivm::LARGE_SUM_COL_PREFIX) + to_string(index));
 		sum.GetChildrenMutable()[0] = make_uniq<BoundCaseExpression>(
-		    std::move(finite), make_uniq<BoundCaseExpression>(std::move(large), zero(), argument->Copy()),
+		    std::move(finite), make_uniq<BoundCaseExpression>(std::move(large), constant(0), argument->Copy()),
 		    make_uniq<BoundConstantExpression>(Value(argument_type)));
 		sum.SetAlias(Identifier(string(openivm::FINITE_SUM_COL_PREFIX) + to_string(index)));
 		ColumnBinding large_binding(aggregate->aggregate_index, ProjectionIndex(aggregate->expressions.size()));
@@ -282,18 +280,17 @@ void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_pt
 			    make_uniq<BoundColumnRefExpression>(LogicalType::BIGINT, counts[i]),
 			    make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
 		};
-		auto constant = [](double value) {
-			return make_uniq<BoundConstantExpression>(Value::DOUBLE(value));
-		};
 		ColumnBinding binding(aggregate->aggregate_index, ProjectionIndex(index));
 		auto small_ref = make_uniq<BoundColumnRefExpression>(LogicalType::DOUBLE, binding);
 		auto large_ref = make_uniq<BoundColumnRefExpression>(LogicalType::DOUBLE, large_binding);
-		auto large_zero = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, large_ref->Copy(), zero());
+		auto large_zero =
+		    BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, large_ref->Copy(), constant(0));
 		auto combined = optimizer.BindScalarFunction(
 		    "*",
-		    optimizer.BindScalarFunction("+", large_ref->Copy(),
-		                                 optimizer.BindScalarFunction("/", small_ref->Copy(), scale())),
-		    scale());
+		    optimizer.BindScalarFunction(
+		        "+", large_ref->Copy(),
+		        optimizer.BindScalarFunction("/", small_ref->Copy(), constant(openivm::FINITE_SUM_SCALE))),
+		    constant(openivm::FINITE_SUM_SCALE));
 		// Keep tiny inputs unscaled when the large lane cancels to zero.
 		unique_ptr<Expression> value =
 		    make_uniq<BoundCaseExpression>(std::move(large_zero), std::move(small_ref), std::move(combined));
