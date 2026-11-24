@@ -864,3 +864,87 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Views created before the preserved-side delta placeholder was retired still store
+# __OPENIVM_LJSEC_PRES_DELTA_<n>__ in their secondary SQL. Refresh no longer resolves it,
+# so such views must fall back to affected-group recompute instead of failing.
+statement ok
+CREATE TABLE lj_legacy_pres_left (id INT);
+
+statement ok
+CREATE TABLE lj_legacy_pres_right (id INT, val INT);
+
+statement ok
+INSERT INTO lj_legacy_pres_left VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO lj_legacy_pres_right VALUES (1, 10), (1, 11), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW lj_legacy_pres_mv AS
+    SELECT l.id, COUNT(r.val) AS matches, SUM(r.val) AS total
+    FROM lj_legacy_pres_left l LEFT JOIN lj_legacy_pres_right r ON l.id = r.id
+    GROUP BY l.id;
+
+query II
+SELECT type, contains(leftjoin_secondary_meta_json, '__OPENIVM_LJSEC_INNER_DELTA_0__ GROUP BY __k)')::INT
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f707265735f6d76_';
+----
+0	1
+
+# Reference the retired placeholder from the stored secondary SQL, as older views did.
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json = replace(leftjoin_secondary_meta_json,
+    '__OPENIVM_LJSEC_INNER_DELTA_0__ GROUP BY __k)',
+    '__OPENIVM_LJSEC_INNER_DELTA_0__ WHERE __k NOT IN (SELECT __k FROM __OPENIVM_LJSEC_PRES_DELTA_0__) GROUP BY __k)')
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f707265735f6d76_';
+
+query I
+SELECT contains(leftjoin_secondary_meta_json, '__OPENIVM_LJSEC_PRES_DELTA_0__')::INT
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f707265735f6d76_';
+----
+1
+
+statement ok
+DELETE FROM lj_legacy_pres_right WHERE id = 2;
+
+statement ok
+INSERT INTO lj_legacy_pres_right VALUES (3, 30), (3, 31);
+
+statement ok
+UPDATE lj_legacy_pres_right SET val = 12 WHERE id = 1 AND val = 11;
+
+statement ok
+DELETE FROM lj_legacy_pres_right WHERE id = 3 AND val = 31;
+
+statement ok
+INSERT INTO lj_legacy_pres_left VALUES (4);
+
+statement ok
+DELETE FROM lj_legacy_pres_left WHERE id = 1;
+
+statement ok
+PRAGMA refresh('lj_legacy_pres_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_legacy_pres_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_pres_left l LEFT JOIN lj_legacy_pres_right r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_pres_left l LEFT JOIN lj_legacy_pres_right r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM lj_legacy_pres_mv
+);
+----
+0

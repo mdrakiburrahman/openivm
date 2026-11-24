@@ -1187,10 +1187,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				// One inner-delta placeholder PER LEFT JOIN level; identities are index-aligned arrays.
 				auto &lj_it = ljsec.inner_tables;
 				auto &lj_ik = ljsec.inner_keys;
-				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size();
+				// Views created before ff8a472b also stored a preserved-side placeholder
+				// (__OPENIVM_LJSEC_PRES_DELTA_<n>__) that refresh no longer resolves.
+				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size() &&
+				             ljsec.sql.find("__OPENIVM_LJSEC_PRES_DELTA_") == string::npos;
 				for (size_t lvl = 0; lj_ok && lvl < lj_it.size(); lvl++) {
 					string inner_src = build_ljsec_delta_source(lj_it[lvl], lj_ik[lvl]);
-					lj_ok = !inner_src.empty();
+					if (inner_src.empty()) {
+						lj_ok = false;
+						break;
+					}
 					ljsec.sql =
 					    SqlUtils::ReplaceAllOccurrences(ljsec.sql,
 					                                    string(openivm::LJSEC_INNER_DELTA_PREFIX) + to_string(lvl) +
