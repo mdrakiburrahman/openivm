@@ -200,14 +200,7 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 			continue;
 		}
 
-		bool exists = false;
-		for (auto &existing : aggregate_columns) {
-			if (StringUtil::CIEquals(existing, col_name)) {
-				exists = true;
-				break;
-			}
-		}
-		if (!exists) {
+		if (!ContainsCI(aggregate_columns, col_name)) {
 			aggregate_columns.push_back(col_name);
 			AddUnique(strategy_reasons, DeltaStrategyReason::JOIN_KEY_GROUP_FALLBACK);
 		}

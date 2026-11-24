@@ -1,3 +1,4 @@
+#include "core/vector_utils.hpp"
 #include "core/parser_plan_helpers.hpp"
 #include "core/metadata_json.hpp"
 
@@ -1862,18 +1863,9 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu DISTINCT aggregate group expressions\n", meta.group_inputs.size());
 }
 
-static void AddUniqueGroupName(vector<string> &group_names, const string &new_name) {
-	for (auto &existing : group_names) {
-		if (StringUtil::CIEquals(existing, new_name)) {
-			return;
-		}
-	}
-	group_names.push_back(new_name);
-}
-
 static void AddUniqueGroupNames(vector<string> &group_names, const vector<string> &new_names) {
 	for (auto &name : new_names) {
-		AddUniqueGroupName(group_names, name);
+		AddUniqueCI(group_names, name);
 	}
 }
 
@@ -1891,7 +1883,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, c
 				continue;
 			}
 			if (!output_names[expr_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_idx])) {
-				AddUniqueGroupName(group_names, output_names[expr_idx]);
+				AddUniqueCI(group_names, output_names[expr_idx]);
 			}
 		}
 	}

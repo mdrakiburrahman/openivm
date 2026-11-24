@@ -1,5 +1,6 @@
 #include "upsert/refresh_internal.hpp"
 
+#include "core/vector_utils.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
@@ -307,11 +308,7 @@ static bool AddWindowRowKeyColumns(const vector<string> &specs, const vector<str
 		if (visible == visible_columns.end()) {
 			return false;
 		}
-		auto duplicate = std::find_if(row_keys.begin(), row_keys.end(),
-		                              [&](const string &column) { return StringUtil::CIEquals(column, *visible); });
-		if (duplicate == row_keys.end()) {
-			row_keys.push_back(*visible);
-		}
+		AddUniqueCI(row_keys, *visible);
 	}
 	return true;
 }

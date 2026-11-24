@@ -1,4 +1,5 @@
 #include "duckdb/transaction/meta_transaction.hpp"
+#include "core/vector_utils.hpp"
 #include "core/parser.hpp"
 #include "duckdb/planner/planner_extension.hpp"
 #include "duckdb/planner/operator/logical_drop.hpp"
@@ -117,18 +118,9 @@ static bool HasDuckLakeSourceForModel(const CreateMVPlanFacts &facts, const unor
 	return false;
 }
 
-static bool ContainsColumnCI(const vector<string> &cols, const string &col_name) {
-	for (auto &col : cols) {
-		if (StringUtil::CIEquals(col, col_name)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static string UniqueInternalColumnName(const vector<string> &existing_cols, const string &base_name) {
 	string candidate = base_name;
-	for (idx_t suffix = 1; ContainsColumnCI(existing_cols, candidate); suffix++) {
+	for (idx_t suffix = 1; ContainsCI(existing_cols, candidate); suffix++) {
 		candidate = base_name + "_" + std::to_string(suffix);
 	}
 	return candidate;

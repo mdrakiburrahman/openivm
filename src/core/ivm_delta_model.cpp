@@ -1,3 +1,4 @@
+#include "core/vector_utils.hpp"
 #include "core/ivm_delta_model.hpp"
 
 #include "core/parser_plan_helpers.hpp"
@@ -12,21 +13,6 @@ namespace duckdb {
 
 namespace {
 
-static bool ContainsStringCI(const vector<string> &values, const string &candidate) {
-	for (auto &value : values) {
-		if (StringUtil::CIEquals(value, candidate)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void AddStringCI(vector<string> &values, const string &candidate) {
-	if (!candidate.empty() && !ContainsStringCI(values, candidate)) {
-		values.push_back(candidate);
-	}
-}
-
 static string WindowPartitionOutputColumn(const string &partition_column) {
 	auto separator = partition_column.find('=');
 	return separator == string::npos ? partition_column : partition_column.substr(0, separator);
@@ -37,8 +23,8 @@ static vector<string> ProjectedWindowPartitionColumns(const vector<string> &part
 	vector<string> projected;
 	for (auto &partition_column : partition_columns) {
 		auto output_column = WindowPartitionOutputColumn(partition_column);
-		if (!IncrementalTableNames::IsInternalColumn(output_column) && ContainsStringCI(output_names, output_column)) {
-			AddStringCI(projected, partition_column);
+		if (!IncrementalTableNames::IsInternalColumn(output_column) && ContainsCI(output_names, output_column)) {
+			AddUniqueCI(projected, partition_column);
 		}
 	}
 	return projected;
@@ -72,7 +58,7 @@ static void CountProfileNode(DeltaModelProfileCounts &counts, DeltaModelNodeKind
 		if (analysis.found_aggregation && (!non_linear || analysis.found_count_distinct)) {
 			counts.node_semantics += 2; // linear: APPEND_ONLY/DELETE_SKIP safe; COUNT DISTINCT: DELETE/UPDATE sensitive
 		}
-		if (ContainsStringCI(model.aggregate_types, "min") || ContainsStringCI(model.aggregate_types, "max")) {
+		if (ContainsCI(model.aggregate_types, "min") || ContainsCI(model.aggregate_types, "max")) {
 			counts.node_semantics++; // MINMAX_INSERT_ONLY_SAFE
 		}
 		if (model.type != RefreshType::GROUP_RECOMPUTE) {
@@ -123,12 +109,12 @@ AsofWindowPartitionReadsRightSideDirectly(const vector<RefreshMetadata::WindowPa
 		for (auto table_index : facts.plan_nodes_post_order[plan_node.child_ids[1]].subtree_table_indices) {
 			auto occurrence = facts.occurrence_by_index.find(table_index);
 			if (occurrence != facts.occurrence_by_index.end()) {
-				AddStringCI(rhs_sources, occurrence->second.table);
+				AddUniqueCI(rhs_sources, occurrence->second.table);
 			}
 		}
 	}
 	for (auto &op : lineage_ops) {
-		if (op.kind == WindowLineageKind::DIRECT && ContainsStringCI(rhs_sources, op.source)) {
+		if (op.kind == WindowLineageKind::DIRECT && ContainsCI(rhs_sources, op.source)) {
 			return true;
 		}
 	}
