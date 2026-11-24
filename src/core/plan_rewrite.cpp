@@ -221,8 +221,53 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		return false;
 	}
 	auto &old_projection = probe_child->Cast<LogicalProjection>();
-	auto replace_probe = [&](unique_ptr<LogicalOperator> source, vector<unique_ptr<Expression>> source_filters,
-	                         vector<unique_ptr<Expression>> projection_expressions) {
+	auto collect_conditions = [](const LogicalComparisonJoin &join, const unordered_set<TableIndex> &source_bindings,
+	                             const unordered_set<TableIndex> &delim_bindings,
+	                             vector<SemiAntiKeyReplacement> &replacements) {
+		for (auto &condition : join.conditions) {
+			if (!condition.LeftReference() || !condition.RightReference() ||
+			    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), *condition.LeftReference(),
+			                                      *condition.RightReference(), source_bindings, delim_bindings,
+			                                      replacements)) {
+				return false;
+			}
+		}
+		return true;
+	};
+	// Project the source keys in place of the correlated keys; fails before mutating anything.
+	auto replace_probe = [&](unique_ptr<LogicalOperator> &source_slot, vector<unique_ptr<Expression>> source_filters,
+	                         const vector<SemiAntiKeyReplacement> &replacements,
+	                         const unordered_set<TableIndex> &source_bindings) {
+		if (replacements.empty()) {
+			return false;
+		}
+		vector<bool> used_replacements(replacements.size(), false);
+		vector<unique_ptr<Expression>> projection_expressions;
+		for (auto &expression : old_projection.expressions) {
+			if (!expression) {
+				return false;
+			}
+			auto match = std::find_if(replacements.begin(), replacements.end(), [&](const SemiAntiKeyReplacement &r) {
+				return Expression::Equals(*expression, *r.delim_expr);
+			});
+			if (match != replacements.end()) {
+				used_replacements[match - replacements.begin()] = true;
+				projection_expressions.push_back(match->source_expr->Copy());
+			} else if (ExpressionUsesOnly(*expression, source_bindings, true)) {
+				projection_expressions.push_back(expression->Copy());
+			} else {
+				return false;
+			}
+		}
+		for (idx_t i = 0; i < replacements.size(); i++) {
+			if (!used_replacements[i]) {
+				return false;
+			}
+			if (replacements[i].null_reject_source) {
+				source_filters.push_back(BuildIsNotNull(replacements[i].source_expr->Copy()));
+			}
+		}
+		auto source = std::move(source_slot);
 		if (!source_filters.empty()) {
 			auto source_filter = make_uniq<LogicalFilter>();
 			source_filter->expressions = std::move(source_filters);
@@ -262,53 +307,10 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		    !domain_join.HasArbitraryConditions() && domain_join.children.size() == 2 &&
 		    IsDistinctCorrelationDomain(*domain_join.children[1])) {
 			auto source_bindings = OutputTableIndexes(*domain_join.children[0]);
-			auto domain_bindings = OutputTableIndexes(*domain_join.children[1]);
 			vector<SemiAntiKeyReplacement> replacements;
-			for (auto &condition : domain_join.conditions) {
-				if (!condition.LeftReference() || !condition.RightReference() ||
-				    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), *condition.LeftReference(),
-				                                      *condition.RightReference(), source_bindings, domain_bindings,
-				                                      replacements)) {
-					return false;
-				}
-			}
-			if (replacements.empty()) {
-				return false;
-			}
-			vector<bool> used_replacements(replacements.size(), false);
-			vector<unique_ptr<Expression>> projection_expressions;
-			for (auto &expression : old_projection.expressions) {
-				if (!expression) {
-					return false;
-				}
-				bool replaced = false;
-				for (idx_t i = 0; i < replacements.size(); i++) {
-					if (Expression::Equals(*expression, *replacements[i].delim_expr)) {
-						used_replacements[i] = true;
-						projection_expressions.push_back(replacements[i].source_expr->Copy());
-						replaced = true;
-						break;
-					}
-				}
-				if (replaced) {
-					continue;
-				}
-				if (!ExpressionUsesOnly(*expression, source_bindings, true)) {
-					return false;
-				}
-				projection_expressions.push_back(expression->Copy());
-			}
-			vector<unique_ptr<Expression>> source_filters;
-			for (idx_t i = 0; i < replacements.size(); i++) {
-				if (!used_replacements[i]) {
-					return false;
-				}
-				if (replacements[i].null_reject_source) {
-					source_filters.push_back(BuildIsNotNull(replacements[i].source_expr->Copy()));
-				}
-			}
-			return replace_probe(std::move(domain_join.children[0]), std::move(source_filters),
-			                     std::move(projection_expressions));
+			return collect_conditions(domain_join, source_bindings, OutputTableIndexes(*domain_join.children[1]),
+			                          replacements) &&
+			       replace_probe(domain_join.children[0], {}, replacements, source_bindings);
 		}
 	}
 	if (!old_projection.children[0] || old_projection.children[0]->type != LogicalOperatorType::LOGICAL_FILTER ||
@@ -343,16 +345,9 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 	vector<SemiAntiKeyReplacement> replacements;
 	if (inner.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &inner_join = inner.Cast<LogicalComparisonJoin>();
-		if (inner_join.join_type != JoinType::INNER || inner_join.HasArbitraryConditions()) {
+		if (inner_join.join_type != JoinType::INNER || inner_join.HasArbitraryConditions() ||
+		    !collect_conditions(inner_join, source_bindings, delim_bindings, replacements)) {
 			return false;
-		}
-		for (auto &condition : inner_join.conditions) {
-			if (!condition.LeftReference() || !condition.RightReference() ||
-			    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), *condition.LeftReference(),
-			                                      *condition.RightReference(), source_bindings, delim_bindings,
-			                                      replacements)) {
-				return false;
-			}
 		}
 	}
 
@@ -375,46 +370,7 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		}
 		source_filters.push_back(expr->Copy());
 	}
-	if (replacements.empty()) {
-		return false;
-	}
-
-	vector<bool> used_replacements(replacements.size(), false);
-	vector<unique_ptr<Expression>> new_projection_exprs;
-	new_projection_exprs.reserve(old_projection.expressions.size());
-	for (auto &expr : old_projection.expressions) {
-		if (!expr) {
-			return false;
-		}
-		bool replaced = false;
-		for (idx_t i = 0; i < replacements.size(); i++) {
-			if (Expression::Equals(*expr, *replacements[i].delim_expr)) {
-				used_replacements[i] = true;
-				new_projection_exprs.push_back(replacements[i].source_expr->Copy());
-				replaced = true;
-				break;
-			}
-		}
-		if (replaced) {
-			continue;
-		}
-		if (ExpressionUsesOnly(*expr, source_bindings, true)) {
-			new_projection_exprs.push_back(expr->Copy());
-			continue;
-		}
-		return false;
-	}
-	for (idx_t i = 0; i < replacements.size(); i++) {
-		if (!used_replacements[i]) {
-			return false;
-		}
-		if (replacements[i].null_reject_source) {
-			source_filters.push_back(BuildIsNotNull(replacements[i].source_expr->Copy()));
-		}
-	}
-
-	return replace_probe(std::move(inner.children[source_child_idx]), std::move(source_filters),
-	                     std::move(new_projection_exprs));
+	return replace_probe(inner.children[source_child_idx], std::move(source_filters), replacements, source_bindings);
 }
 
 static bool RewriteSemiAntiProbeKeyProjections(unique_ptr<LogicalOperator> &node) {
