@@ -45,7 +45,9 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 
 	Connection con(*context.db);
 	Planner planner(context);
-	planner.CreatePlan(IncrementalRewriteRule::LoadStoredViewStatement(context, con, view_catalog_name, view_name));
+	planner.CreatePlan(IncrementalRewriteRule::LoadStoredViewStatement(context, con, view_catalog_name, view_name,
+	                                                                   "IVM: materialized view '" + view_name +
+	                                                                       "' not found or its definition is missing"));
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
 	auto result = make_uniq<TableFunctionData>();

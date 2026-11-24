@@ -57,16 +57,15 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 }
 
 unique_ptr<SQLStatement> IncrementalRewriteRule::LoadStoredViewStatement(ClientContext &context, Connection &con,
-                                                                         const string &view_catalog,
-                                                                         const string &view) {
+                                                                         const string &view_catalog, const string &view,
+                                                                         const string &missing_error) {
 	RefreshMetadata::UseCatalog(context, con, view_catalog);
 	if (!context.transaction.IsAutoCommit()) {
 		RefreshMetadata(con).SnapshotTransaction(context);
 	}
 	auto view_query = RefreshMetadata(con).GetViewQuery(view);
 	if (view_query.empty()) {
-		throw Exception(ExceptionType::CATALOG,
-		                "IVM: materialized view '" + view + "' not found or its definition is missing");
+		throw Exception(ExceptionType::CATALOG, missing_error);
 	}
 	OPENIVM_DEBUG_PRINT("[IVM] View: %s, Query: %s\n", view.c_str(), view_query.c_str());
 	auto parser = Parser::GetBuiltinParser();
@@ -104,7 +103,8 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	Connection con(*input.context.db);
 	Planner planner(input.context);
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
-	PlanWithSourceColumns(planner, LoadStoredViewStatement(input.context, con, view_catalog, view));
+	PlanWithSourceColumns(planner, LoadStoredViewStatement(input.context, con, view_catalog, view,
+	                                                       "IVM: missing view definition for '" + view + "'"));
 	auto derived_outputs = RefreshMetadata(con).GetDerivedAggregateOutputs(view);
 	if (derived_outputs.complete && !derived_outputs.outputs.empty()) {
 		auto group_columns = RefreshMetadata(con).GetGroupColumns(view);

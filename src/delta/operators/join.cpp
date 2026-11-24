@@ -1776,6 +1776,10 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (N == 0) {
 		throw InternalException("DeltaJoin: no leaves found in join tree");
 	}
+	// MAX_JOIN_TABLES is inclusive; >= would reject the documented 16-table boundary.
+	if (N > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
+		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
+	}
 	// 2. Output types
 	auto types = output_types;
 	D_ASSERT(types.size() == original_bindings.size());
@@ -1827,7 +1831,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (!flattened_ducklake && !ducklake_fallback_reason.empty()) {
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Flattening fallback: %s\n", ducklake_fallback_reason.c_str());
 	}
-	// Checked after DuckLake flattening, which may change N. MAX_JOIN_TABLES is inclusive.
+	// DuckLake flattening may change N, but the same inclusive boundary applies.
 	if (N > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
 		throw NotImplementedException("IVM not supported for joins with more than 16 tables");
 	}

@@ -630,12 +630,18 @@ string RefreshMetadata::GetViewQuery(const string &view_name) {
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 	auto result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
+	if (result->HasError()) {
+		// Read the locus without CurrentLocation, which can itself fail and mask this error.
+		auto locus = con.Query("SELECT current_database(), current_schema()");
+		auto locus_text = !locus->HasError() && locus->RowCount() > 0
+		                      ? " (connection locus " + locus->Collection().GetValue(0, 0).ToString() + "." +
+		                            locus->Collection().GetValue(1, 0).ToString() + ")"
+		                      : "";
+		throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
+		                      result->GetError());
+	}
+	if (result->RowCount() == 0) {
 		auto location = CurrentLocation(con);
-		if (result->HasError()) {
-			throw ParserException("Could not read IVM metadata for materialized view '%s' (connection locus %s): %s",
-			                      view_name, location.DisplayName(), result->GetError());
-		}
 		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
 		                       "view_catalog and view_schema in %s",
 		                       view_name, location.Table(openivm::VIEWS_TABLE));
