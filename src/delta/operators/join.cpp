@@ -984,12 +984,30 @@ struct DeltaStatus {
 	uint64_t tiny_mask;        // bit i=1: leaf has a tiny non-empty delta
 };
 
-/// For each leaf, detect delta status in a single query per table.
+static bool SourceFactMatches(const string &fact, TableCatalogEntry &table);
+
+// The refresh's activity for a leaf's source table; keys are always fully qualified.
+static optional_ptr<const openivm::SourceDeltaActivity> FactDeltaActivity(const openivm::CompileFacts &facts,
+                                                                          TableCatalogEntry &table) {
+	for (auto &activity : facts.delta_activity) {
+		auto parts = SqlUtils::ParseQualifiedIdentifier(activity.first);
+		if (parts.size() == 3 && SourceFactMatches(activity.first, table)) {
+			return &activity.second;
+		}
+	}
+	return nullptr;
+}
+
+/// For each leaf, detect delta status in a single query per table, or from the
+/// refresh's delta activity (CompileFacts::delta_activity) when it already counted that source.
 /// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
 /// Also records each catalog leaf's watermark and physical delta in probe_sources for key-domain probes.
 static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, const vector<JoinLeafInfo> &leaves,
-                                     DeltaSourceCache &cache, vector<JoinProbeSource> &probe_sources) {
+                                     DeltaSourceCache &cache, vector<JoinProbeSource> &probe_sources,
+                                     const openivm::CompileFacts &facts) {
 	DeltaStatus status = {0, 0, 0, 0};
+	// Compile-only plans run later against deltas this compiler cannot see.
+	const bool compile_only = facts.compile_only;
 
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
@@ -1010,39 +1028,61 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 			continue;
 		}
 		auto table_ref = get->GetTable();
-		// Get last_update timestamp for this view+table pair
-		auto &watermark = LoadDeltaWatermark(con, view_name, *table_ref, cache);
-		if (!watermark.watermark_error.empty() || watermark.last_update.IsNull()) {
-			continue;
-		}
-		string last_update = watermark.last_update.ToString();
-		auto delta_table_sql = RefreshMetadata(con).ResolveDeltaQualifiedName(
-		    view_name, watermark.delta_key, table_ref->ParentCatalog().GetName().GetIdentifierName(),
-		    table_ref->schema.name.GetIdentifierName());
-		probe_sources[i] = {get, delta_table_sql, last_update};
+		int64_t total_count, delete_count, base_count;
+		auto activity = compile_only ? nullptr : FactDeltaActivity(facts, *table_ref);
+		auto storage_rows = SqlUtils::StorageRowCount(*table_ref);
+		if (activity && storage_rows.IsValid()) {
+			// The refresh already counted this delta at the same watermark; a native base table
+			// reports its size without a statement.
+			auto &watermark = cache[table_ref.get()];
+			if (!watermark.watermark_loaded) {
+				watermark.watermark_loaded = true;
+				watermark.last_update = activity->last_update;
+				watermark.delta_key = activity->delta_key;
+			}
+			probe_sources[i] = {get, activity->delta_table_sql, activity->last_update.ToString()};
+			total_count = activity->pending_rows;
+			delete_count = activity->delete_rows;
+			base_count = NumericCast<int64_t>(storage_rows.GetIndex());
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (%s) reuses refresh delta activity: %lld rows, %lld deletes\n", i,
+			                    table_ref->name.c_str(), static_cast<long long>(total_count),
+			                    static_cast<long long>(delete_count));
+		} else {
+			// Get last_update timestamp for this view+table pair
+			auto &watermark = LoadDeltaWatermark(con, view_name, *table_ref, cache);
+			if (!watermark.watermark_error.empty() || watermark.last_update.IsNull()) {
+				continue;
+			}
+			string last_update = watermark.last_update.ToString();
+			auto delta_table_sql = RefreshMetadata(con).ResolveDeltaQualifiedName(
+			    view_name, watermark.delta_key, table_ref->ParentCatalog().GetName().GetIdentifierName(),
+			    table_ref->schema.name.GetIdentifierName());
+			probe_sources[i] = {get, delta_table_sql, last_update};
 
-		// Single query: get pending delta count, delete count, and current base
-		// cardinality. The base count lets us define "tiny" as <= max(8 rows,
-		// 5% of the source table), avoiding both a hard-coded absolute-only
-		// threshold and silly behavior on very small tables.
-		auto result = con.Query(
-		    "SELECT "
-		    "(SELECT COUNT(*) FROM " +
-		    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-		    SqlUtils::EscapeValue(last_update) +
-		    "'::TIMESTAMP), "
-		    "(SELECT COUNT(*) FROM " +
-		    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-		    SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(openivm::MULTIPLICITY_COL) +
-		    " < 0), "
-		    "(SELECT COUNT(*) FROM " +
-		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, table_ref->name) + ")");
-		if (result->HasError()) {
-			continue;
+			// Single query: get pending delta count, delete count, and current base
+			// cardinality. The base count lets us define "tiny" as <= max(8 rows,
+			// 5% of the source table), avoiding both a hard-coded absolute-only
+			// threshold and silly behavior on very small tables.
+			auto result = con.Query(
+			    "SELECT "
+			    "(SELECT COUNT(*) FROM " +
+			    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+			    SqlUtils::EscapeValue(last_update) +
+			    "'::TIMESTAMP), "
+			    "(SELECT COUNT(*) FROM " +
+			    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+			    SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(openivm::MULTIPLICITY_COL) +
+			    " < 0), "
+			    "(SELECT COUNT(*) FROM " +
+			    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, table_ref->name) +
+			    ")");
+			if (result->HasError()) {
+				continue;
+			}
+			total_count = result->Collection().GetValue(0, 0).GetValue<int64_t>();
+			delete_count = result->Collection().GetValue(1, 0).GetValue<int64_t>();
+			base_count = result->Collection().GetValue(2, 0).GetValue<int64_t>();
 		}
-		int64_t total_count = result->Collection().GetValue(0, 0).GetValue<int64_t>();
-		int64_t delete_count = result->Collection().GetValue(1, 0).GetValue<int64_t>();
-		int64_t base_count = result->Collection().GetValue(2, 0).GetValue<int64_t>();
 
 		if (total_count == 0) {
 			status.empty_mask |= (1ULL << i);
@@ -1390,8 +1430,9 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	// Detect delta status for all leaves (single query per table: total + delete count).
 	// Used by both FK pruning and empty-delta skipping.
 	vector<JoinProbeSource> leaf_refs(N);
-	DeltaStatus delta_status =
-	    DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves, source_cache, leaf_refs);
+	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
+	DeltaStatus delta_status = DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves, source_cache,
+	                                             leaf_refs, compile_facts);
 	uint64_t total_terms = (1ULL << N) - 1;
 	uint64_t non_empty_mask = total_terms & ~delta_status.empty_mask & ~delta_status.constant_mask;
 	idx_t non_empty_leaf_count = std::bitset<64>(non_empty_mask).count();
@@ -1399,7 +1440,6 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	bool fk_pruning_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
 	uint64_t skip_bits = 0;
-	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 	bool compile_only = compile_facts.compile_only;
 	// FK pruning pays for catalog constraint inspection. When every leaf changed
 	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and

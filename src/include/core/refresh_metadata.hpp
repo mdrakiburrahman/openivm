@@ -135,6 +135,7 @@ public:
 
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
+	Value GetLastUpdateValue(const string &view_name, const string &table_name);
 
 	// Every metadata location that may consume delta tables (see MetadataLocator::All).
 	static vector<MetadataLocation> MetadataLocations(Connection &con);
@@ -230,6 +231,9 @@ public:
 	};
 
 	DeltaChangeStats GetStandardDeltaChangeStats(const string &delta_table_sql, const string &last_update);
+	// The stats of several native deltas in one statement, in input order. An empty watermark, or a
+	// failure of the combined statement, falls back to GetStandardDeltaChangeStats per delta.
+	vector<DeltaChangeStats> GetStandardDeltaChangeStats(const vector<pair<string, string>> &deltas_and_watermarks);
 
 	vector<string> GetTableColumns(const string &catalog_name, const string &schema_name, const string &table_name);
 	bool TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,

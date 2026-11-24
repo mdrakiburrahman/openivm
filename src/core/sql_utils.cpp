@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/type_visitor.hpp"
@@ -24,6 +25,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "lpts_sql_scanner.hpp"
 
 #include <cctype>
@@ -693,6 +695,13 @@ SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
 	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
 	                                   : entry.GetCatalog().GetIdentifierName(),
 	        entry.GetSchema().empty() ? string(DEFAULT_SCHEMA) : entry.GetSchema().GetIdentifierName()};
+}
+
+optional_idx SqlUtils::StorageRowCount(TableCatalogEntry &table) {
+	if (!table.IsDuckTable()) {
+		return optional_idx();
+	}
+	return table.Cast<DuckTableEntry>().GetStorage().GetTotalRows();
 }
 
 string SqlUtils::DeleteViewRowsSQL(const string &table, const string &view_name, const string &column) {

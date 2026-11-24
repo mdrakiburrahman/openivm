@@ -848,6 +848,19 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// already established above instead of probing every leaf's snapshot manifest a second time.
 	if (refresh_delta_activity && !active_facts.compile_only) {
 		for (auto &source : refresh_delta_activity->sources) {
+			if (!source.ducklake && source.ok && source.delete_rows >= 0 && !source.catalog_name.empty() &&
+			    !source.schema_name.empty() && !source.last_update.IsNull()) {
+				// Join compilation reuses these counts and watermarks instead of re-reading every leaf.
+				openivm::SourceDeltaActivity activity;
+				activity.delta_key = source.delta_table_name;
+				activity.delta_table_sql = source.delta_table_sql;
+				activity.last_update = source.last_update;
+				activity.pending_rows = source.pending_rows;
+				activity.delete_rows = source.delete_rows;
+				inner_facts_slot_facts->delta_activity[SqlUtils::FullName(source.catalog_name, source.schema_name,
+				                                                          source.source_table_name)] = activity;
+				continue;
+			}
 			if (!source.ducklake || !source.ok || source.source_table_name.empty()) {
 				continue;
 			}

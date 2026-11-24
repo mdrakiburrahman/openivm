@@ -23,6 +23,16 @@ struct CompileFactsFkRelation {
 // Per-call compile context for `openivm_compile_with_facts`. Field names are
 // snake_case to match the JSON wire form 1:1 — `ParseFactsJson` deserialises
 // the JSON object directly into these fields, and ignores unknown fields.
+// Pending changes of one tracked source, as measured by the native refresh that compiles the plan.
+// Never parsed from JSON facts: compile-only callers cannot see the deltas their plans will read.
+struct SourceDeltaActivity {
+	string delta_key;       // the source's openivm_delta_tables table_name
+	string delta_table_sql; // qualified physical delta table
+	Value last_update;      // the view's watermark for the source
+	int64_t pending_rows = 0;
+	int64_t delete_rows = 0;
+};
+
 class CompileFacts {
 public:
 	// Bumped when the JSON fact schema changes in a backward-compatible way;
@@ -47,6 +57,9 @@ public:
 	// constraints (e.g. Spark/Delta tables).
 	unordered_map<string, string> delta_shape;
 	vector<CompileFactsFkRelation> fk_relations;
+	// Keyed by the source's qualified catalog.schema.table name. Lets join compilation reuse the
+	// refresh's delta-activity counts and watermarks instead of re-querying every leaf.
+	unordered_map<string, SourceDeltaActivity> delta_activity;
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every

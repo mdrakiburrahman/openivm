@@ -105,6 +105,10 @@ struct DeltaActivityResult {
 		bool has_deletes = false;
 		bool requires_full_refresh = false;
 		int64_t pending_rows = -1;
+		int64_t delete_rows = -1;
+		// Native sources: the qualified physical delta and the view's watermark the counts used.
+		string delta_table_sql;
+		Value last_update;
 		int64_t last_snapshot_id = -1;
 		int64_t current_snapshot_id = -1;
 		bool backfill_source_table_id = false;

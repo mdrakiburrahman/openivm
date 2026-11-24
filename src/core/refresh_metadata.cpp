@@ -890,8 +890,12 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 }
 
 string RefreshMetadata::GetLastUpdate(const string &view_name, const string &table_name) {
-	auto value = ReadDeltaValue(view_name, table_name, "last_update");
+	auto value = GetLastUpdateValue(view_name, table_name);
 	return value.IsNull() ? "" : value.ToString();
+}
+
+Value RefreshMetadata::GetLastUpdateValue(const string &view_name, const string &table_name) {
+	return ReadDeltaValue(view_name, table_name, "last_update");
 }
 
 vector<MetadataLocation> RefreshMetadata::MetadataLocations(Connection &con) {
@@ -1551,6 +1555,43 @@ RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(c
 	stats.total = result->Collection().GetValue(0, 0).GetValue<int64_t>();
 	if (!result->Collection().GetValue(1, 0).IsNull()) {
 		stats.deletes = result->Collection().GetValue(1, 0).GetValue<int64_t>();
+	}
+	return stats;
+}
+
+vector<RefreshMetadata::DeltaChangeStats>
+RefreshMetadata::GetStandardDeltaChangeStats(const vector<pair<string, string>> &deltas_and_watermarks) {
+	vector<DeltaChangeStats> stats(deltas_and_watermarks.size());
+	vector<string> counts;
+	for (auto &delta : deltas_and_watermarks) {
+		if (delta.second.empty()) {
+			continue;
+		}
+		counts.push_back("(SELECT [COUNT(*), COALESCE(SUM(CASE WHEN " + string(openivm::MULTIPLICITY_COL) +
+		                 " < 0 THEN 1 ELSE 0 END), 0)] FROM " + delta.first + " WHERE " +
+		                 string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(delta.second) +
+		                 "'::TIMESTAMP)");
+	}
+	unique_ptr<QueryResult> result;
+	if (counts.size() > 1) {
+		result = con.Query("SELECT " + StringUtil::Join(counts, ", "));
+	}
+	idx_t column = 0;
+	for (idx_t i = 0; i < deltas_and_watermarks.size(); i++) {
+		auto &delta = deltas_and_watermarks[i];
+		if (delta.second.empty()) {
+			continue;
+		}
+		if (!result || result->HasError() || result->RowCount() != 1) {
+			// One unreadable delta must not make the others unverified.
+			stats[i] = GetStandardDeltaChangeStats(delta.first, delta.second);
+			continue;
+		}
+		auto pair = result->Collection().GetValue(column++, 0);
+		auto &values = ListValue::GetChildren(pair);
+		stats[i].ok = true;
+		stats[i].total = values[0].GetValue<int64_t>();
+		stats[i].deletes = values[1].GetValue<int64_t>();
 	}
 	return stats;
 }
