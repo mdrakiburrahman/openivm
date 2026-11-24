@@ -105,6 +105,10 @@ struct DeltaActivityResult {
 		bool has_deletes = false;
 		bool requires_full_refresh = false;
 		int64_t pending_rows = -1;
+		int64_t delete_rows = -1;
+		// Native sources: the qualified physical delta and the view's watermark the counts used.
+		string delta_table_sql;
+		Value last_update;
 		int64_t last_snapshot_id = -1;
 		int64_t current_snapshot_id = -1;
 		bool backfill_source_table_id = false;
@@ -306,7 +310,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
                           const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
                           ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true,
-                          vector<string> *deferred_cleanup = nullptr);
+                          vector<string> *deferred_cleanup = nullptr,
+                          shared_ptr<const RefreshMetadata::ViewRecord> view_record = nullptr);
 
 } // namespace duckdb
 

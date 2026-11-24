@@ -2,9 +2,11 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
@@ -25,6 +27,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "lpts_sql_scanner.hpp"
 
 #include <cctype>
@@ -303,6 +306,24 @@ string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
 	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
 	// fold only A-Z. Preserve every other code point, including quoted identifiers.
 	auto fold = [](const string &expression) {
+		// A string literal (Value::ToSQLString) folds here instead of in every evaluation; quotes
+		// inside it are doubled, so folding the SQL text folds exactly the literal's value.
+		bool literal = expression.size() >= 2 && expression.front() == '\'' && expression.back() == '\'';
+		for (idx_t i = 1; literal && i + 1 < expression.size(); i++) {
+			if (expression[i] == '\'') {
+				literal = i + 2 < expression.size() && expression[i + 1] == '\'';
+				i++;
+			}
+		}
+		if (literal) {
+			string folded = expression;
+			for (auto &c : folded) {
+				if (c >= 'A' && c <= 'Z') {
+					c = static_cast<char>(c - 'A' + 'a');
+				}
+			}
+			return folded;
+		}
 		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
 	};
 	// An application collation must not widen physical identifier equality either.
@@ -674,11 +695,17 @@ string SqlUtils::DuckLakeChangesSQL(const string &select_list, const string &cat
 }
 
 string SqlUtils::CurrentDatabase(Connection &con) {
-	auto result = con.Query("SELECT current_database()");
-	if (!result->HasError() && result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull()) {
-		return result->Collection().GetValue(0, 0).ToString();
+	// current_database() without planning a statement; empty when no database is attached.
+	return DatabaseManager::TryGetDefaultDatabase(*con.context).GetIdentifierName();
+}
+
+string SqlUtils::RequireCurrentDatabase(Connection &con, const string &format) {
+	try {
+		return DatabaseManager::GetDefaultDatabase(*con.context).GetIdentifierName();
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		throw CatalogException(format, error.RawMessage());
 	}
-	return "";
 }
 
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
@@ -686,6 +713,13 @@ SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
 	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
 	                                   : entry.GetCatalog().GetIdentifierName(),
 	        entry.GetSchema().empty() ? string(DEFAULT_SCHEMA) : entry.GetSchema().GetIdentifierName()};
+}
+
+optional_idx SqlUtils::StorageRowCount(TableCatalogEntry &table) {
+	if (!table.IsDuckTable()) {
+		return optional_idx();
+	}
+	return table.Cast<DuckTableEntry>().GetStorage().GetTotalRows();
 }
 
 string SqlUtils::DeleteViewRowsSQL(const string &table, const string &view_name, const string &column) {

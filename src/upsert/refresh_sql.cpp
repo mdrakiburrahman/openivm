@@ -449,7 +449,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
                           RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in,
                           Connection *metadata_connection, ProjectionDeleteRetryPlan *delete_retry_plan,
-                          bool write_query_file, vector<string> *deferred_cleanup) {
+                          bool write_query_file, vector<string> *deferred_cleanup,
+                          shared_ptr<const RefreshMetadata::ViewRecord> view_record) {
 	if (delete_retry_plan) {
 		*delete_retry_plan = {};
 	}
@@ -482,6 +483,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto &planning_context = owned_connection ? *con.context : context;
 	if (owned_connection) {
 		RefreshMetadata::UseCatalog(context, con, view_catalog_name);
+		// Its planning transactions only read committed metadata: no caller snapshot to copy.
+		RefreshMetadata::MarkPlanningHelper(planning_context);
 	}
 	PropagateRefreshPlanningSettings(context, planning_context);
 	// Mirror the active CompileFacts onto the inner connection's ClientContext
@@ -494,7 +497,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// no pending deltas.
 	auto inner_facts_slot_facts = make_shared_ptr<openivm::CompileFacts>(active_facts);
 	openivm::CompileFactsContextSlot inner_facts_slot(planning_context, inner_facts_slot_facts);
-	con.Query("SET max_expression_depth = 10000");
+	Settings::Set<MaxExpressionDepthSetting>(*con.context, SetScope::SESSION, Value::UBIGINT(10000));
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	// Control metadata has its own schema; internal objects never follow it.
 	auto metadata_location = RefreshMetadata::CurrentLocation(con);
@@ -518,6 +521,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string internal_catalog_prefix = catalog_prefix;
 	auto metadata_start = profile_now();
 	RefreshMetadata metadata(con, owned_connection ? nullptr : &context);
+	// Read the view's metadata once (or reuse the caller's read from this refresh) instead of per column.
+	if (view_record) {
+		metadata.UseView(view_record);
+	} else {
+		view_record = metadata.LoadView(view_name);
+	}
+	if (owned_connection) {
+		RefreshMetadata::RegisterPlanningView(planning_context, view_record);
+	}
 	auto delta_metadata_tables = active_facts.target_dialect == SqlDialect::DUCKDB
 	                                 ? RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)
 	                                 : vector<string>();
@@ -598,16 +610,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool publication_has_filter = false;
 	string publication_source_query;
 	string publication_prefix = internal_catalog_prefix;
-	auto publication = con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
-	                             SqlUtils::EscapeValue(view_name) + "'");
+	auto published_query = metadata.GetPublishedQuery(view_name);
 	bool snapshot_publication = target_is_ducklake && IsSnapshotPublication(*con.context, internal_catalog_name,
 	                                                                        internal_schema_name, view_name);
 	if (snapshot_publication && active_facts.target_dialect != SqlDialect::DUCKDB) {
 		throw NotImplementedException("Snapshot publication is only supported by "
 		                              "the native DuckLake executor");
 	}
-	if (!snapshot_publication && !publication->HasError() && publication->RowCount() &&
-	    !publication->Collection().GetValue(0, 0).IsNull()) {
+	if (!snapshot_publication && !published_query.IsNull()) {
 		auto record_column = [&](const ColumnDefinition &column) {
 			publication_columns.push_back(column.Name().GetIdentifierName());
 			publication_types.push_back(column.Type());
@@ -629,7 +639,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				record_column(column);
 			}
 		}
-		publication_query = publication->Collection().GetValue(0, 0).ToString();
+		publication_query = published_query.ToString();
 		publication_source_query = publication_query;
 		auto publication_parser = Parser::GetBuiltinParser();
 		publication_parser.ParseQuery(publication_query);
@@ -857,6 +867,19 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// already established above instead of probing every leaf's snapshot manifest a second time.
 	if (refresh_delta_activity && !active_facts.compile_only) {
 		for (auto &source : refresh_delta_activity->sources) {
+			if (!source.ducklake && source.ok && source.delete_rows >= 0 && !source.catalog_name.empty() &&
+			    !source.schema_name.empty() && !source.last_update.IsNull()) {
+				// Join compilation reuses these counts and watermarks instead of re-reading every leaf.
+				openivm::SourceDeltaActivity activity;
+				activity.delta_key = source.delta_table_name;
+				activity.delta_table_sql = source.delta_table_sql;
+				activity.last_update = source.last_update;
+				activity.pending_rows = source.pending_rows;
+				activity.delete_rows = source.delete_rows;
+				inner_facts_slot_facts->delta_activity[SqlUtils::FullName(source.catalog_name, source.schema_name,
+				                                                          source.source_table_name)] = activity;
+				continue;
+			}
 			if (!source.ducklake || !source.ok || source.source_table_name.empty()) {
 				continue;
 			}

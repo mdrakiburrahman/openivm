@@ -397,6 +397,10 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
     (lake / "data").mkdir(parents=True)
     base = "SELECT k, SUM(v), COUNT(*) FROM lake.main.events GROUP BY k"
     view = "lake.main.event_totals"
+    # Each refresh of the view cascades into this one. A cascaded node takes its own lease, so it
+    # must read its watermarks and definition only after another client's refresh of it committed.
+    downstream = "lake.main.event_big"
+    downstream_base = "SELECT k, SUM(v), COUNT(*) FROM lake.main.events GROUP BY k HAVING SUM(v) > 2000"
 
     def client():
         # No persistent local database: metadata in PostgreSQL, data in DuckLake.
@@ -408,6 +412,7 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
             "INSERT INTO lake.main.events SELECT i, i % 5, i FROM range(100) t(i);\n"
             f"CREATE MATERIALIZED VIEW {view} AS SELECT k, SUM(v) AS s, COUNT(*) AS c "
             "FROM lake.main.events GROUP BY k;\n"
+            f"CREATE MATERIALIZED VIEW {downstream} AS SELECT k, s, c FROM {view} WHERE s > 2000;\n"
         )
         for round_index in range(4):
             start = 1000 + round_index * 100
@@ -445,6 +450,9 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
             checker = client()
             checker.run(f"PRAGMA refresh('{view}');\n")
             assert checker.value(bag_difference(view, base)) == "0", f"round {round_index}: concurrent refresh diverged"
+            assert (
+                checker.value(bag_difference(downstream, downstream_base)) == "0"
+            ), f"round {round_index}: concurrent cascaded refresh diverged"
             assert checker.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
             assert checker.value(f"SELECT bool_or(refresh_in_progress) FROM control.{schema}.openivm_views;") == "false"
         # Staged DuckLake CREATE and refreshes archive their programs in the remote schema.

@@ -7,6 +7,8 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 
 #include <atomic>
@@ -55,32 +57,31 @@ SimulatedCrashException::SimulatedCrashException(const string &point)
 
 namespace {
 
-struct AttachedCatalog {
-	bool found = false;
-	string name;
-	string type;
-	bool read_only = false;
-};
+AttachedCatalog Describe(AttachedDatabase &database) {
+	AttachedCatalog info;
+	info.found = true;
+	info.name = database.GetName().GetIdentifierName();
+	info.type = database.GetCatalog().GetCatalogType();
+	info.read_only = database.IsReadOnly();
+	return info;
+}
+
+// What duckdb_databases() reports for user-visible databases, without planning a query:
+// catalog resolution runs on every helper connection of a refresh and CREATE.
+bool IsUserVisible(AttachedDatabase &database) {
+	return !database.IsSystem() && !database.IsTemporary() && database.GetVisibility() != AttachVisibility::HIDDEN;
+}
 
 AttachedCatalog DescribeCatalog(Connection &con, const string &catalog) {
-	AttachedCatalog info;
 	if (catalog.empty()) {
-		return info;
+		return AttachedCatalog();
 	}
-	auto result =
-	    SqlUtils::QueryOrThrow(con,
-	                           "SELECT database_name, type, readonly FROM duckdb_databases() WHERE NOT internal AND " +
-	                               SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog).ToSQLString()),
-	                           "OpenIVM could not resolve metadata catalog: %s");
-	if (result->RowCount() == 0) {
-		return info;
+	// Attached-database names compare case-insensitively (ASCII), like catalog lookup.
+	auto database = DatabaseManager::Get(*con.context->db).GetDatabase(Identifier(catalog));
+	if (!database || !IsUserVisible(*database)) {
+		return AttachedCatalog();
 	}
-	info.found = true;
-	info.name = result->Collection().GetValue(0, 0).ToString();
-	info.type = result->Collection().GetValue(1, 0).IsNull() ? "" : result->Collection().GetValue(1, 0).ToString();
-	info.read_only =
-	    !result->Collection().GetValue(2, 0).IsNull() && result->Collection().GetValue(2, 0).GetValue<bool>();
-	return info;
+	return Describe(*database);
 }
 
 void RequireSupportedType(const AttachedCatalog &info) {
@@ -228,17 +229,7 @@ vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &tab
 	add(Resolve(*con.context, con, ""));
 	// Source metadata lives in native catalogs. Enumerating external tables also
 	// opens their metadata transactions and can block on unrelated DuckLake writes.
-	auto rows = SqlUtils::QueryOrThrow(con,
-	                                   "SELECT database_name, readonly FROM duckdb_databases() WHERE type='duckdb' "
-	                                   "AND NOT internal ORDER BY database_name",
-	                                   "OpenIVM could not locate source metadata: %s");
-	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		AttachedCatalog info;
-		info.found = true;
-		info.name = rows->Collection().GetValue(0, row).ToString();
-		info.type = NATIVE_CATALOG_TYPE;
-		info.read_only =
-		    !rows->Collection().GetValue(1, row).IsNull() && rows->Collection().GetValue(1, row).GetValue<bool>();
+	for (auto &info : MetadataLocator::AttachedCatalogs(*con.context->db, NATIVE_CATALOG_TYPE)) {
 		MetadataLocation marked;
 		if (ReadMarker(con, info.name, marked)) {
 			add(marked);
@@ -325,8 +316,24 @@ vector<string> MetadataLocator::ReplaceRowsSQL(const MetadataLocation &location,
 }
 
 bool MetadataLocator::IsNativeCatalog(Connection &con, const string &catalog) {
+	return IsCatalogType(con, catalog, NATIVE_CATALOG_TYPE);
+}
+
+bool MetadataLocator::IsCatalogType(Connection &con, const string &catalog, const string &type) {
 	auto info = DescribeCatalog(con, catalog);
-	return info.found && StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE);
+	return info.found && StringUtil::CIEquals(info.type, type);
+}
+
+vector<AttachedCatalog> MetadataLocator::AttachedCatalogs(DatabaseInstance &db, const string &type) {
+	vector<AttachedCatalog> result;
+	for (auto &database : DatabaseManager::Get(db).GetDatabases()) {
+		if (IsUserVisible(*database) && StringUtil::CIEquals(database->GetCatalog().GetCatalogType(), type)) {
+			result.push_back(Describe(*database));
+		}
+	}
+	std::sort(result.begin(), result.end(),
+	          [](const AttachedCatalog &left, const AttachedCatalog &right) { return left.name < right.name; });
+	return result;
 }
 
 string MetadataLocator::PhysicalDefaultCatalog(DatabaseInstance &db) {
