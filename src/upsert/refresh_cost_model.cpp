@@ -463,10 +463,12 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 	// actually run at refresh time. Defaults to AGGREGATE_GROUP if the view isn't
 	// in metadata yet (e.g. test harnesses that call EstimateRefreshCost on a raw plan).
 	RefreshType view_type = RefreshType::AGGREGATE_GROUP;
+	// A refresh already read the view's metadata; the PRAGMA refresh_cost path reads it here.
+	RefreshMetadata view_meta(con);
+	view_meta.UseView(RefreshMetadata::PlanningView(context, view_name));
 	{
-		RefreshMetadata vt_meta(con);
 		try {
-			view_type = vt_meta.GetViewType(view_name);
+			view_type = view_meta.GetViewType(view_name);
 		} catch (...) {
 			// view_name not in openivm_views — keep default
 		}
@@ -491,7 +493,7 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 		has_active_delta = has_active_delta || ts.delta_card > 0;
 	}
 
-	auto internal_location = RefreshMetadata(con).GetInternalLocation(view_name);
+	auto internal_location = view_meta.GetInternalLocation(view_name);
 	double mv_card =
 	    GetTableRowCount(con, SqlUtils::FullName(internal_location.catalog_name, internal_location.schema_name,
 	                                             IncrementalTableNames::DataTableName(view_name)));

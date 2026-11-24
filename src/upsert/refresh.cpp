@@ -180,6 +180,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	Connection probe_con(*context.db.get());
 	auto metadata_location = RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
+	// Every metadata read of this attempt, including SQL generation, is served from one read.
+	auto view_record = probe_meta.LoadView(vn);
 	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
 	MetadataLocator::RequireWritable(metadata_location, "refresh materialized view '" + display_name + "'");
 	// Before anything reads source deltas, including the empty-delta shortcut below.
@@ -333,7 +335,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
-		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr);
+		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr, view_record);
 		// The ranked rowid program is compiled with the primary one, before refresh_in_progress is set.
 		// It only runs when DuckLake reports that the exhaustive tuple delete removed more rows than the
 		// negative delta requested, and defers the same cleanup, so it never writes outside the data

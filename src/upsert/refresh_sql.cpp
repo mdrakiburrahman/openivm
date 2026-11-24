@@ -449,7 +449,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
                           RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in,
                           Connection *metadata_connection, ProjectionDeleteRetryPlan *delete_retry_plan,
-                          bool write_query_file, vector<string> *deferred_cleanup) {
+                          bool write_query_file, vector<string> *deferred_cleanup,
+                          shared_ptr<const RefreshMetadata::ViewRecord> view_record) {
 	if (delete_retry_plan) {
 		*delete_retry_plan = {};
 	}
@@ -518,6 +519,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string internal_catalog_prefix = catalog_prefix;
 	auto metadata_start = profile_now();
 	RefreshMetadata metadata(con, owned_connection ? nullptr : &context);
+	// Read the view's metadata once (or reuse the caller's read from this refresh) instead of per column.
+	if (view_record) {
+		metadata.UseView(view_record);
+	} else {
+		view_record = metadata.LoadView(view_name);
+	}
+	if (owned_connection) {
+		RefreshMetadata::RegisterPlanningView(planning_context, view_record);
+	}
 	auto delta_metadata_tables = active_facts.target_dialect == SqlDialect::DUCKDB
 	                                 ? RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)
 	                                 : vector<string>();
@@ -598,16 +608,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool publication_has_filter = false;
 	string publication_source_query;
 	string publication_prefix = internal_catalog_prefix;
-	auto publication = con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
-	                             SqlUtils::EscapeValue(view_name) + "'");
+	auto published_query = metadata.GetPublishedQuery(view_name);
 	bool snapshot_publication = target_is_ducklake && IsSnapshotPublication(*con.context, internal_catalog_name,
 	                                                                        internal_schema_name, view_name);
 	if (snapshot_publication && active_facts.target_dialect != SqlDialect::DUCKDB) {
 		throw NotImplementedException("Snapshot publication is only supported by "
 		                              "the native DuckLake executor");
 	}
-	if (!snapshot_publication && !publication->HasError() && publication->RowCount() &&
-	    !publication->Collection().GetValue(0, 0).IsNull()) {
+	if (!snapshot_publication && !published_query.IsNull()) {
 		auto record_column = [&](const ColumnDefinition &column) {
 			publication_columns.push_back(column.Name().GetIdentifierName());
 			publication_types.push_back(column.Type());
@@ -629,7 +637,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				record_column(column);
 			}
 		}
-		publication_query = publication->Collection().GetValue(0, 0).ToString();
+		publication_query = published_query.ToString();
 		publication_source_query = publication_query;
 		auto publication_parser = Parser::GetBuiltinParser();
 		publication_parser.ParseQuery(publication_query);

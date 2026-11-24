@@ -63,7 +63,9 @@ unique_ptr<SQLStatement> IncrementalRewriteRule::LoadStoredViewStatement(ClientC
 	if (!context.transaction.IsAutoCommit()) {
 		RefreshMetadata(con).SnapshotTransaction(context);
 	}
-	auto view_query = RefreshMetadata(con).GetViewQuery(view);
+	RefreshMetadata metadata(con);
+	metadata.UseView(RefreshMetadata::PlanningView(context, view));
+	auto view_query = metadata.GetViewQuery(view);
 	if (view_query.empty()) {
 		throw Exception(ExceptionType::CATALOG, missing_error);
 	}
@@ -105,9 +107,11 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
 	PlanWithSourceColumns(planner, LoadStoredViewStatement(input.context, con, view_catalog, view,
 	                                                       "IVM: missing view definition for '" + view + "'"));
-	auto derived_outputs = RefreshMetadata(con).GetDerivedAggregateOutputs(view);
+	RefreshMetadata metadata(con);
+	metadata.UseView(RefreshMetadata::PlanningView(input.context, view));
+	auto derived_outputs = metadata.GetDerivedAggregateOutputs(view);
 	if (derived_outputs.complete && !derived_outputs.outputs.empty()) {
-		auto group_columns = RefreshMetadata(con).GetGroupColumns(view);
+		auto group_columns = metadata.GetGroupColumns(view);
 		// The upsert evaluates f(state + delta). Evaluating f(delta) here can
 		// be invalid (e.g. an unsigned cast of COUNT(*) - 2 on a one-row delta).
 		// Keep raw aggregate inputs and let the optimizer prune consumed outputs.

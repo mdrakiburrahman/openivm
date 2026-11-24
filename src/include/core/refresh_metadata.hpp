@@ -16,9 +16,34 @@ class TransactionalMVMetadataState;
 // Wraps all raw SQL queries to openivm_views and openivm_delta_tables
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class RefreshMetadata {
+public:
+	// One view's openivm_views row (without its canonical plan) and openivm_delta_tables rows, read with a
+	// single statement. Refresh compilation reads dozens of these columns, each of which would otherwise be
+	// a planned statement. Columns written while a refresh runs (the interruption marker, the after-hook
+	// flag, the lease epoch, schedules and pending-row estimates) are always read live; writes through a
+	// RefreshMetadata that serves a record drop it.
+	struct ViewRecord {
+		string view_name;
+		case_insensitive_map_t<Value> view;
+		vector<case_insensitive_map_t<Value>> deltas;
+	};
+
+private:
 	Connection &con;
 	// Explicit refreshes plan using a helper but execute at the caller's DuckLake snapshot.
 	optional_ptr<ClientContext> snapshot_context;
+	shared_ptr<const ViewRecord> view_record;
+	// The record serving reads of `view_name`, or null when they go to SQL.
+	const ViewRecord *Record(const string &view_name) const;
+	// The record's openivm_delta_tables row of `table_name` (null when it has none). `answered` is false
+	// when the record cannot answer for `column`, which then has to be read with SQL.
+	const case_insensitive_map_t<Value> *RecordDelta(const string &view_name, const string &table_name,
+	                                                 const string &column, bool &answered) const;
+	// The record's values of `columns` for the view row (`table_name` empty) or a delta row; false when
+	// the record cannot answer all of them. A missing delta row reads as NULLs, like SQL without a row.
+	bool RecordValues(const string &view_name, const string &table_name, const vector<string> &columns,
+	                  vector<Value> &values) const;
+	static RefreshType ParseViewType(const string &view_name, const Value &type_value);
 	Value ReadViewValue(const string &view_name, const string &column);
 	string ReadViewString(const string &view_name, const string &column);
 	bool ReadViewBool(const string &view_name, const string &column);
@@ -30,6 +55,18 @@ public:
 	explicit RefreshMetadata(Connection &con, optional_ptr<ClientContext> snapshot_context = nullptr)
 	    : con(con), snapshot_context(snapshot_context) {
 	}
+
+	// Reads `view_name`'s record through this connection and serves later reads of that view from it.
+	// Returns null (reads keep going to SQL) when the view is not registered or the record is unreadable.
+	shared_ptr<const ViewRecord> LoadView(const string &view_name);
+	// Serve reads of the record's view from `record` (read earlier in the same refresh); null clears it.
+	void UseView(shared_ptr<const ViewRecord> record);
+	// Make `record` available to the optimizer rules planning ComputeDelta on `context` (a helper
+	// connection OpenIVM owns for one refresh), and look it up there.
+	static void RegisterPlanningView(ClientContext &context, shared_ptr<const ViewRecord> record);
+	static shared_ptr<const ViewRecord> PlanningView(ClientContext &context, const string &view_name);
+	// The stored publication query, or NULL when the view has none or it cannot be read.
+	Value GetPublishedQuery(const string &view_name);
 
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.
 	// Within that catalog, metadata stays in the schema that already holds it. New metadata uses

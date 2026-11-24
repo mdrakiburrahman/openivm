@@ -599,7 +599,161 @@ bool RefreshMetadata::IsBaseTable(const string &table_name) {
 	return result->RowCount() == 0;
 }
 
+namespace {
+
+// Written while a refresh runs, so never served from a ViewRecord loaded at its start.
+bool IsVolatileViewColumn(const string &column) {
+	for (auto name :
+	     {"refresh_in_progress", "pending_after_hook", "refresh_epoch", "refresh_interval", "last_update"}) {
+		if (StringUtil::CIEquals(column, name)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool IsVolatileDeltaColumn(const string &column) {
+	return StringUtil::CIEquals(column, "pending_row_estimate") || StringUtil::CIEquals(column, "pending_estimate_ts");
+}
+
+constexpr const char *RECORD_DELTAS_COLUMN = "openivm_record_deltas";
+constexpr const char *PLANNING_VIEW_STATE = "openivm_planning_view";
+
+class PlanningViewState : public ClientContextState {
+public:
+	shared_ptr<const RefreshMetadata::ViewRecord> record;
+};
+
+} // namespace
+
+shared_ptr<const RefreshMetadata::ViewRecord> RefreshMetadata::LoadView(const string &view_name) {
+	view_record.reset();
+	// One statement for the row and its sources. canonical_plan_blob is matcher-only and can be large.
+	auto result = con.Query("SELECT COLUMNS(lambda c: c <> 'canonical_plan_blob'), (SELECT list(d) FROM " +
+	                        string(openivm::DELTA_TABLES_TABLE) + " d WHERE d.view_name = v.view_name) AS " +
+	                        RECORD_DELTAS_COLUMN + " FROM " + string(openivm::VIEWS_TABLE) +
+	                        " v WHERE v.view_name = " + Value(view_name).ToSQLString());
+	if (result->HasError() || result->RowCount() != 1) {
+		// Per-column reads report the specific error, or the missing view.
+		OPENIVM_DEBUG_PRINT("[METADATA] No view record for %s: %s\n", view_name.c_str(),
+		                    result->HasError() ? result->GetError().c_str() : "not registered");
+		return nullptr;
+	}
+	auto record = make_shared_ptr<ViewRecord>();
+	record->view_name = view_name;
+	auto &rows = result->Collection();
+	for (idx_t column = 0; column + 1 < result->ColumnCount(); column++) {
+		record->view[result->ColumnName(column).GetIdentifierName()] = rows.GetValue(column, 0);
+	}
+	auto deltas = rows.GetValue(result->ColumnCount() - 1, 0);
+	if (!deltas.IsNull()) {
+		for (auto &delta : ListValue::GetChildren(deltas)) {
+			auto &fields = StructType::GetChildTypes(delta.type());
+			auto &values = StructValue::GetChildren(delta);
+			case_insensitive_map_t<Value> row;
+			for (idx_t field = 0; field < fields.size(); field++) {
+				row[fields[field].first.GetIdentifierName()] = values[field];
+			}
+			record->deltas.push_back(std::move(row));
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[METADATA] Loaded view record for %s (%zu columns, %zu sources)\n", view_name.c_str(),
+	                    record->view.size(), record->deltas.size());
+	view_record = std::move(record);
+	return view_record;
+}
+
+void RefreshMetadata::UseView(shared_ptr<const ViewRecord> record) {
+	view_record = std::move(record);
+}
+
+void RefreshMetadata::RegisterPlanningView(ClientContext &context, shared_ptr<const ViewRecord> record) {
+	context.registered_state->GetOrCreate<PlanningViewState>(PLANNING_VIEW_STATE)->record = std::move(record);
+}
+
+shared_ptr<const RefreshMetadata::ViewRecord> RefreshMetadata::PlanningView(ClientContext &context,
+                                                                            const string &view_name) {
+	auto state = context.registered_state->Get<PlanningViewState>(PLANNING_VIEW_STATE);
+	if (!state || !state->record || state->record->view_name != view_name) {
+		return nullptr;
+	}
+	return state->record;
+}
+
+const RefreshMetadata::ViewRecord *RefreshMetadata::Record(const string &view_name) const {
+	return view_record && view_record->view_name == view_name ? view_record.get() : nullptr;
+}
+
+const case_insensitive_map_t<Value> *RefreshMetadata::RecordDelta(const string &view_name, const string &table_name,
+                                                                  const string &column, bool &answered) const {
+	answered = false;
+	auto record = Record(view_name);
+	if (!record || IsVolatileDeltaColumn(column)) {
+		return nullptr;
+	}
+	for (auto &row : record->deltas) {
+		auto name = row.find("table_name");
+		if (name == row.end()) {
+			return nullptr;
+		}
+		if (!name->second.IsNull() && name->second.ToString() == table_name) {
+			answered = row.find(column) != row.end();
+			return answered ? &row : nullptr;
+		}
+	}
+	// Without a row, SQL would also read NULL.
+	answered = true;
+	return nullptr;
+}
+
+bool RefreshMetadata::RecordValues(const string &view_name, const string &table_name, const vector<string> &columns,
+                                   vector<Value> &values) const {
+	values.clear();
+	auto record = Record(view_name);
+	if (!record) {
+		return false;
+	}
+	for (auto &column : columns) {
+		if (table_name.empty()) {
+			auto entry = record->view.find(column);
+			if (entry == record->view.end() || IsVolatileViewColumn(column)) {
+				return false;
+			}
+			values.push_back(entry->second);
+			continue;
+		}
+		bool answered;
+		auto row = RecordDelta(view_name, table_name, column, answered);
+		if (!answered) {
+			return false;
+		}
+		values.push_back(row ? row->at(column) : Value());
+	}
+	return true;
+}
+
+Value RefreshMetadata::GetPublishedQuery(const string &view_name) {
+	if (auto record = Record(view_name)) {
+		auto entry = record->view.find("published_query");
+		if (entry != record->view.end()) {
+			return entry->second;
+		}
+	}
+	auto result = con.Query("SELECT published_query FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = " + Value(view_name).ToSQLString());
+	if (result->HasError() || result->RowCount() == 0) {
+		return Value();
+	}
+	return result->Collection().GetValue(0, 0);
+}
+
 Value RefreshMetadata::ReadViewValue(const string &view_name, const string &column) {
+	if (auto record = Record(view_name)) {
+		auto entry = record->view.find(column);
+		if (entry != record->view.end() && !IsVolatileViewColumn(column)) {
+			return entry->second;
+		}
+	}
 	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
 	    con,
 	    "SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
@@ -619,6 +773,11 @@ bool RefreshMetadata::ReadViewBool(const string &view_name, const string &column
 }
 
 Value RefreshMetadata::ReadDeltaValue(const string &view_name, const string &table_name, const string &column) {
+	bool answered;
+	auto row = RecordDelta(view_name, table_name, column, answered);
+	if (answered) {
+		return row ? row->at(column) : Value();
+	}
 	auto result =
 	    con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::DELTA_TABLES_TABLE) +
 	              " WHERE view_name = " + Value(view_name).ToSQLString() +
@@ -636,6 +795,10 @@ string RefreshMetadata::GetViewQuery(const string &view_name) {
 }
 
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
+	vector<Value> type;
+	if (RecordValues(view_name, "", {"type"}, type)) {
+		return ParseViewType(view_name, type[0]);
+	}
 	auto result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError()) {
@@ -654,7 +817,10 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 		                       "view_catalog and view_schema in %s",
 		                       view_name, location.Table(openivm::VIEWS_TABLE));
 	}
-	auto type_value = result->Collection().GetValue(0, 0);
+	return ParseViewType(view_name, result->Collection().GetValue(0, 0));
+}
+
+RefreshType RefreshMetadata::ParseViewType(const string &view_name, const Value &type_value) {
 	if (type_value.IsNull()) {
 		throw InvalidInputException("Invalid refresh type NULL in IVM metadata for materialized view '%s'", view_name);
 	}
@@ -691,6 +857,13 @@ string RefreshMetadata::GetFullOuterJoinCols(const string &view_name) {
 }
 
 vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
+	if (auto record = Record(view_name)) {
+		vector<string> tables;
+		for (auto &row : record->deltas) {
+			tables.push_back(row.at("table_name").ToString());
+		}
+		return tables;
+	}
 	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> tables;
@@ -1164,25 +1337,31 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	loc.schema_name = fallback_schema;
 	string delta_schema;
 	string delta_table_name;
-	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
-	    con,
-	    "SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
-	        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-	        "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'",
-	    "Could not read IVM source location for materialized view '%s' and table '%s': %s", view_name, table_name);
-	if (result->RowCount() > 0) {
-		if (!result->Collection().GetValue(0, 0).IsNull()) {
-			loc.catalog_name = result->Collection().GetValue(0, 0).ToString();
+	vector<Value> values;
+	if (!RecordValues(view_name, table_name, {"source_catalog", "source_schema", "delta_schema", "delta_table_name"},
+	                  values)) {
+		auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+		    con,
+		    "SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
+		        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+		        "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'",
+		    "Could not read IVM source location for materialized view '%s' and table '%s': %s", view_name, table_name);
+		values.assign(4, Value());
+		for (idx_t column = 0; result->RowCount() > 0 && column < values.size(); column++) {
+			values[column] = result->Collection().GetValue(column, 0);
 		}
-		if (!result->Collection().GetValue(1, 0).IsNull()) {
-			loc.schema_name = result->Collection().GetValue(1, 0).ToString();
-		}
-		if (!result->Collection().GetValue(2, 0).IsNull()) {
-			delta_schema = result->Collection().GetValue(2, 0).ToString();
-		}
-		if (!result->Collection().GetValue(3, 0).IsNull()) {
-			delta_table_name = result->Collection().GetValue(3, 0).ToString();
-		}
+	}
+	if (!values[0].IsNull()) {
+		loc.catalog_name = values[0].ToString();
+	}
+	if (!values[1].IsNull()) {
+		loc.schema_name = values[1].ToString();
+	}
+	if (!values[2].IsNull()) {
+		delta_schema = values[2].ToString();
+	}
+	if (!values[3].IsNull()) {
+		delta_table_name = values[3].ToString();
 	}
 	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
 	SetSourceDelta(loc.table_name, loc.schema_name, delta_schema, delta_table_name, loc.delta_schema_name,
@@ -1209,18 +1388,23 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
                                                                            const string &fallback_catalog,
                                                                            const string &fallback_schema) {
 	StoredViewLocation loc {fallback_catalog, fallback_schema};
-	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
-	    con,
-	    "SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	        SqlUtils::EscapeValue(view_name) + "'",
-	    "Could not read IVM stored location for materialized view '%s': %s", view_name);
-	if (result->RowCount() > 0) {
-		if (!result->Collection().GetValue(0, 0).IsNull()) {
-			loc.catalog_name = result->Collection().GetValue(0, 0).ToString();
+	vector<Value> values;
+	if (!RecordValues(view_name, "", {"view_catalog", "view_schema"}, values)) {
+		auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+		    con,
+		    "SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+		        SqlUtils::EscapeValue(view_name) + "'",
+		    "Could not read IVM stored location for materialized view '%s': %s", view_name);
+		values.assign(2, Value());
+		for (idx_t column = 0; result->RowCount() > 0 && column < values.size(); column++) {
+			values[column] = result->Collection().GetValue(column, 0);
 		}
-		if (!result->Collection().GetValue(1, 0).IsNull()) {
-			loc.schema_name = result->Collection().GetValue(1, 0).ToString();
-		}
+	}
+	if (!values[0].IsNull()) {
+		loc.catalog_name = values[0].ToString();
+	}
+	if (!values[1].IsNull()) {
+		loc.schema_name = values[1].ToString();
 	}
 	if (loc.catalog_name.empty()) {
 		loc.catalog_name = SqlUtils::CurrentDatabase(con);
@@ -1260,30 +1444,44 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
-	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
-	    con,
-	    "SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, delta_table_name FROM " +
-	        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
-	    "Could not read IVM delta source metadata for materialized view '%s': %s", view_name);
+	static const vector<string> COLUMNS = {"table_name",    "catalog_type", "source_catalog",
+	                                       "source_schema", "delta_schema", "delta_table_name"};
+	vector<vector<Value>> rows;
+	auto record = Record(view_name);
+	for (idx_t row = 0; record && row < record->deltas.size(); row++) {
+		vector<Value> values;
+		for (auto &column : COLUMNS) {
+			auto entry = record->deltas[row].find(column);
+			if (entry == record->deltas[row].end()) {
+				record = nullptr;
+				break;
+			}
+			values.push_back(entry->second);
+		}
+		rows.push_back(std::move(values));
+	}
+	if (!record) {
+		auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+		    con,
+		    "SELECT " + StringUtil::Join(COLUMNS, ", ") + " FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
+		    "Could not read IVM delta source metadata for materialized view '%s': %s", view_name);
+		rows.assign(result->RowCount(), vector<Value>());
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			for (idx_t column = 0; column < COLUMNS.size(); column++) {
+				rows[row].push_back(result->Collection().GetValue(column, row));
+			}
+		}
+	}
 	vector<DeltaSource> sources;
-	for (idx_t row = 0; row < result->RowCount(); row++) {
+	for (auto &values : rows) {
 		DeltaSource source;
-		source.table_name = result->Collection().GetValue(0, row).ToString();
-		source.catalog_type = result->Collection().GetValue(1, row).IsNull()
-		                          ? "duckdb"
-		                          : result->Collection().GetValue(1, row).ToString();
-		source.catalog_name = result->Collection().GetValue(2, row).IsNull()
-		                          ? fallback_catalog
-		                          : result->Collection().GetValue(2, row).ToString();
-		source.schema_name = result->Collection().GetValue(3, row).IsNull()
-		                         ? fallback_schema
-		                         : result->Collection().GetValue(3, row).ToString();
-		auto delta_schema = result->Collection().GetValue(4, row).IsNull()
-		                        ? string()
-		                        : result->Collection().GetValue(4, row).ToString();
-		auto delta_name = result->Collection().GetValue(5, row).IsNull()
-		                      ? string()
-		                      : result->Collection().GetValue(5, row).ToString();
+		source.table_name = values[0].ToString();
+		source.catalog_type = values[1].IsNull() ? "duckdb" : values[1].ToString();
+		source.catalog_name = values[2].IsNull() ? fallback_catalog : values[2].ToString();
+		source.schema_name = values[3].IsNull() ? fallback_schema : values[3].ToString();
+		auto delta_schema = values[4].IsNull() ? string() : values[4].ToString();
+		auto delta_name = values[5].IsNull() ? string() : values[5].ToString();
 		SetSourceDelta(SourceTableName(source.table_name, source.catalog_name, source.schema_name), source.schema_name,
 		               delta_schema, delta_name, source.delta_schema_name, source.delta_table_name);
 		sources.push_back(std::move(source));
@@ -1940,6 +2138,8 @@ string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name,
 
 void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name,
                                                     int64_t snapshot_id, int64_t source_table_id) {
+	// The record holds the watermark this write replaces.
+	view_record.reset();
 	auto result = con.Query(BuildDuckLakeRefreshMetadataSQL(view_name, table_name, to_string(snapshot_id), "",
 	                                                        source_table_id < 0 ? "" : to_string(source_table_id)));
 	if (result->HasError()) {

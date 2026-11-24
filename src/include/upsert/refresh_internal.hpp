@@ -303,7 +303,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
                           const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
                           ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true,
-                          vector<string> *deferred_cleanup = nullptr);
+                          vector<string> *deferred_cleanup = nullptr,
+                          shared_ptr<const RefreshMetadata::ViewRecord> view_record = nullptr);
 
 } // namespace duckdb
 
