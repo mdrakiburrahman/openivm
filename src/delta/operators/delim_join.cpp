@@ -125,10 +125,8 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 }
 
 // Replace a DELIM_GET with its distinct key source, recording the one-to-one binding replacements.
-static void ReplaceDelimGet(ClientContext &context, unique_ptr<LogicalOperator> &node,
-                            LogicalComparisonJoin &delim_join, bool allow_ordinal_fallback,
+static void ReplaceDelimGet(unique_ptr<LogicalOperator> &node, unique_ptr<LogicalOperator> source,
                             vector<ReplacementBinding> &replacements) {
-	auto source = BuildDelimKeySource(context, delim_join, node->Cast<LogicalDelimGet>(), allow_ordinal_fallback);
 	auto old_bindings = node->GetColumnBindings();
 	auto new_bindings = source->GetColumnBindings();
 	if (old_bindings.size() != new_bindings.size()) {
@@ -213,7 +211,8 @@ static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator>
 		if (!active_delim_join) {
 			throw NotImplementedException("LOGICAL_DELIM_GET without enclosing DELIM_JOIN is not supported");
 		}
-		ReplaceDelimGet(context, node, *active_delim_join, true, replacement_bindings);
+		ReplaceDelimGet(node, BuildDelimKeySource(context, *active_delim_join, node->Cast<LogicalDelimGet>(), true),
+		                replacement_bindings);
 		return true;
 	}
 
@@ -256,11 +255,13 @@ static bool ReplaceSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<Logi
 			return false;
 		}
 		// Shapes the strict key source cannot express keep the original DELIM_JOIN.
+		unique_ptr<LogicalOperator> source;
 		try {
-			ReplaceDelimGet(context, node, *active_delim_join, false, *active_replacements);
+			source = BuildDelimKeySource(context, *active_delim_join, node->Cast<LogicalDelimGet>(), false);
 		} catch (Exception &) {
 			return false;
 		}
+		ReplaceDelimGet(node, std::move(source), *active_replacements);
 		return true;
 	}
 
