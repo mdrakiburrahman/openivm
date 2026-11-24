@@ -653,20 +653,13 @@ GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binde
 
 // After DemoteOuterJoinsForMask, a LEFT/RIGHT join may remain un-demoted (kept as an outer join)
 // because its null-supplying side has no delta leaf in THIS mask — so it reads that side as
-// "current" state. If that null-supplying leaf independently has ANY pending delta (from this
-// same refresh, just not part of this term's mask), "current" silently mixes old and new state
-// for the dangling-tuple decision: a preserved-side row whose matching child rows are ALSO being
-// deleted in this same batch gets a spurious extra dangling row here, on top of the correct
-// removal already produced by the higher-order term that covers {this leaf, that leaf} together
-// (double-count). This is the outer-join analogue of the classic T_old-vs-T_new join delta
-// problem — LEFT JOIN's NULL-padding is a non-linear threshold function (unlike inner join's
-// bilinear product), so it cannot be decomposed by inclusion-exclusion the way ordinary joins
-// can; instead (matching Larson & Zhou / DBSP's semijoin-count treatment), we must exclude keys
-// that are themselves transitioning, since those are exclusively owned by the term(s) that
-// include this leaf's delta bit. Guard: anti-join the null-supplying leaf's current scan against
-// its own delta table on the join key, excluding any key present there. Only applies when the
-// null-supplying side is a single, unwrapped base-table leaf directly under the join (bails
-// silently otherwise, matching this file's existing unsupported-shape convention).
+// "current" state. If that null-supplying leaf independently has pending deltas in this refresh,
+// "current" mixes old and new state for the dangling-tuple decision and double-counts with the
+// higher-order term that covers both leaves. LEFT JOIN's NULL-padding is a non-linear threshold
+// function, so (matching Larson & Zhou / DBSP's semijoin-count treatment) this term excludes the
+// preserved-side rows whose key match-count transitions across zero; the terms including this
+// leaf's delta bit own them. Applies only when the null-supplying side resolves to a base-table
+// scan (bails silently otherwise).
 static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &binder,
                                           LogicalOperator *node, const vector<JoinLeafInfo> &leaves,
                                           uint64_t leaf_has_delta_mask, uint64_t old_state_mask,
@@ -734,14 +727,8 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &co
 				}
 				if (key_expr && key_pos != DConstants::INVALID_INDEX &&
 				    other_key_expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-					// Build the set of keys whose match-count on the null-supplying side ACTUALLY
-					// transitions across zero (old>0,new=0 or old=0,new>0). A key merely appearing in
-					// the delta is NOT enough to exclude it: for a 1:many relationship (e.g. one
-					// customer, many orders) a single changed order must not suppress the customer's
-					// row when the customer still has OTHER, unchanged matches. Only a true 0<->>0
-					// transition means "this key's presence here is fully owned by the higher-order
-					// term" -- matching the same match-count-transition principle as the secondary-delta
-					// fix, just applied here to avoid a double-count instead of to add a missing row.
+					// Only a true 0<->>0 match-count transition (see BuildTransitioningKeySetImpl) means
+					// the key is fully owned by the higher-order term.
 					auto transitioning_keys = GetTransitioningKeySetRef(
 					    context, con, binder,
 					    old_state_mask & (1ULL << null_leaf_idx) ? GetLeafScan(leaves[null_leaf_idx])
