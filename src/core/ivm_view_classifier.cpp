@@ -254,28 +254,27 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	const bool has_union_over_agg = analysis.found_aggregation && facts.has_union_before_aggregate;
 	model.union_distinct_over_agg =
 	    has_union_over_agg && (analysis.found_union_distinct || (analysis.found_distinct && model.distinct_at_top));
+	// Fallback group columns for GROUP_RECOMPUTE, with the reason recorded when any are found.
+	auto add_fallback = [&](const vector<string> &names, DeltaStrategyReason reason, const char *label) {
+		AddVisibleGroupNames(model.group_columns, names);
+		if (!model.group_columns.empty()) {
+			AddUnique(model.strategy_reasons, reason);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] %s: using %zu group columns for GROUP_RECOMPUTE\n", label,
+			                    model.group_columns.size());
+		}
+	};
 
 	if (analysis.found_distinct_on) {
 		model.group_columns = DistinctOnGroupColumns(facts, output_names);
 	} else if (model.union_distinct_over_agg) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	} else if (analysis.found_union_distinct && !analysis.found_aggregation) {
-		AddVisibleGroupNames(model.group_columns, output_names);
-		if (!model.group_columns.empty()) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] UNION DISTINCT: using %zu visible output columns for "
-			                    "GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(output_names, DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE, "UNION DISTINCT");
 	} else if (model.distinct_at_top) {
 		AddVisibleGroupNames(model.group_columns, output_names);
 	} else if (analysis.found_distinct && !analysis.found_aggregation && HasOuterProjectionOverDistinct(facts)) {
-		AddVisibleGroupNames(model.group_columns, output_names);
-		if (!model.group_columns.empty()) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Inner DISTINCT below an outer projection -- using "
-			                    "GROUP_RECOMPUTE\n");
-		}
+		add_fallback(output_names, DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE,
+		             "Inner DISTINCT below an outer projection");
 	} else if (group_count > 0 && group_index.IsValid()) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	}
@@ -299,36 +298,18 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 
 	if (analysis.found_delim_join && analysis.found_single_join && !analysis.found_aggregation &&
 	    model.group_columns.empty()) {
-		auto before = model.group_columns.size();
-		AddVisibleGroupNames(model.group_columns, DeriveScalarDelimKeyColumnNames(facts, output_names));
-		if (model.group_columns.size() > before) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::SCALAR_DELIM_PROJECTION_GROUP_FALLBACK);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Scalar DELIM/DEPENDENT projection: using %zu visible key columns "
-			                    "for GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(DeriveScalarDelimKeyColumnNames(facts, output_names),
+		             DeltaStrategyReason::SCALAR_DELIM_PROJECTION_GROUP_FALLBACK, "Scalar DELIM/DEPENDENT projection");
 	}
 
 	if (analysis.found_nested_aggregate && model.group_columns.empty()) {
-		auto before = model.group_columns.size();
-		AddVisibleGroupNames(model.group_columns, DeriveAggregateGroupColumnNames(facts, output_names, false));
-		if (model.group_columns.size() > before) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Nested aggregate: using %zu visible inner group columns for "
-			                    "GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(DeriveAggregateGroupColumnNames(facts, output_names, false),
+		             DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK, "Nested aggregate");
 	}
 
 	if (analysis.found_aggregation && model.group_columns.empty()) {
-		auto before = model.group_columns.size();
-		AddVisibleGroupNames(model.group_columns, DeriveAggregateGroupColumnNames(facts, output_names, true));
-		if (model.group_columns.size() > before) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Repeated CTE aggregate under join: using %zu visible group columns "
-			                    "for GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(DeriveAggregateGroupColumnNames(facts, output_names, true),
+		             DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK, "Repeated CTE aggregate under join");
 	}
 
 	DeduplicateGroupColumns(model.group_columns);
