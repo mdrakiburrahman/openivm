@@ -139,7 +139,8 @@ public:
 	                                    const vector<string> &unique_keys = {}, const string &temp_table = "",
 	                                    const vector<string> &columns = {},
 	                                    const vector<LogicalType> &column_types = {});
-	// Upserts `source` rows into a data table keyed by a UNIQUE index.
+	// Upserts `source` rows into a data table keyed by a UNIQUE index. Callers delete NULL-containing
+	// keys first. Matched rows are updated in the target's storage order (see the definition).
 	static string BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
 	                                  const vector<string> &columns);
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);

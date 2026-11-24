@@ -316,3 +316,109 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Keyed upserts (full refresh and group-recompute) resolve each recomputed row's target row id and
+# update in storage order: DuckDB applies MERGE updates in join-emission order, and a source-probe
+# order uncorrelated with the data table was up to ~100x slower on a freshly reopened database.
+# Cover a shuffled source, multi-column keys with NULL components, vanished, new and NULL groups,
+# a key-only view (only its hidden count is updated), and a `rowid` output column that hides the row id.
+restart
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+CREATE TABLE ups_src(id INT, a INT, b VARCHAR, x INT);
+INSERT INTO ups_src SELECT i, (hash(i) % 300)::INT, CASE WHEN i % 7 = 0 THEN NULL ELSE 'k' || (i % 3) END, i
+    FROM range(3000) t(i) ORDER BY hash(i);
+INSERT INTO ups_src VALUES (-1, NULL, NULL, 5), (-2, NULL, 'k1', 6), (-3, 7, NULL, 8);
+CREATE MATERIALIZED VIEW ups_sum AS SELECT a, b, SUM(x) AS s, COUNT(*) AS n FROM ups_src GROUP BY a, b;
+CREATE MATERIALIZED VIEW ups_min AS SELECT a, b, MIN(x) AS mn, MAX(x) AS mx FROM ups_src GROUP BY a, b;
+CREATE MATERIALIZED VIEW ups_keys AS SELECT a, b FROM ups_src GROUP BY a, b;
+CREATE MATERIALIZED VIEW ups_rowid AS SELECT a AS rowid, SUM(x) AS s FROM ups_src GROUP BY a;
+CREATE VIEW ups_sum_expected AS SELECT a, b, SUM(x) AS s, COUNT(*) AS n FROM ups_src GROUP BY a, b;
+CREATE VIEW ups_min_expected AS SELECT a, b, MIN(x) AS mn, MAX(x) AS mx FROM ups_src GROUP BY a, b;
+CREATE VIEW ups_keys_expected AS SELECT a, b FROM ups_src GROUP BY a, b;
+CREATE VIEW ups_rowid_expected AS SELECT a AS rowid, SUM(x) AS s FROM ups_src GROUP BY a;
+
+query I
+SELECT count(*) FROM duckdb_indexes() i JOIN openivm_views v ON i.table_name = 'openivm_data_' || v.view_name
+WHERE v.view_sql_name IN ('ups_sum', 'ups_min', 'ups_keys', 'ups_rowid');
+----
+4
+
+loop round 0 2
+
+# Reopen so every refresh below runs against freshly loaded on-disk indexes.
+restart
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+SET openivm_refresh_mode = 'incremental';
+
+# Mostly-conflicting batch: change most groups, add new and NULL-component groups, move rows between
+# groups (key updates), and empty some groups entirely.
+statement ok
+INSERT INTO ups_src SELECT 10000 + i, (hash(i + ${round}) % 320)::INT, CASE WHEN i % 5 = 0 THEN NULL ELSE 'k' || (i % 4) END,
+    i * 3 FROM range(2500) t(i) ORDER BY hash(i * 11);
+INSERT INTO ups_src VALUES (-10 - ${round}, NULL, NULL, 50), (-20 - ${round}, NULL, 'k2', 60), (-30 - ${round}, 999, NULL, 1);
+UPDATE ups_src SET x = x + 1000 WHERE id % 5 = 0;
+UPDATE ups_src SET b = NULL WHERE a = 4;
+UPDATE ups_src SET a = NULL WHERE a = 5 AND b = 'k1';
+DELETE FROM ups_src WHERE a = 3 OR (a IS NULL AND b = 'k1') OR id % 11 = 0;
+
+# Group-recompute upsert of the MIN/MAX view resolves target row ids.
+query I
+SELECT bool_or(contains(sql, 'MERGE INTO') AND contains(sql, 'openivm_target_rowid'))::INT
+FROM openivm_compile_with_facts('ups_min', '{"target_dialect":"duckdb","compile_only":true}');
+----
+1
+
+statement ok
+PRAGMA refresh('ups_min');
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+# Full refresh uses the row-id upsert; a `rowid` output column hides the row id and keeps the key MERGE.
+query III
+SELECT (SELECT bool_or(contains(sql, 'openivm_target_rowid') AND contains(sql, 'openivm_full_recompute_'))::INT
+        FROM openivm_compile_with_facts('ups_sum', '{"target_dialect":"duckdb","compile_only":true}')),
+       (SELECT bool_or(contains(sql, 'openivm_target_rowid') AND contains(sql, 'openivm_full_recompute_'))::INT
+        FROM openivm_compile_with_facts('ups_keys', '{"target_dialect":"duckdb","compile_only":true}')),
+       (SELECT (bool_or(contains(sql, 'MERGE INTO') AND contains(sql, 'openivm_full_recompute_'))
+                AND NOT bool_or(contains(sql, 'openivm_target_rowid')))::INT
+        FROM openivm_compile_with_facts('ups_rowid', '{"target_dialect":"duckdb","compile_only":true}'));
+----
+1	1	1
+
+statement ok
+PRAGMA refresh('ups_sum');
+PRAGMA refresh('ups_keys');
+PRAGMA refresh('ups_rowid');
+
+query IIII
+SELECT
+    (SELECT count(*) FROM ((SELECT * FROM ups_sum EXCEPT ALL SELECT * FROM ups_sum_expected)
+        UNION ALL (SELECT * FROM ups_sum_expected EXCEPT ALL SELECT * FROM ups_sum))),
+    (SELECT count(*) FROM ((SELECT * FROM ups_min EXCEPT ALL SELECT * FROM ups_min_expected)
+        UNION ALL (SELECT * FROM ups_min_expected EXCEPT ALL SELECT * FROM ups_min))),
+    (SELECT count(*) FROM ((SELECT * FROM ups_keys EXCEPT ALL SELECT * FROM ups_keys_expected)
+        UNION ALL (SELECT * FROM ups_keys_expected EXCEPT ALL SELECT * FROM ups_keys))),
+    (SELECT count(*) FROM ((SELECT * FROM ups_rowid EXCEPT ALL SELECT * FROM ups_rowid_expected)
+        UNION ALL (SELECT * FROM ups_rowid_expected EXCEPT ALL SELECT * FROM ups_rowid)));
+----
+0	0	0	0
+
+# The full-refresh path of the MIN/MAX view, after another conflicting batch.
+statement ok
+UPDATE ups_src SET x = x - 7 WHERE id % 3 = 0;
+DELETE FROM ups_src WHERE a = 6;
+INSERT INTO ups_src VALUES (-40 - ${round}, NULL, NULL, -5), (-50 - ${round}, 6, 'k1', 2);
+PRAGMA refresh('ups_min');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ups_min EXCEPT ALL SELECT * FROM ups_min_expected)
+    UNION ALL (SELECT * FROM ups_min_expected EXCEPT ALL SELECT * FROM ups_min));
+----
+0
+
+endloop

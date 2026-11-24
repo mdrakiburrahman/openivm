@@ -810,20 +810,37 @@ string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &sou
 	if (keys.empty() || columns.empty()) {
 		throw InternalException("Keyed upsert into %s needs its key and column names", data_table);
 	}
-	// DuckDB 2.0 plans INSERT OR REPLACE as a MERGE that probes with the source, so matched rows
-	// are updated in random order. An explicit MERGE keeps the target on the probe side. Only
-	// non-key columns are assigned: an indexed key assignment turns every update into delete+insert.
+	// Only non-key columns are assigned: an indexed key assignment turns every update into
+	// delete+insert.
 	vector<string> updates;
+	bool shadows_rowid = false;
 	for (auto &column : columns) {
+		shadows_rowid |= StringUtil::CIEquals(column, "rowid");
 		if (std::find(keys.begin(), keys.end(), column) == keys.end()) {
 			auto quoted = QuoteIdentifier(column);
 			updates.push_back(quoted + " = d." + quoted);
 		}
 	}
-	auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
-	return "MERGE INTO " + data_table + " v USING " + source + " d ON " + BuildNullSafeKeyPredicate(keys, "v.", "d.") +
-	       matched + "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
-	       JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+	auto not_matched = "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
+	                   JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+	if (updates.empty() || shadows_rowid) {
+		// Nothing is updated, or a `rowid` column hides the row id: match on the key directly.
+		auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
+		return "MERGE INTO " + data_table + " v USING " + source + " d ON " +
+		       BuildNullSafeKeyPredicate(keys, "v.", "d.") + matched + not_matched;
+	}
+	// DuckDB applies matched updates in the order the join emits them. INSERT OR REPLACE and a key
+	// MERGE each pick the probe side by cardinality estimate, and when the source probes, an order
+	// uncorrelated with the target's storage makes every update chunk touch many row groups (~100x
+	// slower). Resolve each source row's target row id and sort by it first: matching on the row id
+	// then follows storage order whichever side probes. Unmatched rows get a NULL row id and insert.
+	const string rowid_column = "openivm_target_rowid";
+	auto ordered_source = "(SELECT openivm_src.*, openivm_old.rowid AS " + rowid_column + " FROM " + source +
+	                      " openivm_src LEFT JOIN " + data_table + " openivm_old ON " +
+	                      BuildNullSafeKeyPredicate(keys, "openivm_old.", "openivm_src.") + " ORDER BY " +
+	                      rowid_column + ")";
+	return "MERGE INTO " + data_table + " v USING " + ordered_source + " d ON v.rowid = d." + rowid_column +
+	       "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ") + not_matched;
 }
 
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
