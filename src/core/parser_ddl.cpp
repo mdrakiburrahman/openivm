@@ -238,10 +238,6 @@ static string StabilizeTransactionalMetadata(const string &statement, const stri
 }
 
 struct DDLExecutorBindData : public TableFunctionData {
-	explicit DDLExecutorBindData(bool result) : result(result) {
-	}
-
-	bool result;
 	vector<string> ddl;
 };
 
@@ -474,11 +470,14 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			}
 		}
 	};
-	auto fail_ddl = [&](const string &message) {
-		run_cleanup();
+	auto finish = [&]() {
 		profiler.AddTotal();
 		profiler.Flush();
 		restore_outer_transaction();
+	};
+	auto fail_ddl = [&](const string &message) {
+		run_cleanup();
+		finish();
 		throw CatalogException("Failed to execute IVM DDL: " + message);
 	};
 	auto require_lifecycle = [&]() {
@@ -681,9 +680,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			if (!conn->context->transaction.IsAutoCommit()) {
 				conn->Rollback();
 			}
-			profiler.AddTotal();
-			profiler.Flush();
-			restore_outer_transaction();
+			finish();
 			throw CatalogException("CREATE OR REPLACE MATERIALIZED VIEW committed, but OpenIVM could not archive "
 			                       "its compiled SQL: " +
 			                       error);
@@ -691,14 +688,12 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		pending_ddl.push_back(q);
 	}
 	flush_pending();
-	profiler.AddTotal();
-	profiler.Flush();
-	restore_outer_transaction();
+	finish();
 }
 
 unique_ptr<FunctionData> DDLExecutorBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
-	auto bind_data = make_uniq<DDLExecutorBindData>(true);
+	auto bind_data = make_uniq<DDLExecutorBindData>();
 	for (auto &param : input.inputs) {
 		auto q = param.GetValue<string>();
 		if (!q.empty()) {
@@ -717,7 +712,7 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 		return;
 	}
 	ExecuteDDL(context, bind_data.ddl);
-	output.data[0].SetValue(0, Value::BOOLEAN(bind_data.result));
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
 	output.SetCardinalityUnsafe(1);
 	gdata.offset++;
 }
