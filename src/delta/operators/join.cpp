@@ -1581,9 +1581,8 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	}
 	vector<unique_ptr<Expression>> current_exprs;
 	D_ASSERT(current_types.size() == current_bindings.size());
-	idx_t current_type_idx = 0;
-	for (auto &binding : current_bindings) {
-		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[current_type_idx++], binding));
+	for (idx_t i = 0; i < current_bindings.size(); i++) {
+		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[i], current_bindings[i]));
 	}
 	current_exprs.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
 	auto current_projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(current_exprs));
@@ -1594,13 +1593,9 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	auto delta_bindings = delta.op->GetColumnBindings();
 	auto delta_types = delta.op->types;
 	D_ASSERT(delta_bindings.size() == current_bindings.size() + 1);
-	delta_bindings.pop_back();
-	delta_types.pop_back();
 	vector<unique_ptr<Expression>> delta_exprs;
-	idx_t delta_idx = 0;
-	for (auto &delta_binding : delta_bindings) {
-		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[delta_idx], delta_binding));
-		delta_idx++;
+	for (idx_t i = 0; i + 1 < delta_bindings.size(); i++) { // the last binding is the multiplicity
+		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[i], delta_bindings[i]));
 	}
 	delta_exprs.push_back(MultiplyIntegers(binder, make_uniq<BoundConstantExpression>(Value::INTEGER(-1)),
 	                                       make_uniq<BoundColumnRefExpression>(mul_type, delta.mul_binding)));
