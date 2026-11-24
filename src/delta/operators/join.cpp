@@ -868,12 +868,10 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 			auto shift_parent_projection = [&](idx_t insertion_idx, idx_t added) {
 				ShiftAncestorProjectionMap(ancestors, leaf_path, depth, insertion_idx, added);
 			};
+			auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
+			idx_t mul_idx = mul_binding_it == child_bindings.end() ? DConstants::INVALID_INDEX
+			                                                       : idx_t(mul_binding_it - child_bindings.begin());
 			if (!proj_map.empty()) {
-				idx_t mul_idx = DConstants::INVALID_INDEX;
-				auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
-				if (mul_binding_it != child_bindings.end()) {
-					mul_idx = idx_t(mul_binding_it - child_bindings.begin());
-				}
 				// Aggregate delta compilation inserts multiplicity among group bindings. This map still indexes
 				// the pre-rewrite child, so shift every selected data column at or after that insertion.
 				if (immediate_parent && original_leaf_width != DConstants::INVALID_INDEX &&
@@ -896,8 +894,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
 				}
-				idx_t old_width = proj_map.size();
-				idx_t insertion_idx = old_width + JoinChildOutputOffset(*join, child_side);
+				idx_t insertion_idx = proj_map.size() + JoinChildOutputOffset(*join, child_side);
 				// Appending to this join's own left_projection_map grows its LEFT
 				// contribution width, which shifts the absolute position where its RIGHT
 				// contribution starts within its own combined GetColumnBindings(). A
@@ -940,15 +937,12 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				continue;
 			}
 
-			auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
-			if (mul_binding_it == child_bindings.end()) {
+			if (mul_idx == DConstants::INVALID_INDEX) {
 				continue;
 			}
-			idx_t insertion_idx =
-			    idx_t(mul_binding_it - child_bindings.begin()) + JoinChildOutputOffset(*join, child_side);
 			// An empty map passes the child's bindings through unchanged, so the
 			// multiplicity is inserted in-place and shifts every later binding.
-			shift_parent_projection(insertion_idx, 1);
+			shift_parent_projection(mul_idx + JoinChildOutputOffset(*join, child_side), 1);
 			join->ResolveOperatorTypes();
 		}
 	}
