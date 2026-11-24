@@ -903,9 +903,7 @@ static bool ExpressionReferencesNonGroupBinding(Expression *expr, TableIndex gro
 	}
 	bool refs_non_group = false;
 	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
-		if (!refs_non_group && ExpressionReferencesNonGroupBinding(child.get(), group_index)) {
-			refs_non_group = true;
-		}
+		refs_non_group = refs_non_group || ExpressionReferencesNonGroupBinding(child.get(), group_index);
 	});
 	return refs_non_group;
 }
@@ -1252,11 +1250,8 @@ static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
 	}
 
 	bool found = false;
-	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
-		if (!found && ExpressionReferencesMinMaxAggregate(child, aggregates)) {
-			found = true;
-		}
-	});
+	ExpressionIterator::EnumerateChildren(
+	    expr, [&](Expression &child) { found = found || ExpressionReferencesMinMaxAggregate(child, aggregates); });
 	return found;
 }
 
@@ -1287,9 +1282,7 @@ static bool ExpressionReferencesUserSumAggregate(Expression &expr, const CreateM
 
 	bool found = false;
 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
-		if (!found && ExpressionReferencesUserSumAggregate(child, facts, aggregates, depth + 1)) {
-			found = true;
-		}
+		found = found || ExpressionReferencesUserSumAggregate(child, facts, aggregates, depth + 1);
 	});
 	return found;
 }
@@ -1975,18 +1968,12 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 			return {};
 		}
 		auto right = DirectSourceKeyBindings(*op.children[1], facts, key, source, depth + 1);
-		bool same_key = false;
-		for (auto &condition : join.conditions) {
-			if (!condition.IsComparison()) {
-				continue;
-			}
-			if ((condition.GetComparisonType() == ExpressionType::COMPARE_EQUAL ||
-			     condition.GetComparisonType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
-			    IsKeyReference(*condition.LeftReference(), left) &&
-			    IsKeyReference(*condition.RightReference(), right)) {
-				same_key = true;
-			}
-		}
+		bool same_key = std::any_of(join.conditions.begin(), join.conditions.end(), [&](const JoinCondition &c) {
+			return c.IsComparison() &&
+			       (c.GetComparisonType() == ExpressionType::COMPARE_EQUAL ||
+			        c.GetComparisonType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+			       IsKeyReference(*c.LeftReference(), left) && IsKeyReference(*c.RightReference(), right);
+		});
 		if (!same_key) {
 			return {};
 		}
