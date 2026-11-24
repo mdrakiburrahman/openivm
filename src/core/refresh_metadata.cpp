@@ -2032,7 +2032,6 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Str("aux_table", m.aux_table);
 	io.Arr("cols", m.cols);
 	io.Arr("source_exprs", m.source_exprs, Presence::OPTIONAL);
-	io.Str("input_sql", m.input_sql);
 	io.Str("source", m.source);
 	io.Str("filter", m.filter, Presence::OPTIONAL); // empty without a WHERE clause
 	io.Str("sum_arg", m.sum_arg);

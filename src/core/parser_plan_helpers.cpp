@@ -1711,11 +1711,9 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 			return input_renderer.ExpressionToAliasedString(*projection->second->expressions[binding.column_index]);
 		};
 		meta.source_exprs.clear();
-		vector<string> select_list;
 		for (idx_t i = 0; i < bindings.size(); i++) {
 			BoundColumnRefExpression input(LogicalType::SQLNULL, bindings[i]);
 			meta.source_exprs.push_back(input_renderer.ExpressionToAliasedString(input));
-			select_list.push_back(meta.source_exprs.back() + " AS " + SqlUtils::QuoteIdentifier(meta.cols[i]));
 		}
 		auto predicates = input_renderer.ScanFiltersToSql(get);
 		for (auto *filter : filters) {
@@ -1724,8 +1722,6 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 			}
 		}
 		meta.filter = StringUtil::Join(predicates, " AND ");
-		meta.input_sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + meta.source +
-		                 (meta.filter.empty() ? "" : " WHERE " + meta.filter);
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Resolved DISTINCT input to bound source %s\n", meta.source.c_str());
 	}
 

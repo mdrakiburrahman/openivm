@@ -715,9 +715,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
 	vector<string> distinct_extracted_cols;
-	string distinct_extracted_input_sql;
-	string distinct_extracted_source;
-	string distinct_extracted_filter;
 	// Outer-aggregate spec for the v0 aux-state pipeline. Single SUM(<arg>) only —
 	// any other shape (multiple SUMs, AVG, COUNT, etc.) demotes to GROUP_RECOMPUTE.
 	// `sum_arg` is the column name from the DISTINCT input (one of distinct_cols).
@@ -847,17 +844,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// caller's session settings.
 		if (SqlUtils::GetBoolSetting(context, "openivm_distinct_aux_state", false) &&
 		    facts.source_table_info.size() == 1) {
-			vector<string> dcols;
-			string d_input_sql, d_source, d_filter;
-			if (!ExtractInnerDistinct(local_view_query, dcols, d_input_sql, d_source, d_filter)) {
+			if (!ExtractInnerDistinct(local_view_query, distinct_extracted_cols)) {
+				distinct_extracted_cols.clear();
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL extractor failed — demoting to "
 				                    "GROUP_RECOMPUTE\n");
-			} else {
-				distinct_extracted_cols = std::move(dcols);
-				distinct_extracted_source = qualify_source(d_source);
-				distinct_extracted_input_sql =
-				    SqlUtils::ReplaceTableReferences(d_input_sql, d_source, distinct_extracted_source);
-				distinct_extracted_filter = std::move(d_filter);
 			}
 		}
 		// Inspect the outer aggregate collected by the existing plan-facts walk. v0 supports
@@ -925,15 +915,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	RefreshMetadata::DistinctAuxMeta distinct_aux_candidate;
 	if (!distinct_sum_arg.empty() && !distinct_sum_out.empty()) {
-		string aux_table = "openivm_distinct_count_" + view_name;
-		distinct_aux_candidate = {aux_table,
-		                          distinct_extracted_cols,
-		                          distinct_extracted_cols,
-		                          distinct_extracted_input_sql,
-		                          distinct_extracted_source,
-		                          distinct_extracted_filter,
-		                          distinct_sum_arg,
-		                          distinct_sum_out};
+		// PopulateDistinctAggregateInputs resolves the bound source, its expressions and filter.
+		distinct_aux_candidate.aux_table = "openivm_distinct_count_" + view_name;
+		distinct_aux_candidate.cols = distinct_extracted_cols;
+		distinct_aux_candidate.sum_arg = distinct_sum_arg;
+		distinct_aux_candidate.sum_out = distinct_sum_out;
 		PopulateDistinctAggregateInputs(context, *planner.binder, facts, output_names, distinct_aux_candidate);
 		if (!distinct_aux_candidate.SelectionTable().empty()) {
 			D_ASSERT(initial_load_ast);
