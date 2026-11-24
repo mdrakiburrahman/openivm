@@ -825,17 +825,15 @@ vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
 }
 
 string DistinctSelectionInputSQL(const RefreshMetadata::DistinctAuxMeta &meta, const string &candidate_table) {
-	const auto count_column = SqlUtils::QuoteIdentifier(meta.InternalColumn("_count"));
+	const auto count = "openivm_candidates." + SqlUtils::QuoteIdentifier(meta.InternalColumn("_count"));
 	vector<string> columns;
 	for (idx_t i = 0; i < meta.selected_source_columns.size(); i++) {
 		columns.push_back("openivm_candidates." + SqlUtils::QuoteIdentifier(meta.cols[i]) + " AS " +
 		                  SqlUtils::QuoteIdentifier(meta.selected_source_columns[i]));
 	}
 	auto candidates = "(SELECT " + StringUtil::Join(columns, ", ") + " FROM " + candidate_table +
-	                  " openivm_candidates CROSS JOIN generate_series(1, openivm_candidates." + count_column +
-	                  ") "
-	                  "openivm_copies WHERE openivm_candidates." +
-	                  count_column + " > 0)";
+	                  " openivm_candidates CROSS JOIN generate_series(1, " + count + ") openivm_copies WHERE " + count +
+	                  " > 0)";
 	return SqlUtils::ReplaceTableReferences(meta.selected_input_sql, "openivm_topk_candidates", candidates);
 }
 
