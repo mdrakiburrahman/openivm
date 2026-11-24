@@ -1222,10 +1222,6 @@ static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_
 	facts.plan_nodes_post_order.push_back(std::move(node_facts));
 }
 
-static bool IsHiddenHavingColumn(const string &name) {
-	return StringUtil::StartsWith(name, "openivm_having_");
-}
-
 // The aggregate function a column reference reads from one of `aggregates`, if any.
 static optional_ptr<BoundAggregateExpression>
 ReferencedAggregate(const BoundColumnRefExpression &column_ref,
@@ -1317,7 +1313,7 @@ static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 				facts.has_computed_sum_aggregate_projection = true;
 			}
 			if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-			    IsHiddenHavingColumn(expr->GetAlias().GetIdentifierName())) {
+			    StringUtil::StartsWith(expr->GetAlias().GetIdentifierName(), "openivm_having_")) {
 				auto &column_ref = expr->Cast<BoundColumnRefExpression>();
 				if (IsMinMaxAggregateColumn(column_ref, aggregates)) {
 					facts.has_hidden_minmax_having_column = true;
@@ -1392,11 +1388,6 @@ bool ResolvesToOutputBinding(TableIndex table_index, ProjectionIndex column_inde
 	return false;
 }
 
-static bool ResolvesToGroupBinding(TableIndex table_index, ProjectionIndex column_index, TableIndex group_index,
-                                   size_t group_count, const CreateMVPlanFacts &facts) {
-	return ResolvesToOutputBinding(table_index, column_index, group_index, group_count, facts, false);
-}
-
 LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root) {
 	return SpineAggregate(ViewOutputSpine(root));
 }
@@ -1452,8 +1443,8 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateM
 			continue;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		if (!ResolvesToGroupBinding(bcr.Binding().table_index, bcr.Binding().column_index, group_index, group_count,
-		                            facts)) {
+		if (!ResolvesToOutputBinding(bcr.Binding().table_index, bcr.Binding().column_index, group_index, group_count,
+		                             facts, false)) {
 			continue;
 		}
 		string col_name = ProjectionOutputName(proj, expr_i, facts, output_names, bcr);
@@ -1473,7 +1464,8 @@ static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanF
 	auto bindings = op.GetColumnBindings();
 	for (idx_t col_idx = 0; col_idx < bindings.size() && col_idx < output_names.size(); col_idx++) {
 		auto &binding = bindings[col_idx];
-		if (!ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts)) {
+		if (!ResolvesToOutputBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
+		                             false)) {
 			continue;
 		}
 		if (!output_names[col_idx].empty() && (!IncrementalTableNames::IsInternalColumn(output_names[col_idx]) ||
