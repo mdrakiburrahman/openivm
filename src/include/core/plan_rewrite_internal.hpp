@@ -18,7 +18,7 @@ unique_ptr<LogicalAggregate> MakeGroupedAggregate(Binder &binder, vector<unique_
                                                   vector<unique_ptr<Expression>> aggregates,
                                                   unique_ptr<LogicalOperator> child);
 LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan, bool allow_having_filter);
-// Reuse or append a pass-through expression; the caller resolves projection types after its edits.
+// Reuse or append a pass-through expression, refreshing the projection types on append.
 ColumnBinding ExposeBindingInProjection(LogicalProjection &projection, const ColumnBinding &binding,
                                         const LogicalType &type, const string &alias, bool reuse_existing,
                                         bool &appended);

@@ -959,6 +959,14 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 	plan->ResolveOperatorTypes();
 }
 
+static void ResolveProjectionTypes(LogicalProjection &projection) {
+	// Bound output expressions suffice; avoid recursively revisiting the child plan.
+	projection.types.clear();
+	for (auto &expression : projection.expressions) {
+		projection.types.push_back(expression->GetReturnType());
+	}
+}
+
 ColumnBinding ExposeBindingInProjection(LogicalProjection &proj, const ColumnBinding &binding, const LogicalType &type,
                                         const string &alias, bool reuse_existing, bool &appended) {
 	if (reuse_existing) {
@@ -974,15 +982,8 @@ ColumnBinding ExposeBindingInProjection(LogicalProjection &proj, const ColumnBin
 	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
 	passthrough->SetAlias(Identifier(alias));
 	proj.expressions.push_back(std::move(passthrough));
+	ResolveProjectionTypes(proj);
 	return ColumnBinding(TableIndex(proj.table_index), ProjectionIndex(proj.expressions.size() - 1));
-}
-
-static void ResolveProjectionTypes(LogicalProjection &projection) {
-	// Bound output expressions suffice; avoid recursively revisiting the child plan.
-	projection.types.clear();
-	for (auto &expression : projection.expressions) {
-		projection.types.push_back(expression->GetReturnType());
-	}
 }
 
 bool PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path, ColumnBinding binding,
@@ -990,11 +991,7 @@ bool PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &pr
 	bool appended = false;
 	for (auto it = projection_path.rbegin(); it != projection_path.rend(); ++it) {
 		auto &projection = **it;
-		auto previous_count = projection.expressions.size();
 		binding = ExposeBindingInProjection(projection, binding, type, alias, reuse_existing, appended);
-		if (projection.expressions.size() != previous_count) {
-			ResolveProjectionTypes(projection);
-		}
 		type = projection.expressions[binding.column_index]->GetReturnType();
 	}
 	return appended;
@@ -1535,11 +1532,8 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 	for (auto &entry : path) {
 		if (entry.op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			bool appended = false;
-			auto &projection = entry.op->Cast<LogicalProjection>();
-			current = ExposeBindingInProjection(projection, current, type, alias, true, appended);
-			if (appended) {
-				ResolveProjectionTypes(projection);
-			}
+			current =
+			    ExposeBindingInProjection(entry.op->Cast<LogicalProjection>(), current, type, alias, true, appended);
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
 		           StringUtil::StartsWith(alias, openivm::FULL_SCOPE_PREFIX)) {
 			auto &aggregate = entry.op->Cast<LogicalAggregate>();
