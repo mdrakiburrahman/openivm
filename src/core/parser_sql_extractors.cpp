@@ -134,8 +134,7 @@ static string RenameQualifier(ParsedExpression &expression, const string &table,
 
 } // namespace
 
-bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &out_input_sql, string &out_source,
-                          string &out_filter_sql) {
+bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols) {
 	auto statement = SqlUtils::TryParseSelect(sql);
 	if (!statement) {
 		return false;
@@ -164,8 +163,8 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 		}
 		source = select->from_table.get();
 	}
-	string alias;
-	if (!ReadSource(*source, out_source, alias)) {
+	string table, alias;
+	if (!ReadSource(*source, table, alias)) {
 		return false;
 	}
 	for (auto &expression : distinct->select_list) {
@@ -175,11 +174,7 @@ bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols, string &o
 		out_cols.push_back(expression->GetName().GetIdentifierName());
 	}
 	QueryResult::DeduplicateColumns(out_cols);
-	out_filter_sql = ExprSQL(distinct->where_clause);
-	auto input = distinct->Copy();
-	input->modifiers.clear();
-	out_input_sql = input->ToString();
-	OPENIVM_DEBUG_PRINT("[EXTRACT] Parsed inner DISTINCT from %s\n", out_source.c_str());
+	OPENIVM_DEBUG_PRINT("[EXTRACT] Parsed inner DISTINCT from %s\n", table.c_str());
 	return !out_cols.empty();
 }
 

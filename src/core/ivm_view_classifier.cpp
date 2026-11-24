@@ -85,8 +85,7 @@ static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const
 }
 
 static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, const CreateMVPlanFacts &facts,
-                                              const vector<string> &output_names, idx_t visible_output_count,
-                                              const vector<string> &aggregate_columns) {
+                                              const vector<string> &output_names, idx_t visible_output_count) {
 	idx_t visible_count = GetVisibleOutputCount(output_names, visible_output_count);
 	auto bindings = facts.root ? facts.root->GetColumnBindings() : vector<ColumnBinding>();
 	for (idx_t output_idx = 0; output_idx < visible_count; output_idx++) {
@@ -95,7 +94,8 @@ static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, con
 		    VisibleOutputResolvesToAggregateValue(facts, bindings, output_idx)) {
 			continue;
 		}
-		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) && ContainsCI(aggregate_columns, name)) {
+		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) &&
+		    ContainsCI(facts.analysis.aggregate_columns, name)) {
 			continue;
 		}
 		group_columns.push_back(name);
@@ -104,15 +104,10 @@ static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, con
 
 static bool HasVisibleNonGroupNonAggregateOutput(const DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                                  const vector<string> &output_names, idx_t visible_output_count) {
-	vector<string> non_aggregate_outputs;
-	AddVisibleNonAggregateOutputNames(non_aggregate_outputs, facts, output_names, visible_output_count,
-	                                  facts.analysis.aggregate_columns);
-	for (auto &name : non_aggregate_outputs) {
-		if (!ContainsCI(model.group_columns, name)) {
-			return true;
-		}
-	}
-	return false;
+	vector<string> names;
+	AddVisibleNonAggregateOutputNames(names, facts, output_names, visible_output_count);
+	return std::any_of(names.begin(), names.end(),
+	                   [&](const string &name) { return !ContainsCI(model.group_columns, name); });
 }
 
 static bool GroupColumnsAreVisibleOutputs(const vector<string> &group_columns, const vector<string> &output_names,
@@ -227,19 +222,15 @@ static vector<string> DistinctOnGroupColumns(const CreateMVPlanFacts &facts, con
 	for (auto &target : distinct.distinct_targets) {
 		auto binding = target->Cast<BoundColumnRefExpression>().Binding();
 		for (auto projection = spine.projections.rbegin(); projection != spine.projections.rend(); ++projection) {
-			bool found = false;
-			for (idx_t i = 0; i < (*projection)->expressions.size(); i++) {
-				auto &expression = *(*projection)->expressions[i];
-				if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    expression.Cast<BoundColumnRefExpression>().Binding() == binding) {
-					binding = ColumnBinding((*projection)->table_index, ProjectionIndex(i));
-					found = true;
-					break;
-				}
-			}
-			if (!found) {
+			auto &expressions = (*projection)->expressions;
+			auto match = std::find_if(expressions.begin(), expressions.end(), [&](const unique_ptr<Expression> &e) {
+				return e->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				       e->Cast<BoundColumnRefExpression>().Binding() == binding;
+			});
+			if (match == expressions.end()) {
 				return {};
 			}
+			binding = ColumnBinding((*projection)->table_index, ProjectionIndex(match - expressions.begin()));
 		}
 		auto output = std::find(outputs.begin(), outputs.end(), binding);
 		if (output == outputs.end() || idx_t(output - outputs.begin()) >= output_names.size()) {
@@ -263,28 +254,27 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	const bool has_union_over_agg = analysis.found_aggregation && facts.has_union_before_aggregate;
 	model.union_distinct_over_agg =
 	    has_union_over_agg && (analysis.found_union_distinct || (analysis.found_distinct && model.distinct_at_top));
+	// Fallback group columns for GROUP_RECOMPUTE, with the reason recorded when any are found.
+	auto add_fallback = [&](const vector<string> &names, DeltaStrategyReason reason, const char *label) {
+		AddVisibleGroupNames(model.group_columns, names);
+		if (!model.group_columns.empty()) {
+			AddUnique(model.strategy_reasons, reason);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] %s: using %zu group columns for GROUP_RECOMPUTE\n", label,
+			                    model.group_columns.size());
+		}
+	};
 
 	if (analysis.found_distinct_on) {
 		model.group_columns = DistinctOnGroupColumns(facts, output_names);
 	} else if (model.union_distinct_over_agg) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	} else if (analysis.found_union_distinct && !analysis.found_aggregation) {
-		AddVisibleGroupNames(model.group_columns, output_names);
-		if (!model.group_columns.empty()) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] UNION DISTINCT: using %zu visible output columns for "
-			                    "GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(output_names, DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE, "UNION DISTINCT");
 	} else if (model.distinct_at_top) {
 		AddVisibleGroupNames(model.group_columns, output_names);
 	} else if (analysis.found_distinct && !analysis.found_aggregation && HasOuterProjectionOverDistinct(facts)) {
-		AddVisibleGroupNames(model.group_columns, output_names);
-		if (!model.group_columns.empty()) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Inner DISTINCT below an outer projection -- using "
-			                    "GROUP_RECOMPUTE\n");
-		}
+		add_fallback(output_names, DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE,
+		             "Inner DISTINCT below an outer projection");
 	} else if (group_count > 0 && group_index.IsValid()) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	}
@@ -308,36 +298,18 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 
 	if (analysis.found_delim_join && analysis.found_single_join && !analysis.found_aggregation &&
 	    model.group_columns.empty()) {
-		auto before = model.group_columns.size();
-		AddVisibleGroupNames(model.group_columns, DeriveScalarDelimKeyColumnNames(facts, output_names));
-		if (model.group_columns.size() > before) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::SCALAR_DELIM_PROJECTION_GROUP_FALLBACK);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Scalar DELIM/DEPENDENT projection: using %zu visible key columns "
-			                    "for GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(DeriveScalarDelimKeyColumnNames(facts, output_names),
+		             DeltaStrategyReason::SCALAR_DELIM_PROJECTION_GROUP_FALLBACK, "Scalar DELIM/DEPENDENT projection");
 	}
 
 	if (analysis.found_nested_aggregate && model.group_columns.empty()) {
-		auto before = model.group_columns.size();
-		AddVisibleGroupNames(model.group_columns, DeriveAggregateGroupColumnNames(facts, output_names, false));
-		if (model.group_columns.size() > before) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Nested aggregate: using %zu visible inner group columns for "
-			                    "GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(DeriveAggregateGroupColumnNames(facts, output_names, false),
+		             DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK, "Nested aggregate");
 	}
 
 	if (analysis.found_aggregation && model.group_columns.empty()) {
-		auto before = model.group_columns.size();
-		AddVisibleGroupNames(model.group_columns, DeriveAggregateGroupColumnNames(facts, output_names, true));
-		if (model.group_columns.size() > before) {
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Repeated CTE aggregate under join: using %zu visible group columns "
-			                    "for GROUP_RECOMPUTE\n",
-			                    model.group_columns.size());
-		}
+		add_fallback(DeriveAggregateGroupColumnNames(facts, output_names, true),
+		             DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK, "Repeated CTE aggregate under join");
 	}
 
 	DeduplicateGroupColumns(model.group_columns);
@@ -353,8 +325,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	if (analysis.found_join && analysis.found_aggregation &&
 	    !GroupColumnsAreVisibleOutputs(model.group_columns, output_names, visible_output_count)) {
 		model.group_columns.clear();
-		AddVisibleNonAggregateOutputNames(model.group_columns, facts, output_names, visible_output_count,
-		                                  analysis.aggregate_columns);
+		AddVisibleNonAggregateOutputNames(model.group_columns, facts, output_names, visible_output_count);
 		if (!model.group_columns.empty()) {
 			AddUnique(model.strategy_reasons, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Join-over-aggregate projection: using %zu visible non-aggregate "
@@ -428,7 +399,13 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 		model.type = semi_anti_stateful ? RefreshType::SEMI_ANTI_RECOMPUTE : RefreshType::FULL_REFRESH;
-	} else if (analysis.found_retained_aggregate_filter && !model.group_columns.empty()) {
+	} else if ((analysis.found_retained_aggregate_filter ||
+	            (input.stored_query_retains_aggregate_filter && analysis.found_aggregation)) &&
+	           !model.group_columns.empty()) {
+		// A FILTER separated from its aggregate by a projection cannot be exposed on
+		// the user-facing view by StripHavingFilter. Applying that retained predicate
+		// to SUM(delta) is incorrect: a negative delta does not imply a negative new
+		// group total. Recompute only the affected groups from current base state.
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_retained_aggregate_filter) {
 		// Scalar MIN/MAX and ARG_MIN/ARG_MAX already have a native recompute path
@@ -436,13 +413,6 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = analysis.found_minmax ? RefreshType::SIMPLE_AGGREGATE : RefreshType::FULL_REFRESH;
 	} else if (input.has_computed_sum_aggregate_projection) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
-	} else if (input.stored_query_retains_aggregate_filter && analysis.found_aggregation &&
-	           !model.group_columns.empty()) {
-		// A FILTER separated from its aggregate by a projection cannot be exposed on
-		// the user-facing view by StripHavingFilter. Applying that retained predicate
-		// to SUM(delta) is incorrect: a negative delta does not imply a negative new
-		// group total. Recompute only the affected groups from current base state.
-		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && !analysis.found_union_distinct && model.distinct_at_top &&
 	           analysis.found_aggregation) {
 		// DISTINCT over multiple aggregate result rows is a second non-linear
@@ -487,18 +457,13 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 }
 
 static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaViewModelInput &input) {
-	if (model.type != RefreshType::GROUP_RECOMPUTE) {
+	if (model.type != RefreshType::GROUP_RECOMPUTE || input.facts->analysis.found_distinct_on) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 		return;
 	}
-	if (input.facts && input.facts->analysis.found_distinct_on) {
-		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
-		return;
-	}
-	bool aggregate_filter_join =
-	    input.stored_query_has_aggregate_filter && input.facts && input.facts->analysis.found_join;
-	if ((input.facts && input.facts->analysis.found_asof_join) || input.stored_query_has_top_k ||
-	    aggregate_filter_join || (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
+	bool aggregate_filter_join = input.stored_query_has_aggregate_filter && input.facts->analysis.found_join;
+	if (input.facts->analysis.found_asof_join || input.stored_query_has_top_k || aggregate_filter_join ||
+	    (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
 	} else if (HasStrategyReason(model, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK) ||
 	           HasStrategyReason(model, DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE)) {
@@ -572,21 +537,13 @@ bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &outpu
 
 	auto spine = DistinctSpine(facts);
 	auto *node = spine.bottom;
-	if (!spine.projections.empty()) {
+	if (!spine.projections.empty() || !node) {
 		return false;
 	}
-	if (node && node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
-		return true;
-	}
-	if (!node || node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		return false;
-	}
-	for (auto &name : output_names) {
-		if (name == openivm::DISTINCT_COUNT_COL) {
-			return true;
-		}
-	}
-	return false;
+	// A rewritten DISTINCT is an aggregate that carries the DISTINCT support count.
+	return node->type == LogicalOperatorType::LOGICAL_DISTINCT ||
+	       (node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+	        std::find(output_names.begin(), output_names.end(), openivm::DISTINCT_COUNT_COL) != output_names.end());
 }
 
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {

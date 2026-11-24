@@ -515,9 +515,7 @@ SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61
 # Exact serialized arrays also verify cardinality without the JSON extension.
 query I
 SELECT (contains(leftjoin_secondary_meta_json, '"inner_tables":["memory.main.\"lj,r\""]')
-        AND contains(leftjoin_secondary_meta_json, '"inner_keys":["id"]')
-        AND contains(leftjoin_secondary_meta_json, '"pres_tables":["memory.main.lj_comma_left"]')
-        AND contains(leftjoin_secondary_meta_json, '"pres_keys":["id"]'))::INT
+        AND contains(leftjoin_secondary_meta_json, '"inner_keys":["id"]'))::INT
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 ----
 1
@@ -571,28 +569,12 @@ SET leftjoin_secondary_meta_json =
     replace(leftjoin_secondary_meta_json, '"inner_keys":["id"]', '"inner_key":"id"')
 WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 
-statement ok
-UPDATE openivm_views
-SET leftjoin_secondary_meta_json =
-    replace(leftjoin_secondary_meta_json, '"pres_tables":["memory.main.lj_comma_left"]', '"pres_table":"lj_comma_left"')
-WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
-
-statement ok
-UPDATE openivm_views
-SET leftjoin_secondary_meta_json =
-    replace(leftjoin_secondary_meta_json, '"pres_keys":["id"]', '"pres_key":"id"')
-WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
-
 # Verify the fixture really installed the legacy representation before refreshing.
 query I
 SELECT (contains(leftjoin_secondary_meta_json, '"inner_table":"lj,r"')
         AND contains(leftjoin_secondary_meta_json, '"inner_key":"id"')
-        AND contains(leftjoin_secondary_meta_json, '"pres_table":"lj_comma_left"')
-        AND contains(leftjoin_secondary_meta_json, '"pres_key":"id"')
         AND NOT contains(leftjoin_secondary_meta_json, '"inner_tables":')
-        AND NOT contains(leftjoin_secondary_meta_json, '"inner_keys":')
-        AND NOT contains(leftjoin_secondary_meta_json, '"pres_tables":')
-        AND NOT contains(leftjoin_secondary_meta_json, '"pres_keys":'))::INT
+        AND NOT contains(leftjoin_secondary_meta_json, '"inner_keys":'))::INT
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 ----
 1
@@ -879,6 +861,166 @@ SELECT COUNT(*) FROM (
     EXCEPT ALL
     SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
     FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid GROUP BY c.nation
+);
+----
+0
+
+# Views created before the preserved-side delta placeholder was retired still store
+# __OPENIVM_LJSEC_PRES_DELTA_<n>__ in their secondary SQL. Refresh no longer resolves it,
+# so such views must fall back to affected-group recompute instead of failing.
+statement ok
+CREATE TABLE lj_legacy_pres_left (id INT);
+
+statement ok
+CREATE TABLE lj_legacy_pres_right (id INT, val INT);
+
+statement ok
+INSERT INTO lj_legacy_pres_left VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO lj_legacy_pres_right VALUES (1, 10), (1, 11), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW lj_legacy_pres_mv AS
+    SELECT l.id, COUNT(r.val) AS matches, SUM(r.val) AS total
+    FROM lj_legacy_pres_left l LEFT JOIN lj_legacy_pres_right r ON l.id = r.id
+    GROUP BY l.id;
+
+query II
+SELECT type, contains(leftjoin_secondary_meta_json, '__OPENIVM_LJSEC_INNER_DELTA_0__ GROUP BY __k)')::INT
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f707265735f6d76_';
+----
+0	1
+
+# Reference the retired placeholder from the stored secondary SQL, as older views did.
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json = replace(leftjoin_secondary_meta_json,
+    '__OPENIVM_LJSEC_INNER_DELTA_0__ GROUP BY __k)',
+    '__OPENIVM_LJSEC_INNER_DELTA_0__ WHERE __k NOT IN (SELECT __k FROM __OPENIVM_LJSEC_PRES_DELTA_0__) GROUP BY __k)')
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f707265735f6d76_';
+
+query I
+SELECT contains(leftjoin_secondary_meta_json, '__OPENIVM_LJSEC_PRES_DELTA_0__')::INT
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f707265735f6d76_';
+----
+1
+
+statement ok
+DELETE FROM lj_legacy_pres_right WHERE id = 2;
+
+statement ok
+INSERT INTO lj_legacy_pres_right VALUES (3, 30), (3, 31);
+
+statement ok
+UPDATE lj_legacy_pres_right SET val = 12 WHERE id = 1 AND val = 11;
+
+statement ok
+DELETE FROM lj_legacy_pres_right WHERE id = 3 AND val = 31;
+
+statement ok
+INSERT INTO lj_legacy_pres_left VALUES (4);
+
+statement ok
+DELETE FROM lj_legacy_pres_left WHERE id = 1;
+
+statement ok
+PRAGMA refresh('lj_legacy_pres_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_legacy_pres_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_pres_left l LEFT JOIN lj_legacy_pres_right r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_pres_left l LEFT JOIN lj_legacy_pres_right r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM lj_legacy_pres_mv
+);
+----
+0
+
+# Metadata written before the preserved-side fields were dropped still carries
+# pres_tables/pres_keys. The reader ignores them; refresh must stay incremental and exact.
+statement ok
+CREATE TABLE lj_legacy_keys_left (id INT);
+
+statement ok
+CREATE TABLE lj_legacy_keys_right (id INT, val INT);
+
+statement ok
+INSERT INTO lj_legacy_keys_left VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO lj_legacy_keys_right VALUES (1, 10), (1, 11), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW lj_legacy_keys_mv AS
+    SELECT l.id, COUNT(r.val) AS matches, SUM(r.val) AS total
+    FROM lj_legacy_keys_left l LEFT JOIN lj_legacy_keys_right r ON l.id = r.id
+    GROUP BY l.id;
+
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json = replace(leftjoin_secondary_meta_json, '"inner_keys":["id"]',
+    '"inner_keys":["id"],"pres_tables":["memory.main.lj_legacy_keys_left"],"pres_keys":["id"]')
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f6b6579735f6d76_';
+
+query I
+SELECT (contains(leftjoin_secondary_meta_json, '"pres_tables":["memory.main.lj_legacy_keys_left"]')
+        AND contains(leftjoin_secondary_meta_json, '"pres_keys":["id"]'))::INT
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f6b6579735f6d76_';
+----
+1
+
+statement ok
+DELETE FROM lj_legacy_keys_right WHERE id = 2;
+
+statement ok
+INSERT INTO lj_legacy_keys_right VALUES (3, 30), (3, 31);
+
+statement ok
+UPDATE lj_legacy_keys_right SET val = 12 WHERE id = 1 AND val = 11;
+
+statement ok
+DELETE FROM lj_legacy_keys_right WHERE id = 3 AND val = 31;
+
+statement ok
+INSERT INTO lj_legacy_keys_left VALUES (4);
+
+statement ok
+DELETE FROM lj_legacy_keys_left WHERE id = 1;
+
+statement ok
+PRAGMA refresh('lj_legacy_keys_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_legacy_keys_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_keys_left l LEFT JOIN lj_legacy_keys_right r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_keys_left l LEFT JOIN lj_legacy_keys_right r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM lj_legacy_keys_mv
 );
 ----
 0

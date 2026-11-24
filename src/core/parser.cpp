@@ -534,7 +534,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto ast = LogicalPlanToAst(context, candidate, dialect, time_travel_pins.Resolver(),
 			                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 			auto cte_list = AstToCteList(*ast, dialect);
-			auto sql = cte_list->ToQuery(true, output_names);
+			auto sql = SqlUtils::StripTrailingSemicolon(cte_list->ToQuery(true, output_names));
 			initial_load_ast = std::move(ast);
 			return sql;
 		};
@@ -542,18 +542,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto affected_plan = select_plan->Copy(context);
 			if (RemoveDistinctOnWinnerFilters(affected_plan)) {
 				group_recompute_affected_query = serialize_plan(affected_plan);
-				if (!group_recompute_affected_query.empty() && group_recompute_affected_query.back() == ';') {
-					group_recompute_affected_query.pop_back();
-				}
 			}
 		}
 		auto serialize_original = [&]() {
 			try {
 				view_query = serialize_plan(select_plan);
-				if (!view_query.empty() && view_query.back() == ';') {
-					view_query.pop_back();
-				}
-				StringUtil::Trim(view_query);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query without common-subplan compaction: %s\n",
 				                    view_query.c_str());
 			} catch (std::exception &) {
@@ -571,10 +564,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				compacted_plan = CompactCommonSubplans(context, *select_planner.binder, std::move(compacted_plan),
 				                                       CommonSubplanCompactionMode::SERIALIZATION_SIZE);
 				view_query = serialize_plan(compacted_plan);
-				if (!view_query.empty() && view_query.back() == ';') {
-					view_query.pop_back();
-				}
-				StringUtil::Trim(view_query);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
 			} catch (std::exception &) {
 				// Common-subplan compaction is an optional size optimization. Some
@@ -715,9 +704,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
 	vector<string> distinct_extracted_cols;
-	string distinct_extracted_input_sql;
-	string distinct_extracted_source;
-	string distinct_extracted_filter;
 	// Outer-aggregate spec for the v0 aux-state pipeline. Single SUM(<arg>) only —
 	// any other shape (multiple SUMs, AVG, COUNT, etc.) demotes to GROUP_RECOMPUTE.
 	// `sum_arg` is the column name from the DISTINCT input (one of distinct_cols).
@@ -847,17 +833,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// caller's session settings.
 		if (SqlUtils::GetBoolSetting(context, "openivm_distinct_aux_state", false) &&
 		    facts.source_table_info.size() == 1) {
-			vector<string> dcols;
-			string d_input_sql, d_source, d_filter;
-			if (!ExtractInnerDistinct(local_view_query, dcols, d_input_sql, d_source, d_filter)) {
+			if (!ExtractInnerDistinct(local_view_query, distinct_extracted_cols)) {
+				distinct_extracted_cols.clear();
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL extractor failed — demoting to "
 				                    "GROUP_RECOMPUTE\n");
-			} else {
-				distinct_extracted_cols = std::move(dcols);
-				distinct_extracted_source = qualify_source(d_source);
-				distinct_extracted_input_sql =
-				    SqlUtils::ReplaceTableReferences(d_input_sql, d_source, distinct_extracted_source);
-				distinct_extracted_filter = std::move(d_filter);
 			}
 		}
 		// Inspect the outer aggregate collected by the existing plan-facts walk. v0 supports
@@ -893,12 +872,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 					}
 					distinct_sum_arg = bcr->GetAlias().empty() ? bcr->GetName().GetIdentifierName()
 					                                           : bcr->GetAlias().GetIdentifierName();
-					distinct_sum_out =
-					    ResolvePlanOutputColumn(ColumnBinding(outer_agg->aggregate_index, ProjectionIndex(agg_index)),
-					                            output_plan, facts, output_names);
-					if (!single_sum_state_column.empty()) {
-						distinct_sum_out = single_sum_state_column;
-					}
+					distinct_sum_out = !single_sum_state_column.empty()
+					                       ? single_sum_state_column
+					                       : ResolvePlanOutputColumn(
+					                             ColumnBinding(outer_agg->aggregate_index, ProjectionIndex(agg_index)),
+					                             output_plan, facts, output_names);
 					if (distinct_sum_out.empty()) {
 						distinct_sum_out = bound.GetAlias().GetIdentifierName();
 					}
@@ -925,15 +903,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	RefreshMetadata::DistinctAuxMeta distinct_aux_candidate;
 	if (!distinct_sum_arg.empty() && !distinct_sum_out.empty()) {
-		string aux_table = "openivm_distinct_count_" + view_name;
-		distinct_aux_candidate = {aux_table,
-		                          distinct_extracted_cols,
-		                          distinct_extracted_cols,
-		                          distinct_extracted_input_sql,
-		                          distinct_extracted_source,
-		                          distinct_extracted_filter,
-		                          distinct_sum_arg,
-		                          distinct_sum_out};
+		// PopulateDistinctAggregateInputs resolves the bound source, its expressions and filter.
+		distinct_aux_candidate.aux_table = "openivm_distinct_count_" + view_name;
+		distinct_aux_candidate.cols = distinct_extracted_cols;
+		distinct_aux_candidate.sum_arg = distinct_sum_arg;
+		distinct_aux_candidate.sum_out = distinct_sum_out;
 		PopulateDistinctAggregateInputs(context, *planner.binder, facts, output_names, distinct_aux_candidate);
 		if (!distinct_aux_candidate.SelectionTable().empty()) {
 			D_ASSERT(initial_load_ast);

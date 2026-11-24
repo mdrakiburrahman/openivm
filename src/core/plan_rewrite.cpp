@@ -51,23 +51,14 @@
 namespace duckdb {
 
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
-/// Returns whether a DISTINCT state aggregate was added at the top level.
-static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node,
-                            bool is_top_level) {
-	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
-		// A projection can drop DISTINCT keys or map them to duplicate output rows.
-		// Its child's count is internal state, not an output of the outer query.
+/// Returns whether a DISTINCT state aggregate replaced `node` itself.
+static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node) {
+	// A projection can drop DISTINCT keys or map them to duplicate output rows, so a child's count is
+	// internal state. DISTINCT ON picks winners by ORDER BY, not by full-row multiplicity.
+	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT ||
+	    node->Cast<LogicalDistinct>().distinct_type == DistinctType::DISTINCT_ON) {
 		for (auto &child : node->children) {
-			RewriteDistinct(context, binder, child, false);
-		}
-		return false;
-	}
-
-	auto &distinct = node->Cast<LogicalDistinct>();
-	if (distinct.distinct_type == DistinctType::DISTINCT_ON) {
-		// Winner selection depends on ORDER BY, not full-row multiplicity.
-		for (auto &child : node->children) {
-			RewriteDistinct(context, binder, child, false);
+			RewriteDistinct(context, binder, child);
 		}
 		return false;
 	}
@@ -75,16 +66,10 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 		OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT has no children — skipping\n");
 		return false;
 	}
-	if (ProducesAtMostOneRow(*node->children[0])) {
-		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over scalar aggregate\n");
+	if (ProducesAtMostOneRow(*node->children[0]) || IsRedundantDistinctOverGroupKeys(*node)) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over a single row or group keys\n");
 		node = std::move(node->children[0]);
-		RewriteDistinct(context, binder, node, false);
-		return false;
-	}
-	if (IsRedundantDistinctOverGroupKeys(*node)) {
-		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over aggregate group keys\n");
-		node = std::move(node->children[0]);
-		RewriteDistinct(context, binder, node, false);
+		RewriteDistinct(context, binder, node);
 		return false;
 	}
 	auto &child = node->children[0];
@@ -109,7 +94,7 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
-	return is_top_level;
+	return true;
 }
 
 static bool IsSemiAntiJoinType(JoinType join_type) {
@@ -236,8 +221,53 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		return false;
 	}
 	auto &old_projection = probe_child->Cast<LogicalProjection>();
-	auto replace_probe = [&](unique_ptr<LogicalOperator> source, vector<unique_ptr<Expression>> source_filters,
-	                         vector<unique_ptr<Expression>> projection_expressions) {
+	auto collect_conditions = [](const LogicalComparisonJoin &join, const unordered_set<TableIndex> &source_bindings,
+	                             const unordered_set<TableIndex> &delim_bindings,
+	                             vector<SemiAntiKeyReplacement> &replacements) {
+		for (auto &condition : join.conditions) {
+			if (!condition.LeftReference() || !condition.RightReference() ||
+			    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), *condition.LeftReference(),
+			                                      *condition.RightReference(), source_bindings, delim_bindings,
+			                                      replacements)) {
+				return false;
+			}
+		}
+		return true;
+	};
+	// Project the source keys in place of the correlated keys; fails before mutating anything.
+	auto replace_probe = [&](unique_ptr<LogicalOperator> &source_slot, vector<unique_ptr<Expression>> source_filters,
+	                         const vector<SemiAntiKeyReplacement> &replacements,
+	                         const unordered_set<TableIndex> &source_bindings) {
+		if (replacements.empty()) {
+			return false;
+		}
+		vector<bool> used_replacements(replacements.size(), false);
+		vector<unique_ptr<Expression>> projection_expressions;
+		for (auto &expression : old_projection.expressions) {
+			if (!expression) {
+				return false;
+			}
+			auto match = std::find_if(replacements.begin(), replacements.end(), [&](const SemiAntiKeyReplacement &r) {
+				return Expression::Equals(*expression, *r.delim_expr);
+			});
+			if (match != replacements.end()) {
+				used_replacements[match - replacements.begin()] = true;
+				projection_expressions.push_back(match->source_expr->Copy());
+			} else if (ExpressionUsesOnly(*expression, source_bindings, true)) {
+				projection_expressions.push_back(expression->Copy());
+			} else {
+				return false;
+			}
+		}
+		for (idx_t i = 0; i < replacements.size(); i++) {
+			if (!used_replacements[i]) {
+				return false;
+			}
+			if (replacements[i].null_reject_source) {
+				source_filters.push_back(BuildIsNotNull(replacements[i].source_expr->Copy()));
+			}
+		}
+		auto source = std::move(source_slot);
 		if (!source_filters.empty()) {
 			auto source_filter = make_uniq<LogicalFilter>();
 			source_filter->expressions = std::move(source_filters);
@@ -277,53 +307,10 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		    !domain_join.HasArbitraryConditions() && domain_join.children.size() == 2 &&
 		    IsDistinctCorrelationDomain(*domain_join.children[1])) {
 			auto source_bindings = OutputTableIndexes(*domain_join.children[0]);
-			auto domain_bindings = OutputTableIndexes(*domain_join.children[1]);
 			vector<SemiAntiKeyReplacement> replacements;
-			for (auto &condition : domain_join.conditions) {
-				if (!condition.LeftReference() || !condition.RightReference() ||
-				    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), *condition.LeftReference(),
-				                                      *condition.RightReference(), source_bindings, domain_bindings,
-				                                      replacements)) {
-					return false;
-				}
-			}
-			if (replacements.empty()) {
-				return false;
-			}
-			vector<bool> used_replacements(replacements.size(), false);
-			vector<unique_ptr<Expression>> projection_expressions;
-			for (auto &expression : old_projection.expressions) {
-				if (!expression) {
-					return false;
-				}
-				bool replaced = false;
-				for (idx_t i = 0; i < replacements.size(); i++) {
-					if (Expression::Equals(*expression, *replacements[i].delim_expr)) {
-						used_replacements[i] = true;
-						projection_expressions.push_back(replacements[i].source_expr->Copy());
-						replaced = true;
-						break;
-					}
-				}
-				if (replaced) {
-					continue;
-				}
-				if (!ExpressionUsesOnly(*expression, source_bindings, true)) {
-					return false;
-				}
-				projection_expressions.push_back(expression->Copy());
-			}
-			vector<unique_ptr<Expression>> source_filters;
-			for (idx_t i = 0; i < replacements.size(); i++) {
-				if (!used_replacements[i]) {
-					return false;
-				}
-				if (replacements[i].null_reject_source) {
-					source_filters.push_back(BuildIsNotNull(replacements[i].source_expr->Copy()));
-				}
-			}
-			return replace_probe(std::move(domain_join.children[0]), std::move(source_filters),
-			                     std::move(projection_expressions));
+			return collect_conditions(domain_join, source_bindings, OutputTableIndexes(*domain_join.children[1]),
+			                          replacements) &&
+			       replace_probe(domain_join.children[0], {}, replacements, source_bindings);
 		}
 	}
 	if (!old_projection.children[0] || old_projection.children[0]->type != LogicalOperatorType::LOGICAL_FILTER ||
@@ -358,16 +345,9 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 	vector<SemiAntiKeyReplacement> replacements;
 	if (inner.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &inner_join = inner.Cast<LogicalComparisonJoin>();
-		if (inner_join.join_type != JoinType::INNER || inner_join.HasArbitraryConditions()) {
+		if (inner_join.join_type != JoinType::INNER || inner_join.HasArbitraryConditions() ||
+		    !collect_conditions(inner_join, source_bindings, delim_bindings, replacements)) {
 			return false;
-		}
-		for (auto &condition : inner_join.conditions) {
-			if (!condition.LeftReference() || !condition.RightReference() ||
-			    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), *condition.LeftReference(),
-			                                      *condition.RightReference(), source_bindings, delim_bindings,
-			                                      replacements)) {
-				return false;
-			}
 		}
 	}
 
@@ -390,46 +370,7 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		}
 		source_filters.push_back(expr->Copy());
 	}
-	if (replacements.empty()) {
-		return false;
-	}
-
-	vector<bool> used_replacements(replacements.size(), false);
-	vector<unique_ptr<Expression>> new_projection_exprs;
-	new_projection_exprs.reserve(old_projection.expressions.size());
-	for (auto &expr : old_projection.expressions) {
-		if (!expr) {
-			return false;
-		}
-		bool replaced = false;
-		for (idx_t i = 0; i < replacements.size(); i++) {
-			if (Expression::Equals(*expr, *replacements[i].delim_expr)) {
-				used_replacements[i] = true;
-				new_projection_exprs.push_back(replacements[i].source_expr->Copy());
-				replaced = true;
-				break;
-			}
-		}
-		if (replaced) {
-			continue;
-		}
-		if (ExpressionUsesOnly(*expr, source_bindings, true)) {
-			new_projection_exprs.push_back(expr->Copy());
-			continue;
-		}
-		return false;
-	}
-	for (idx_t i = 0; i < replacements.size(); i++) {
-		if (!used_replacements[i]) {
-			return false;
-		}
-		if (replacements[i].null_reject_source) {
-			source_filters.push_back(BuildIsNotNull(replacements[i].source_expr->Copy()));
-		}
-	}
-
-	return replace_probe(std::move(inner.children[source_child_idx]), std::move(source_filters),
-	                     std::move(new_projection_exprs));
+	return replace_probe(inner.children[source_child_idx], std::move(source_filters), replacements, source_bindings);
 }
 
 static bool RewriteSemiAntiProbeKeyProjections(unique_ptr<LogicalOperator> &node) {
@@ -960,6 +901,14 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 	plan->ResolveOperatorTypes();
 }
 
+static void ResolveProjectionTypes(LogicalProjection &projection) {
+	// Bound output expressions suffice; avoid recursively revisiting the child plan.
+	projection.types.clear();
+	for (auto &expression : projection.expressions) {
+		projection.types.push_back(expression->GetReturnType());
+	}
+}
+
 ColumnBinding ExposeBindingInProjection(LogicalProjection &proj, const ColumnBinding &binding, const LogicalType &type,
                                         const string &alias, bool reuse_existing, bool &appended) {
 	if (reuse_existing) {
@@ -975,15 +924,8 @@ ColumnBinding ExposeBindingInProjection(LogicalProjection &proj, const ColumnBin
 	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
 	passthrough->SetAlias(Identifier(alias));
 	proj.expressions.push_back(std::move(passthrough));
+	ResolveProjectionTypes(proj);
 	return ColumnBinding(TableIndex(proj.table_index), ProjectionIndex(proj.expressions.size() - 1));
-}
-
-static void ResolveProjectionTypes(LogicalProjection &projection) {
-	// Bound output expressions suffice; avoid recursively revisiting the child plan.
-	projection.types.clear();
-	for (auto &expression : projection.expressions) {
-		projection.types.push_back(expression->GetReturnType());
-	}
 }
 
 bool PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path, ColumnBinding binding,
@@ -991,11 +933,7 @@ bool PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &pr
 	bool appended = false;
 	for (auto it = projection_path.rbegin(); it != projection_path.rend(); ++it) {
 		auto &projection = **it;
-		auto previous_count = projection.expressions.size();
 		binding = ExposeBindingInProjection(projection, binding, type, alias, reuse_existing, appended);
-		if (projection.expressions.size() != previous_count) {
-			ResolveProjectionTypes(projection);
-		}
 		type = projection.expressions[binding.column_index]->GetReturnType();
 	}
 	return appended;
@@ -1035,6 +973,44 @@ OutputSpine FindAggregateOutputSpine(LogicalOperator *root) {
 	});
 }
 
+unordered_map<TableIndex, const LogicalProjection *> OutputSpine::ProjectionMap() const {
+	unordered_map<TableIndex, const LogicalProjection *> map;
+	for (auto *projection : projections) {
+		map.emplace(projection->table_index, projection);
+	}
+	return map;
+}
+
+void VisitSpineAggregateInputs(const OutputSpine &spine, TableIndex aggregate_index,
+                               const std::function<void(ColumnBinding, bool)> &visit) {
+	auto projections = spine.ProjectionMap();
+	std::function<void(const Expression &, bool)> collect = [&](const Expression &expression, bool computed) {
+		if (expression.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) { collect(child, true); });
+			return;
+		}
+		auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
+		auto projection = projections.find(binding.table_index);
+		if (binding.table_index == aggregate_index) {
+			visit(binding, computed);
+		} else if (projection != projections.end()) {
+			collect(*projection->second->expressions[binding.column_index], computed);
+		}
+	};
+	for (auto &expression : spine.projections.front()->expressions) {
+		collect(*expression, false);
+	}
+}
+
+OutputSpine ViewOutputSpine(LogicalOperator *root) {
+	return FindOutputSpine(root, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
+}
+
 LogicalAggregate *SpineAggregate(const OutputSpine &spine) {
 	auto *node = spine.bottom;
 	if (node && node->type == LogicalOperatorType::LOGICAL_FILTER && node->children.size() == 1) {
@@ -1047,12 +1023,7 @@ LogicalAggregate *SpineAggregate(const OutputSpine &spine) {
 }
 
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
-	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
-		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
-		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
-		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
-	});
+	auto spine = ViewOutputSpine(plan.get());
 	if (!spine.bottom || spine.projections.empty()) {
 		return;
 	}
@@ -1202,33 +1173,13 @@ void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan) {
 	if (!aggregate || spine.projections.empty()) {
 		return;
 	}
-	unordered_map<TableIndex, LogicalProjection *> projections;
-	for (auto *projection : spine.projections) {
-		projections.emplace(projection->table_index, projection);
-	}
 	column_binding_set_t visited;
 	vector<ColumnBinding> inputs;
-	std::function<void(const Expression &)> collect = [&](const Expression &expression) {
-		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-			auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
-			if (!visited.insert(binding).second) {
-				return;
-			}
-			if (binding.table_index == aggregate->aggregate_index) {
-				inputs.push_back(binding);
-			} else {
-				auto projection = projections.find(binding.table_index);
-				if (projection != projections.end()) {
-					collect(*projection->second->expressions[binding.column_index]);
-				}
-			}
-			return;
+	VisitSpineAggregateInputs(spine, aggregate->aggregate_index, [&](ColumnBinding binding, bool) {
+		if (visited.insert(binding).second) {
+			inputs.push_back(binding);
 		}
-		ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) { collect(child); });
-	};
-	for (auto &expression : spine.projections.front()->expressions) {
-		collect(*expression);
-	}
+	});
 	bool changed = false;
 	for (auto binding : inputs) {
 		auto &expression = aggregate->expressions[binding.column_index]->Cast<BoundAggregateExpression>();
@@ -1487,12 +1438,10 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
                                                 LogicalType &type, const string &alias = "") {
 	plan->ResolveOperatorTypes();
 	auto top_bindings = plan->GetColumnBindings();
-	auto top_types = plan->types;
-	for (idx_t i = 0; i < top_bindings.size(); i++) {
-		if (top_bindings[i] == binding) {
-			type = top_types[i];
-			return;
-		}
+	auto top = std::find(top_bindings.begin(), top_bindings.end(), binding);
+	if (top != top_bindings.end()) {
+		type = plan->types[top - top_bindings.begin()];
+		return;
 	}
 
 	struct PathEntry {
@@ -1500,34 +1449,27 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 		idx_t child_idx;
 	};
 	vector<PathEntry> path;
-	std::function<bool(LogicalOperator *, bool)> find_path = [&](LogicalOperator *node, bool is_root) -> bool {
+	std::function<bool(LogicalOperator *)> find_path = [&](LogicalOperator *node) -> bool {
 		auto bindings = node->GetColumnBindings();
-		for (auto &candidate : bindings) {
-			if (candidate == binding) {
-				return true;
-			}
+		if (std::find(bindings.begin(), bindings.end(), binding) != bindings.end()) {
+			return true;
 		}
 		for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
-			if (find_path(node->children[child_idx].get(), false)) {
-				if (!is_root) {
-					path.push_back({node, child_idx});
-				}
+			if (find_path(node->children[child_idx].get())) {
+				path.push_back({node, child_idx});
 				return true;
 			}
 		}
 		return false;
 	};
-	find_path(plan.get(), false);
+	find_path(plan.get());
 
 	ColumnBinding current = binding;
 	for (auto &entry : path) {
 		if (entry.op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			bool appended = false;
-			auto &projection = entry.op->Cast<LogicalProjection>();
-			current = ExposeBindingInProjection(projection, current, type, alias, true, appended);
-			if (appended) {
-				ResolveProjectionTypes(projection);
-			}
+			current =
+			    ExposeBindingInProjection(entry.op->Cast<LogicalProjection>(), current, type, alias, true, appended);
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
 		           StringUtil::StartsWith(alias, openivm::FULL_SCOPE_PREFIX)) {
 			auto &aggregate = entry.op->Cast<LogicalAggregate>();
@@ -1572,38 +1514,23 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 			current = ColumnBinding(setop.table_index, ProjectionIndex(column));
 			setop.ResolveOperatorTypes();
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
-			auto &filter = entry.op->Cast<LogicalFilter>();
-			if (!filter.projection_map.empty()) {
-				bool in_map = false;
-				for (auto &idx : filter.projection_map) {
-					if (idx == current.column_index) {
-						in_map = true;
-						break;
-					}
-				}
-				if (!in_map) {
-					filter.projection_map.push_back(current.column_index);
-				}
+			auto &map = entry.op->Cast<LogicalFilter>().projection_map;
+			if (!map.empty() && std::find(map.begin(), map.end(), current.column_index) == map.end()) {
+				map.push_back(current.column_index);
 			}
-			filter.ResolveOperatorTypes();
-		} else if (entry.op->type == LogicalOperatorType::LOGICAL_UNION ||
-		           entry.op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
+			entry.op->ResolveOperatorTypes();
+		} else if (entry.op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
 		           entry.op->type == LogicalOperatorType::LOGICAL_INTERSECT) {
 			// Set operations expose a fresh table index. A binding from either input
 			// remains visible only through its positional set-operation output; carrying
 			// the branch-local binding above this boundary produces invalid SQL when the
 			// hidden outer-join key is projected at the root.
 			auto child_bindings = entry.op->children[entry.child_idx]->GetColumnBindings();
-			idx_t output_idx = DConstants::INVALID_INDEX;
-			for (idx_t i = 0; i < child_bindings.size(); i++) {
-				if (child_bindings[i] == current) {
-					output_idx = i;
-					break;
-				}
-			}
-			if (output_idx == DConstants::INVALID_INDEX) {
+			auto input = std::find(child_bindings.begin(), child_bindings.end(), current);
+			if (input == child_bindings.end()) {
 				throw InternalException("OpenIVM could not propagate hidden binding through set-operation input");
 			}
+			idx_t output_idx = input - child_bindings.begin();
 			entry.op->ResolveOperatorTypes();
 			auto output_bindings = entry.op->GetColumnBindings();
 			if (output_idx >= output_bindings.size() || output_idx >= entry.op->types.size()) {
@@ -1622,12 +1549,12 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 /// Add openivm_left_key (and openivm_right_key for FULL OUTER) projection at
 /// the top of the plan.
 static void RewriteLeftJoinKey(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                               const OuterJoinBindings &outer_join) {
+                               OuterJoinBindings outer_join) {
 	bool is_full_outer = outer_join.is_full_outer;
-	auto key_binding = outer_join.preserved_key_binding;
-	auto key_type = outer_join.preserved_key_type;
-	auto right_key_binding = outer_join.right_key_binding;
-	auto right_key_type = outer_join.right_key_type;
+	auto &key_binding = outer_join.preserved_key_binding;
+	auto &key_type = outer_join.preserved_key_type;
+	auto &right_key_binding = outer_join.right_key_binding;
+	auto &right_key_type = outer_join.right_key_type;
 
 	// Outer-join key bindings originate inside the join subtree. User projections,
 	// filters with projection maps, and CTE/projection stacks can hide either key
@@ -1671,14 +1598,8 @@ static void RewriteLeftJoinKey(ClientContext &context, Binder &binder, unique_pt
 /// openivm_right_match_count. These hidden aggregates track how many rows match
 /// from each side (Larson & Zhou / Zhang & Larson). When match_count=0,
 /// aggregate columns from that side should be NULL.
-static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+static void RewriteLeftJoinMatchCount(ClientContext &context, unique_ptr<LogicalOperator> &plan,
                                       const OuterJoinBindings &outer_join) {
-	bool is_full_outer = outer_join.is_full_outer;
-	auto null_side_binding = outer_join.null_side_binding;
-	auto null_side_type = outer_join.null_side_type;
-	auto left_side_binding = outer_join.left_side_binding;
-	auto left_side_type = outer_join.left_side_type;
-
 	// Only applies to aggregate plans (PROJECTION → [PROJECTION ...] → AGGREGATE → ...).
 	// For SIMPLE_PROJECTION outer JOINs, match count isn't needed (partial recompute via keys).
 	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &) { return false; });
@@ -1687,47 +1608,25 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	    spine.bottom->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		return;
 	}
-	auto *agg_search = spine.bottom;
-	auto &agg = agg_search->Cast<LogicalAggregate>();
-
-	// Add COUNT(null_side_key) as openivm_match_count (tracks right-side matches for LEFT/OUTER).
-	idx_t match_count_idx = agg.expressions.size();
-	agg.expressions.push_back(MakeAggregate(context, "count",
-	                                        make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding),
-	                                        openivm::MATCH_COUNT_COL));
-
-	// For FULL OUTER: add COUNT(left_key) as openivm_right_match_count (tracks left-side matches).
-	idx_t right_match_count_idx = 0;
-	if (is_full_outer) {
-		right_match_count_idx = agg.expressions.size();
-		agg.expressions.push_back(MakeAggregate(context, "count",
-		                                        make_uniq<BoundColumnRefExpression>(left_side_type, left_side_binding),
-		                                        openivm::RIGHT_MATCH_COUNT_COL));
+	auto &agg = spine.bottom->Cast<LogicalAggregate>();
+	// Expose the COUNT through every projection between the aggregate and the root. PIVOT and other
+	// planner rewrites can introduce several projection layers; adding the hidden binding only to the
+	// top projection leaves LPTS with a reference to a column that no child CTE emits.
+	auto add_count = [&](ColumnBinding input, const LogicalType &input_type, const char *alias) {
+		ColumnBinding binding(agg.aggregate_index, ProjectionIndex(agg.expressions.size()));
+		agg.expressions.push_back(
+		    MakeAggregate(context, "count", make_uniq<BoundColumnRefExpression>(input_type, input), alias));
+		agg.ResolveOperatorTypes();
+		PropagateHiddenBindingThroughProjectionPath(projection_path, binding, agg.expressions.back()->GetReturnType(),
+		                                            alias);
+	};
+	// COUNT(null_side_key) tracks right-side matches; FULL OUTER also tracks left-side matches.
+	add_count(outer_join.null_side_binding, outer_join.null_side_type, openivm::MATCH_COUNT_COL);
+	if (outer_join.is_full_outer) {
+		add_count(outer_join.left_side_binding, outer_join.left_side_type, openivm::RIGHT_MATCH_COUNT_COL);
 	}
-
-	agg.ResolveOperatorTypes();
-
-	// Add passthrough through every projection between the aggregate and the root.
-	// PIVOT and other planner rewrites can introduce several projection layers; adding
-	// the hidden binding only to the top projection leaves LPTS with a reference to a
-	// column that no child CTE emits.
-	auto agg_bindings = agg_search->GetColumnBindings();
-	const auto &agg_types = agg_search->types;
-	idx_t group_count = agg.groups.size();
-
-	ColumnBinding match_binding = agg_bindings[group_count + match_count_idx];
-	const LogicalType &match_type = agg_types[group_count + match_count_idx];
-	PropagateHiddenBindingThroughProjectionPath(projection_path, match_binding, match_type, openivm::MATCH_COUNT_COL);
-
-	if (is_full_outer) {
-		ColumnBinding right_match_binding = agg_bindings[group_count + right_match_count_idx];
-		const LogicalType &right_match_type = agg_types[group_count + right_match_count_idx];
-		PropagateHiddenBindingThroughProjectionPath(projection_path, right_match_binding, right_match_type,
-		                                            openivm::RIGHT_MATCH_COUNT_COL);
-	}
-
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Added openivm_match_count%s for outer join aggregate\n",
-	                    is_full_outer ? " + openivm_right_match_count" : "");
+	                    outer_join.is_full_outer ? " + openivm_right_match_count" : "");
 }
 
 static ColumnBinding AddScopePresence(Binder &binder, unique_ptr<LogicalOperator> &plan,
@@ -1769,7 +1668,7 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 	}
 
 	if (has_aggregate) {
-		RewriteLeftJoinMatchCount(context, binder, plan, outer_join);
+		RewriteLeftJoinMatchCount(context, plan, outer_join);
 		return;
 	}
 
@@ -1795,32 +1694,33 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 		}
 	};
 	collect(*selected);
-	if (!nested_outer.empty()) {
-		idx_t source_index = 0;
-		for (auto &input : selected->children) {
-			vector<std::pair<ColumnBinding, string>> sources;
-			std::function<void(unique_ptr<LogicalOperator> &, bool)> mark_inputs =
-			    [&](unique_ptr<LogicalOperator> &node, bool in_scope) {
-				    if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-				        IsOuterJoin(node->Cast<LogicalComparisonJoin>().join_type)) {
-					    in_scope = true;
-				    }
-				    if (in_scope && node->type == LogicalOperatorType::LOGICAL_GET) {
-					    auto name = string(openivm::FULL_SCOPE_PREFIX) + "source_" + to_string(source_index++);
-					    sources.emplace_back(AddScopePresence(binder, plan, node, name), name);
-					    return;
-				    }
-				    for (auto &child : node->children) {
-					    mark_inputs(child, in_scope);
-				    }
-			    };
-			mark_inputs(input, false);
-			for (auto &source : sources) {
-				LogicalType type = LogicalType::BOOLEAN;
-				// Source participation is needed inside the scoped input only;
-				// it is not an extra persisted output of the materialized view.
-				PropagateBindingThroughOperatorPath(context, binder, input, source.first, type, source.second);
+	if (nested_outer.empty()) {
+		return;
+	}
+	idx_t source_index = 0;
+	for (auto &input : selected->children) {
+		vector<std::pair<ColumnBinding, string>> sources;
+		std::function<void(unique_ptr<LogicalOperator> &, bool)> mark_inputs = [&](unique_ptr<LogicalOperator> &node,
+		                                                                           bool in_scope) {
+			if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+			    IsOuterJoin(node->Cast<LogicalComparisonJoin>().join_type)) {
+				in_scope = true;
 			}
+			if (in_scope && node->type == LogicalOperatorType::LOGICAL_GET) {
+				auto name = string(openivm::FULL_SCOPE_PREFIX) + "source_" + to_string(source_index++);
+				sources.emplace_back(AddScopePresence(binder, plan, node, name), name);
+				return;
+			}
+			for (auto &child : node->children) {
+				mark_inputs(child, in_scope);
+			}
+		};
+		mark_inputs(input, false);
+		for (auto &source : sources) {
+			LogicalType type = LogicalType::BOOLEAN;
+			// Source participation is needed inside the scoped input only;
+			// it is not an extra persisted output of the materialized view.
+			PropagateBindingThroughOperatorPath(context, binder, input, source.first, type, source.second);
 		}
 	}
 	for (idx_t index = 0; index < nested_outer.size(); index++) {
@@ -1837,10 +1737,7 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 			root.expressions[presence.column_index]->SetAlias(Identifier(name));
 		}
 	}
-	if (!nested_outer.empty()) {
-		OPENIVM_DEBUG_PRINT("[PlanRewrite] Added presence columns for %zu nested outer JOIN scopes\n",
-		                    nested_outer.size());
-	}
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Added presence columns for %zu nested outer JOIN scopes\n", nested_outer.size());
 }
 
 struct PlanRewriteContext {
@@ -1972,7 +1869,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	     &PlanRewriteNeeds::aggregate_filters},
 	    {"distinct",
 	     [](PlanRewriteContext &c) {
-		     if (RewriteDistinct(c.context, c.binder, c.plan, true)) {
+		     if (RewriteDistinct(c.context, c.binder, c.plan)) {
 			     c.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 		     }
 		     InjectHiddenGroupKeys(c.plan);
@@ -2070,10 +1967,7 @@ void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<Lo
 	if (!aggregate || spine.projections.empty()) {
 		return;
 	}
-	DerivedOutputProjectionMap projections;
-	for (auto *projection : spine.projections) {
-		projections.emplace(projection->table_index, projection);
-	}
+	auto projections = spine.ProjectionMap();
 	Optimizer optimizer(binder, context);
 	auto &output = *spine.projections.front();
 	const auto output_count = output.expressions.size();
@@ -2088,8 +1982,7 @@ void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<Lo
 			continue;
 		}
 		auto &group = aggregate->groups[binding.column_index];
-		if (group->GetReturnType().id() != LogicalTypeId::DOUBLE &&
-		    group->GetReturnType().id() != LogicalTypeId::FLOAT) {
+		if (!group->GetReturnType().IsFloating()) {
 			continue;
 		}
 		auto argument = make_uniq<BoundCaseExpression>(MakeNegativeZeroExpression(context, optimizer, group->Copy()),
@@ -2166,10 +2059,7 @@ vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vec
 	if (!aggregate) {
 		return {};
 	}
-	DerivedOutputProjectionMap projections;
-	for (auto *projection : spine.projections) {
-		projections.emplace(projection->table_index, projection);
-	}
+	auto projections = spine.ProjectionMap();
 	vector<string> names;
 	auto bindings = plan.GetColumnBindings();
 	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
@@ -2194,18 +2084,19 @@ static column_binding_map_t<string> BuildOutputBindingNames(LogicalOperator &pla
 		projections[projection->table_index] = projection;
 	}
 	column_binding_map_t<string> binding_to_column;
-	auto bindings = plan.GetColumnBindings();
-	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
-		BoundColumnRefExpression output(LogicalType::SQLNULL, bindings[i]);
+	// Every binding on a resolved pass-through path denotes the published value,
+	// including when the path ends at a computed expression.
+	auto publish = [&](const Expression &expression, const string &name) {
 		vector<ColumnBinding> path;
-		auto resolved = ResolveDerivedOutputPassThrough(output, projections, &path);
-		// Every binding on this pass-through path denotes the published value,
-		// including when the path ends at a computed expression.
-		if (resolved) {
+		if (ResolveDerivedOutputPassThrough(expression, projections, &path)) {
 			for (auto key : path) {
-				binding_to_column.emplace(key, output_names[i]);
+				binding_to_column.emplace(key, name);
 			}
 		}
+	};
+	auto bindings = plan.GetColumnBindings();
+	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
+		publish(BoundColumnRefExpression(LogicalType::SQLNULL, bindings[i]), output_names[i]);
 	}
 	// DISTINCT normalization replaces pass-through bindings with group outputs.
 	// ORDER BY can still reference the corresponding input binding, so expose
@@ -2213,16 +2104,8 @@ static column_binding_map_t<string> BuildOutputBindingNames(LogicalOperator &pla
 	for (auto *aggregate : facts.aggregates) {
 		for (idx_t i = 0; i < aggregate->groups.size(); i++) {
 			auto entry = binding_to_column.find(ColumnBinding(TableIndex(aggregate->group_index), ProjectionIndex(i)));
-			if (entry == binding_to_column.end()) {
-				continue;
-			}
-			auto name = entry->second;
-			vector<ColumnBinding> path;
-			auto resolved = ResolveDerivedOutputPassThrough(*aggregate->groups[i], projections, &path);
-			if (resolved) {
-				for (auto input_key : path) {
-					binding_to_column.emplace(input_key, name);
-				}
+			if (entry != binding_to_column.end()) {
+				publish(*aggregate->groups[i], string(entry->second));
 			}
 		}
 	}
@@ -2370,10 +2253,7 @@ string StripHavingFilter(ClientContext &context, unique_ptr<LogicalOperator> &pl
 	if (parent && parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		// The spine pushes every projection it passes, so the parent is the last one.
 		proj_ptr = &parent->Cast<LogicalProjection>();
-		DerivedOutputProjectionMap projections;
-		for (auto *projection : proj_chain) {
-			projections[projection->table_index] = projection;
-		}
+		auto projections = spine.ProjectionMap();
 		auto *output_projection = proj_chain.front();
 		for (idx_t i = 0; i < output_projection->expressions.size() && i < output_names.size(); i++) {
 			auto *resolved = ResolveDerivedOutputPassThrough(*output_projection->expressions[i], projections);

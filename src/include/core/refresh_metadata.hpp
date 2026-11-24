@@ -393,9 +393,8 @@ public:
 
 	// Metadata captured at CREATE-MV time for the aux-state DISTINCT pipeline.
 	// `aux_table` is the per-tuple count table (e.g. `openivm_distinct_count_<view>`);
-	// `cols` are the columns being deduplicated; `input_sql` is the DISTINCT subquery
-	// body with the DISTINCT keyword stripped; `source` is the base table referenced
-	// by `input_sql`'s FROM clause; `filter` is the WHERE predicate (empty if none);
+	// `cols` are the columns being deduplicated; `source_exprs` compute them from the
+	// base table `source`; `filter` is the WHERE predicate (empty if none);
 	// `sum_arg` and `sum_out` describe the parent aggregate's single SUM expression
 	// (`SUM(<sum_arg>) AS <sum_out>`); sum_out can name hidden state for a cast output.
 	// v0 supports exactly one SUM expression, with shared projected aliases.
@@ -403,7 +402,6 @@ public:
 		string aux_table;
 		vector<string> cols;
 		vector<string> source_exprs;
-		string input_sql;
 		string source;
 		string filter;
 		string sum_arg;
@@ -574,8 +572,6 @@ public:
 		// them to build the right row source per storage backend (delta table vs DuckLake snapshots).
 		vector<string> inner_tables; // qualified base-table names of the inner (null-supplying) sides
 		vector<string> inner_keys;   // join key columns on the inner sides
-		vector<string> pres_tables;  // qualified base-table names of the preserved sides
-		vector<string> pres_keys;    // join key columns on the preserved sides
 	};
 
 	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);

@@ -903,19 +903,11 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
                            const string &attached_schema, const string &catalog_prefix, const string &metadata_prefix,
                            string *out_post_meta, vector<string> *deferred_cleanup,
                            const vector<string> &delta_metadata_tables, const string &data_catalog) {
-	string qdt = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	// Indexed keys cannot be deleted and reinserted in the same on-disk transaction.
 	// Non-indexable group keys use the ordinary DELETE/INSERT full-refresh form.
-	vector<string> unique_keys;
-	string recompute_temp;
-	if (!upsert_columns.empty()) {
-		unique_keys = metadata.GetGroupColumns(view_name);
-		if (!unique_keys.empty()) {
-			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
-		}
-	}
-	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp, upsert_columns,
-	                                               upsert_types) +
+	string query = CompileFullRecompute(view_name, view_query_sql, catalog_prefix, false,
+	                                    upsert_columns.empty() ? vector<string>() : metadata.GetGroupColumns(view_name),
+	                                    upsert_columns, upsert_types) +
 	               "\n";
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
 	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = " + string(openivm::UTC_NOW_SQL) +

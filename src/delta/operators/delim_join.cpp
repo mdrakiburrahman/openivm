@@ -373,7 +373,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 	}
 
 	auto result = AssembleJoinUnionAll(terms, types, binder);
-	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);
+	ColumnBinding new_mul_binding =
+	    ReplaceJoinOutputBindings(*input.root, *result, original_bindings, result->GetColumnBindings());
 	input.plan = std::move(result);
 	return {std::move(input.plan), new_mul_binding};
 }

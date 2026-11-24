@@ -143,6 +143,8 @@ public:
 	static string BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
 	                                  const vector<string> &columns);
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
+	// Trim whitespace and one trailing ';' so the statement can be embedded as a subquery.
+	static string StripTrailingSemicolon(string sql);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
 	// Table-reference helpers accept SQL identifier spellings. Use QuoteIdentifier for

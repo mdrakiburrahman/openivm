@@ -265,11 +265,7 @@ static string RenderStoredViewQueryForDialect(Connection &con, const string &vie
 		auto cte_list = AstToCteList(*ast, dialect);
 		rendered = cte_list->ToQuery(true, output_names);
 	});
-	if (!rendered.empty() && rendered.back() == ';') {
-		rendered.pop_back();
-	}
-	StringUtil::Trim(rendered);
-	return rendered;
+	return SqlUtils::StripTrailingSemicolon(rendered);
 }
 
 struct TrackedSourceInput {
@@ -1153,7 +1149,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			bool have_ljsec = source_has_left_join && !source_has_full_outer &&
 			                  metadata.GetLeftJoinSecondaryMeta(view_name, ljsec) && !ljsec.sql.empty();
 			bool force_lj_group_recompute = source_has_left_join && !source_has_full_outer && !have_ljsec;
-			// Resolve the two delta row-source placeholders. Regular tables read their delta table;
+			// Resolve the per-level inner delta placeholders. Regular tables read their delta table;
 			// DuckLake tables have none and must read ducklake_table_insertions/deletions between the
 			// last-refreshed and current snapshot -- IDs that exist only here, not at CREATE time.
 			if (have_ljsec) {
@@ -1167,18 +1163,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					if (cached != lj_delta_source_cache.end()) {
 						return cached->second;
 					}
-					string qkey = SqlUtils::QuoteIdentifier(key_col);
-					optional_ptr<RefreshMetadata::DeltaSource> source;
+					// Empty when the source cannot be resolved.
+					auto &result = lj_delta_source_cache[cache_key];
 					auto metadata_key = ResolveDeltaMetadataKey(metadata, view_name, base_table, delta_table_names);
-					for (auto &candidate : lj_sources) {
-						if (StringUtil::CIEquals(candidate.table_name, metadata_key)) {
-							source = &candidate;
-							break;
-						}
-					}
-					if (!source) {
-						lj_delta_source_cache[cache_key] = "";
-						return "";
+					auto source = std::find_if(lj_sources.begin(), lj_sources.end(),
+					                           [&](const RefreshMetadata::DeltaSource &entry) {
+						                           return StringUtil::CIEquals(entry.table_name, metadata_key);
+					                           });
+					if (source == lj_sources.end()) {
+						return result;
 					}
 					string delta_name = source->table_name;
 					string relation;
@@ -1194,8 +1187,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						}
 						int64_t cur_snap = snapshot->second;
 						if (source->catalog_name.empty() || last_snap < 0 || cur_snap < 0) {
-							lj_delta_source_cache[cache_key] = "";
-							return "";
+							return result;
 						}
 						relation = BuildDuckLakeSignedDeltaRelation(
 						    {source->catalog_name, source->schema_name,
@@ -1210,35 +1202,29 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						               SqlUtils::EscapeValue(delta_name) + "')";
 					}
 					// Insertions carry weight +1 and deletions -1.
-					string projection =
-					    key_col.empty() ? "*" : qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) + " AS __m";
-					string result = "(SELECT " + projection + " FROM " + relation + where_clause + ")";
-					lj_delta_source_cache[cache_key] = result;
-					return result;
+					string projection = key_col.empty() ? "*"
+					                                    : SqlUtils::QuoteIdentifier(key_col) + " AS __k, " +
+					                                          string(openivm::MULTIPLICITY_COL) + " AS __m";
+					return result = "(SELECT " + projection + " FROM " + relation + where_clause + ")";
 				};
-				// One placeholder pair PER LEFT JOIN level; identities are index-aligned arrays.
+				// One inner-delta placeholder PER LEFT JOIN level; identities are index-aligned arrays.
 				auto &lj_it = ljsec.inner_tables;
 				auto &lj_ik = ljsec.inner_keys;
-				auto &lj_pt = ljsec.pres_tables;
-				auto &lj_pk = ljsec.pres_keys;
-				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size() && lj_it.size() == lj_pt.size() &&
-				             lj_it.size() == lj_pk.size();
+				// Views created before ff8a472b also stored a preserved-side placeholder
+				// (__OPENIVM_LJSEC_PRES_DELTA_<n>__) that refresh no longer resolves.
+				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size() &&
+				             ljsec.sql.find("__OPENIVM_LJSEC_PRES_DELTA_") == string::npos;
 				for (size_t lvl = 0; lj_ok && lvl < lj_it.size(); lvl++) {
 					string inner_src = build_ljsec_delta_source(lj_it[lvl], lj_ik[lvl]);
-					string pres_src = build_ljsec_delta_source(lj_pt[lvl], lj_pk[lvl]);
-					if (inner_src.empty() || pres_src.empty()) {
+					if (inner_src.empty()) {
 						lj_ok = false;
 						break;
 					}
-					string lvl_str = to_string(lvl);
-					ljsec.sql = SqlUtils::ReplaceAllOccurrences(ljsec.sql,
-					                                            string(openivm::LJSEC_INNER_DELTA_PREFIX) + lvl_str +
-					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
-					                                            inner_src);
-					ljsec.sql = SqlUtils::ReplaceAllOccurrences(ljsec.sql,
-					                                            string(openivm::LJSEC_PRES_DELTA_PREFIX) + lvl_str +
-					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
-					                                            pres_src);
+					ljsec.sql =
+					    SqlUtils::ReplaceAllOccurrences(ljsec.sql,
+					                                    string(openivm::LJSEC_INNER_DELTA_PREFIX) + to_string(lvl) +
+					                                        string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
+					                                    inner_src);
 				}
 				unordered_map<string, string> previous_sources;
 				ljsec.sql = SqlUtils::RewriteTableReferences(ljsec.sql, [&](const vector<string> &parts) -> string {
@@ -1431,14 +1417,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			if (!aux_meta.selected_input_sql.empty()) {
 				input_columns = &aux_meta.selected_input_columns;
 				if (aux_meta.representative_input) {
-					vector<string> candidates;
-					for (auto &column : aux_meta.selected_source_columns) {
-						candidates.push_back("openivm_candidates." + SqlUtils::QuoteIdentifier(column));
-					}
 					string candidate_bag =
-					    "(SELECT " + StringUtil::Join(candidates, ", ") + " FROM " + aux_table_sql(aux_meta.aux_table) +
-					    " openivm_candidates SEMI JOIN " + SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) +
-					    " i ON " +
+					    "(SELECT " +
+					    SqlUtils::JoinQualifiedQuotedColumns(aux_meta.selected_source_columns, "openivm_candidates") +
+					    " FROM " + aux_table_sql(aux_meta.aux_table) + " openivm_candidates SEMI JOIN " +
+					    SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) + " i ON " +
 					    SqlUtils::BuildNullSafeMatch(aux_meta.selected_source_columns, "openivm_candidates", "i") +
 					    " WHERE " + SqlUtils::QuoteIdentifier(aux_meta.InternalColumn("_count")) + " > 0 AND " +
 					    SqlUtils::QuoteIdentifier(aux_meta.InternalColumn("openivm_selected")) + ")";
@@ -1713,10 +1696,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				raw_refresh_sql = cte_list->ToQuery(false);
 				if (use_transient_mv_delta && ast->NodeType() == "Insert" && ast->children.size() == 1) {
 					auto inline_cte_list = AstToCteList(*ast->children[0], dialect, emit_spark_hints);
-					inline_delta_select_query = inline_cte_list->ToQuery(false, column_names);
-					if (!inline_delta_select_query.empty() && inline_delta_select_query.back() == ';') {
-						inline_delta_select_query.pop_back();
-					}
+					inline_delta_select_query =
+					    SqlUtils::StripTrailingSemicolon(inline_cte_list->ToQuery(false, column_names));
 				}
 				add_profile_step("generate_refresh_sql.lpts", lpts_start,
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));

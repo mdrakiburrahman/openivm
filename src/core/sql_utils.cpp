@@ -54,7 +54,7 @@ string SqlUtils::FloatingRepresentativeSQL(const string &value, const string &ne
 }
 
 string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation) {
-	if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+	if (type.IsFloating()) {
 		return NegativeZeroSQL(value);
 	}
 	if (type.id() == LogicalTypeId::VARCHAR &&
@@ -66,8 +66,7 @@ string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, 
 
 bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
 	return TypeVisitor::Contains(type, [](const LogicalType &child) {
-		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL ||
-		       child.id() == LogicalTypeId::FLOAT || child.id() == LogicalTypeId::DOUBLE;
+		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL || child.IsFloating();
 	});
 }
 
@@ -868,6 +867,15 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 		       StringUtil::Join(zero_keys, " OR ") + ") AND (" + StringUtil::Join(sign_changes, " OR ") + ");\n";
 	}
 	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
+	return sql;
+}
+
+string SqlUtils::StripTrailingSemicolon(string sql) {
+	StringUtil::Trim(sql);
+	if (!sql.empty() && sql.back() == ';') {
+		sql.pop_back();
+		StringUtil::Trim(sql);
+	}
 	return sql;
 }
 

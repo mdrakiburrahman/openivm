@@ -2292,7 +2292,6 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Distinct
 	io.Str("aux_table", m.aux_table);
 	io.Arr("cols", m.cols);
 	io.Arr("source_exprs", m.source_exprs, Presence::OPTIONAL);
-	io.Str("input_sql", m.input_sql);
 	io.Str("source", m.source);
 	io.Str("filter", m.filter, Presence::OPTIONAL); // empty without a WHERE clause
 	io.Str("sum_arg", m.sum_arg);
@@ -2417,8 +2416,6 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoin
 	io.Arr("preserved_cols", m.preserved_cols);
 	io.Arr("inner_tables", m.inner_tables);
 	io.Arr("inner_keys", m.inner_keys);
-	io.Arr("pres_tables", m.pres_tables);
-	io.Arr("pres_keys", m.pres_keys);
 }
 
 template <class T>

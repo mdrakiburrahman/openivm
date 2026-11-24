@@ -99,23 +99,21 @@ unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperat
 	return std::move(clean_proj);
 }
 
-ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bindings,
-                                        unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
-	auto union_bindings = result->GetColumnBindings();
-	if (union_bindings.size() != original_bindings.size() + 1) {
+ColumnBinding ReplaceJoinOutputBindings(LogicalOperator &root, LogicalOperator &replaced,
+                                        const vector<ColumnBinding> &original_bindings,
+                                        const vector<ColumnBinding> &replacement_bindings) {
+	if (replacement_bindings.size() != original_bindings.size() + 1) {
 		throw InternalException("Join rewrite produced %zu bindings for %zu original columns and multiplicity",
-		                        union_bindings.size(), original_bindings.size());
+		                        replacement_bindings.size(), original_bindings.size());
 	}
+	OPENIVM_DEBUG_PRINT("[DeltaJoin] Binding replacement: %zu mappings\n", original_bindings.size());
 	ColumnBindingReplacer replacer;
-	const idx_t map_count = original_bindings.size();
-	OPENIVM_DEBUG_PRINT("[DeltaJoin] Binding replacement: %zu mappings (original=%zu, union=%zu)\n", map_count,
-	                    original_bindings.size(), union_bindings.size());
-	for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
-		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
+	for (idx_t i = 0; i < original_bindings.size(); ++i) {
+		replacer.replacement_bindings.emplace_back(original_bindings[i], replacement_bindings[i]);
 	}
-	replacer.stop_operator = result;
+	replacer.stop_operator = &replaced;
 	replacer.VisitOperator(root);
-	return union_bindings.back();
+	return replacement_bindings.back();
 }
 
 idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {

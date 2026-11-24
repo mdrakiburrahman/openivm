@@ -188,7 +188,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	string group_list = column_list;
 	idx_t zero_sign_keys = 0;
 	for (idx_t index = 0; index < columns.size(); index++) {
-		if (column_types[index].id() == LogicalTypeId::FLOAT || column_types[index].id() == LogicalTypeId::DOUBLE) {
+		if (column_types[index].IsFloating()) {
 			group_list += ", " + SqlUtils::NegativeZeroSQL(quoted_columns[index], dialect);
 			zero_sign_keys++;
 		}

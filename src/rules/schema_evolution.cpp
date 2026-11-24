@@ -385,7 +385,6 @@ static bool RewriteDistinctAuxMetaFields(RefreshMetadata::DistinctAuxMeta &meta,
 		changed |= SqlUtils::RewriteColumnReferences(expr, old_name, new_name, qualifiers, true);
 	}
 	changed |= SqlUtils::RewriteColumnReferences(meta.filter, old_name, new_name, qualifiers, true);
-	changed |= SqlUtils::RewriteColumnReferences(meta.input_sql, old_name, new_name, qualifiers, true);
 	return changed;
 }
 

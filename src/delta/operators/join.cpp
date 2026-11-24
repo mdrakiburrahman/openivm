@@ -653,20 +653,13 @@ GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binde
 
 // After DemoteOuterJoinsForMask, a LEFT/RIGHT join may remain un-demoted (kept as an outer join)
 // because its null-supplying side has no delta leaf in THIS mask — so it reads that side as
-// "current" state. If that null-supplying leaf independently has ANY pending delta (from this
-// same refresh, just not part of this term's mask), "current" silently mixes old and new state
-// for the dangling-tuple decision: a preserved-side row whose matching child rows are ALSO being
-// deleted in this same batch gets a spurious extra dangling row here, on top of the correct
-// removal already produced by the higher-order term that covers {this leaf, that leaf} together
-// (double-count). This is the outer-join analogue of the classic T_old-vs-T_new join delta
-// problem — LEFT JOIN's NULL-padding is a non-linear threshold function (unlike inner join's
-// bilinear product), so it cannot be decomposed by inclusion-exclusion the way ordinary joins
-// can; instead (matching Larson & Zhou / DBSP's semijoin-count treatment), we must exclude keys
-// that are themselves transitioning, since those are exclusively owned by the term(s) that
-// include this leaf's delta bit. Guard: anti-join the null-supplying leaf's current scan against
-// its own delta table on the join key, excluding any key present there. Only applies when the
-// null-supplying side is a single, unwrapped base-table leaf directly under the join (bails
-// silently otherwise, matching this file's existing unsupported-shape convention).
+// "current" state. If that null-supplying leaf independently has pending deltas in this refresh,
+// "current" mixes old and new state for the dangling-tuple decision and double-counts with the
+// higher-order term that covers both leaves. LEFT JOIN's NULL-padding is a non-linear threshold
+// function, so (matching Larson & Zhou / DBSP's semijoin-count treatment) this term excludes the
+// preserved-side rows whose key match-count transitions across zero; the terms including this
+// leaf's delta bit own them. Applies only when the null-supplying side resolves to a base-table
+// scan (bails silently otherwise).
 static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &binder,
                                           LogicalOperator *node, const vector<JoinLeafInfo> &leaves,
                                           uint64_t leaf_has_delta_mask, uint64_t old_state_mask,
@@ -734,14 +727,8 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &co
 				}
 				if (key_expr && key_pos != DConstants::INVALID_INDEX &&
 				    other_key_expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-					// Build the set of keys whose match-count on the null-supplying side ACTUALLY
-					// transitions across zero (old>0,new=0 or old=0,new>0). A key merely appearing in
-					// the delta is NOT enough to exclude it: for a 1:many relationship (e.g. one
-					// customer, many orders) a single changed order must not suppress the customer's
-					// row when the customer still has OTHER, unchanged matches. Only a true 0<->>0
-					// transition means "this key's presence here is fully owned by the higher-order
-					// term" -- matching the same match-count-transition principle as the secondary-delta
-					// fix, just applied here to avoid a double-count instead of to add a missing row.
+					// Only a true 0<->>0 match-count transition (see BuildTransitioningKeySetImpl) means
+					// the key is fully owned by the higher-order term.
 					auto transitioning_keys = GetTransitioningKeySetRef(
 					    context, con, binder,
 					    old_state_mask & (1ULL << null_leaf_idx) ? GetLeafScan(leaves[null_leaf_idx])
@@ -881,12 +868,10 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 			auto shift_parent_projection = [&](idx_t insertion_idx, idx_t added) {
 				ShiftAncestorProjectionMap(ancestors, leaf_path, depth, insertion_idx, added);
 			};
+			auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
+			idx_t mul_idx = mul_binding_it == child_bindings.end() ? DConstants::INVALID_INDEX
+			                                                       : idx_t(mul_binding_it - child_bindings.begin());
 			if (!proj_map.empty()) {
-				idx_t mul_idx = DConstants::INVALID_INDEX;
-				auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
-				if (mul_binding_it != child_bindings.end()) {
-					mul_idx = idx_t(mul_binding_it - child_bindings.begin());
-				}
 				// Aggregate delta compilation inserts multiplicity among group bindings. This map still indexes
 				// the pre-rewrite child, so shift every selected data column at or after that insertion.
 				if (immediate_parent && original_leaf_width != DConstants::INVALID_INDEX &&
@@ -909,8 +894,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
 				}
-				idx_t old_width = proj_map.size();
-				idx_t insertion_idx = old_width + JoinChildOutputOffset(*join, child_side);
+				idx_t insertion_idx = proj_map.size() + JoinChildOutputOffset(*join, child_side);
 				// Appending to this join's own left_projection_map grows its LEFT
 				// contribution width, which shifts the absolute position where its RIGHT
 				// contribution starts within its own combined GetColumnBindings(). A
@@ -953,15 +937,12 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				continue;
 			}
 
-			auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
-			if (mul_binding_it == child_bindings.end()) {
+			if (mul_idx == DConstants::INVALID_INDEX) {
 				continue;
 			}
-			idx_t insertion_idx =
-			    idx_t(mul_binding_it - child_bindings.begin()) + JoinChildOutputOffset(*join, child_side);
 			// An empty map passes the child's bindings through unchanged, so the
 			// multiplicity is inserted in-place and shifts every later binding.
-			shift_parent_projection(insertion_idx, 1);
+			shift_parent_projection(mul_idx + JoinChildOutputOffset(*join, child_side), 1);
 			join->ResolveOperatorTypes();
 		}
 	}
@@ -1640,9 +1621,8 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	}
 	vector<unique_ptr<Expression>> current_exprs;
 	D_ASSERT(current_types.size() == current_bindings.size());
-	idx_t current_type_idx = 0;
-	for (auto &binding : current_bindings) {
-		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[current_type_idx++], binding));
+	for (idx_t i = 0; i < current_bindings.size(); i++) {
+		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[i], current_bindings[i]));
 	}
 	current_exprs.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
 	auto current_projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(current_exprs));
@@ -1653,13 +1633,9 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	auto delta_bindings = delta.op->GetColumnBindings();
 	auto delta_types = delta.op->types;
 	D_ASSERT(delta_bindings.size() == current_bindings.size() + 1);
-	delta_bindings.pop_back();
-	delta_types.pop_back();
 	vector<unique_ptr<Expression>> delta_exprs;
-	idx_t delta_idx = 0;
-	for (auto &delta_binding : delta_bindings) {
-		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[delta_idx], delta_binding));
-		delta_idx++;
+	for (idx_t i = 0; i + 1 < delta_bindings.size(); i++) { // the last binding is the multiplicity
+		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[i], delta_bindings[i]));
 	}
 	delta_exprs.push_back(MultiplyIntegers(binder, make_uniq<BoundConstantExpression>(Value::INTEGER(-1)),
 	                                       make_uniq<BoundColumnRefExpression>(mul_type, delta.mul_binding)));
@@ -1675,22 +1651,6 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	old_node->ResolveOperatorTypes();
 	return {std::move(old_node),
 	        ColumnBinding(TableIndex(output_table_index), ProjectionIndex(current_bindings.size()))};
-}
-
-static void RebindRegularLeafParent(LogicalOperator &root, LogicalOperator &leaf,
-                                    const vector<ColumnBinding> &original_bindings,
-                                    const vector<ColumnBinding> &replacement_bindings) {
-	if (replacement_bindings.size() != original_bindings.size() + 1) {
-		throw InternalException("DeltaJoin: replacement leaf produced %zu bindings for %zu source columns",
-		                        replacement_bindings.size(), original_bindings.size());
-	}
-	OPENIVM_DEBUG_PRINT("[DeltaJoin] Rebinding %zu regular-leaf parent columns\n", original_bindings.size());
-	ColumnBindingReplacer replacer;
-	for (idx_t i = 0; i < original_bindings.size(); i++) {
-		replacer.replacement_bindings.emplace_back(original_bindings[i], replacement_bindings[i]);
-	}
-	replacer.stop_operator = &leaf;
-	replacer.VisitOperator(root);
 }
 
 DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context, Binder &binder,
@@ -1709,7 +1669,7 @@ DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, Clien
 		// compaction emits contiguous bindings. Rebind conditions and expressions
 		// above the leaf before replacing it; join projection maps are positional and
 		// remain the responsibility of UpdateParentProjectionMap.
-		RebindRegularLeafParent(*term_root, *leaf_node, original_bindings, delta_bindings);
+		ReplaceJoinOutputBindings(*term_root, *leaf_node, original_bindings, delta_bindings);
 		return delta;
 	}
 	return input.CompileCopiedSubtree(leaf_node, term_root);
@@ -1788,7 +1748,7 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 			leaf_node = std::move(old.op);
 			// The old-state UNION compacts sparse scan bindings, including scans with
 			// filter-only columns. Rebind parent conditions to the new positions.
-			RebindRegularLeafParent(*term_root, *leaf_node, original_leaf_bindings, leaf_node->GetColumnBindings());
+			ReplaceJoinOutputBindings(*term_root, *leaf_node, original_leaf_bindings, leaf_node->GetColumnBindings());
 			UpdateParentProjectionMap(term, leaves[leaf], old.mul_binding, original_leaf_width);
 		}
 
@@ -1974,7 +1934,8 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	}
 
 	// 5. Rebind parent references
-	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);
+	ColumnBinding new_mul_binding =
+	    ReplaceJoinOutputBindings(*input.root, *result, original_bindings, result->GetColumnBindings());
 
 	input.plan = std::move(result);
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
