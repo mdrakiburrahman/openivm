@@ -112,14 +112,8 @@ void RefreshDaemon::Run() {
 				}
 
 				// Determine effective interval (may be backed off)
-				int64_t interval = sv.interval_seconds;
-				{
-					std::lock_guard<std::mutex> guard(backoff_mutex_);
-					auto it = effective_intervals_.find(view_key);
-					if (it != effective_intervals_.end()) {
-						interval = it->second;
-					}
-				}
+				auto backed_off = GetEffectiveInterval(view_key);
+				int64_t interval = backed_off < 0 ? sv.interval_seconds : backed_off;
 
 				// Check if the view is due for refresh
 				if (!sv.last_update.empty()) {
@@ -175,14 +169,11 @@ void RefreshDaemon::Run() {
 
 				// Adaptive backoff
 				if (adaptive_backoff_.load() && duration_seconds > sv.interval_seconds) {
-					std::lock_guard<std::mutex> guard(backoff_mutex_);
-					int64_t current = sv.interval_seconds;
-					auto it = effective_intervals_.find(view_key);
-					if (it != effective_intervals_.end()) {
-						current = it->second;
+					int64_t new_interval = std::min(interval * 2, MAX_BACKOFF_SECONDS);
+					{
+						std::lock_guard<std::mutex> guard(backoff_mutex_);
+						effective_intervals_[view_key] = new_interval;
 					}
-					int64_t new_interval = std::min(current * 2, MAX_BACKOFF_SECONDS);
-					effective_intervals_[view_key] = new_interval;
 					Printer::Print("Warning: refresh of '" + sv.view_name + "' took " + to_string(duration_seconds) +
 					               "s (interval: " + to_string(sv.interval_seconds) +
 					               "s). Increasing effective interval to " + to_string(new_interval) +

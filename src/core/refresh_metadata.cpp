@@ -192,7 +192,7 @@ bool AnyMetadataOwnership(Connection &con, const string &table,
                           optional_ptr<TransactionalMVMetadataState> transaction_state,
                           const std::function<bool(Connection &, const MetadataLocation &, const string &)> &matches) {
 	auto current = RefreshMetadata::CurrentLocation(con);
-	auto locations = RefreshMetadata::MetadataLocations(con, table);
+	auto locations = MetadataLocator::All(con, table);
 	auto include_location = [&](const MetadataLocation &candidate) {
 		for (auto &location : locations) {
 			if (StringUtil::CIEquals(location.catalog, candidate.catalog) &&
@@ -374,19 +374,7 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 			if (!target) {
 				throw CatalogException("could not create %s", target_name);
 			}
-			// Copy the shared columns: legacy tables can predate later metadata columns.
-			vector<string> columns;
-			for (auto &column : source->columns) {
-				for (auto &target_column : target->columns) {
-					if (StringUtil::CIEquals(column.Name().GetIdentifierName(),
-					                         target_column.Name().GetIdentifierName())) {
-						columns.push_back(SqlUtils::QuoteIdentifier(column.Name()));
-						break;
-					}
-				}
-			}
-			auto column_list = StringUtil::Join(columns, ", ");
-			run("INSERT INTO " + target_name + " (" + column_list + ") SELECT " + column_list + " FROM " + source_name);
+			run("INSERT INTO " + target_name + " BY NAME SELECT * FROM " + source_name);
 			// This migration owns the old control table. SQL DROP would re-enter
 			// source cleanup while both registries exist in this transaction, and
 			// discovery would mistake that intermediate state for ambiguity. Use
@@ -442,10 +430,6 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 	}
 }
 
-vector<MetadataLocation> RefreshMetadata::MetadataLocations(Connection &con, const string &table) {
-	return MetadataLocator::All(con, table);
-}
-
 vector<MetadataLocation> RefreshMetadata::MetadataLocations(ClientContext &context, const string &table) {
 	vector<MetadataLocation> locations;
 	for (auto &database : DatabaseManager::Get(context).GetDatabases(context)) {
@@ -476,7 +460,7 @@ vector<MetadataLocation> RefreshMetadata::MetadataLocations(ClientContext &conte
 
 vector<string> RefreshMetadata::MetadataTables(Connection &con, const string &table) {
 	vector<string> tables;
-	for (auto &location : MetadataLocations(con, table)) {
+	for (auto &location : MetadataLocator::All(con, table)) {
 		tables.push_back(SqlUtils::FullName(location.catalog, location.schema, table));
 	}
 	return tables;
@@ -671,16 +655,11 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 	auto result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
-		if (result->HasError()) {
-			auto locus = con.Query("SELECT current_database(), current_schema()");
-			auto locus_text = !locus->HasError() && locus->RowCount() > 0
-			                      ? " (connection locus " + locus->Collection().GetValue(0, 0).ToString() + "." +
-			                            locus->Collection().GetValue(1, 0).ToString() + ")"
-			                      : "";
-			throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
-			                      result->GetError());
-		}
 		auto location = CurrentLocation(con);
+		if (result->HasError()) {
+			throw ParserException("Could not read IVM metadata for materialized view '%s' (connection locus %s): %s",
+			                      view_name, location.DisplayName(), result->GetError());
+		}
 		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
 		                       "view_catalog and view_schema in %s",
 		                       view_name, location.Table(openivm::VIEWS_TABLE));

@@ -52,9 +52,8 @@ public:
 	// In autocommit mode, move a catalog's metadata into the configured schema and, for a new
 	// materialized view, create that schema. Other metadata objects keep their placement.
 	static void PrepareMetadataSchema(ClientContext &context, const string &view_catalog, bool create_schema);
-	// Every native metadata location containing `table`, and the qualified table names.
-	static vector<MetadataLocation> MetadataLocations(Connection &con, const string &table);
-	// Caller-snapshot discovery includes uncommitted schemas and registries.
+	// Every native metadata location containing `table`; caller-snapshot discovery includes uncommitted schemas and
+	// registries.
 	static vector<MetadataLocation> MetadataLocations(ClientContext &context, const string &table);
 	static vector<string> MetadataTables(Connection &con, const string &table);
 
