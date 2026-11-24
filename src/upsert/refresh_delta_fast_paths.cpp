@@ -128,6 +128,7 @@ static void ApplyChangeStats(DeltaActivityResult::Source &source, const RefreshM
 	source.ok = stats.ok;
 	if (stats.ok) {
 		source.pending_rows = stats.total;
+		source.delete_rows = stats.deletes;
 		source.has_changes = stats.total > 0;
 		source.has_deletes = stats.deletes > 0;
 	}
@@ -173,19 +174,22 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 	AddDeltaSource(summary, std::move(source));
 }
 
-static void AccumulateStandardDeltaSummary(DeltaActivityResult &summary, RefreshMetadata &metadata,
-                                           const string &view_name, const string &delta_table,
-                                           const string &view_catalog_name, const string &view_schema_name) {
-	summary.all_ducklake = false;
+// A native source, with the physical delta and watermark its change stats are read from.
+static DeltaActivityResult::Source DescribeStandardDeltaSource(RefreshMetadata &metadata, const string &view_name,
+                                                               const string &delta_table,
+                                                               const string &view_catalog_name,
+                                                               const string &view_schema_name) {
 	DeltaActivityResult::Source source;
 	source.delta_table_name = delta_table;
-	source.source_table_name = BaseTableNameFromDeltaKey(delta_table);
-	// An empty watermark yields unverified stats.
-	ApplyChangeStats(
-	    source, metadata.GetStandardDeltaChangeStats(
-	                metadata.ResolveDeltaQualifiedName(view_name, delta_table, view_catalog_name, view_schema_name),
-	                metadata.GetLastUpdate(view_name, delta_table)));
-	AddDeltaSource(summary, std::move(source));
+	auto loc = metadata.GetSourceLocation(view_name, delta_table, view_catalog_name, view_schema_name);
+	// A qualified key (sources with colliding names) still names the unqualified base table.
+	source.source_table_name = BaseTableNameFromDeltaKey(loc.table_name);
+	source.catalog_name = loc.catalog_name;
+	source.schema_name = loc.schema_name;
+	source.delta_table_sql =
+	    metadata.ResolveDeltaQualifiedName(view_name, delta_table, view_catalog_name, view_schema_name);
+	source.last_update = metadata.GetLastUpdateValue(view_name, delta_table);
+	return source;
 }
 
 static bool IsInsertOnlyDeltaSummary(const DeltaActivityResult &summary, const vector<string> &delta_table_names) {
@@ -213,14 +217,34 @@ DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connecti
                                              const string &attached_db_schema_name) {
 	DeltaActivityResult summary;
 	summary.has_join = metadata.HasJoin(view_name) || delta_table_names.size() > 1;
+	// Native deltas are counted together, in one statement; DuckLake sources are probed per snapshot range.
+	vector<DeltaActivityResult::Source> standard_sources;
+	vector<pair<string, string>> standard_deltas;
+	for (auto &dt : delta_table_names) {
+		if (!metadata.IsDuckLakeTable(view_name, dt)) {
+			standard_sources.push_back(
+			    DescribeStandardDeltaSource(metadata, view_name, dt, view_catalog_name, view_schema_name));
+			auto &last_update = standard_sources.back().last_update;
+			// An empty watermark yields unverified stats.
+			standard_deltas.emplace_back(standard_sources.back().delta_table_sql,
+			                             last_update.IsNull() ? "" : last_update.ToString());
+		}
+	}
+	auto standard_stats = metadata.GetStandardDeltaChangeStats(standard_deltas);
+	idx_t standard_index = 0;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			AccumulateDuckLakeDeltaSummary(summary, metadata, con, view_name, dt, view_catalog_name, view_schema_name,
 			                               attached_db_catalog_name, attached_db_schema_name);
-		} else {
-			AccumulateStandardDeltaSummary(summary, metadata, view_name, dt, view_catalog_name, view_schema_name);
+			continue;
 		}
+		summary.all_ducklake = false;
+		auto &source = standard_sources[standard_index];
+		ApplyChangeStats(source, standard_stats[standard_index++]);
+		AddDeltaSource(summary, std::move(source));
 	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] Delta activity of %s: %zu of %zu sources changed\n", view_name.c_str(),
+	                    summary.active_delta_table_names.size(), delta_table_names.size());
 	return summary;
 }
 

@@ -17,6 +17,7 @@ namespace duckdb {
 
 class BaseTableRef;
 class SelectStatement;
+class TableCatalogEntry;
 
 struct SessionLocation {
 	string catalog;
@@ -101,8 +102,14 @@ public:
 	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
 	/// The connection's current_database(), or empty when it cannot be read.
 	static string CurrentDatabase(Connection &con);
+	/// The connection's current_database(), read without a statement; throws CatalogException(format, error)
+	/// when there is none (for example, the default database was detached).
+	static string RequireCurrentDatabase(Connection &con, const string &format);
 	/// The caller's default catalog and schema; an unset session catalog is the default database.
 	static SessionLocation SessionDefaultLocation(ClientContext &context);
+	/// Rows in a native table's storage, without a COUNT(*) statement. An estimate: it includes deleted
+	/// rows not yet vacuumed. Invalid for tables of other catalogs (DuckLake, attached SQL databases).
+	static optional_idx StorageRowCount(TableCatalogEntry &table);
 	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.
 	static string DeleteViewRowsSQL(const string &table, const string &view_name, const string &column = "view_name");
 	static bool IsDelta(const string &name);

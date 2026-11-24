@@ -85,15 +85,8 @@ static DuckLakeSourcePins PinDuckLakeSources(Connection &con, RefreshMetadata &m
 		return pins;
 	}
 	// Watermark placeholders may name any attached DuckLake catalog, so pin all of them.
-	auto catalogs = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
-	if (catalogs->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "OpenIVM could not list DuckLake catalogs: " + catalogs->GetError());
-	}
-	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-		if (!catalogs->Collection().GetValue(0, row).IsNull()) {
-			auto catalog = catalogs->Collection().GetValue(0, row).ToString();
-			pins.snapshots[catalog] = metadata.GetCurrentDuckLakeSnapshot(catalog);
-		}
+	for (auto &catalog : MetadataLocator::AttachedCatalogs(*con.context->db, "ducklake")) {
+		pins.snapshots[catalog.name] = metadata.GetCurrentDuckLakeSnapshot(catalog.name);
 	}
 	// Resolved after the snapshots, so a drop or recreate after the pin shows up as a change.
 	for (auto &source : pins.sources) {
@@ -189,9 +182,6 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	RefreshMetadata probe_meta(probe_con);
 	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
 	MetadataLocator::RequireWritable(metadata_location, "refresh materialized view '" + display_name + "'");
-	// Before anything reads source deltas, including the empty-delta shortcut below.
-	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
-	                                      attached_db_catalog_name, attached_db_schema_name);
 	// Metadata stored outside the MV's database cannot commit with its data. The split
 	// protocol commits (1) the interruption marker, (2) the MV data, (3) the watermarks
 	// with the marker cleared. A failure at any point leaves the marker set, so the next
@@ -200,6 +190,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	bool split_native = split_protocol && probe_meta.IsNativeCatalog(view_catalog_name);
 	// Remote metadata can be shared by several clients; only the lease holder refreshes.
 	RefreshLease lease(context, metadata_location, vn);
+	// Every later metadata read of this attempt, including SQL generation, is served from one read.
+	// It follows the lease: until then another client sharing remote metadata may refresh or replace
+	// the view (cascaded nodes reach this point without a lease from RefreshNodeWithHooks).
+	auto view_record = probe_meta.LoadView(vn);
+	// Before anything reads source deltas, including the empty-delta shortcut below.
+	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
+	                                      attached_db_catalog_name, attached_db_schema_name);
 	bool was_interrupted = false;
 	int64_t refresh_epoch = 0;
 	if (split_protocol) {
@@ -340,7 +337,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
-		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr);
+		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr, view_record);
 		// The ranked rowid program is compiled with the primary one, before refresh_in_progress is set.
 		// It only runs when DuckLake reports that the exhaustive tuple delete removed more rows than the
 		// negative delta requested, and defers the same cleanup, so it never writes outside the data
@@ -376,7 +373,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs. Keep the
 		// established guard while rejecting unexpectedly recursive generated plans.
-		exec_con.Query("SET max_expression_depth = 10000");
+		Settings::Set<MaxExpressionDepthSetting>(*exec_con.context, SetScope::SESSION, Value::UBIGINT(10000));
 		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
 		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
 		// overflow in the optimizer before the refresh query runs.
@@ -995,8 +992,7 @@ static vector<string> PipelineTargets(const FunctionParameters &parameters) {
 static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const string &view_catalog) {
 	auto catalog = view_catalog;
 	if (catalog.empty()) {
-		auto result = SqlUtils::QueryOrThrow(con, "SELECT current_database()", "Cannot resolve after-hook catalog: %s");
-		catalog = result->Collection().GetValue(0, 0).ToString();
+		catalog = SqlUtils::RequireCurrentDatabase(con, "Cannot resolve after-hook catalog: %s");
 	}
 	for (auto &statement : con.ExtractStatements(hook_sql)) {
 		auto prepared = con.Prepare(std::move(statement));
@@ -1115,10 +1111,8 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	RefreshMetadata::PrepareMetadataSchema(context, target.view_catalog_name, false);
 	RefreshMetadata::UseCatalog(context, con, target.view_catalog_name);
 	// Only external data catalogs need a separate native metadata transaction.
-	auto metadata_catalog =
-	    SqlUtils::QueryOrThrow(con, "SELECT current_database()", "OpenIVM could not resolve metadata catalog: %s");
-	target.cross_system = !target.view_catalog_name.empty() &&
-	                      metadata_catalog->Collection().GetValue(0, 0).ToString() != target.view_catalog_name;
+	auto metadata_catalog = SqlUtils::RequireCurrentDatabase(con, "OpenIVM could not resolve metadata catalog: %s");
+	target.cross_system = !target.view_catalog_name.empty() && metadata_catalog != target.view_catalog_name;
 
 	// Check cascade mode
 	auto cascade_mode = StringUtil::Lower(SqlUtils::GetStringSetting(context, "openivm_cascade_refresh", "downstream"));

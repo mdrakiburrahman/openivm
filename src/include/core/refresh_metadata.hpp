@@ -5,6 +5,8 @@
 #include "core/metadata_location.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
+
+#include <atomic>
 #include "core/openivm_constants.hpp"
 
 namespace duckdb {
@@ -16,9 +18,37 @@ class TransactionalMVMetadataState;
 // Wraps all raw SQL queries to openivm_views and openivm_delta_tables
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class RefreshMetadata {
+public:
+	// One view's openivm_views row (without its canonical plan) and openivm_delta_tables rows, read with a
+	// single statement. Refresh compilation reads dozens of these columns, each of which would otherwise be
+	// a planned statement. Columns written while a refresh runs (the interruption marker, the after-hook
+	// flag, the lease epoch, schedules and pending-row estimates) are always read live. One refresh attempt
+	// shares a single record between the attempt, SQL generation and the planning connection: a metadata
+	// write through any RefreshMetadata serving it invalidates it for all of them, and their later reads go
+	// to SQL. The refresh program's own writes run after the attempt's last metadata read.
+	struct ViewRecord {
+		string view_name;
+		case_insensitive_map_t<Value> view;
+		vector<case_insensitive_map_t<Value>> deltas;
+		mutable std::atomic<bool> invalidated {false};
+	};
+
+private:
 	Connection &con;
 	// Explicit refreshes plan using a helper but execute at the caller's DuckLake snapshot.
 	optional_ptr<ClientContext> snapshot_context;
+	shared_ptr<const ViewRecord> view_record;
+	// The record serving reads of `view_name`, or null when they go to SQL.
+	const ViewRecord *Record(const string &view_name) const;
+	// The record's openivm_delta_tables row of `table_name` (null when it has none). `answered` is false
+	// when the record cannot answer for `column`, which then has to be read with SQL.
+	const case_insensitive_map_t<Value> *RecordDelta(const string &view_name, const string &table_name,
+	                                                 const string &column, bool &answered) const;
+	// The record's values of `columns` for the view row (`table_name` empty) or a delta row; false when
+	// the record cannot answer all of them. A missing delta row reads as NULLs, like SQL without a row.
+	bool RecordValues(const string &view_name, const string &table_name, const vector<string> &columns,
+	                  vector<Value> &values) const;
+	static RefreshType ParseViewType(const string &view_name, const Value &type_value);
 	Value ReadViewValue(const string &view_name, const string &column);
 	string ReadViewString(const string &view_name, const string &column);
 	bool ReadViewBool(const string &view_name, const string &column);
@@ -30,6 +60,26 @@ public:
 	explicit RefreshMetadata(Connection &con, optional_ptr<ClientContext> snapshot_context = nullptr)
 	    : con(con), snapshot_context(snapshot_context) {
 	}
+
+	// Reads `view_name`'s record through this connection and serves later reads of that view from it.
+	// Returns null (reads keep going to SQL) when the view is not registered or the record is unreadable.
+	shared_ptr<const ViewRecord> LoadView(const string &view_name);
+	// Serve reads of the record's view from `record` (read earlier in the same refresh); null clears it.
+	void UseView(shared_ptr<const ViewRecord> record);
+	// Every method that immediately writes openivm_views or openivm_delta_tables columns a record serves
+	// (anything but the volatile columns) must call this first. Writes emitted as refresh program text
+	// (watermark and DuckLake checkpoint UPDATEs) are exempt: they run after the attempt's last read.
+	void InvalidateView();
+	// Make `record` available to the optimizer rules planning ComputeDelta on `context` (a helper
+	// connection OpenIVM owns for one refresh), and look it up there.
+	static void RegisterPlanningView(ClientContext &context, shared_ptr<const ViewRecord> record);
+	static shared_ptr<const ViewRecord> PlanningView(ClientContext &context, const string &view_name);
+	// Whether the transaction of `context` can hold metadata changes a fresh helper connection cannot see.
+	// A helper connection OpenIVM opened to plan a refresh only reads committed metadata.
+	static bool TransactionMayHoldMetadata(ClientContext &context);
+	static void MarkPlanningHelper(ClientContext &context);
+	// The stored publication query, or NULL when the view has none or it cannot be read.
+	Value GetPublishedQuery(const string &view_name);
 
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.
 	// Within that catalog, metadata stays in the schema that already holds it. New metadata uses
@@ -94,6 +144,7 @@ public:
 
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
+	Value GetLastUpdateValue(const string &view_name, const string &table_name);
 
 	// Every metadata location that may consume delta tables (see MetadataLocator::All).
 	static vector<MetadataLocation> MetadataLocations(Connection &con);
@@ -189,6 +240,9 @@ public:
 	};
 
 	DeltaChangeStats GetStandardDeltaChangeStats(const string &delta_table_sql, const string &last_update);
+	// The stats of several native deltas in one statement, in input order. An empty watermark, or a
+	// failure of the combined statement, falls back to GetStandardDeltaChangeStats per delta.
+	vector<DeltaChangeStats> GetStandardDeltaChangeStats(const vector<pair<string, string>> &deltas_and_watermarks);
 
 	vector<string> GetTableColumns(const string &catalog_name, const string &schema_name, const string &table_name);
 	bool TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,
