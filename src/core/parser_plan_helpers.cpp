@@ -3753,8 +3753,6 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 	meta.sql += (meta.sql.empty() ? "" : "\n") + sql;
 	meta.inner_tables.push_back(inner_identity);
 	meta.inner_keys.push_back(inner_col);
-	meta.pres_tables.push_back(pres_identity);
-	meta.pres_keys.push_back(pres_col);
 	for (auto &col : preserved_cols) {
 		if (std::find(meta.preserved_cols.begin(), meta.preserved_cols.end(), col) == meta.preserved_cols.end()) {
 			meta.preserved_cols.push_back(col);
@@ -3770,8 +3768,8 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 // COUNT(intermediate_key) undercounted for 4+ table chains: with c ⟕ o ⟕ l ⟕ s, deleting an order's
 // last line dropped that order from COUNT(o.oid) because the `⟕ l` level had no correction.
 //
-// The per-level SQL fragments are concatenated and the two source identities per level are stored as
-// index-aligned arrays, so refresh can resolve each level's placeholders independently (a regular
+// The per-level SQL fragments are concatenated and each level's inner source identity is stored in
+// index-aligned arrays, so refresh can resolve each level's placeholder independently (a regular
 // table reads its delta table, a DuckLake table reads snapshot insertions/deletions).
 RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(Binder &binder, const CreateMVPlanFacts &facts,
                                                                       const vector<string> &output_names,

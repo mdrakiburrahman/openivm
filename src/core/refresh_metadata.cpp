@@ -2156,8 +2156,6 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoin
 	io.Arr("preserved_cols", m.preserved_cols);
 	io.Arr("inner_tables", m.inner_tables);
 	io.Arr("inner_keys", m.inner_keys);
-	io.Arr("pres_tables", m.pres_tables);
-	io.Arr("pres_keys", m.pres_keys);
 }
 
 template <class T>

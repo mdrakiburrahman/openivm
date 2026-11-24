@@ -518,10 +518,6 @@ public:
 		// them to build the right row source per storage backend (delta table vs DuckLake snapshots).
 		vector<string> inner_tables; // qualified base-table names of the inner (null-supplying) sides
 		vector<string> inner_keys;   // join key columns on the inner sides
-		// Preserved-side identities: recorded for inspection only; refresh resolves preserved rows
-		// through LJSEC_OLD_* relation placeholders instead.
-		vector<string> pres_tables; // qualified base-table names of the preserved sides
-		vector<string> pres_keys;   // join key columns on the preserved sides
 	};
 
 	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);
