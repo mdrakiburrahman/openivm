@@ -227,19 +227,15 @@ static vector<string> DistinctOnGroupColumns(const CreateMVPlanFacts &facts, con
 	for (auto &target : distinct.distinct_targets) {
 		auto binding = target->Cast<BoundColumnRefExpression>().Binding();
 		for (auto projection = spine.projections.rbegin(); projection != spine.projections.rend(); ++projection) {
-			bool found = false;
-			for (idx_t i = 0; i < (*projection)->expressions.size(); i++) {
-				auto &expression = *(*projection)->expressions[i];
-				if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    expression.Cast<BoundColumnRefExpression>().Binding() == binding) {
-					binding = ColumnBinding((*projection)->table_index, ProjectionIndex(i));
-					found = true;
-					break;
-				}
-			}
-			if (!found) {
+			auto &expressions = (*projection)->expressions;
+			auto match = std::find_if(expressions.begin(), expressions.end(), [&](const unique_ptr<Expression> &e) {
+				return e->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				       e->Cast<BoundColumnRefExpression>().Binding() == binding;
+			});
+			if (match == expressions.end()) {
 				return {};
 			}
+			binding = ColumnBinding((*projection)->table_index, ProjectionIndex(match - expressions.begin()));
 		}
 		auto output = std::find(outputs.begin(), outputs.end(), binding);
 		if (output == outputs.end() || idx_t(output - outputs.begin()) >= output_names.size()) {
@@ -566,21 +562,13 @@ bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &outpu
 
 	auto spine = DistinctSpine(facts);
 	auto *node = spine.bottom;
-	if (!spine.projections.empty()) {
+	if (!spine.projections.empty() || !node) {
 		return false;
 	}
-	if (node && node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
-		return true;
-	}
-	if (!node || node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		return false;
-	}
-	for (auto &name : output_names) {
-		if (name == openivm::DISTINCT_COUNT_COL) {
-			return true;
-		}
-	}
-	return false;
+	// A rewritten DISTINCT is an aggregate that carries the DISTINCT support count.
+	return node->type == LogicalOperatorType::LOGICAL_DISTINCT ||
+	       (node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+	        std::find(output_names.begin(), output_names.end(), openivm::DISTINCT_COUNT_COL) != output_names.end());
 }
 
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
