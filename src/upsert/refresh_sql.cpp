@@ -1126,7 +1126,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			bool have_ljsec = source_has_left_join && !source_has_full_outer &&
 			                  metadata.GetLeftJoinSecondaryMeta(view_name, ljsec) && !ljsec.sql.empty();
 			bool force_lj_group_recompute = source_has_left_join && !source_has_full_outer && !have_ljsec;
-			// Resolve the two delta row-source placeholders. Regular tables read their delta table;
+			// Resolve the per-level inner delta placeholders. Regular tables read their delta table;
 			// DuckLake tables have none and must read ducklake_table_insertions/deletions between the
 			// last-refreshed and current snapshot -- IDs that exist only here, not at CREATE time.
 			if (have_ljsec) {
@@ -1140,18 +1140,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					if (cached != lj_delta_source_cache.end()) {
 						return cached->second;
 					}
-					string qkey = SqlUtils::QuoteIdentifier(key_col);
-					optional_ptr<RefreshMetadata::DeltaSource> source;
+					// Empty when the source cannot be resolved.
+					auto &result = lj_delta_source_cache[cache_key];
 					auto metadata_key = ResolveDeltaMetadataKey(metadata, view_name, base_table, delta_table_names);
-					for (auto &candidate : lj_sources) {
-						if (StringUtil::CIEquals(candidate.table_name, metadata_key)) {
-							source = &candidate;
-							break;
-						}
-					}
-					if (!source) {
-						lj_delta_source_cache[cache_key] = "";
-						return "";
+					auto source = std::find_if(lj_sources.begin(), lj_sources.end(),
+					                           [&](const RefreshMetadata::DeltaSource &entry) {
+						                           return StringUtil::CIEquals(entry.table_name, metadata_key);
+					                           });
+					if (source == lj_sources.end()) {
+						return result;
 					}
 					string delta_name = source->table_name;
 					string relation;
@@ -1167,8 +1164,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						}
 						int64_t cur_snap = snapshot->second;
 						if (source->catalog_name.empty() || last_snap < 0 || cur_snap < 0) {
-							lj_delta_source_cache[cache_key] = "";
-							return "";
+							return result;
 						}
 						relation = BuildDuckLakeSignedDeltaRelation(
 						    {source->catalog_name, source->schema_name,
@@ -1183,11 +1179,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						               SqlUtils::EscapeValue(delta_name) + "')";
 					}
 					// Insertions carry weight +1 and deletions -1.
-					string projection =
-					    key_col.empty() ? "*" : qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) + " AS __m";
-					string result = "(SELECT " + projection + " FROM " + relation + where_clause + ")";
-					lj_delta_source_cache[cache_key] = result;
-					return result;
+					string projection = key_col.empty() ? "*"
+					                                    : SqlUtils::QuoteIdentifier(key_col) + " AS __k, " +
+					                                          string(openivm::MULTIPLICITY_COL) + " AS __m";
+					return result = "(SELECT " + projection + " FROM " + relation + where_clause + ")";
 				};
 				// One inner-delta placeholder PER LEFT JOIN level; identities are index-aligned arrays.
 				auto &lj_it = ljsec.inner_tables;
