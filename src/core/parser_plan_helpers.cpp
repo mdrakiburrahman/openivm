@@ -1797,12 +1797,6 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu DISTINCT aggregate group expressions\n", meta.group_inputs.size());
 }
 
-static void AddUniqueGroupNames(vector<string> &group_names, const vector<string> &new_names) {
-	for (auto &name : new_names) {
-		AddUniqueCI(group_names, name);
-	}
-}
-
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
 	vector<string> group_names;
 	auto *top_projection = facts.first_projection;
@@ -1833,16 +1827,15 @@ vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, c
 vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                                bool include_first_aggregate) {
 	vector<string> group_names;
-	bool seen_aggregate = false;
-	for (auto *agg_ptr : facts.aggregates) {
-		auto &agg = *agg_ptr;
-		bool include_this = include_first_aggregate || seen_aggregate;
-		seen_aggregate = true;
-		if (include_this && !agg.groups.empty()) {
-			vector<string> nested_names;
-			if (FindGroupColumns(facts, agg.group_index, agg.groups.size(), output_names, nested_names)) {
-				AddUniqueGroupNames(group_names, nested_names);
-			}
+	for (idx_t i = include_first_aggregate ? 0 : 1; i < facts.aggregates.size(); i++) {
+		auto &agg = *facts.aggregates[i];
+		vector<string> nested_names;
+		// FindGroupColumns adds names only when it finds a match.
+		if (!agg.groups.empty()) {
+			FindGroupColumns(facts, agg.group_index, agg.groups.size(), output_names, nested_names);
+		}
+		for (auto &name : nested_names) {
+			AddUniqueCI(group_names, name);
 		}
 	}
 	return group_names;
