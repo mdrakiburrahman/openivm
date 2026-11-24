@@ -114,7 +114,7 @@ private:
 static void EnterDeltaWritePhase(ClientContext &context) {
 	// Normally a no-op: the statement already took the gate before execution (see
 	// RefreshInsertRule and TransactionalMVLockState::OnExecutePrepared).
-	TransactionalMVLockState::Get(context).AcquireMutationLock();
+	TransactionalMVLockState::Get(context).AcquireMutationLock(true);
 }
 
 class TransactionalDeltaAppendState {
@@ -1179,8 +1179,20 @@ void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op) {
 		return;
 	}
 	if (dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op) || dynamic_cast<PhysicalActionDeltaCapture *>(&op)) {
-		TransactionalMVLockState::Get(context).AcquireMutationLock();
+		TransactionalMVLockState::Get(context).AcquireMutationLock(true);
 		return;
+	}
+	optional_ptr<TableCatalogEntry> target;
+	if (op.type == PhysicalOperatorType::INSERT) {
+		target = op.Cast<PhysicalInsert>().insert_table.get();
+	} else if (op.type == PhysicalOperatorType::UPDATE) {
+		target = op.Cast<PhysicalUpdate>().tableref;
+	} else if (op.type == PhysicalOperatorType::DELETE_OPERATOR) {
+		target = op.Cast<PhysicalDelete>().tableref;
+	}
+	if (target && TransactionalMVLockState::IsOwnershipRegistry(target->name.GetIdentifierName())) {
+		// A cached plan writing an ownership registry runs without the optimizer rule.
+		TransactionalMVLockState::Get(context).MarkOwnershipMetadataWrite();
 	}
 	if (op.type == PhysicalOperatorType::MERGE_INTO) {
 		for (auto &action : op.Cast<PhysicalMergeInto>().actions) {

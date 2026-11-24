@@ -953,6 +953,9 @@ string RefreshMetadata::SourceGeneration(ClientContext &context, const string &c
 // local uniqueness bookkeeping, including DROP -> CREATE in one transaction.
 static void DeleteRegistryRows(ClientContext &context, TableCatalogEntry &entry,
                                const std::function<bool(DataChunk &, idx_t)> &matches) {
+	if (TransactionalMVLockState::IsOwnershipRegistry(entry.name.GetIdentifierName())) {
+		TransactionalMVLockState::Get(context).MarkOwnershipMetadataWrite();
+	}
 	auto &storage = entry.GetStorage();
 	auto &transaction = DuckTransaction::Get(context, entry.catalog);
 	vector<StorageIndex> columns;

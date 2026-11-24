@@ -167,7 +167,7 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
 	catalog.Alter(context, *delta_alter);
 }
 
-static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
+static TableCatalogEntry &GetDMLTarget(LogicalOperator &dml) {
 	optional_ptr<TableCatalogEntry> table;
 	switch (dml.type) {
 	case LogicalOperatorType::LOGICAL_INSERT:
@@ -185,6 +185,11 @@ static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
 	default:
 		throw InternalException("OpenIVM expected a source DML operator");
 	}
+	return *table;
+}
+
+static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
+	optional_ptr<TableCatalogEntry> table = GetDMLTarget(dml);
 	if (table->name.GetIdentifierName().empty() ||
 	    IncrementalTableNames::IsMaintenanceTable(table->name.GetIdentifierName()) || !table->catalog.IsDuckCatalog()) {
 		return nullptr;
@@ -537,6 +542,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			wrap_generation();
 			return;
 		}
+		// Schema evolution rewrites the delta: treat it as an ownership change.
+		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
 		auto delta_locus =
 		    std::make_pair(delta_entry->schema.name.GetIdentifierName(), delta_entry->name.GetIdentifierName());
@@ -661,6 +668,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 	if (dml->type == LogicalOperatorType::LOGICAL_UPDATE) {
 		PreserveGroupRepresentatives(dml->Cast<LogicalUpdate>());
+	}
+	if (TransactionalMVLockState::IsOwnershipRegistry(GetDMLTarget(*dml).name.GetIdentifierName())) {
+		TransactionalMVLockState::Get(input.context).MarkOwnershipMetadataWrite();
 	}
 	auto table = GetNativeDMLTable(*dml);
 	if (!table) {
