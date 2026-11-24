@@ -160,19 +160,6 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 		return materialized;
 	};
 	string error;
-	// Databases created before the archive existed get its tables on first use.
-	auto resolved_schema = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
-	if (!con.TableInfo(Identifier(catalog), Identifier(resolved_schema),
-	                   Identifier(openivm::COMPILED_PROGRAMS_TABLE)) ||
-	    !con.TableInfo(Identifier(catalog), Identifier(resolved_schema),
-	                   Identifier(openivm::COMPILED_STATEMENTS_TABLE))) {
-		for (auto &ddl : CompiledSQLArchiveSchemaDDL(catalog, schema)) {
-			auto created = con.Query(ddl);
-			if (created->HasError()) {
-				return created->GetError();
-			}
-		}
-	}
 	auto programs = ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE);
 	auto statements = ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE);
 	Value view_name(program.view_name);

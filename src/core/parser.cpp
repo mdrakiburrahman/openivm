@@ -2635,16 +2635,10 @@ static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo 
 
 	auto tracked = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
 	                         " WHERE view_name = '" + SqlUtils::EscapeValue(view_key) + "'");
-	bool legacy_identity = tracked->HasError();
-	if (legacy_identity) {
-		tracked = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		                    SqlUtils::EscapeValue(view_key) + "'");
-	}
 	if (tracked->HasError() || tracked->RowCount() == 0) {
 		return program;
 	}
-	if (!legacy_identity && !tracked->Collection().GetValue(0, 0).IsNull() &&
-	    !tracked->Collection().GetValue(1, 0).IsNull()) {
+	if (!tracked->Collection().GetValue(0, 0).IsNull() && !tracked->Collection().GetValue(1, 0).IsNull()) {
 		if (!StringUtil::CIEquals(tracked->Collection().GetValue(0, 0).ToString(), catalog_name) ||
 		    !StringUtil::CIEquals(tracked->Collection().GetValue(1, 0).ToString(), schema_name)) {
 			return program;

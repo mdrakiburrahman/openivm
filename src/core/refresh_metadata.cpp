@@ -518,37 +518,17 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 }
 
 string RefreshMetadata::GetViewSQLName(const string &view_key) {
-	// Metadata written before SQL names were stored separately has no view_sql_name column (see FindViewKey).
-	auto result = con.Query("SELECT view_sql_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_key) + "'");
-	if (result->HasError()) {
-		// Only the missing view_sql_name column (a binder error) is legacy metadata; anything else is a real failure.
-		if (result->GetErrorObject().Type() == ExceptionType::BINDER) {
-			return view_key;
-		}
-		throw InvalidInputException("Could not read IVM metadata column 'view_sql_name' for materialized view '%s': %s",
-		                            view_key, result->GetError());
-	}
-	if (result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
-		return view_key;
-	}
-	auto name = result->Collection().GetValue(0, 0).ToString();
+	auto name = ReadViewString(view_key, "view_sql_name");
 	return name.empty() ? view_key : name;
 }
 
 string RefreshMetadata::FindViewKey(const string &catalog, const string &schema, const string &name) {
-	auto query = [&](const string &name_expression) {
-		return con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
-		                 SqlUtils::IdentifierEqualsSQL(name_expression, Value(name).ToSQLString()) + " AND " +
-		                 SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(catalog).ToSQLString() + ")",
-		                                               Value(catalog).ToSQLString()) +
-		                 " AND " +
-		                 SqlUtils::IdentifierEqualsSQL("COALESCE(view_schema, 'main')", Value(schema).ToSQLString()));
-	};
-	auto result = query("COALESCE(view_sql_name, view_name)");
-	if (result->HasError()) {
-		result = query("view_name"); // Metadata written before SQL names were stored separately.
-	}
+	auto result = con.Query(
+	    "SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
+	    SqlUtils::IdentifierEqualsSQL("COALESCE(view_sql_name, view_name)", Value(name).ToSQLString()) + " AND " +
+	    SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(catalog).ToSQLString() + ")",
+	                                  Value(catalog).ToSQLString()) +
+	    " AND " + SqlUtils::IdentifierEqualsSQL("COALESCE(view_schema, 'main')", Value(schema).ToSQLString()));
 	if (result->HasError() || !result->RowCount()) {
 		return "";
 	}
@@ -593,10 +573,6 @@ string RefreshMetadata::ResolveViewName(const string &view_name, const string &c
 	auto matches =
 	    con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
 	              SqlUtils::IdentifierEqualsSQL("COALESCE(view_sql_name, view_name)", Value(view_name).ToSQLString()));
-	if (matches->HasError()) {
-		matches = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
-		                    SqlUtils::IdentifierEqualsSQL("view_name", Value(view_name).ToSQLString()));
-	}
 	if (!matches->HasError() && matches->RowCount() > 1) {
 		throw CatalogException("Ambiguous materialized view '%s'; use catalog.schema.view", view_name);
 	}
@@ -1208,23 +1184,12 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	loc.schema_name = fallback_schema;
 	string delta_schema;
 	string delta_table_name;
-	auto filter = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	              SqlUtils::EscapeValue(table_name) + "'";
-	auto result = con.Query("SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) + filter);
-	if (result->HasError()) {
-		// Metadata written before physical delta names were stored.
-		result = con.Query("SELECT source_catalog, source_schema, delta_schema, NULL FROM " +
-		                   string(openivm::DELTA_TABLES_TABLE) + filter);
-	}
-	if (result->HasError()) {
-		result = con.Query("SELECT source_catalog, source_schema, NULL, NULL FROM " +
-		                   string(openivm::DELTA_TABLES_TABLE) + filter);
-	}
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM source location for materialized view '%s' and table '%s': %s",
-		                            view_name, table_name, result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
+	        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+	        "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'",
+	    "Could not read IVM source location for materialized view '%s' and table '%s': %s", view_name, table_name);
 	if (result->RowCount() > 0) {
 		if (!result->Collection().GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->Collection().GetValue(0, 0).ToString();
@@ -1295,23 +1260,16 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 	auto owner = PublishedSourceViewName(table_name);
 	auto matches = [&](Connection &reader, const MetadataLocation &location, const string &views_table) {
 		// An MV owns its deltas even when no child consumes them.
-		auto query = [&](const string &schema_expression) {
-			return reader.Query(
-			    "SELECT 1 FROM " + views_table + " WHERE view_name=" + Value(owner).ToSQLString() + " AND " +
-			    SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(location.catalog).ToSQLString() + ")",
-			                                  Value(source.catalog_name).ToSQLString()) +
-			    " AND " +
-			    SqlUtils::IdentifierEqualsSQL("COALESCE(" + schema_expression + ", " +
-			                                      Value(source.schema_name).ToSQLString() + ")",
-			                                  Value(source.schema_name).ToSQLString()));
-		};
-		auto result = query("internal_schema, view_schema");
-		if (result->HasError()) {
-			result = query("view_schema"); // Metadata written before internal schemas existed.
-		}
-		if (result->HasError()) {
-			throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
-		}
+		auto result = SqlUtils::QueryOrThrow(
+		    reader,
+		    "SELECT 1 FROM " + views_table + " WHERE view_name=" + Value(owner).ToSQLString() + " AND " +
+		        SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(location.catalog).ToSQLString() + ")",
+		                                      Value(source.catalog_name).ToSQLString()) +
+		        " AND " +
+		        SqlUtils::IdentifierEqualsSQL("COALESCE(internal_schema, view_schema, " +
+		                                          Value(source.schema_name).ToSQLString() + ")",
+		                                      Value(source.schema_name).ToSQLString()),
+		    "Cannot resolve delta owner for '%s': %s", source.table_name);
 		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Checked MV owner in %s with transaction replay=%d\n",
 		                    views_table.c_str(), transaction_state ? 1 : 0);
 		return result->RowCount() != 0;
@@ -1322,23 +1280,12 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
-	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "'";
-	auto result = con.Query(
-	    "SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, delta_table_name" + filter);
-	if (result->HasError()) {
-		// Metadata written before physical delta names were stored.
-		result =
-		    con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, NULL" + filter);
-	}
-	if (result->HasError()) {
-		result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, NULL, NULL" + filter);
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, delta_table_name FROM " +
+	        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
+	    "Could not read IVM delta source metadata for materialized view '%s': %s", view_name);
 	vector<DeltaSource> sources;
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM delta source metadata for materialized view '%s': %s",
-		                            view_name, result->GetError());
-	}
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		DeltaSource source;
 		source.table_name = result->Collection().GetValue(0, row).ToString();
@@ -1576,26 +1523,20 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	}
 	// Read the same source metadata used by single-view cascades, not the optional matcher edges.
 	// A child reads the parent's internal tables, which may live in the parent's internal schema.
-	auto edge_query = [&](const string &parent_schema) {
-		return con.Query("SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
-		                 string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" +
-		                 string(openivm::DELTA_PREFIX) + "' || p.view_name OR d.table_name = '" +
-		                 string(openivm::DATA_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
-		                 string(openivm::VISIBLE_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
-		                 string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
-		                 "' || p.view_name)"
-		                 " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR " +
-		                 SqlUtils::IdentifierEqualsSQL("d.source_catalog", "p.view_catalog") + ")" +
-		                 " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR " +
-		                 SqlUtils::IdentifierEqualsSQL("d.source_schema", parent_schema) + ")");
-	};
-	auto edges = edge_query("COALESCE(p.internal_schema, p.view_schema)");
-	if (edges->HasError()) {
-		edges = edge_query("p.view_schema"); // Metadata written before internal schemas existed.
-	}
-	if (edges->HasError()) {
-		throw CatalogException("refresh_pipeline: cannot read dependencies: %s", edges->GetError());
-	}
+	auto edges = SqlUtils::QueryOrThrow(
+	    con,
+	    "SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
+	        string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" + string(openivm::DELTA_PREFIX) +
+	        "' || p.view_name OR d.table_name = '" + string(openivm::DATA_TABLE_PREFIX) +
+	        "' || p.view_name OR d.table_name = '" + string(openivm::VISIBLE_TABLE_PREFIX) +
+	        "' || p.view_name OR d.table_name = '" + string(openivm::DELTA_PREFIX) +
+	        string(openivm::VISIBLE_TABLE_PREFIX) +
+	        "' || p.view_name)"
+	        " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR " +
+	        SqlUtils::IdentifierEqualsSQL("d.source_catalog", "p.view_catalog") + ")" +
+	        " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR " +
+	        SqlUtils::IdentifierEqualsSQL("d.source_schema", "COALESCE(p.internal_schema, p.view_schema)") + ")",
+	    "refresh_pipeline: cannot read dependencies: %s");
 	for (idx_t i = 0; i < edges->RowCount(); i++) {
 		auto parent = edges->Collection().GetValue(0, i).ToString();
 		auto child = edges->Collection().GetValue(1, i).ToString();

@@ -1033,10 +1033,6 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 	bool staged_after_hook = hook_mode == "after" && has_refresh_hook &&
 	                         (cross_system || AfterHookNeedsStaging(con, hook_sql, view_catalog_name));
 	if (hook_mode == "after" && has_refresh_hook) {
-		// Attached controllers may predate this column and were not present at LOAD.
-		SqlUtils::QueryOrThrow(
-		    con, "ALTER TABLE openivm_views ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL",
-		    "Cannot initialize after-hook state: %s");
 		auto pending = SqlUtils::QueryOrThrow(con,
 		                                      "SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
 		                                          SqlUtils::EscapeValue(view_name) + "'",
