@@ -2093,8 +2093,7 @@ void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<Lo
 			continue;
 		}
 		auto &group = aggregate->groups[binding.column_index];
-		if (group->GetReturnType().id() != LogicalTypeId::DOUBLE &&
-		    group->GetReturnType().id() != LogicalTypeId::FLOAT) {
+		if (!group->GetReturnType().IsFloating()) {
 			continue;
 		}
 		auto argument = make_uniq<BoundCaseExpression>(MakeNegativeZeroExpression(context, optimizer, group->Copy()),

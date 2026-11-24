@@ -94,9 +94,7 @@ static void RewriteSourceColumns(Binder &binder, SQLStatement &statement);
 } // namespace
 
 static Vector CanonicalizeNaNKeys(const Vector &input, idx_t count) {
-	if (!TypeVisitor::Contains(input.GetType(), [](const LogicalType &type) {
-		    return type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE;
-	    })) {
+	if (!TypeVisitor::Contains(input.GetType(), [](const LogicalType &type) { return type.IsFloating(); })) {
 		return Vector::Ref(input);
 	}
 	Vector result(input.GetType(), count);
@@ -1721,7 +1719,7 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 			auto &type = distinct_types[i];
 			identities.push_back(
 			    SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), type, default_collation));
-			if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+			if (type.IsFloating()) {
 				meta.sign_columns.push_back(meta.cols[i]);
 			} else if (!identities.back().empty()) {
 				needs_representative = true;

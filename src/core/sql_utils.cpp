@@ -63,8 +63,7 @@ string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, 
 
 bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
 	return TypeVisitor::Contains(type, [](const LogicalType &child) {
-		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL ||
-		       child.id() == LogicalTypeId::FLOAT || child.id() == LogicalTypeId::DOUBLE;
+		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL || child.IsFloating();
 	});
 }
 
