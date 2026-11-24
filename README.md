@@ -162,6 +162,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 |------|-------------|---------------|
 | `PRAGMA refresh('view_name')` | Refresh a materialized view; accepts `schema.view`, `catalog.view`, or `catalog.schema.view` | [Refresh strategies](docs/refresh/refresh-strategies.md) |
 | `PRAGMA refresh_options(catalog, schema, view_name)` | Refresh with explicit catalog/schema | — |
+| `PRAGMA refresh_cross_system(view_catalog, view_schema, attached_catalog, attached_schema, view_name)` | Refresh with an explicit view location and fallback source location | [Cross-system refresh](docs/refresh/cross-system-refresh.md) |
 | `PRAGMA refresh_pipeline('view_name', ...)` | Refresh one or more MVs and their cascade dependencies as one ordered run | [Pipelines](docs/refresh/pipelines.md) |
 | `PRAGMA refresh_status('view_name')` | Show refresh interval, last/next refresh, daemon status, and refresh strategy | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `PRAGMA refresh_cost('view_name')` | Show incremental refresh vs full recompute cost estimate (static + calibrated) | [Cost model](docs/internals/cost_model.md) |
