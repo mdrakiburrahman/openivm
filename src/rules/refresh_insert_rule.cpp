@@ -311,17 +311,16 @@ static optional_idx FindScannedColumn(LogicalGet &get, idx_t logical_index) {
 	return optional_idx();
 }
 
-// Scanning the missing columns beats one row-id fetch per target row when every
-// scanned row is a target (no pushed-down filter), or when the columns are
-// fixed-width: filtered scans then decode only vectors holding targets, cheaply.
-// Wide variable-size columns under a selective filter keep the row-id fetch.
+// Scanning the missing columns beats one row-id fetch per target row only when
+// every scanned row is a target (no pushed-down filter). A filtered scan decodes
+// each added column for every vector holding a single target, which loses to
+// the fetch for sparse targets, and estimates cannot bound how sparse they are.
 static bool ScannedPreimageIsCheap(LogicalGet &get, TableCatalogEntry &table) {
 	if (!get.table_filters.HasFilters()) {
 		return true;
 	}
 	for (auto &column : table.GetColumns().Physical()) {
-		if (!FindScannedColumn(get, column.Logical().index).IsValid() &&
-		    !TypeIsConstantSize(column.Type().InternalType())) {
+		if (!FindScannedColumn(get, column.Logical().index).IsValid()) {
 			return false;
 		}
 	}

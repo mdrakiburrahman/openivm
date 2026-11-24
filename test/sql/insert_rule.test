@@ -2122,8 +2122,9 @@ SELECT count(*) FROM (
 ----
 0
 
-# Fixed-width tables read preimages from filtered scans too; DML under a
-# MATERIALIZED CTE is captured like any other statement.
+# Filtered DML fetches preimages by row id unless its scan already reads every
+# column (e.g. a primary-key update, which DuckDB runs as delete+insert); DML
+# under a MATERIALIZED CTE is captured like any other statement.
 statement ok
 CREATE TABLE scan_pre_narrow (id INTEGER PRIMARY KEY, k INTEGER, v BIGINT, d DATE);
 
