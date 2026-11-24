@@ -106,48 +106,6 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 	return !join.duplicate_eliminated_columns.empty();
 }
 
-static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op, const column_binding_set_t &mul_set) {
-	if (IsJoinNode(op.type)) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
-		if (join) {
-			const idx_t projected_child_count = std::min<idx_t>(op.children.size(), 2);
-			// A comparison join owns exactly these two projection maps; disabling the loop only corrupts its internal
-			// plan.
-			for (idx_t child_idx = 0; child_idx < projected_child_count; child_idx++) { // mull-ignore: cxx_lt_to_ge
-				auto &proj_map = child_idx == 0 ? join->left_projection_map : join->right_projection_map;
-				if (proj_map.empty()) {
-					continue;
-				}
-				auto child_bindings = op.children[child_idx]->GetColumnBindings();
-				for (auto projected_idx : proj_map) {
-					// Equality is valid: the largest valid index is size - 1.
-					if (projected_idx >= child_bindings.size()) { // mull-ignore: cxx_ge_to_gt
-						throw InternalException(
-						    "DeltaDelimJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
-						    (idx_t)projected_idx, (idx_t)child_idx, (idx_t)child_bindings.size());
-					}
-				}
-				// Disabling this bounded scan only creates an invalid internal projection map, not another SQL
-				// behavior.
-				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); // mull-ignore: cxx_lt_to_ge
-				     binding_idx++) {                                  // mull-ignore: cxx_post_inc_to_post_dec
-					if (!mul_set.count(child_bindings[binding_idx])) { // mull-ignore: cxx_remove_negation
-						continue;
-					}
-					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
-						proj_map.push_back(ProjectionIndex(binding_idx));
-					}
-				}
-			}
-		}
-	}
-	for (auto &child : op.children) {
-		if (child) {
-			AppendMultiplicityBindingsToJoinProjectionMaps(*child, mul_set);
-		}
-	}
-}
-
 static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, LogicalComparisonJoin &delim_join,
                                                        LogicalDelimGet &delim_get, bool allow_ordinal_fallback) {
 	if (delim_join.children.size() != 2) {
@@ -435,7 +393,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		output_replacements.insert(output_replacements.end(), delim_replacements.begin(), delim_replacements.end());
 
 		column_binding_set_t mul_set(mul_bindings.begin(), mul_bindings.end());
-		AppendMultiplicityBindingsToJoinProjectionMaps(*term, mul_set);
+		AppendBindingsToJoinProjectionMaps(*term, mul_set);
 
 		auto term_bindings = term->GetColumnBindings();
 		vector<unique_ptr<Expression>> exprs;
