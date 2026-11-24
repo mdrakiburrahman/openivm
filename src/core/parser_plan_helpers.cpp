@@ -1593,18 +1593,6 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 		           node.plan_node->type == LogicalOperatorType::LOGICAL_LIMIT;
 	    });
 	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
-	if (!candidate_input) {
-		D_ASSERT(distinct);
-		bindings = distinct->GetColumnBindings();
-		D_ASSERT(bindings.size() == meta.cols.size());
-		distinct->ResolveOperatorTypes();
-		for (idx_t index = 0; index < meta.cols.size(); index++) {
-			if (distinct->types[index].id() == LogicalTypeId::DOUBLE ||
-			    distinct->types[index].id() == LogicalTypeId::FLOAT) {
-				meta.sign_columns.push_back(meta.cols[index]);
-			}
-		}
-	}
 	if (candidate_input) {
 		// Keep the candidate bag, not just today's selected rows: deletes must refill the boundary.
 		LogicalGet *source = nullptr;
@@ -1642,17 +1630,12 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 				}
 			}
 		}
-		vector<string> identity_keys;
-		for (idx_t i = 0; i < meta.selected_source_columns.size(); i++) {
-			auto &type = source_types[i];
-			auto identity = SqlUtils::ValueIdentitySQL(meta.source_exprs[i], type, default_collation);
+		for (idx_t i = 0, source_count = source_types.size(); i < source_count; i++) {
+			auto identity = SqlUtils::ValueIdentitySQL(meta.source_exprs[i], source_types[i], default_collation);
 			if (!identity.empty()) {
-				identity_keys.push_back(std::move(identity));
+				meta.cols.push_back("openivm_topk_identity_" + to_string(meta.cols.size()));
+				meta.source_exprs.push_back(std::move(identity));
 			}
-		}
-		for (auto &key : identity_keys) {
-			meta.cols.push_back("openivm_topk_identity_" + to_string(meta.cols.size()));
-			meta.source_exprs.push_back(key);
 		}
 		bindings = aggregate.children[0]->GetColumnBindings();
 		aggregate.children[0]->ResolveOperatorTypes();
@@ -1688,6 +1671,11 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 		    SqlUtils::ReplaceTableReferences(meta.selected_input_sql, meta.source, "openivm_topk_candidates");
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu candidate columns for DISTINCT input\n", meta.cols.size());
 	} else {
+		D_ASSERT(distinct);
+		bindings = distinct->GetColumnBindings();
+		D_ASSERT(bindings.size() == meta.cols.size());
+		distinct->ResolveOperatorTypes();
+		const auto &distinct_types = distinct->types;
 		// Resolve the input through bound projections and filters. Parsed CTE names
 		// have no catalog identity, and their expressions must also apply to delta rows.
 		auto &get = distinct_source->Cast<LogicalGet>();
@@ -1723,19 +1711,22 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 		}
 		meta.filter = StringUtil::Join(predicates, " AND ");
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Resolved DISTINCT input to bound source %s\n", meta.source.c_str());
-	}
 
-	if (!candidate_input) {
-		const auto &distinct_types = distinct->types;
-		// Per-column counters cannot preserve correlations between floating signs.
-		meta.representative_input = meta.sign_columns.size() > 1;
+		// Floating columns keep per-column sign counts; other identity-bearing types need representatives.
+		vector<string> identities;
+		bool needs_representative = false;
 		for (idx_t i = 0; i < distinct_types.size(); i++) {
 			auto &type = distinct_types[i];
-			if (type.id() != LogicalTypeId::FLOAT && type.id() != LogicalTypeId::DOUBLE &&
-			    !SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), type, default_collation).empty()) {
-				meta.representative_input = true;
+			identities.push_back(
+			    SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), type, default_collation));
+			if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+				meta.sign_columns.push_back(meta.cols[i]);
+			} else if (!identities.back().empty()) {
+				needs_representative = true;
 			}
 		}
+		// Per-column counters cannot preserve correlations between floating signs.
+		meta.representative_input = needs_representative || meta.sign_columns.size() > 1;
 		if (meta.representative_input) {
 			meta.sign_columns.clear();
 			meta.selected_source_columns = meta.cols;
@@ -1743,14 +1734,11 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 			meta.selected_input_sql =
 			    "SELECT " + SqlUtils::JoinQuotedColumns(meta.cols) + " FROM openivm_topk_candidates";
 			for (idx_t i = 0; i < distinct_types.size(); i++) {
-				auto identity = SqlUtils::ValueIdentitySQL(SqlUtils::QuoteIdentifier(meta.cols[i]), distinct_types[i],
-				                                           default_collation);
-				if (identity.empty()) {
+				if (identities[i].empty()) {
 					continue;
 				}
-				meta.selected_identity_exprs.push_back(std::move(identity));
-				auto name = meta.InternalColumn("openivm_tuple_identity_" + to_string(i));
-				meta.cols.push_back(std::move(name));
+				meta.selected_identity_exprs.push_back(std::move(identities[i]));
+				meta.cols.push_back(meta.InternalColumn("openivm_tuple_identity_" + to_string(i)));
 				meta.source_exprs.push_back(
 				    SqlUtils::ValueIdentitySQL(meta.source_exprs[i], distinct_types[i], default_collation));
 			}
