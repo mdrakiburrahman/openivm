@@ -872,12 +872,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 					}
 					distinct_sum_arg = bcr->GetAlias().empty() ? bcr->GetName().GetIdentifierName()
 					                                           : bcr->GetAlias().GetIdentifierName();
-					distinct_sum_out =
-					    ResolvePlanOutputColumn(ColumnBinding(outer_agg->aggregate_index, ProjectionIndex(agg_index)),
-					                            output_plan, facts, output_names);
-					if (!single_sum_state_column.empty()) {
-						distinct_sum_out = single_sum_state_column;
-					}
+					distinct_sum_out = !single_sum_state_column.empty()
+					                       ? single_sum_state_column
+					                       : ResolvePlanOutputColumn(
+					                             ColumnBinding(outer_agg->aggregate_index, ProjectionIndex(agg_index)),
+					                             output_plan, facts, output_names);
 					if (distinct_sum_out.empty()) {
 						distinct_sum_out = bound.GetAlias().GetIdentifierName();
 					}
