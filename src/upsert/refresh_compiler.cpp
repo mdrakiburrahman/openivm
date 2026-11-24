@@ -1094,7 +1094,9 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		               " FROM " + matched + " d WHERE v.rowid = d." + target_rowid + ";\n" + "INSERT INTO " +
 		               data_table + " (" + insert_cols + ") SELECT " + key_insert_values + ", " + insert_vals +
 		               " FROM " + matched + " d WHERE d." + target_rowid + " IS NULL;\n" + "DROP TABLE " + matched +
-		               ";\n" + sign_fixup;
+		               ";\n";
+		// No zero-sign fix-up: insertions only add support, so no stored zero key loses its sign,
+		// and a new group inserts the delta's representative.
 	}
 	if (insert_only && options.cascade_delta_specs && options.inline_cascade_delta) {
 		// The inline companion emitted by refresh_sql.cpp is a compact aggregate-delta
