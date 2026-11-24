@@ -4,6 +4,7 @@
 #include "core/derived_aggregate_output.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/openivm_constants.hpp"
+#include "sql_dialect.hpp"
 #include "duckdb.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -61,6 +62,7 @@ struct AggregateGroupsOptions {
 	bool derived_output_expressions_complete = false;
 	vector<string> preserved_side_cols;
 	bool force_group_recompute = false;
+	SqlDialect dialect = SqlDialect::DUCKDB;
 };
 
 struct AggregateGroupsOutcome {

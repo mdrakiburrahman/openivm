@@ -28,6 +28,8 @@ public:
 	// SQL equality can merge observably different values, including nested ones.
 	static bool EqualityCanHideValueIdentity(const LogicalType &type);
 	static string NegativeZeroSQL(const string &value);
+	// DuckDB tests the sign bit directly; other dialects keep the portable string form.
+	static string NegativeZeroSQL(const string &value, SqlDialect dialect);
 	static string FloatingRepresentativeSQL(const string &value, const string &negative_count,
 	                                        const string &total_count);
 	static string ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation = "");

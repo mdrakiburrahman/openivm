@@ -5813,3 +5813,133 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Aux-state DISTINCT over DOUBLE inputs: one joined pass derives both the old and the new zero
+# representative. Batched conflicting DML flips zero signs, mixes them, adds new tuples, updates
+# into -0.0 and churns NaN/NULL tuples before each refresh. Only unambiguous zero groups (all
+# -0.0 or all +0.0 rows) have a determined stored sign.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE dz(id INT, g INT, v DOUBLE, x INT);
+
+statement ok
+INSERT INTO dz VALUES (1,1,'-0.0',1),(2,1,'-0.0',1),(3,2,0.0,2),(4,3,'-0.0',3),(5,3,0.0,3),(6,4,'NaN',4),
+    (7,4,-('NaN'::DOUBLE),4),(8,5,NULL,5),(9,6,2.5,6),(10,6,1.25,6);
+
+statement ok
+CREATE MATERIALIZED VIEW dz_group AS SELECT g, v, SUM(x)+1 a FROM (SELECT DISTINCT g, v, x FROM dz) d GROUP BY g, v;
+
+statement ok
+CREATE VIEW dz_group_expected AS SELECT g, v, SUM(x)+1 a FROM (SELECT DISTINCT g, v, x FROM dz) d GROUP BY g, v;
+
+statement ok
+CREATE MATERIALIZED VIEW dz_sum AS SELECT g, SUM(v) s FROM (SELECT DISTINCT g, v FROM dz) d GROUP BY g;
+
+statement ok
+CREATE VIEW dz_sum_expected AS SELECT g, SUM(v) s FROM (SELECT DISTINCT g, v FROM dz) d GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW dz_simple AS SELECT SUM(v) s FROM (SELECT DISTINCT v FROM dz) d;
+
+statement ok
+CREATE VIEW dz_simple_expected AS SELECT SUM(v) s FROM (SELECT DISTINCT v FROM dz) d;
+
+statement ok
+CREATE VIEW dz_signs AS SELECT g, v, bool_and(signbit(v)) neg, bool_and(NOT signbit(v)) pos FROM dz WHERE v = 0 GROUP BY g, v;
+
+foreach variant group sum simple
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='dz_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dz_{variant} EXCEPT ALL SELECT * FROM dz_{variant}_expected) UNION ALL (SELECT * FROM dz_{variant}_expected EXCEPT ALL SELECT * FROM dz_{variant}));
+----
+0
+
+endloop
+
+# Round 1: (g=1) -0 -> +0, (g=2) +0 -> -0, (g=3) mixed -> +0, (g=7) a new tuple whose delta
+# mixes signs but ends -0, (g=6) an update into -0.0, NaN/NULL churn and conflicting ops.
+statement ok
+INSERT INTO dz VALUES (11,1,0.0,1),(12,2,'-0.0',2),(70,7,0.0,7),(71,7,'-0.0',7),(13,4,'NaN',4),(14,5,NULL,5);
+
+statement ok
+UPDATE dz SET x = x + 10 WHERE id IN (11, 12, 70, 71, 13);
+
+statement ok
+DELETE FROM dz WHERE id IN (1, 2, 3, 4, 70, 7, 8);
+
+statement ok
+UPDATE dz SET v = '-0.0' WHERE id = 9;
+
+foreach variant group sum simple
+
+statement ok
+PRAGMA refresh('dz_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dz_{variant} EXCEPT ALL SELECT * FROM dz_{variant}_expected) UNION ALL (SELECT * FROM dz_{variant}_expected EXCEPT ALL SELECT * FROM dz_{variant}));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM dz_group m JOIN dz_signs e ON m.g = e.g AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+query II
+SELECT g, signbit(v) FROM dz_group WHERE v = 0 ORDER BY g;
+----
+1	false
+2	true
+3	false
+6	true
+7	true
+
+# Round 2: (g=1) back to -0, (g=3) mixed again, (g=7) disappears, (g=6) leaves -0.0
+# while a +0 joins, and (g=2) is replaced by +0.
+statement ok
+INSERT INTO dz VALUES (15,1,'-0.0',1),(16,3,'-0.0',3),(17,6,0.0,6),(18,2,0.0,12);
+
+statement ok
+DELETE FROM dz WHERE id IN (11, 71, 12);
+
+statement ok
+UPDATE dz SET v = 2.5 WHERE id = 9;
+
+statement ok
+UPDATE dz SET x = x + 1 WHERE id IN (15, 16, 17, 18, 5);
+
+foreach variant group sum simple
+
+statement ok
+PRAGMA refresh('dz_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dz_{variant} EXCEPT ALL SELECT * FROM dz_{variant}_expected) UNION ALL (SELECT * FROM dz_{variant}_expected EXCEPT ALL SELECT * FROM dz_{variant}));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM dz_group m JOIN dz_signs e ON m.g = e.g AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+query II
+SELECT g, signbit(v) FROM dz_group WHERE v = 0 AND g <> 3 ORDER BY g;
+----
+1	true
+2	false
+6	false
+
+statement ok
+SET openivm_distinct_aux_state=false;

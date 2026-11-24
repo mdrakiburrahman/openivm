@@ -1079,6 +1079,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		options.render_derived_output = render_derived_output;
 		options.derived_output_expressions_complete = derived_output_info.complete;
 		options.column_types = column_types;
+		options.dialect = active_facts.target_dialect;
 		return options;
 	};
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));

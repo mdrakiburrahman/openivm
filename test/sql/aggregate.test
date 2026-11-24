@@ -6908,3 +6908,191 @@ DROP VIEW comma_group_expected;
 DROP TABLE comma_group_src;
 
 endloop
+
+# Floating zero group keys: the stored key keeps its sign while that sign has support and
+# flips once it loses it, for MERGE, recompute (INSERT OR REPLACE), derived and unindexed views.
+# Only unambiguous zero groups (all -0.0 or all +0.0 rows) have a determined stored sign.
+statement ok
+CREATE TABLE fz(id INT, k INT, v DOUBLE, x INT);
+
+statement ok
+INSERT INTO fz VALUES (1,1,'-0.0',1),(2,1,'-0.0',2),(3,2,0.0,3),(4,2,0.0,4),(5,3,'-0.0',5),(6,3,0.0,6),
+    (7,4,'NaN',7),(8,4,-('NaN'::DOUBLE),8),(9,4,1.5,9),(10,5,NULL,10),(11,5,NULL,11),(12,6,'-0.0',12),
+    (13,8,2.5,13),(14,8,0.0,14),(15,9,-3.25,15);
+
+statement ok
+CREATE MATERIALIZED VIEW fz_merge AS SELECT k, v, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v;
+
+statement ok
+CREATE VIEW fz_merge_expected AS SELECT k, v, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v;
+
+statement ok
+CREATE MATERIALIZED VIEW fz_float AS SELECT k, v::FLOAT v, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v::FLOAT;
+
+statement ok
+CREATE VIEW fz_float_expected AS SELECT k, v::FLOAT v, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v::FLOAT;
+
+statement ok
+CREATE MATERIALIZED VIEW fz_having AS SELECT k, v, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v HAVING SUM(x) > 2;
+
+statement ok
+CREATE VIEW fz_having_expected AS SELECT k, v, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v HAVING SUM(x) > 2;
+
+statement ok
+CREATE MATERIALIZED VIEW fz_minmax AS SELECT k, v, COUNT(*) c, MIN(x) m FROM fz GROUP BY k, v;
+
+statement ok
+CREATE VIEW fz_minmax_expected AS SELECT k, v, COUNT(*) c, MIN(x) m FROM fz GROUP BY k, v;
+
+statement ok
+CREATE MATERIALIZED VIEW fz_avg AS SELECT k, v, COUNT(*) c, AVG(x::DOUBLE) a FROM fz GROUP BY k, v;
+
+statement ok
+CREATE VIEW fz_avg_expected AS SELECT k, v, COUNT(*) c, AVG(x::DOUBLE) a FROM fz GROUP BY k, v;
+
+statement ok
+CREATE MATERIALIZED VIEW fz_noindex AS SELECT k, v, [k] lk, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v, [k];
+
+statement ok
+CREATE VIEW fz_noindex_expected AS SELECT k, v, [k] lk, COUNT(*) c, SUM(x) s FROM fz GROUP BY k, v, [k];
+
+# The incremental MERGE path stays incremental; the nested-key view has no key index.
+query II
+SELECT view_sql_name, type FROM openivm_views WHERE view_sql_name IN ('fz_merge', 'fz_float', 'fz_noindex', 'fz_avg') ORDER BY 1;
+----
+fz_avg	0
+fz_float	0
+fz_merge	0
+fz_noindex	0
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE table_name LIKE 'openivm_data%' AND table_name IN (SELECT 'openivm_data_' || view_name FROM openivm_views WHERE view_sql_name = 'fz_noindex');
+----
+0
+
+# Expected stored sign of every unambiguous zero group, per key type.
+statement ok
+CREATE VIEW fz_double_signs AS SELECT k, v, bool_and(signbit(v)) neg, bool_and(NOT signbit(v)) pos FROM fz WHERE v = 0 GROUP BY k, v;
+
+statement ok
+CREATE VIEW fz_float_signs AS SELECT k, v::FLOAT v, bool_and(signbit(v::FLOAT)) neg, bool_and(NOT signbit(v::FLOAT)) pos FROM fz WHERE v = 0 GROUP BY k, v::FLOAT;
+
+foreach variant merge float having minmax avg noindex
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fz_{variant} EXCEPT ALL SELECT * FROM fz_{variant}_expected) UNION ALL (SELECT * FROM fz_{variant}_expected EXCEPT ALL SELECT * FROM fz_{variant}));
+----
+0
+
+endloop
+
+# Round 1, one batch: (k=1) -0 -> +0, (k=2) +0 -> -0, (k=3) mixed -> -0, (k=7) new group whose
+# delta mixes signs but ends all -0, (k=8) an update into -0 plus deleting its +0 row, (k=6)
+# untouched -0, NaN/NULL churn, and insert/update/delete conflicts on the same rows.
+statement ok
+INSERT INTO fz VALUES (20,1,0.0,20),(21,2,'-0.0',21),(22,2,'-0.0',22),(70,7,0.0,70),(71,7,'-0.0',71),
+    (40,4,'NaN',40),(50,5,NULL,50),(90,9,0.0,90);
+
+statement ok
+UPDATE fz SET x = x + 100 WHERE id IN (20, 21, 70, 71, 50, 2);
+
+statement ok
+DELETE FROM fz WHERE id IN (1, 2, 3, 4, 6, 70, 8, 90);
+
+statement ok
+UPDATE fz SET v = '-0.0' WHERE id = 13;
+
+statement ok
+DELETE FROM fz WHERE id = 14;
+
+statement ok
+UPDATE fz SET x = x - 1 WHERE k = 5;
+
+foreach variant merge float having minmax avg noindex
+
+statement ok
+PRAGMA refresh('fz_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fz_{variant} EXCEPT ALL SELECT * FROM fz_{variant}_expected) UNION ALL (SELECT * FROM fz_{variant}_expected EXCEPT ALL SELECT * FROM fz_{variant}));
+----
+0
+
+endloop
+
+foreach variant merge having minmax avg noindex
+
+query I
+SELECT count(*) FROM fz_{variant} m JOIN fz_double_signs e ON m.k = e.k AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM fz_float m JOIN fz_float_signs e ON m.k = e.k AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+# The flipped groups are really stored with their new sign.
+query IIT
+SELECT k, signbit(v), c FROM fz_merge WHERE v = 0 ORDER BY k;
+----
+1	false	1
+2	true	2
+3	true	1
+6	true	1
+7	true	1
+8	true	1
+
+# Round 2, one batch: (k=1) back to -0, (k=3) mixed again (sticky), (k=6) deleted and re-inserted
+# as +0, (k=7) disappears, (k=2) gains a +0 row and then loses every -0 row.
+statement ok
+INSERT INTO fz VALUES (23,1,'-0.0',23),(60,6,0.0,60),(31,3,0.0,31),(24,2,0.0,24);
+
+statement ok
+DELETE FROM fz WHERE id IN (20, 12, 71, 21, 22);
+
+statement ok
+UPDATE fz SET x = x * 2 WHERE id IN (23, 60, 31, 24, 5);
+
+statement ok
+INSERT INTO fz VALUES (72,7,'-0.0',72);
+
+statement ok
+DELETE FROM fz WHERE id = 72;
+
+foreach variant merge float having minmax avg noindex
+
+statement ok
+PRAGMA refresh('fz_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fz_{variant} EXCEPT ALL SELECT * FROM fz_{variant}_expected) UNION ALL (SELECT * FROM fz_{variant}_expected EXCEPT ALL SELECT * FROM fz_{variant}));
+----
+0
+
+endloop
+
+foreach variant merge having minmax avg noindex
+
+query I
+SELECT count(*) FROM fz_{variant} m JOIN fz_double_signs e ON m.k = e.k AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM fz_float m JOIN fz_float_signs e ON m.k = e.k AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+query IIT
+SELECT k, signbit(v), c FROM fz_merge WHERE v = 0 ORDER BY k;
+----
+1	true	1
+2	false	1
+3	true	2
+6	false	1
+8	true	1
