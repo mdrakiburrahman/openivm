@@ -671,8 +671,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		lpts_fallback = true;
 	}
 	auto classification_start = create_profile_now();
-	bool has_full_outer_aggregate = analysis.found_full_outer && analysis.found_aggregation;
-	bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
 	bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
 	if (has_unsupported_incremental_construct) {
 		// These views are maintained by full refresh, so store the user's query directly.

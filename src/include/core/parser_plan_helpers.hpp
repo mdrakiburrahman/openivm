@@ -95,10 +95,8 @@ struct CreateMVPlanFacts {
 	unordered_map<TableIndex, ProjectionSourceOccurrence> occurrence_by_index;
 	vector<ProjectionSourceOccurrence> source_occurrences;
 	vector<ProjectionLineageEdge> projection_lineage_edges;
-	unordered_map<TableIndex, int> cte_refs_under_join_count;
 	bool has_union_before_aggregate = false;
 	bool has_unsupported_set_operation = false;
-	bool has_repeated_cte_ref_under_join = false;
 	bool has_pivot = false;
 	bool has_filter_above_aggregate = false;
 	bool has_cardinality_changing_filter = false;
