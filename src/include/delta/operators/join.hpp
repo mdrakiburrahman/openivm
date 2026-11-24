@@ -57,7 +57,6 @@ void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, cons
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,
                                                 bool preserve_constant_sibling_child_outputs = false,
-                                                idx_t fallback_mul_idx = DConstants::INVALID_INDEX,
                                                 idx_t original_leaf_width = DConstants::INVALID_INDEX);
 
 // lhs * rhs, bound as DuckDB's multiplication operator.

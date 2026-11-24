@@ -853,7 +853,7 @@ void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, cons
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,
-                                                bool preserve_constant_sibling_child_outputs, idx_t fallback_mul_idx,
+                                                bool preserve_constant_sibling_child_outputs,
                                                 idx_t original_leaf_width) {
 	if (leaf_path.empty()) {
 		return;
@@ -911,18 +911,6 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 						    "%s: projection map index %llu out of bounds for child %llu with %llu bindings",
 						    context_label, (idx_t)projected_idx, (idx_t)child_side, (idx_t)child_bindings.size());
 					}
-				}
-				// CompileChild normally exposes the binding directly. This fallback exists only for an immediate copied
-				// wrapper whose validated output position is supplied by the caller.
-				switch (mul_idx) {
-				case DConstants::INVALID_INDEX:
-					if (immediate_parent &&
-					    fallback_mul_idx < child_bindings.size()) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-						mul_idx = fallback_mul_idx;
-					}
-					break;
-				default:
-					break;
 				}
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
@@ -996,8 +984,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding, idx_t original_leaf_width) {
-	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin", false,
-	                                           DConstants::INVALID_INDEX, original_leaf_width);
+	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin", false, original_leaf_width);
 }
 
 // ============================================================================
