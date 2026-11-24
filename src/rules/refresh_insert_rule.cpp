@@ -52,8 +52,7 @@ public:
 		OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] restoring %zu metadata snapshots\n", restore_sql.size());
 		try {
 			Connection con(*context.db);
-			TransactionalMVLockState::Get(*con.context)
-			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+			TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 			for (auto it = restore_sql.rbegin(); it != restore_sql.rend(); ++it) {
 				con.BeginTransaction();
 				auto result = con.Query(*it);
@@ -139,10 +138,8 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
                                     const string &predicate) {
 	auto location = RefreshMetadata::CurrentLocation(con);
 	auto target = SqlUtils::FullName(location.catalog, location.schema, table_name);
-	auto rows = con.Query("SELECT * FROM " + target + " WHERE " + predicate);
-	if (rows->HasError()) {
-		throw CatalogException("OpenIVM could not snapshot helper metadata: %s", rows->GetError());
-	}
+	auto rows = SqlUtils::QueryOrThrow(con, "SELECT * FROM " + target + " WHERE " + predicate,
+	                                   "OpenIVM could not snapshot helper metadata: %s");
 	auto restore = BuildRestoreRowsSQL(*rows, target, {"view_name"}, location.IsNative());
 	if (!restore.empty()) {
 		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
@@ -150,8 +147,7 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
 }
 
 static void SnapshotSchemaEvolutionMetadata(ClientContext &context, Connection &con, const MetadataLocation &location) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	RefreshMetadata::UseLocation(con, location);
 	RefreshMetadata(con).SnapshotTransaction(context);
 	if (auto state = TransactionalMVMetadataState::TryGet(context)) {

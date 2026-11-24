@@ -95,10 +95,8 @@ struct CreateMVPlanFacts {
 	unordered_map<TableIndex, ProjectionSourceOccurrence> occurrence_by_index;
 	vector<ProjectionSourceOccurrence> source_occurrences;
 	vector<ProjectionLineageEdge> projection_lineage_edges;
-	unordered_map<TableIndex, int> cte_refs_under_join_count;
 	bool has_union_before_aggregate = false;
 	bool has_unsupported_set_operation = false;
-	bool has_repeated_cte_ref_under_join = false;
 	bool has_pivot = false;
 	bool has_filter_above_aggregate = false;
 	bool has_cardinality_changing_filter = false;
@@ -117,7 +115,6 @@ PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, uni
 string QualifyCreateSourceTable(ClientContext &context, const string &table_name, const CreateMVPlanFacts &facts,
                                 const string &current_catalog, const string &current_schema, const string &default_db,
                                 const string &default_schema);
-string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
 bool ResolvesToOutputBinding(TableIndex table_index, ProjectionIndex column_index, TableIndex group_index,
                              size_t group_count, const CreateMVPlanFacts &facts, bool through_casts, int depth = 0);

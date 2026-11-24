@@ -656,6 +656,23 @@ string SqlUtils::DuckLakeTableFunction(const string &function_name, const string
 	       "', " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 }
 
+string SqlUtils::DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
+                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id) {
+	auto rows = [&](const char *function_name) {
+		return "SELECT " + select_list + " FROM " +
+		       DuckLakeTableFunction(function_name, catalog, schema, table, last_snapshot_id, current_snapshot_id);
+	};
+	return rows("ducklake_table_insertions") + " UNION ALL " + rows("ducklake_table_deletions");
+}
+
+string SqlUtils::CurrentDatabase(Connection &con) {
+	auto result = con.Query("SELECT current_database()");
+	if (!result->HasError() && result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull()) {
+		return result->Collection().GetValue(0, 0).ToString();
+	}
+	return "";
+}
+
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
 	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
 	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()

@@ -470,7 +470,7 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			string quoted_column = SqlUtils::QuoteIdentifier(column);
 			aggregates.push_back(quoted_column);
 			aggregate_raw_names[quoted_column] = column;
-			if (i < options.column_types.size() && !IsSummableLogicalType(options.column_types[i]) &&
+			if (i < options.column_types.size() && !options.column_types[i].IsNumeric() &&
 			    !quoted_derived_output_expressions.count(quoted_column)) {
 				non_summable_columns.insert(quoted_column);
 			}
@@ -1185,7 +1185,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		if (derived_columns.count(column_names[i])) {
 			continue;
 		}
-		if (!IsSummableLogicalType(column_types[i])) {
+		if (!column_types[i].IsNumeric()) {
 			has_non_summable_col = true;
 			break;
 		}

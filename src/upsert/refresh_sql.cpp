@@ -815,15 +815,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool has_minmax = metadata.HasMinMax(view_name) || view_query_type == RefreshType::AGGREGATE_HAVING ||
 	                  (source_has_left_join && !source_has_full_outer && !left_join_merge) ||
 	                  (source_has_full_outer && !full_outer_merge);
-	Value refresh_mode_val;
-	bool force_full_refresh = false;
-	if (context.TryGetCurrentSetting(Identifier("openivm_refresh_mode"), refresh_mode_val) &&
-	    !refresh_mode_val.IsNull()) {
-		auto mode = StringUtil::Lower(refresh_mode_val.ToString());
-		if (mode == "full") {
-			force_full_refresh = true;
-		}
-	}
+	bool force_full_refresh = StringUtil::CIEquals(SqlUtils::GetStringSetting(context, "openivm_refresh_mode"), "full");
 	// The cascading full refresh clears refresh_in_progress with the watermarks (meta_post).
 	force_full_refresh = force_full_refresh || recover_with_cascade_delta;
 	bool metadata_requires_full_refresh =
@@ -1949,10 +1941,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (!fallback_upsert_query.empty()) {
 		delete_retry_plan->fallback_program = build_program(fallback_upsert_query);
 	}
-	Value files_path_val;
-	if (write_query_file && context.TryGetCurrentSetting(Identifier("openivm_files_path"), files_path_val) &&
-	    !files_path_val.IsNull()) {
-		string refresh_file_path = files_path_val.ToString() + "/openivm_upsert_queries_" + view_name + ".sql";
+	auto files_path = SqlUtils::GetStringSetting(context, "openivm_files_path");
+	if (write_query_file && !files_path.empty()) {
+		string refresh_file_path = files_path + "/openivm_upsert_queries_" + view_name + ".sql";
 		duckdb::SqlUtils::WriteFile(refresh_file_path, false, clean_query);
 	}
 

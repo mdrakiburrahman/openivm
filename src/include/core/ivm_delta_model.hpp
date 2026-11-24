@@ -11,8 +11,9 @@ DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op);
 void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts, bool full_only);
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                    const vector<string> &output_names);
-string BuildDeltaViewModelLineageJson(const DeltaViewModel &model);
-string BuildDeltaViewModelProfileDetail(const DeltaViewModel &model);
+// The lineage_json metadata; entry_count receives the number of lineage entries it holds.
+string BuildDeltaViewModelLineageJson(const DeltaViewModel &model, idx_t &entry_count);
+string BuildDeltaViewModelProfileDetail(const DeltaViewModel &model, idx_t lineage_entry_count);
 
 } // namespace duckdb
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/openivm_constants.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/common/enums/optimizer_type.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -15,9 +16,7 @@ inline string FinalPlanDisabledOptimizers(ClientContext &context, bool cross_sys
 	if (cross_system) {
 		return openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 	}
-	Value setting;
-	if (context.TryGetCurrentSetting(Identifier("openivm_enable_data_dependent_optimizers"), setting) &&
-	    !setting.IsNull() && setting.GetValue<bool>()) {
+	if (SqlUtils::GetBoolSetting(context, "openivm_enable_data_dependent_optimizers", false)) {
 		return "";
 	}
 	return openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;

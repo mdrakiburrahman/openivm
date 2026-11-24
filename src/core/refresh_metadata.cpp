@@ -131,10 +131,7 @@ void SelectMetadataLocation(Connection &con, const MetadataLocation &location) {
 	auto selected = SchemaExists(con, location.catalog, location.schema) ? location.schema : string(DEFAULT_SCHEMA);
 	auto target = SqlUtils::QualifiedPrefix(location.catalog, selected);
 	target.pop_back();
-	auto result = con.Query("USE " + target);
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
-	}
+	SqlUtils::QueryOrThrow(con, "USE " + target, "OpenIVM could not select metadata catalog: %s");
 	con.context->registered_state->GetOrCreate<MetadataLocationState>(METADATA_LOCATION_STATE)->location = location;
 	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for metadata schema '%s'\n", target.c_str(), location.schema.c_str());
 }
@@ -195,7 +192,7 @@ bool AnyMetadataOwnership(Connection &con, const string &table,
                           optional_ptr<TransactionalMVMetadataState> transaction_state,
                           const std::function<bool(Connection &, const MetadataLocation &, const string &)> &matches) {
 	auto current = RefreshMetadata::CurrentLocation(con);
-	auto locations = RefreshMetadata::MetadataLocations(con, table);
+	auto locations = MetadataLocator::All(con, table);
 	auto include_location = [&](const MetadataLocation &candidate) {
 		for (auto &location : locations) {
 			if (StringUtil::CIEquals(location.catalog, candidate.catalog) &&
@@ -240,11 +237,7 @@ bool AnyMetadataOwnership(Connection &con, const string &table,
 } // namespace
 
 string RefreshMetadata::ConfiguredMetadataSchema(ClientContext &context) {
-	Value value;
-	if (context.TryGetCurrentSetting(Identifier(openivm::METADATA_SCHEMA_SETTING), value) && !value.IsNull()) {
-		return value.ToString();
-	}
-	return "";
+	return SqlUtils::GetStringSetting(context, openivm::METADATA_SCHEMA_SETTING);
 }
 
 vector<string> RefreshMetadata::FindMetadataSchemas(Connection &con, const string &catalog, const string &table) {
@@ -270,16 +263,14 @@ MetadataLocation RefreshMetadata::ResolveLocation(ClientContext &context, Connec
 }
 
 MetadataLocation RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	auto location = ResolveLocation(context, con, view_catalog);
 	SelectMetadataLocation(con, location);
 	return location;
 }
 
 void RefreshMetadata::UseSameLocation(ClientContext &context, Connection &con) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	auto state = TryGetLocationState(context);
 	if (!state || state->location.catalog.empty()) {
 		UseCatalog(context, con);
@@ -320,8 +311,7 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 	}
 	Connection con(*context.db);
 	// Metadata INSERTs still enter the maintenance optimizer on this helper.
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 	MutationLockGuard guard(context);
 	auto location = MetadataLocator::Resolve(context, con, view_catalog);
 	MetadataLocator::RequireWritable(location, "move metadata schema");
@@ -384,19 +374,7 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 			if (!target) {
 				throw CatalogException("could not create %s", target_name);
 			}
-			// Copy the shared columns: legacy tables can predate later metadata columns.
-			vector<string> columns;
-			for (auto &column : source->columns) {
-				for (auto &target_column : target->columns) {
-					if (StringUtil::CIEquals(column.Name().GetIdentifierName(),
-					                         target_column.Name().GetIdentifierName())) {
-						columns.push_back(SqlUtils::QuoteIdentifier(column.Name()));
-						break;
-					}
-				}
-			}
-			auto column_list = StringUtil::Join(columns, ", ");
-			run("INSERT INTO " + target_name + " (" + column_list + ") SELECT " + column_list + " FROM " + source_name);
+			run("INSERT INTO " + target_name + " BY NAME SELECT * FROM " + source_name);
 			// This migration owns the old control table. SQL DROP would re-enter
 			// source cleanup while both registries exist in this transaction, and
 			// discovery would mistake that intermediate state for ambiguity. Use
@@ -452,10 +430,6 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 	}
 }
 
-vector<MetadataLocation> RefreshMetadata::MetadataLocations(Connection &con, const string &table) {
-	return MetadataLocator::All(con, table);
-}
-
 vector<MetadataLocation> RefreshMetadata::MetadataLocations(ClientContext &context, const string &table) {
 	vector<MetadataLocation> locations;
 	for (auto &database : DatabaseManager::Get(context).GetDatabases(context)) {
@@ -486,7 +460,7 @@ vector<MetadataLocation> RefreshMetadata::MetadataLocations(ClientContext &conte
 
 vector<string> RefreshMetadata::MetadataTables(Connection &con, const string &table) {
 	vector<string> tables;
-	for (auto &location : MetadataLocations(con, table)) {
+	for (auto &location : MetadataLocator::All(con, table)) {
 		tables.push_back(SqlUtils::FullName(location.catalog, location.schema, table));
 	}
 	return tables;
@@ -519,11 +493,10 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 			column_ids.emplace_back(column.StorageOid());
 			columns.push_back(SqlUtils::QuoteIdentifier(column.Name()) + " " + column.Type().ToString());
 		}
-		auto created = con.Query("CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(name) + " (" +
-		                         StringUtil::Join(columns, ", ") + ")");
-		if (created->HasError()) {
-			throw CatalogException("Cannot snapshot transaction metadata: %s", created->GetError());
-		}
+		SqlUtils::QueryOrThrow(con,
+		                       "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(name) + " (" +
+		                           StringUtil::Join(columns, ", ") + ")",
+		                       "Cannot snapshot transaction metadata: %s");
 		auto &transaction = DuckTransaction::Get(context, entry->catalog);
 		auto &storage = entry->GetStorage();
 		TableScanState scan;
@@ -545,37 +518,17 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 }
 
 string RefreshMetadata::GetViewSQLName(const string &view_key) {
-	// Metadata written before SQL names were stored separately has no view_sql_name column (see FindViewKey).
-	auto result = con.Query("SELECT view_sql_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_key) + "'");
-	if (result->HasError()) {
-		// Only the missing view_sql_name column (a binder error) is legacy metadata; anything else is a real failure.
-		if (result->GetErrorObject().Type() == ExceptionType::BINDER) {
-			return view_key;
-		}
-		throw InvalidInputException("Could not read IVM metadata column 'view_sql_name' for materialized view '%s': %s",
-		                            view_key, result->GetError());
-	}
-	if (result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
-		return view_key;
-	}
-	auto name = result->Collection().GetValue(0, 0).ToString();
+	auto name = ReadViewString(view_key, "view_sql_name");
 	return name.empty() ? view_key : name;
 }
 
 string RefreshMetadata::FindViewKey(const string &catalog, const string &schema, const string &name) {
-	auto query = [&](const string &name_expression) {
-		return con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
-		                 SqlUtils::IdentifierEqualsSQL(name_expression, Value(name).ToSQLString()) + " AND " +
-		                 SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(catalog).ToSQLString() + ")",
-		                                               Value(catalog).ToSQLString()) +
-		                 " AND " +
-		                 SqlUtils::IdentifierEqualsSQL("COALESCE(view_schema, 'main')", Value(schema).ToSQLString()));
-	};
-	auto result = query("COALESCE(view_sql_name, view_name)");
-	if (result->HasError()) {
-		result = query("view_name"); // Metadata written before SQL names were stored separately.
-	}
+	auto result = con.Query(
+	    "SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
+	    SqlUtils::IdentifierEqualsSQL("COALESCE(view_sql_name, view_name)", Value(name).ToSQLString()) + " AND " +
+	    SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(catalog).ToSQLString() + ")",
+	                                  Value(catalog).ToSQLString()) +
+	    " AND " + SqlUtils::IdentifierEqualsSQL("COALESCE(view_schema, 'main')", Value(schema).ToSQLString()));
 	if (result->HasError() || !result->RowCount()) {
 		return "";
 	}
@@ -620,10 +573,6 @@ string RefreshMetadata::ResolveViewName(const string &view_name, const string &c
 	auto matches =
 	    con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
 	              SqlUtils::IdentifierEqualsSQL("COALESCE(view_sql_name, view_name)", Value(view_name).ToSQLString()));
-	if (matches->HasError()) {
-		matches = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
-		                    SqlUtils::IdentifierEqualsSQL("view_name", Value(view_name).ToSQLString()));
-	}
 	if (!matches->HasError() && matches->RowCount() > 1) {
 		throw CatalogException("Ambiguous materialized view '%s'; use catalog.schema.view", view_name);
 	}
@@ -634,22 +583,20 @@ string RefreshMetadata::ResolveViewName(const string &view_name, const string &c
 }
 
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
-	auto result = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM metadata table '%s' for '%s': %s", openivm::VIEWS_TABLE,
-		                            table_name, result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(table_name) +
+	        "'",
+	    "Could not read IVM metadata table '%s' for '%s': %s", openivm::VIEWS_TABLE, table_name);
 	return result->RowCount() == 0;
 }
 
 Value RefreshMetadata::ReadViewValue(const string &view_name, const string &column) {
-	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM metadata column '%s' for materialized view '%s': %s", column,
-		                            view_name, result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
+	        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
+	    "Could not read IVM metadata column '%s' for materialized view '%s': %s", column, view_name);
 	return result->RowCount() == 0 ? Value() : result->Collection().GetValue(0, 0);
 }
 
@@ -683,16 +630,17 @@ string RefreshMetadata::GetViewQuery(const string &view_name) {
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 	auto result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
-		if (result->HasError()) {
-			auto locus = con.Query("SELECT current_database(), current_schema()");
-			auto locus_text = !locus->HasError() && locus->RowCount() > 0
-			                      ? " (connection locus " + locus->Collection().GetValue(0, 0).ToString() + "." +
-			                            locus->Collection().GetValue(1, 0).ToString() + ")"
-			                      : "";
-			throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
-			                      result->GetError());
-		}
+	if (result->HasError()) {
+		// Read the locus without CurrentLocation, which can itself fail and mask this error.
+		auto locus = con.Query("SELECT current_database(), current_schema()");
+		auto locus_text = !locus->HasError() && locus->RowCount() > 0
+		                      ? " (connection locus " + locus->Collection().GetValue(0, 0).ToString() + "." +
+		                            locus->Collection().GetValue(1, 0).ToString() + ")"
+		                      : "";
+		throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
+		                      result->GetError());
+	}
+	if (result->RowCount() == 0) {
 		auto location = CurrentLocation(con);
 		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
 		                       "view_catalog and view_schema in %s",
@@ -812,7 +760,8 @@ static void SetSourceDelta(const string &delta_key, const string &schema, const 
 	    stored_name.empty() ? RefreshMetadata::SourceDeltaTableName(schema, base, delta_schema) : stored_name;
 }
 
-enum class SourceDeltaLookup { LOCAL, LOCAL_LEGACY_CANDIDATE, LOCAL_LEGACY, REGISTERED };
+// LOCAL reads the source catalog's routing table; REGISTERED reads every metadata registry.
+enum class SourceDeltaLookup { LOCAL, REGISTERED };
 
 static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &context, const string &catalog,
                                                            const string &schema, const string &table,
@@ -824,8 +773,6 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(SqlUtils::DeltaName(table))),
 		    OnEntryNotFound::RETURN_NULL);
 	}
-	const auto delta_key_name = SqlUtils::DeltaName(table);
-	const auto qualified_delta_key = SqlUtils::FullName(catalog, schema, delta_key_name);
 	optional_ptr<TableCatalogEntry> delta;
 	unordered_map<string, unordered_set<string>> delta_owners;
 	auto consume = [&](const vector<Value> &values, const string &metadata_catalog) {
@@ -863,16 +810,6 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 	vector<MetadataLocation> locations;
 	if (lookup == SourceDeltaLookup::REGISTERED) {
 		locations = RefreshMetadata::MetadataLocations(context, openivm::DELTA_TABLES_TABLE);
-	} else if (lookup == SourceDeltaLookup::LOCAL_LEGACY || lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-		// Older native ownership rows can be read locally without following a
-		// controller marker or contacting a detached/remote metadata catalog.
-		auto &source_catalog = Catalog::GetCatalog(context, Identifier(catalog));
-		if (!source_catalog.IsDuckCatalog()) {
-			return nullptr;
-		}
-		for (auto &source_schema : duckdb::FindMetadataSchemas(context, source_catalog, openivm::DELTA_TABLES_TABLE)) {
-			locations.emplace_back(catalog, source_schema);
-		}
 	} else {
 		locations.emplace_back(catalog, DEFAULT_SCHEMA);
 	}
@@ -905,11 +842,9 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 		vector<Value> values(5);
 		if (!metadata_catalog.IsDuckCatalog()) {
 			Connection reader(*context.db);
-			auto rows =
-			    reader.Query("SELECT " + StringUtil::Join(projection, ", ") + " FROM " + location.Table(registry));
-			if (rows->HasError()) {
-				throw CatalogException("OpenIVM could not read source delta ownership: %s", rows->GetError());
-			}
+			auto rows = SqlUtils::QueryOrThrow(
+			    reader, "SELECT " + StringUtil::Join(projection, ", ") + " FROM " + location.Table(registry),
+			    "OpenIVM could not read source delta ownership: %s");
 			for (idx_t row = 0; row < rows->RowCount(); row++) {
 				for (idx_t field = 0; field < values.size(); field++) {
 					values[field] = rows->Collection().GetValue(field, row);
@@ -935,7 +870,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			                                                            Value(StringUtil::Lower(schema))));
 		}
 		// DuckDB 2.0 requires a non-null TableFilterSet to contain at least one
-		// filter. Legacy/registered ownership scans intentionally read all rows.
+		// filter. Registered ownership scans intentionally read all rows.
 		storage.InitializeScan(context, transaction, scan, columns,
 		                       lookup == SourceDeltaLookup::LOCAL ? &filters : nullptr);
 		DataChunk rows;
@@ -946,24 +881,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			if (!rows.size()) {
 				break;
 			}
-			UnifiedVectorFormat names;
-			if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-				rows.data[positions[0].GetIndex()].ToUnifiedFormat(names);
-			}
 			for (idx_t row = 0; row < rows.size(); row++) {
-				if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-					auto index = names.sel->get_index(row);
-					if (!names.validity.RowIsValid(index)) {
-						continue;
-					}
-					auto name = UnifiedVectorFormat::GetData<string_t>(names)[index];
-					auto matches = [&](const string &key) {
-						return StringUtil::CIEquals(name.GetData(), name.GetSize(), key.data(), key.size());
-					};
-					if (!matches(delta_key_name) && !matches(qualified_delta_key)) {
-						continue;
-					}
-				}
 				for (idx_t field = 0; field < values.size(); field++) {
 					values[field] =
 					    positions[field].IsValid() ? rows.GetValue(positions[field].GetIndex(), row) : Value();
@@ -971,10 +889,6 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 				consume(values, location.catalog);
 			}
 		}
-	}
-	if (delta && lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-		// Only legacy tracked sources need the complete cross-registry ownership check.
-		return FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL_LEGACY);
 	}
 	if (delta) {
 		auto physical_key = StringUtil::Lower(SqlUtils::FullName(catalog, delta->schema.name, delta->name));
@@ -992,9 +906,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 
 optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &context, const string &catalog,
                                                                  const string &schema, const string &table) {
-	auto delta = FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL);
-	return delta ? delta
-	             : FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE);
+	return FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL);
 }
 
 optional_ptr<TableCatalogEntry> RefreshMetadata::FindRegisteredSourceDelta(ClientContext &context,
@@ -1244,23 +1156,12 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	loc.schema_name = fallback_schema;
 	string delta_schema;
 	string delta_table_name;
-	auto filter = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	              SqlUtils::EscapeValue(table_name) + "'";
-	auto result = con.Query("SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) + filter);
-	if (result->HasError()) {
-		// Metadata written before physical delta names were stored.
-		result = con.Query("SELECT source_catalog, source_schema, delta_schema, NULL FROM " +
-		                   string(openivm::DELTA_TABLES_TABLE) + filter);
-	}
-	if (result->HasError()) {
-		result = con.Query("SELECT source_catalog, source_schema, NULL, NULL FROM " +
-		                   string(openivm::DELTA_TABLES_TABLE) + filter);
-	}
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM source location for materialized view '%s' and table '%s': %s",
-		                            view_name, table_name, result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
+	        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+	        "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'",
+	    "Could not read IVM source location for materialized view '%s' and table '%s': %s", view_name, table_name);
 	if (result->RowCount() > 0) {
 		if (!result->Collection().GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->Collection().GetValue(0, 0).ToString();
@@ -1300,12 +1201,11 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
                                                                            const string &fallback_catalog,
                                                                            const string &fallback_schema) {
 	StoredViewLocation loc {fallback_catalog, fallback_schema};
-	auto result = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM stored location for materialized view '%s': %s", view_name,
-		                            result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	        SqlUtils::EscapeValue(view_name) + "'",
+	    "Could not read IVM stored location for materialized view '%s': %s", view_name);
 	if (result->RowCount() > 0) {
 		if (!result->Collection().GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->Collection().GetValue(0, 0).ToString();
@@ -1315,10 +1215,7 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 		}
 	}
 	if (loc.catalog_name.empty()) {
-		auto current = con.Query("SELECT current_database()");
-		if (!current->HasError() && current->RowCount() > 0 && !current->Collection().GetValue(0, 0).IsNull()) {
-			loc.catalog_name = current->Collection().GetValue(0, 0).ToString();
-		}
+		loc.catalog_name = SqlUtils::CurrentDatabase(con);
 	}
 	if (loc.schema_name.empty()) {
 		loc.schema_name = DEFAULT_SCHEMA;
@@ -1335,23 +1232,16 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 	auto owner = PublishedSourceViewName(table_name);
 	auto matches = [&](Connection &reader, const MetadataLocation &location, const string &views_table) {
 		// An MV owns its deltas even when no child consumes them.
-		auto query = [&](const string &schema_expression) {
-			return reader.Query(
-			    "SELECT 1 FROM " + views_table + " WHERE view_name=" + Value(owner).ToSQLString() + " AND " +
-			    SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(location.catalog).ToSQLString() + ")",
-			                                  Value(source.catalog_name).ToSQLString()) +
-			    " AND " +
-			    SqlUtils::IdentifierEqualsSQL("COALESCE(" + schema_expression + ", " +
-			                                      Value(source.schema_name).ToSQLString() + ")",
-			                                  Value(source.schema_name).ToSQLString()));
-		};
-		auto result = query("internal_schema, view_schema");
-		if (result->HasError()) {
-			result = query("view_schema"); // Metadata written before internal schemas existed.
-		}
-		if (result->HasError()) {
-			throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
-		}
+		auto result = SqlUtils::QueryOrThrow(
+		    reader,
+		    "SELECT 1 FROM " + views_table + " WHERE view_name=" + Value(owner).ToSQLString() + " AND " +
+		        SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(location.catalog).ToSQLString() + ")",
+		                                      Value(source.catalog_name).ToSQLString()) +
+		        " AND " +
+		        SqlUtils::IdentifierEqualsSQL("COALESCE(internal_schema, view_schema, " +
+		                                          Value(source.schema_name).ToSQLString() + ")",
+		                                      Value(source.schema_name).ToSQLString()),
+		    "Cannot resolve delta owner for '%s': %s", source.table_name);
 		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Checked MV owner in %s with transaction replay=%d\n",
 		                    views_table.c_str(), transaction_state ? 1 : 0);
 		return result->RowCount() != 0;
@@ -1362,23 +1252,12 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
-	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "'";
-	auto result = con.Query(
-	    "SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, delta_table_name" + filter);
-	if (result->HasError()) {
-		// Metadata written before physical delta names were stored.
-		result =
-		    con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, NULL" + filter);
-	}
-	if (result->HasError()) {
-		result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, NULL, NULL" + filter);
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, delta_table_name FROM " +
+	        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
+	    "Could not read IVM delta source metadata for materialized view '%s': %s", view_name);
 	vector<DeltaSource> sources;
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM delta source metadata for materialized view '%s': %s",
-		                            view_name, result->GetError());
-	}
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		DeltaSource source;
 		source.table_name = result->Collection().GetValue(0, row).ToString();
@@ -1416,11 +1295,8 @@ bool RefreshMetadata::HasSourceDeltaConsumers(Connection &con, const DeltaSource
 		if (consumers != excluded_consumers.end() && !consumers->second.empty()) {
 			query += " AND view_name NOT IN (" + consumers->second + ")";
 		}
-		auto remaining = reader.Query(query);
-		if (remaining->HasError()) {
-			throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
-			                       remaining->GetError());
-		}
+		auto remaining = SqlUtils::QueryOrThrow(
+		    reader, query, "OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name);
 		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Checked %s with transaction replay=%d\n", table.c_str(),
 		                    transaction_state ? 1 : 0);
 		return remaining->Collection().GetValue(0, 0).GetValue<int64_t>() != 0;
@@ -1581,6 +1457,19 @@ vector<string> RefreshMetadata::GetDownstreamViewsStrict(const string &view_name
 	return GetDownstreamViewsInternal(con, view_name, true);
 }
 
+vector<string> RefreshMetadata::CascadeOrder(const string &view_name, const string &cascade_mode) {
+	vector<string> order;
+	if (cascade_mode == "upstream" || cascade_mode == "both") {
+		order = GetUpstreamViews(view_name);
+	}
+	order.push_back(view_name);
+	if (cascade_mode == "downstream" || cascade_mode == "both") {
+		auto downstream = GetDownstreamViews(view_name);
+		order.insert(order.end(), downstream.begin(), downstream.end());
+	}
+	return order;
+}
+
 vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode) {
 	if (cascade_mode != "off" && cascade_mode != "upstream" && cascade_mode != "downstream" && cascade_mode != "both") {
 		throw InvalidInputException("refresh_pipeline: unknown cascade mode '%s'", cascade_mode);
@@ -1591,10 +1480,8 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 		idx_t pending = 0;
 	};
 	std::map<string, Node> graph;
-	auto views = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE));
-	if (views->HasError()) {
-		throw CatalogException("refresh_pipeline: cannot read materialized views: %s", views->GetError());
-	}
+	auto views = SqlUtils::QueryOrThrow(con, "SELECT view_name FROM " + string(openivm::VIEWS_TABLE),
+	                                    "refresh_pipeline: cannot read materialized views: %s");
 	for (idx_t i = 0; i < views->RowCount(); i++) {
 		graph.emplace(views->Collection().GetValue(0, i).ToString(), Node());
 	}
@@ -1608,26 +1495,20 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	}
 	// Read the same source metadata used by single-view cascades, not the optional matcher edges.
 	// A child reads the parent's internal tables, which may live in the parent's internal schema.
-	auto edge_query = [&](const string &parent_schema) {
-		return con.Query("SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
-		                 string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" +
-		                 string(openivm::DELTA_PREFIX) + "' || p.view_name OR d.table_name = '" +
-		                 string(openivm::DATA_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
-		                 string(openivm::VISIBLE_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
-		                 string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
-		                 "' || p.view_name)"
-		                 " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR " +
-		                 SqlUtils::IdentifierEqualsSQL("d.source_catalog", "p.view_catalog") + ")" +
-		                 " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR " +
-		                 SqlUtils::IdentifierEqualsSQL("d.source_schema", parent_schema) + ")");
-	};
-	auto edges = edge_query("COALESCE(p.internal_schema, p.view_schema)");
-	if (edges->HasError()) {
-		edges = edge_query("p.view_schema"); // Metadata written before internal schemas existed.
-	}
-	if (edges->HasError()) {
-		throw CatalogException("refresh_pipeline: cannot read dependencies: %s", edges->GetError());
-	}
+	auto edges = SqlUtils::QueryOrThrow(
+	    con,
+	    "SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
+	        string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" + string(openivm::DELTA_PREFIX) +
+	        "' || p.view_name OR d.table_name = '" + string(openivm::DATA_TABLE_PREFIX) +
+	        "' || p.view_name OR d.table_name = '" + string(openivm::VISIBLE_TABLE_PREFIX) +
+	        "' || p.view_name OR d.table_name = '" + string(openivm::DELTA_PREFIX) +
+	        string(openivm::VISIBLE_TABLE_PREFIX) +
+	        "' || p.view_name)"
+	        " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR " +
+	        SqlUtils::IdentifierEqualsSQL("d.source_catalog", "p.view_catalog") + ")" +
+	        " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR " +
+	        SqlUtils::IdentifierEqualsSQL("d.source_schema", "COALESCE(p.internal_schema, p.view_schema)") + ")",
+	    "refresh_pipeline: cannot read dependencies: %s");
 	for (idx_t i = 0; i < edges->RowCount(); i++) {
 		auto parent = edges->Collection().GetValue(0, i).ToString();
 		auto child = edges->Collection().GetValue(1, i).ToString();
@@ -1700,10 +1581,8 @@ bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_p
 				             ")";
 			}
 		}
-		auto result = reader.Query("SELECT 1 FROM " + target + " WHERE " + predicate + " LIMIT 1");
-		if (result->HasError()) {
-			throw CatalogException("Cannot resolve downstream consumers for '%s': %s", view_name, result->GetError());
-		}
+		auto result = SqlUtils::QueryOrThrow(reader, "SELECT 1 FROM " + target + " WHERE " + predicate + " LIMIT 1",
+		                                     "Cannot resolve downstream consumers for '%s': %s", view_name);
 		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Downstream consumers for %s in %s: %d\n", view_name.c_str(),
 		                    target.c_str(), result->RowCount() != 0);
 		return result->RowCount() != 0;
@@ -1913,13 +1792,11 @@ bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
 	if (catalog_name.empty()) {
 		return false;
 	}
-	auto result =
-	    con.Query("SELECT type FROM duckdb_databases() WHERE " +
-	              SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog_name).ToSQLString()) + " LIMIT 1");
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM could not resolve the type of catalog '%s': %s", catalog_name,
-		                       result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow(
+	    con,
+	    "SELECT type FROM duckdb_databases() WHERE " +
+	        SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog_name).ToSQLString()) + " LIMIT 1",
+	    "OpenIVM could not resolve the type of catalog '%s': %s", catalog_name);
 	return result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->Collection().GetValue(0, 0).ToString(), "ducklake");
 }
@@ -1959,11 +1836,9 @@ int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) 
 	if (snapshot_context) {
 		return GetTransactionalDuckLakeSnapshot(*snapshot_context, catalog_name);
 	}
-	auto result = con.Query("SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot()");
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read current snapshot of catalog '%s': %s", catalog_name,
-		                            result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con, "SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot()",
+	    "Could not read current snapshot of catalog '%s': %s", catalog_name);
 	if (result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
 		return -1;
 	}
@@ -2014,13 +1889,11 @@ RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name, const st
                                                const string &catalog_name, const string &schema_name,
                                                int64_t last_snapshot_id, int64_t current_snapshot_id) {
 	DuckLakeSourceIdentity identity;
-	auto result =
-	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read source_table_id for '%s' of materialized view '%s': %s", table_name,
-		                            view_name, result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	        SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name),
+	    "Could not read source_table_id for '%s' of materialized view '%s': %s", table_name, view_name);
 	if (result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->Collection().GetValue(0, 0).GetValue<int64_t>();
 	}
@@ -2397,20 +2270,23 @@ string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
 	return writer.Finish();
 }
 
+template <class T>
+string RefreshMetadata::ToJson(const T &meta) {
+	return MetadataJson::Write(meta);
+}
+template string RefreshMetadata::ToJson(const CountDistinctAuxMeta &);
+template string RefreshMetadata::ToJson(const SemiAntiAuxMeta &);
+template string RefreshMetadata::ToJson(const LeftJoinKeySource &);
+template string RefreshMetadata::ToJson(const LeftJoinNullableSources &);
+template string RefreshMetadata::ToJson(const FilteredGroupCountAuxMeta &);
+template string RefreshMetadata::ToJson(const LeftJoinSecondaryMeta &);
+
 bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "count_distinct_aux_meta_json"), out);
 }
 
-string RefreshMetadata::CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta) {
-	return MetadataJson::Write(meta);
-}
-
 bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "semi_anti_aux_meta_json"), out);
-}
-
-string RefreshMetadata::SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta) {
-	return MetadataJson::Write(meta);
 }
 
 bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
@@ -2491,10 +2367,6 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 	    ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_key_source"), out);
 }
 
-string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
-	return MetadataJson::Write(source);
-}
-
 vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(const string &view_name) {
 	vector<FullOuterScope> scopes;
 	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "full_outer_scopes");
@@ -2546,25 +2418,13 @@ bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJo
 	                          out);
 }
 
-string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
-	return MetadataJson::Write(src);
-}
-
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "aggregate_decomposition_json"), out);
-}
-
-string RefreshMetadata::FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta) {
-	return MetadataJson::Write(meta);
 }
 
 // Metadata written before the side lists were JSON arrays fails to parse; refresh then group-recomputes.
 bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "leftjoin_secondary_meta_json"), out);
-}
-
-string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {
-	return MetadataJson::Write(meta);
 }
 
 string RefreshMetadata::DistinctAuxMeta::InternalColumn(const string &name) const {

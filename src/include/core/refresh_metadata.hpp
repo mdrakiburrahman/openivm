@@ -52,9 +52,8 @@ public:
 	// In autocommit mode, move a catalog's metadata into the configured schema and, for a new
 	// materialized view, create that schema. Other metadata objects keep their placement.
 	static void PrepareMetadataSchema(ClientContext &context, const string &view_catalog, bool create_schema);
-	// Every native metadata location containing `table`, and the qualified table names.
-	static vector<MetadataLocation> MetadataLocations(Connection &con, const string &table);
-	// Caller-snapshot discovery includes uncommitted schemas and registries.
+	// Every native metadata location containing `table`; caller-snapshot discovery includes uncommitted schemas and
+	// registries.
 	static vector<MetadataLocation> MetadataLocations(ClientContext &context, const string &table);
 	static vector<string> MetadataTables(Connection &con, const string &table);
 
@@ -203,6 +202,8 @@ public:
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
+	// Refresh order of a single-view cascade: upstream views, the view itself, then downstream views.
+	vector<string> CascadeOrder(const string &view_name, const string &cascade_mode);
 	bool HasDownstreamViews(const string &view_name, bool include_published = true,
 	                        optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr);
 
@@ -391,8 +392,11 @@ public:
 		string filter;
 	};
 
+	// JSON encoding of a metadata struct without nested objects (CountDistinctAuxMeta, SemiAntiAuxMeta,
+	// LeftJoinKeySource, LeftJoinNullableSources, FilteredGroupCountAuxMeta, LeftJoinSecondaryMeta).
+	template <class T>
+	static string ToJson(const T &meta);
 	bool GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out);
-	static string CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta);
 
 	struct SemiAntiAuxMeta {
 		string aux_table;
@@ -413,7 +417,6 @@ public:
 	};
 
 	bool GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out);
-	static string SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta);
 
 	struct WindowPartitionLineageOp {
 		WindowLineageKind kind = WindowLineageKind::DIRECT;
@@ -466,7 +469,6 @@ public:
 	};
 
 	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);
-	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
 
 	// Nested outer-join inputs used to discover NULL-padding keys of a FULL projection.
 	struct FullOuterScopeInput {
@@ -491,7 +493,6 @@ public:
 	};
 
 	bool GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out);
-	static string LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src);
 
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
@@ -507,7 +508,6 @@ public:
 	};
 
 	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);
-	static string FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta);
 
 	// LEFT JOIN pipeline secondary-delta maintenance (Larson & Zhou). The secondary-delta SQL is
 	// generated once at CREATE time (from the plan) and stored; refresh substitutes the per-source
@@ -525,7 +525,6 @@ public:
 	};
 
 	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);
-	static string LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta);
 
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
 	static vector<pair<string, string>> DistinctSignCountColumns(const DistinctAuxMeta &meta);

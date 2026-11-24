@@ -10,31 +10,17 @@
 #include "core/refresh_daemon.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
-#include "core/time_travel_pins.hpp"
-#include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
 #include "upsert/refresh_internal.hpp"
 
-#include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
-#include "duckdb/parser/query_error_context.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/planner_extension.hpp"
 #include "core/parser.hpp"
@@ -44,9 +30,6 @@
 #include "rules/refresh_insert_rule.hpp"
 #include "core/openivm_debug.hpp"
 
-#include <map>
-#include <mutex>
-
 namespace duckdb {
 
 // Global daemon instance — started unconditionally at extension load.
@@ -55,28 +38,16 @@ static shared_ptr<RefreshDaemon> global_daemon;
 
 static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context, TableFunctionBindInput &input,
                                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
+	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
 	string view_catalog_name = StringValue::Get(input.inputs[0]);
-	string view_schema_name = StringValue::Get(input.inputs[1]);
 	string view_name = StringValue::Get(input.inputs[2]);
 	OPENIVM_DEBUG_PRINT("View to be incrementally maintained: %s \n", view_name.c_str());
 
 	Connection con(*context.db);
-	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
-	if (!context.transaction.IsAutoCommit()) {
-		RefreshMetadata(con).SnapshotTransaction(context);
-	}
-	string view_query = RefreshMetadata(con).GetViewQuery(view_name);
-	if (view_query.empty()) {
-		throw Exception(ExceptionType::CATALOG,
-		                "IVM: materialized view '" + view_name + "' not found or its definition is missing");
-	}
-	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
-
-	auto parser = Parser::GetBuiltinParser();
-	parser.ParseQuery(view_query);
-	duckdb::openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
 	Planner planner(context);
-	planner.CreatePlan(std::move(parser.statements[0]));
+	planner.CreatePlan(IncrementalRewriteRule::LoadStoredViewStatement(context, con, view_catalog_name, view_name,
+	                                                                   "IVM: materialized view '" + view_name +
+	                                                                       "' not found or its definition is missing"));
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
 	auto result = make_uniq<TableFunctionData>();
@@ -193,11 +164,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"openivm_profile_retention_days",
 	     "delete refresh profile rows older than this many days when profiling is written", LogicalType::BIGINT,
 	     Value::BIGINT(31)},
-	    {"openivm_explain_initial_load", "print CREATE MATERIALIZED VIEW initial-load SQL and EXPLAIN plans",
-	     LogicalType::BOOLEAN, off},
 	    {"openivm_snapshot_publication", "publish unordered DuckLake materialized views through retained snapshots",
-	     LogicalType::BOOLEAN, off},
-	    {"openivm_explain_initial_load_only", "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	     LogicalType::BOOLEAN, off},
 	    {openivm::INTERNAL_SCHEMA_SETTING,
 	     "schema for OpenIVM internal maintenance tables within each data catalog; empty keeps them beside the "
@@ -373,24 +340,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    Connection con(*context.db);
 		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 		    RefreshMetadata(con).GetViewType(view_name);
-		    Value directory;
-		    bool enabled =
-		        context.TryGetCurrentSetting(Identifier("openivm_files_path"), directory) && !directory.IsNull();
+		    auto directory = SqlUtils::GetStringSetting(context, "openivm_files_path");
+		    bool enabled = !directory.empty();
 		    auto &fs = FileSystem::GetFileSystem(context);
 		    auto cwd = FileSystem::GetWorkingDirectory();
 		    vector<string> rows;
-		    const vector<pair<string, string>> files = {
-		        {"system", "openivm_system_tables.sql"},
-		        {"create", "openivm_compiled_queries_" + view_name + ".sql"},
-		        {"refresh", "openivm_upsert_queries_" + view_name + ".sql"},
-		        {"explain", "openivm_initial_load_explain_" + view_name + ".txt"}};
+		    const vector<pair<string, string>> files = {{"system", "openivm_system_tables.sql"},
+		                                                {"create", "openivm_compiled_queries_" + view_name + ".sql"},
+		                                                {"refresh", "openivm_upsert_queries_" + view_name + ".sql"}};
 		    for (const auto &file : files) {
 			    string path;
 			    bool exists = false;
 			    string status =
 			        "disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh";
 			    if (enabled) {
-				    path = directory.ToString() + "/" + file.second;
+				    path = directory + "/" + file.second;
 				    if (!fs.IsPathAbsolute(path)) {
 					    path = fs.JoinPath(cwd, path);
 				    }

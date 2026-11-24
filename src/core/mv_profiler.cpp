@@ -62,8 +62,7 @@ void MVProfiler::Flush() {
 	}
 	flushed = true;
 	Connection profile_con(*context.db);
-	TransactionalMVLockState::Get(*profile_con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *profile_con.context);
 	if (profile_table.empty()) {
 		RefreshMetadata::UseCatalog(context, profile_con, view_catalog);
 		profile_table = RefreshMetadata::MetadataTable(profile_con, openivm::PROFILE_TABLE);

@@ -309,7 +309,7 @@ struct JoinPlanFacts {
 
 // Collect join leaves and the properties needed to select a compilation strategy. Non-join wrappers remain leaves,
 // but their descendants are still inspected for validation and existing multiplicity bindings.
-static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool is_right_of_left, bool collect_leaf,
+static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool collect_leaf,
                                  bool collect_ducklake_leaf, JoinPlanFacts &facts) {
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
@@ -355,36 +355,25 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		}
 	}
 	if ((collect_leaf || collect_ducklake_leaf) && is_join_tree_node) {
-		bool left_is_nullable = is_right_of_left;
-		bool right_is_nullable = is_right_of_left;
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join) {
-			left_is_nullable =
-			    left_is_nullable || join->join_type == JoinType::RIGHT || join->join_type == JoinType::OUTER;
-			right_is_nullable =
-			    right_is_nullable || join->join_type == JoinType::LEFT || join->join_type == JoinType::OUTER;
-		}
 		D_ASSERT(node->children.size() == 2);
 		path.push_back(0);
-		CollectJoinPlanFacts(node->children[0].get(), path, left_is_nullable, collect_leaf, collect_ducklake_leaf,
-		                     facts);
+		CollectJoinPlanFacts(node->children[0].get(), path, collect_leaf, collect_ducklake_leaf, facts);
 		path.pop_back();
 		path.push_back(1);
-		CollectJoinPlanFacts(node->children[1].get(), path, right_is_nullable, collect_leaf, collect_ducklake_leaf,
-		                     facts);
+		CollectJoinPlanFacts(node->children[1].get(), path, collect_leaf, collect_ducklake_leaf, facts);
 		path.pop_back();
 		return;
 	}
 	if (collect_leaf) {
 		auto *get = node->type == LogicalOperatorType::LOGICAL_GET ? dynamic_cast<LogicalGet *>(node) : nullptr;
-		facts.leaves.push_back({path, get, node, is_right_of_left});
+		facts.leaves.push_back({path, get, node});
 	}
 	if (collect_ducklake_leaf) {
 		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
 		    node->type == LogicalOperatorType::LOGICAL_FILTER) {
 			if (node->children.size() == 1) {
 				path.push_back(0);
-				CollectJoinPlanFacts(node->children[0].get(), path, is_right_of_left, false, true, facts);
+				CollectJoinPlanFacts(node->children[0].get(), path, false, true, facts);
 				path.pop_back();
 				return;
 			}
@@ -394,7 +383,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		} else if (node->type == LogicalOperatorType::LOGICAL_GET) {
 			auto *get = dynamic_cast<LogicalGet *>(node);
 			if (get && get->function.GetName().GetIdentifierName() == "ducklake_scan" && get->function.function_info) {
-				facts.ducklake_leaves.push_back({path, get, node, is_right_of_left});
+				facts.ducklake_leaves.push_back({path, get, node});
 				return;
 			}
 			if (facts.ducklake_fallback_reason.empty()) {
@@ -406,7 +395,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 	}
 	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
 		path.push_back(child_idx);
-		CollectJoinPlanFacts(node->children[child_idx].get(), path, is_right_of_left, false, false, facts);
+		CollectJoinPlanFacts(node->children[child_idx].get(), path, false, false, facts);
 		path.pop_back();
 	}
 }
@@ -419,18 +408,6 @@ static bool IsNullSupplyingJoin(JoinType join_type) {
 		return true;
 	default:
 		return false;
-	}
-}
-
-void DemoteLeftJoins(LogicalOperator *node) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (j && IsNullSupplyingJoin(j->join_type)) {
-			j->join_type = JoinType::INNER;
-		}
-	}
-	for (auto &child : node->children) {
-		DemoteLeftJoins(child.get());
 	}
 }
 
@@ -514,7 +491,7 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
                                                                     Binder &binder, LogicalGet *base_get, idx_t key_pos,
                                                                     const string &view_name, bool old_state) {
 	auto delta_result = CreateDeltaGetNode(context, con, binder, base_get, view_name, nullptr, true);
-	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.node), binder);
+	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.op), binder);
 	auto delta_bindings = delta_renumbered.op->GetColumnBindings();
 	auto delta_types = delta_renumbered.op->types;
 	// These mutations admit the appended multiplicity as a data key; valid plans must reject it.
@@ -828,6 +805,35 @@ static void GuardKeptOuterJoinsForMask(ClientContext &context, Connection &con, 
 	                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
 }
 
+vector<LogicalOperator *> LeafPathAncestors(LogicalOperator &root, const vector<size_t> &leaf_path,
+                                            const char *context_label) {
+	vector<LogicalOperator *> ancestors;
+	ancestors.reserve(leaf_path.size());
+	LogicalOperator *node = &root;
+	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
+		// Equality is the first invalid child index and is handled by this exception.
+		// mull-ignore-next: cxx_ge_to_gt
+		if (leaf_path[depth] >= node->children.size()) {
+			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
+			                        (idx_t)leaf_path[depth], (idx_t)depth);
+		}
+		ancestors.push_back(node);
+		node = node->children[leaf_path[depth]].get();
+	}
+	return ancestors;
+}
+
+idx_t JoinChildOutputOffset(LogicalOperator &join, size_t child_side) {
+	if (child_side == 0) {
+		return 0;
+	}
+	auto *logical_join = dynamic_cast<LogicalJoin *>(&join);
+	if (logical_join && !logical_join->left_projection_map.empty()) {
+		return logical_join->left_projection_map.size();
+	}
+	return join.children[0]->GetColumnBindings().size();
+}
+
 void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, const vector<size_t> &leaf_path,
                                 size_t depth, idx_t insertion_idx, idx_t added) {
 	if (added == 0 || depth == 0) {
@@ -853,24 +859,12 @@ void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, cons
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,
-                                                bool preserve_constant_sibling_child_outputs, idx_t fallback_mul_idx,
+                                                bool preserve_constant_sibling_child_outputs,
                                                 idx_t original_leaf_width) {
 	if (leaf_path.empty()) {
 		return;
 	}
-	vector<LogicalOperator *> ancestors;
-	ancestors.reserve(leaf_path.size());
-	LogicalOperator *node = term.get();
-	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
-		// Equality is the first invalid child index and is handled by this exception.
-		// mull-ignore-next: cxx_ge_to_gt
-		if (leaf_path[depth] >= node->children.size()) {
-			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
-			                        (idx_t)leaf_path[depth], (idx_t)depth);
-		}
-		ancestors.push_back(node);
-		node = node->children[leaf_path[depth]].get();
-	}
+	auto ancestors = LeafPathAncestors(*term, leaf_path, context_label);
 	for (size_t depth = leaf_path.size(); depth-- > 0;) {
 		size_t child_side = leaf_path[depth];
 		auto *join = dynamic_cast<LogicalJoin *>(ancestors[depth]);
@@ -912,28 +906,11 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 						    context_label, (idx_t)projected_idx, (idx_t)child_side, (idx_t)child_bindings.size());
 					}
 				}
-				// CompileChild normally exposes the binding directly. This fallback exists only for an immediate copied
-				// wrapper whose validated output position is supplied by the caller.
-				switch (mul_idx) {
-				case DConstants::INVALID_INDEX:
-					if (immediate_parent &&
-					    fallback_mul_idx < child_bindings.size()) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-						mul_idx = fallback_mul_idx;
-					}
-					break;
-				default:
-					break;
-				}
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
 				}
 				idx_t old_width = proj_map.size();
-				idx_t insertion_idx = old_width;
-				if (child_side == 1) {
-					auto left_bindings = join->children[0]->GetColumnBindings();
-					insertion_idx +=
-					    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
-				}
+				idx_t insertion_idx = old_width + JoinChildOutputOffset(*join, child_side);
 				// Appending to this join's own left_projection_map grows its LEFT
 				// contribution width, which shifts the absolute position where its RIGHT
 				// contribution starts within its own combined GetColumnBindings(). A
@@ -980,12 +957,8 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 			if (mul_binding_it == child_bindings.end()) {
 				continue;
 			}
-			idx_t insertion_idx = idx_t(mul_binding_it - child_bindings.begin());
-			if (child_side == 1) {
-				auto left_bindings = join->children[0]->GetColumnBindings();
-				insertion_idx +=
-				    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
-			}
+			idx_t insertion_idx =
+			    idx_t(mul_binding_it - child_bindings.begin()) + JoinChildOutputOffset(*join, child_side);
 			// An empty map passes the child's bindings through unchanged, so the
 			// multiplicity is inserted in-place and shifts every later binding.
 			shift_parent_projection(insertion_idx, 1);
@@ -996,8 +969,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding, idx_t original_leaf_width) {
-	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin", false,
-	                                           DConstants::INVALID_INDEX, original_leaf_width);
+	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin", false, original_leaf_width);
 }
 
 // ============================================================================
@@ -1132,23 +1104,17 @@ static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafIn
 }
 
 static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, const string &table_name, size_t &leaf) {
-	auto assign_leaf = [&](unordered_map<string, size_t>::const_iterator it) {
-		if (it == table_to_leaf.end()) {
-			return false;
-		}
-		switch (it->second) {
-		case size_t(-1):
-			return false;
-		default:
-			leaf = it->second;
-			return true;
-		}
-	};
 	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
 	for (auto &part : parts) {
 		part = SqlUtils::QuoteIdentifier(part);
 	}
-	return assign_leaf(table_to_leaf.find(StringUtil::Lower(StringUtil::Join(parts, "."))));
+	auto it = table_to_leaf.find(StringUtil::Lower(StringUtil::Join(parts, ".")));
+	// size_t(-1) marks an ambiguous alias.
+	if (it == table_to_leaf.end() || it->second == size_t(-1)) {
+		return false;
+	}
+	leaf = it->second;
+	return true;
 }
 
 static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes, size_t child_leaf,
@@ -1179,7 +1145,7 @@ static bool AllFKColumnsJoined(const vector<vector<DeltaJoinKeyProbe>> &key_prob
 	return true;
 }
 
-static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
+static vector<FKRelation> DetectFKRelations(const vector<JoinLeafInfo> &leaves,
                                             const vector<vector<DeltaJoinKeyProbe>> &key_probes,
                                             const vector<openivm::CachedConstraint> &declarations) {
 	vector<FKRelation> relations;
@@ -1314,6 +1280,23 @@ static bool SourceFactMatches(const string &fact, TableCatalogEntry &table) {
 	       (parts.size() < 3 || StringUtil::CIEquals(parts[0], table.ParentCatalog().GetName().GetIdentifierName()));
 }
 
+string FactDeltaShape(const openivm::CompileFacts &facts, TableCatalogEntry &table) {
+	// Several keys can name one table (bare, schema- or fully-qualified). Independent of map order, the least
+	// optimistic shape wins: UNCHANGED < INSERT_ONLY < anything else (a change of unknown or mixed kind); equally
+	// ranked shapes tie-break by name so the result never depends on hash order.
+	auto rank = [](const string &shape) {
+		return StringUtil::CIEquals(shape, "UNCHANGED") ? 1 : StringUtil::CIEquals(shape, "INSERT_ONLY") ? 2 : 3;
+	};
+	string result;
+	for (auto &entry : facts.delta_shape) {
+		if (SourceFactMatches(entry.first, table) && (result.empty() || rank(entry.second) > rank(result) ||
+		                                              (rank(entry.second) == rank(result) && entry.second > result))) {
+			result = entry.second;
+		}
+	}
+	return result;
+}
+
 static bool DeltaShapeIsInsertOnlyForPruning(const string &shape) {
 	return StringUtil::CIEquals(shape, "INSERT_ONLY") || StringUtil::CIEquals(shape, "UNCHANGED");
 }
@@ -1329,11 +1312,8 @@ static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, c
 			mask |= (1ULL << i);
 			continue;
 		}
-		for (auto &entry : facts.delta_shape) {
-			if (SourceFactMatches(entry.first, *get->GetTable()) && DeltaShapeIsInsertOnlyForPruning(entry.second)) {
-				mask |= (1ULL << i);
-				break;
-			}
+		if (DeltaShapeIsInsertOnlyForPruning(FactDeltaShape(facts, *get->GetTable()))) {
+			mask |= (1ULL << i);
 		}
 	}
 	return mask;
@@ -1352,17 +1332,7 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 				if (get.GetTable().get() == nullptr) {
 					continue;
 				}
-				bool table_unchanged = false;
-				for (auto &entry : facts.delta_shape) {
-					if (SourceFactMatches(entry.first, *get.GetTable()) &&
-					    StringUtil::CIEquals(entry.second, "UNCHANGED")) {
-						table_unchanged = true;
-						break;
-					}
-				}
-				if (!table_unchanged) {
-					all_unchanged = false;
-				}
+				all_unchanged = StringUtil::CIEquals(FactDeltaShape(facts, *get.GetTable()), "UNCHANGED");
 			}
 			for (auto &child : node->children) {
 				pending.push_back(child.get());
@@ -1443,7 +1413,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	    has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1; // mull-ignore: cxx_eq_to_ne
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = has_compile_fk_facts ? DetectCompileFactsFKRelations(compile_facts, leaves, key_probes)
-		                                         : DetectFKRelations(context, leaves, key_probes, declarations);
+		                                         : DetectFKRelations(leaves, key_probes, declarations);
 		if (!fk_relations.empty()) {
 			uint64_t insert_only_mask = has_compile_fk_facts ? ComputeFactsInsertOnlyMask(compile_facts, leaves)
 			                                                 : delta_status.insert_only_mask;
@@ -1693,14 +1663,14 @@ DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, Clien
 		auto original_bindings = leaf_node->GetColumnBindings();
 		auto delta = CreateDeltaGetNode(context, input.context.metadata_con, binder, &get, input.context.view,
 		                                &source_cache, true);
-		auto delta_bindings = delta.node->GetColumnBindings();
+		auto delta_bindings = delta.op->GetColumnBindings();
 		// DuckDB 2.0 can expose projected GET bindings using their sparse physical
 		// positions (for example 1,2,3 when position 0 is filter-only). Delta
 		// compaction emits contiguous bindings. Rebind conditions and expressions
 		// above the leaf before replacing it; join projection maps are positional and
 		// remain the responsibility of UpdateParentProjectionMap.
 		RebindRegularLeafParent(*term_root, *leaf_node, original_bindings, delta_bindings);
-		return {std::move(delta.node), delta.mul_binding};
+		return delta;
 	}
 	return input.CompileCopiedSubtree(leaf_node, term_root);
 }
@@ -1799,7 +1769,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	bool collect_ducklake_leaves = ducklake_nterm_enabled && input.context.model.type == RefreshType::SIMPLE_PROJECTION;
 	JoinPlanFacts join_facts;
 	vector<size_t> join_path;
-	CollectJoinPlanFacts(input.plan.get(), join_path, false, true, collect_ducklake_leaves, join_facts);
+	CollectJoinPlanFacts(input.plan.get(), join_path, true, collect_ducklake_leaves, join_facts);
 	vector<ColumnBinding> original_bindings;
 	vector<LogicalType> output_types;
 	FilterInternalMultiplicityColumns(all_original_bindings, input.plan->types,
@@ -1818,7 +1788,6 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (N > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
 		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
 	}
-
 	// 2. Output types
 	auto types = output_types;
 	D_ASSERT(types.size() == original_bindings.size());

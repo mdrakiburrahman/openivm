@@ -13,9 +13,7 @@
 namespace duckdb {
 
 bool CompiledSQLArchiveEnabled(ClientContext &context) {
-	Value value;
-	return context.TryGetCurrentSetting(Identifier("openivm_archive_compiled_sql"), value) && !value.IsNull() &&
-	       value.GetValue<bool>();
+	return SqlUtils::GetBoolSetting(context, "openivm_archive_compiled_sql", false);
 }
 
 const char *CompiledProgramOutcomeName(CompiledProgramOutcome outcome) {
@@ -162,19 +160,6 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 		return materialized;
 	};
 	string error;
-	// Databases created before the archive existed get its tables on first use.
-	auto resolved_schema = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
-	if (!con.TableInfo(Identifier(catalog), Identifier(resolved_schema),
-	                   Identifier(openivm::COMPILED_PROGRAMS_TABLE)) ||
-	    !con.TableInfo(Identifier(catalog), Identifier(resolved_schema),
-	                   Identifier(openivm::COMPILED_STATEMENTS_TABLE))) {
-		for (auto &ddl : CompiledSQLArchiveSchemaDDL(catalog, schema)) {
-			auto created = con.Query(ddl);
-			if (created->HasError()) {
-				return created->GetError();
-			}
-		}
-	}
 	auto programs = ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE);
 	auto statements = ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE);
 	Value view_name(program.view_name);
@@ -258,8 +243,7 @@ string RecordCompiledProgram(ClientContext &context, const string &view_catalog,
 	try {
 		Connection con(*context.db);
 		// The caller owns the database-wide mutation gate; let tracked writes re-enter it.
-		TransactionalMVLockState::Get(*con.context)
-		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+		TransactionalMVLockState::ShareMutationOwner(context, *con.context);
 		// The archive belongs to the view's metadata location (openivm_metadata_catalog/_schema).
 		RefreshMetadata::UseCatalog(context, con, view_catalog);
 		auto location = RefreshMetadata::CurrentLocation(con);

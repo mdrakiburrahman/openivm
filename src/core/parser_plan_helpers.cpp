@@ -1,3 +1,4 @@
+#include "core/vector_utils.hpp"
 #include "core/parser_plan_helpers.hpp"
 #include "core/metadata_json.hpp"
 
@@ -845,37 +846,6 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
 	       table_name;
 }
 
-static string StripTrailingSemicolon(string sql) {
-	StringUtil::Trim(sql);
-	if (!sql.empty() && sql.back() == ';') {
-		sql.pop_back();
-		StringUtil::Trim(sql);
-	}
-	return sql;
-}
-
-string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query) {
-	string sql = StripTrailingSemicolon(query);
-	if (sql.empty()) {
-		return label + "\n<empty query>\n";
-	}
-	auto old_explain = con.Query("SELECT current_setting('explain_output')");
-	con.Query("SET explain_output='all'");
-	auto explain = con.Query("EXPLAIN " + sql);
-	if (old_explain && !old_explain->HasError() && old_explain->RowCount() > 0 &&
-	    !old_explain->Collection().GetValue(0, 0).IsNull()) {
-		con.Query("SET explain_output='" +
-		          SqlUtils::EscapeSingleQuotes(old_explain->Collection().GetValue(0, 0).ToString()) + "'");
-	}
-	string result = label + "\n";
-	if (!explain || explain->HasError()) {
-		result += "<EXPLAIN failed: " + (explain ? explain->GetError() : string("no result")) + ">\n";
-	} else {
-		result += explain->ToString() + "\n";
-	}
-	return result;
-}
-
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
                       unordered_map<TableIndex, unordered_set<ProjectionIndex>> &join_key_cols) {
 	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
@@ -1051,7 +1021,7 @@ static void AppendUniqueValues(vector<T> &target, const vector<T> &source) {
 
 static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
                                      unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
-                                     bool under_join, const LogicalOperator *redundant_distinct, PlanAnalysis &analysis,
+                                     const LogicalOperator *redundant_distinct, PlanAnalysis &analysis,
                                      TableIndex internal_delim_cte = TableIndex()) {
 	if (!op) {
 		return;
@@ -1107,11 +1077,6 @@ static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_
 				facts.has_filter_above_aggregate = true;
 			}
 		}
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
-		under_join = true;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &proj = op->Cast<LogicalProjection>();
@@ -1174,11 +1139,6 @@ static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_
 	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op->Cast<LogicalCTERef>();
 		facts.cte_refs_by_table_index[cte_ref.table_index] = &cte_ref;
-		if (under_join) {
-			if (++facts.cte_refs_under_join_count[cte_ref.cte_index] >= 2) {
-				facts.has_repeated_cte_ref_under_join = true;
-			}
-		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && op->children.size() >= 2) {
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
 		facts.cte_defs_by_index[cte.table_index] = op->children[0].get();
@@ -1188,8 +1148,8 @@ static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_
 	vector<idx_t> child_ids;
 	child_ids.reserve(op->children.size());
 	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis, TableIndex child_delim_cte) {
-		CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above, under_join,
-		                         redundant_distinct, child_analysis, child_delim_cte);
+		CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above, redundant_distinct,
+		                         child_analysis, child_delim_cte);
 		D_ASSERT(!facts.plan_nodes_post_order.empty());
 		child_ids.push_back(facts.plan_nodes_post_order.size() - 1);
 	};
@@ -1862,18 +1822,9 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Retained %zu DISTINCT aggregate group expressions\n", meta.group_inputs.size());
 }
 
-static void AddUniqueGroupName(vector<string> &group_names, const string &new_name) {
-	for (auto &existing : group_names) {
-		if (StringUtil::CIEquals(existing, new_name)) {
-			return;
-		}
-	}
-	group_names.push_back(new_name);
-}
-
 static void AddUniqueGroupNames(vector<string> &group_names, const vector<string> &new_names) {
 	for (auto &name : new_names) {
-		AddUniqueGroupName(group_names, name);
+		AddUniqueCI(group_names, name);
 	}
 }
 
@@ -1891,7 +1842,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, c
 				continue;
 			}
 			if (!output_names[expr_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_idx])) {
-				AddUniqueGroupName(group_names, output_names[expr_idx]);
+				AddUniqueCI(group_names, output_names[expr_idx]);
 			}
 		}
 	}
@@ -2332,7 +2283,7 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 	    top && top->type == LogicalOperatorType::LOGICAL_DISTINCT && !top->children.empty() &&
 	    (ProducesAtMostOneRow(*top->children[0]) || IsRedundantDistinctOverGroupKeys(*top));
 	unordered_map<string, idx_t> next_occurrence;
-	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false,
+	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false,
 	                         facts.has_top_level_redundant_distinct ? top : nullptr, facts.analysis);
 	next_occurrence.clear();
 	for (auto &source : facts.source_occurrences) {

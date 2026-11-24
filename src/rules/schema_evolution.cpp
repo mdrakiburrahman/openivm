@@ -389,17 +389,6 @@ static bool RewriteDistinctAuxMetaFields(RefreshMetadata::DistinctAuxMeta &meta,
 	return changed;
 }
 
-static bool RewriteDistinctAuxMeta(Connection &con, RefreshMetadata &metadata, const string &view_name,
-                                   const string &table_name, const string &old_name, const string &new_name) {
-	RefreshMetadata::DistinctAuxMeta meta;
-	if (metadata.GetDistinctAuxMeta(view_name, meta) &&
-	    RewriteDistinctAuxMetaFields(meta, table_name, old_name, new_name)) {
-		UpdateViewMetadataValue(con, view_name, "distinct_aux_meta_json", RefreshMetadata::DistinctAuxMetaToJson(meta));
-		return true;
-	}
-	return false;
-}
-
 static bool RewriteFilteredGroupCountMetaFields(RefreshMetadata::FilteredGroupCountAuxMeta &meta,
                                                 const string &table_name, const string &old_name,
                                                 const string &new_name) {
@@ -418,18 +407,6 @@ static bool RewriteFilteredGroupCountMetaFields(RefreshMetadata::FilteredGroupCo
 	changed |= SqlUtils::RewriteColumnReferences(meta.source_sum_expr, old_name, new_name, qualifiers, true);
 	changed |= SqlUtils::RewriteColumnReferences(meta.filter, old_name, new_name, qualifiers, true);
 	return changed;
-}
-
-static bool RewriteFilteredGroupCountMeta(Connection &con, RefreshMetadata &metadata, const string &view_name,
-                                          const string &table_name, const string &old_name, const string &new_name) {
-	RefreshMetadata::FilteredGroupCountAuxMeta meta;
-	if (metadata.GetFilteredGroupCountAuxMeta(view_name, meta) &&
-	    RewriteFilteredGroupCountMetaFields(meta, table_name, old_name, new_name)) {
-		UpdateViewMetadataValue(con, view_name, "aggregate_decomposition_json",
-		                        RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta));
-		return true;
-	}
-	return false;
 }
 
 static bool RewriteSemiAntiAuxMetaFields(RefreshMetadata::SemiAntiAuxMeta &meta, const string &table_name,
@@ -457,16 +434,26 @@ static bool RewriteSemiAntiAuxMetaFields(RefreshMetadata::SemiAntiAuxMeta &meta,
 	return changed;
 }
 
-static bool RewriteSemiAntiAuxMeta(Connection &con, RefreshMetadata &metadata, const string &view_name,
-                                   const string &table_name, const string &old_name, const string &new_name) {
-	RefreshMetadata::SemiAntiAuxMeta meta;
-	if (metadata.GetSemiAntiAuxMeta(view_name, meta) &&
-	    RewriteSemiAntiAuxMetaFields(meta, table_name, old_name, new_name, /*include_stable_left_predicate=*/false)) {
-		UpdateViewMetadataValue(con, view_name, "semi_anti_aux_meta_json",
-		                        RefreshMetadata::SemiAntiAuxMetaToJson(meta));
-		return true;
+// Rename a source column inside each aux-state metadata entry that reads table_name.
+static void RewriteAuxMetas(Connection &con, RefreshMetadata &metadata, const string &view_name,
+                            const string &table_name, const string &old_name, const string &new_name) {
+	RefreshMetadata::DistinctAuxMeta distinct;
+	if (metadata.GetDistinctAuxMeta(view_name, distinct) &&
+	    RewriteDistinctAuxMetaFields(distinct, table_name, old_name, new_name)) {
+		UpdateViewMetadataValue(con, view_name, "distinct_aux_meta_json",
+		                        RefreshMetadata::DistinctAuxMetaToJson(distinct));
 	}
-	return false;
+	RefreshMetadata::FilteredGroupCountAuxMeta filtered;
+	if (metadata.GetFilteredGroupCountAuxMeta(view_name, filtered) &&
+	    RewriteFilteredGroupCountMetaFields(filtered, table_name, old_name, new_name)) {
+		UpdateViewMetadataValue(con, view_name, "aggregate_decomposition_json", RefreshMetadata::ToJson(filtered));
+	}
+	RefreshMetadata::SemiAntiAuxMeta semi_anti;
+	if (metadata.GetSemiAntiAuxMeta(view_name, semi_anti) &&
+	    RewriteSemiAntiAuxMetaFields(semi_anti, table_name, old_name, new_name,
+	                                 /*include_stable_left_predicate=*/false)) {
+		UpdateViewMetadataValue(con, view_name, "semi_anti_aux_meta_json", RefreshMetadata::ToJson(semi_anti));
+	}
 }
 
 static bool RewriteWindowLineageFields(vector<RefreshMetadata::WindowPartitionLineageOp> &ops, const string &table_name,
@@ -702,10 +689,7 @@ static void PersistRenamedViewMetadata(ClientContext &context, Connection &con, 
 		} else {
 			// A different native catalog cannot join the caller's ALTER transaction.
 			// Its durable preimage is retained by TransactionalHelperUndoState.
-			auto result = con.Query(sql);
-			if (result->HasError()) {
-				throw CatalogException("Cannot persist renamed materialized view metadata: %s", result->GetError());
-			}
+			SqlUtils::QueryOrThrow(con, sql, "Cannot persist renamed materialized view metadata: %s");
 		}
 		TransactionalMVMetadataState::Get(context).RegisterSQL(sql, key.ToString());
 		OPENIVM_DEBUG_PRINT("[SCHEMA EVOLUTION] Rewrote metadata for '%s' in %s.%s\n", key.ToString().c_str(),
@@ -723,23 +707,17 @@ void RewriteDependentViewMetadataForRename(ClientContext &context, Connection &c
 	try {
 		con.BeginTransaction();
 		tx_open = true;
-		auto before = con.Query("SELECT * FROM openivm_views ORDER BY view_name");
-		if (before->HasError()) {
-			throw CatalogException("Cannot snapshot materialized view rename metadata: %s", before->GetError());
-		}
+		auto before = SqlUtils::QueryOrThrow(con, "SELECT * FROM openivm_views ORDER BY view_name",
+		                                     "Cannot snapshot materialized view rename metadata: %s");
 		for (auto &view : views) {
 			RewriteStoredViewQuery(context, con, metadata, view.name, qualified_source, old_name, new_name,
 			                       /*persist=*/true);
-			RewriteDistinctAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
-			RewriteFilteredGroupCountMeta(con, metadata, view.name, qualified_source, old_name, new_name);
-			RewriteSemiAntiAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
+			RewriteAuxMetas(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteLineageMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
 		}
-		auto after = con.Query("SELECT * FROM openivm_views ORDER BY view_name");
-		if (after->HasError()) {
-			throw CatalogException("Cannot read materialized view rename metadata: %s", after->GetError());
-		}
+		auto after = SqlUtils::QueryOrThrow(con, "SELECT * FROM openivm_views ORDER BY view_name",
+		                                    "Cannot read materialized view rename metadata: %s");
 		PersistRenamedViewMetadata(context, con, source_catalog, *before, *after);
 		con.Commit();
 		tx_open = false;

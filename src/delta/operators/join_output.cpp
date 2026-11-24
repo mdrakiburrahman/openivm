@@ -5,8 +5,11 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -75,14 +78,7 @@ unique_ptr<LogicalOperator> FinalizeJoinTerm(Binder &binder, unique_ptr<LogicalO
 unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                  const vector<LogicalType> &types, Binder &binder) {
 	if (terms.empty()) {
-		vector<ColumnBinding> bindings;
-		auto table_index = binder.GenerateTableIndex();
-		for (idx_t i = 0; i < types.size(); i++) {
-			bindings.emplace_back(table_index, ProjectionIndex(i));
-		}
-		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
-		empty->ResolveOperatorTypes();
-		return std::move(empty);
+		return EmptyDeltaResult(binder, types).op;
 	}
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {
@@ -120,6 +116,59 @@ ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bi
 	replacer.stop_operator = result;
 	replacer.VisitOperator(root);
 	return union_bindings.back();
+}
+
+idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
+	auto bindings = op.GetColumnBindings();
+	// The <= mutant indexes one past bindings.
+	for (idx_t binding_idx = 0; binding_idx < bindings.size(); binding_idx++) { // mull-ignore: cxx_lt_to_le
+		if (bindings[binding_idx] == binding) {
+			return binding_idx;
+		}
+	}
+	throw InternalException("%s: multiplicity binding %s is not exposed by %s", context_label,
+	                        binding.ToString().c_str(), op.GetName().c_str());
+}
+
+void AppendBindingsToJoinProjectionMaps(LogicalOperator &op, const column_binding_set_t &bindings) {
+	// Children first: a join's child bindings already reflect the child's own projection maps.
+	for (auto &child : op.children) {
+		if (child) {
+			AppendBindingsToJoinProjectionMaps(*child, bindings);
+		}
+	}
+	// Every LogicalJoin (comparison, ANY, DELIM) applies its projection maps in GetColumnBindings the same way.
+	// The UNNEST walker already covered all of them; the DELIM_JOIN walker saw only comparison joins.
+	auto *join = dynamic_cast<LogicalJoin *>(&op);
+	if (!join) {
+		return;
+	}
+	bool changed = false;
+	for (idx_t child_idx = 0; child_idx < MinValue<idx_t>(op.children.size(), 2); child_idx++) {
+		auto &proj_map = child_idx == 0 ? join->left_projection_map : join->right_projection_map;
+		if (proj_map.empty()) {
+			continue;
+		}
+		auto child_bindings = op.children[child_idx]->GetColumnBindings();
+		for (auto projected_idx : proj_map) {
+			// Equality is valid: the largest valid index is size - 1.
+			if (projected_idx >= child_bindings.size()) { // mull-ignore: cxx_ge_to_gt
+				throw InternalException(
+				    "Join projection map index %llu out of bounds for child %llu with %llu bindings",
+				    (idx_t)projected_idx, child_idx, (idx_t)child_bindings.size());
+			}
+		}
+		for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
+			if (bindings.count(child_bindings[binding_idx]) &&
+			    std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
+				proj_map.push_back(ProjectionIndex(binding_idx));
+				changed = true;
+			}
+		}
+	}
+	if (changed) {
+		join->ResolveOperatorTypes();
+	}
 }
 
 } // namespace duckdb

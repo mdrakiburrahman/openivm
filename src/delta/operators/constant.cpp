@@ -14,23 +14,9 @@ DeltaPlanFragment CompileConstantZeroDelta(DeltaOperatorInput input) {
 	vector<LogicalType> output_types = input.plan->types;
 	output_types.push_back(input.mul_type);
 
-	vector<ColumnBinding> bindings;
-	auto table_index = input.context.input.optimizer.binder.GenerateTableIndex();
-	// The empty result needs one binding per output type; >= disables construction and <= adds a type-less binding.
-	for (idx_t i = 0; i < output_types.size(); // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-	     i++) {                                // mull-ignore: cxx_post_inc_to_post_dec
-		bindings.emplace_back(table_index, ProjectionIndex(i));
-	}
-	if (bindings.empty()) {
-		throw InternalException("DeltaConstant: zero-delta result has no multiplicity binding");
-	}
-	auto mul_binding = bindings.back();
-	auto empty = make_uniq<LogicalEmptyResult>(output_types, std::move(bindings));
-	empty->ResolveOperatorTypes();
-
 	OPENIVM_DEBUG_PRINT("[Delta Operator] %s constant leaf -- returning empty delta\n",
 	                    LogicalOperatorToString(input.plan->type).c_str());
-	return {std::move(empty), mul_binding};
+	return EmptyDeltaResult(input.context.input.optimizer.binder, output_types);
 }
 
 DeltaPlanFragment CompileStaticConstantLeaf(DeltaOperatorInput input) {

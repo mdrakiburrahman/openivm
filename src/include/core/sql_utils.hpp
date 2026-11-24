@@ -66,6 +66,19 @@ public:
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
+	/// Rows inserted into or deleted from a DuckLake table between two snapshots, projected to select_list.
+	static string DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
+	                                 const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
+	/// Run sql and throw EXCEPTION(format, args..., error) when it fails; format's last %s receives the error.
+	template <class EXCEPTION = CatalogException, class... ARGS>
+	static unique_ptr<QueryResult> QueryOrThrow(Connection &con, const string &sql, const string &format,
+	                                            ARGS... args) {
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			throw EXCEPTION(format, args..., result->GetError());
+		}
+		return result;
+	}
 	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
 		Value setting_value;
 		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {
@@ -73,8 +86,19 @@ public:
 		}
 		return default_value;
 	}
+	/// The setting's text, or default_value when it is unset or NULL.
+	static string GetStringSetting(ClientContext &context, const string &setting_name,
+	                               const string &default_value = "") {
+		Value setting_value;
+		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {
+			return setting_value.ToString();
+		}
+		return default_value;
+	}
 	// Copy a registered extension setting to a helper connection without changing the database default.
 	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
+	/// The connection's current_database(), or empty when it cannot be read.
+	static string CurrentDatabase(Connection &con);
 	/// The caller's default catalog and schema; an unset session catalog is the default database.
 	static SessionLocation SessionDefaultLocation(ClientContext &context);
 	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.

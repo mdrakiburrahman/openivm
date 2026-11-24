@@ -66,9 +66,6 @@ public:
 	// or when a durable marker contradicts the configured placement.
 	static MetadataLocation At(Connection &con, const string &catalog, const string &schema);
 	static MetadataLocation Resolve(ClientContext &context, Connection &con, const string &view_catalog);
-	// Point `con` at `location` so unqualified metadata table names resolve there.
-	// Creates the selected schema of an explicit placement when it does not exist yet.
-	static void Use(Connection &con, const MetadataLocation &location);
 	// Every location that holds OpenIVM delta-table metadata: the configured location,
 	// marker targets and legacy native catalogs. Delta cleanup must consult all of them.
 	static vector<MetadataLocation> All(Connection &con, const string &table = openivm::DELTA_TABLES_TABLE);

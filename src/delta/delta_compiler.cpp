@@ -103,17 +103,11 @@ void LogDeltaModelSummary(const DeltaViewModel &model) {
 
 DeltaPlanFragment DeltaOperatorInput::CompileChild(unique_ptr<LogicalOperator> &child,
                                                    LogicalOperator *&child_root) const {
-	if (!compiler) {
-		throw InternalException("DeltaOperatorInput::CompileChild requires a DeltaCompiler");
-	}
 	return copied_subtree ? compiler->CompileCopiedSubtree(child, child_root) : compiler->Compile(child, child_root);
 }
 
 DeltaPlanFragment DeltaOperatorInput::CompileCopiedSubtree(unique_ptr<LogicalOperator> &subtree,
                                                            LogicalOperator *&subtree_root) const {
-	if (!compiler) {
-		throw InternalException("DeltaOperatorInput::CompileCopiedSubtree requires a DeltaCompiler");
-	}
 	return compiler->CompileCopiedSubtree(subtree, subtree_root);
 }
 

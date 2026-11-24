@@ -117,34 +117,14 @@ struct FojJoinInfo {
 	static vector<FojJoinInfo> ParseAll(RefreshMetadata &metadata, const string &view_name,
 	                                    const vector<string> &delta_table_names) {
 		vector<FojJoinInfo> joins;
-		string raw = metadata.GetFullOuterJoinCols(view_name);
-		if (StringUtil::StartsWith(raw, "{")) {
-			for (const auto &object : MetadataJson::ExtractJsonObjectsFromArray(raw, "edges")) {
-				FojJoinInfo info;
-				if (!MetadataJson::ExtractJsonString(object, "left_table", info.left_table) ||
-				    !MetadataJson::ExtractJsonString(object, "left_column", info.left_col) ||
-				    !MetadataJson::ExtractJsonString(object, "right_table", info.right_table) ||
-				    !MetadataJson::ExtractJsonString(object, "right_column", info.right_col)) {
-					continue;
-				}
+		auto raw = metadata.GetFullOuterJoinCols(view_name);
+		for (const auto &object : MetadataJson::ExtractJsonObjectsFromArray(raw, "edges")) {
+			FojJoinInfo info;
+			if (MetadataJson::ExtractJsonString(object, "left_table", info.left_table) &&
+			    MetadataJson::ExtractJsonString(object, "left_column", info.left_col) &&
+			    MetadataJson::ExtractJsonString(object, "right_table", info.right_table) &&
+			    MetadataJson::ExtractJsonString(object, "right_column", info.right_col)) {
 				joins.push_back(std::move(info));
-			}
-		} else {
-			// Databases created before multi-boundary metadata used one table:column pair.
-			auto comma_pos = raw.find(',');
-			if (comma_pos != string::npos) {
-				FojJoinInfo info;
-				string left_part = raw.substr(0, comma_pos);
-				string right_part = raw.substr(comma_pos + 1);
-				auto lc = left_part.find(':');
-				auto rc = right_part.find(':');
-				if (lc != string::npos && rc != string::npos) {
-					info.left_table = left_part.substr(0, lc);
-					info.left_col = left_part.substr(lc + 1);
-					info.right_table = right_part.substr(0, rc);
-					info.right_col = right_part.substr(rc + 1);
-					joins.push_back(std::move(info));
-				}
 			}
 		}
 		auto resolve_source = [&](string &table, string &delta_name) {
@@ -185,27 +165,6 @@ static string NormalizeColumnNameForMatch(const string &name) {
 		}
 	}
 	return normalized;
-}
-
-bool IsSummableLogicalType(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::UHUGEINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-	case LogicalTypeId::DECIMAL:
-		return true;
-	default:
-		return false;
-	}
 }
 
 string BaseTableNameFromDeltaKey(const string &delta_key) {
@@ -684,16 +643,11 @@ bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const 
 string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const string &source_col,
                                      const string &source_cast, const string &output_col) {
 	string source_expr = SqlUtils::ApplyCastSpec(SqlUtils::QuoteIdentifier(source_col), source_cast);
-	string qoutput_col = SqlUtils::QuoteIdentifier(output_col);
-	string insertions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	string deletions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	return "(" + insertions + " UNION ALL " + deletions + ")";
+	return "(" +
+	       SqlUtils::DuckLakeChangesSQL(source_expr + " AS " + SqlUtils::QuoteIdentifier(output_col),
+	                                    spec.loc.catalog_name, spec.loc.schema_name, spec.loc.table_name, spec.old_snap,
+	                                    spec.current_snap) +
+	       ")";
 }
 
 static string BuildProjectionLineageArmSQL(const RefreshMetadata::ProjectionKeyLineageArm &arm,
@@ -857,35 +811,26 @@ bool IsEmptyDeltaPlan(LogicalOperator *op) {
 }
 
 static string NullLiteralForDialect(const LogicalType &type, SqlDialect dialect) {
-	if (dialect == SqlDialect::SPARK) {
-		switch (type.id()) {
-		case LogicalTypeId::BOOLEAN:
-			return "CAST(NULL AS BOOLEAN)";
-		case LogicalTypeId::TINYINT:
-			return "CAST(NULL AS TINYINT)";
-		case LogicalTypeId::SMALLINT:
-			return "CAST(NULL AS SMALLINT)";
-		case LogicalTypeId::INTEGER:
-			return "CAST(NULL AS INTEGER)";
-		case LogicalTypeId::BIGINT:
-			return "CAST(NULL AS BIGINT)";
-		case LogicalTypeId::FLOAT:
-			return "CAST(NULL AS FLOAT)";
-		case LogicalTypeId::DOUBLE:
-			return "CAST(NULL AS DOUBLE)";
-		case LogicalTypeId::DECIMAL:
-			return "CAST(NULL AS " + type.ToString() + ")";
-		case LogicalTypeId::VARCHAR:
-			return "CAST(NULL AS VARCHAR)";
-		case LogicalTypeId::DATE:
-			return "CAST(NULL AS DATE)";
-		case LogicalTypeId::TIMESTAMP:
-			return "CAST(NULL AS TIMESTAMP)";
-		default:
-			return "CAST(NULL AS STRING)";
-		}
+	if (dialect != SqlDialect::SPARK) {
+		return "NULL::" + type.ToString();
 	}
-	return "NULL::" + type.ToString();
+	switch (type.id()) {
+	case LogicalTypeId::DECIMAL:
+		return "CAST(NULL AS " + type.ToString() + ")";
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+		return "CAST(NULL AS " + LogicalTypeIdToString(type.id()) + ")";
+	default:
+		return "CAST(NULL AS STRING)";
+	}
 }
 
 string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &column_names,
@@ -1602,16 +1547,7 @@ static string NormalizeTableToken(string token) {
 	while (!token.empty() && (token.back() == '"' || token.back() == '`' || token.back() == '\'')) {
 		token.pop_back();
 	}
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	static const string delta_prefix(openivm::DELTA_PREFIX);
-	token = SqlUtils::LastIdentifierPart(token);
-	if (token.size() > data_prefix.size() && token.rfind(data_prefix, 0) == 0) {
-		token = token.substr(data_prefix.size());
-	}
-	if (token.size() > delta_prefix.size() && token.rfind(delta_prefix, 0) == 0) {
-		token = token.substr(delta_prefix.size());
-	}
-	return StringUtil::Lower(token);
+	return StringUtil::Lower(BaseTableNameFromDeltaKey(StripOpenIVMDataPrefix(token)));
 }
 
 static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
@@ -1659,14 +1595,6 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 	}
 	return CompileProjectionsFilters(view_name, column_names, column_types, delta_ts_filter, catalog_prefix,
 	                                 skip_proj_delete, appended_rows);
-}
-
-static string CurrentDatabase(Connection &con) {
-	auto res = con.Query("SELECT current_database()");
-	if (!res->HasError() && res->RowCount() > 0 && !res->Collection().GetValue(0, 0).IsNull()) {
-		return res->Collection().GetValue(0, 0).ToString();
-	}
-	return "";
 }
 
 ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name) {
@@ -1732,7 +1660,7 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	resolved.view_catalog_name = location.catalog_name;
 	resolved.view_schema_name = location.schema_name;
 	resolved.view_name = key;
-	resolved.cross_system = resolved.view_catalog_name != CurrentDatabase(con);
+	resolved.cross_system = resolved.view_catalog_name != SqlUtils::CurrentDatabase(con);
 	return resolved;
 }
 
@@ -1741,7 +1669,7 @@ ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const
 	auto location = RefreshMetadata(con).GetStoredViewLocation(view_name, fallback_catalog, fallback_schema);
 	auto &catalog_name = location.catalog_name;
 	auto &schema_name = location.schema_name;
-	auto current_database = CurrentDatabase(con);
+	auto current_database = SqlUtils::CurrentDatabase(con);
 	bool cross_system = !catalog_name.empty() && !current_database.empty() && catalog_name != current_database;
 	return {catalog_name, schema_name, cross_system};
 }

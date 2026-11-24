@@ -9,11 +9,6 @@
 
 namespace duckdb {
 
-struct DeltaGetResult {
-	unique_ptr<LogicalOperator> node;
-	ColumnBinding mul_binding;
-};
-
 // One source's delta metadata for the view being compiled, read once per compile.
 struct DeltaSourceState {
 	bool watermark_loaded = false;
@@ -32,12 +27,15 @@ using DeltaSourceCache = unordered_map<const TableCatalogEntry *, DeltaSourceSta
 DeltaSourceState &LoadDeltaWatermark(Connection &con, const string &view_name, TableCatalogEntry &source,
                                      DeltaSourceCache &cache);
 
+// An empty relation of `types`, whose last column is the multiplicity.
+DeltaPlanFragment EmptyDeltaResult(Binder &binder, const vector<LogicalType> &types);
+
 // Restore the SQL arguments that DuckLake plan serialization omits.
 void PopulateDuckLakeChangeScanParameters(LogicalGet &get);
 
-DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
-                                  const string &view_name, DeltaSourceCache *cache = nullptr,
-                                  bool honor_source_projection = false);
+DeltaPlanFragment CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
+                                     const string &view_name, DeltaSourceCache *cache = nullptr,
+                                     bool honor_source_projection = false);
 
 } // namespace duckdb
 
