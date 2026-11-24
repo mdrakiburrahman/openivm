@@ -66,8 +66,9 @@ public:
 	shared_ptr<const ViewRecord> LoadView(const string &view_name);
 	// Serve reads of the record's view from `record` (read earlier in the same refresh); null clears it.
 	void UseView(shared_ptr<const ViewRecord> record);
-	// Every method that writes openivm_views or openivm_delta_tables columns a record serves (anything
-	// but the volatile columns) must call this first.
+	// Every method that immediately writes openivm_views or openivm_delta_tables columns a record serves
+	// (anything but the volatile columns) must call this first. Writes emitted as refresh program text
+	// (watermark and DuckLake checkpoint UPDATEs) are exempt: they run after the attempt's last read.
 	void InvalidateView();
 	// Make `record` available to the optimizer rules planning ComputeDelta on `context` (a helper
 	// connection OpenIVM owns for one refresh), and look it up there.

@@ -9,10 +9,10 @@ require openivm
 require parquet
 
 # Every internal statement costs a parse, bind and plan, which dominates small refreshes. Each bound is
-# the measured count plus 3-6 statements of slack; the counts are deterministic (delta sources are read
-# in table_name order). Before metadata was read once per refresh, refreshes issued 94-136 statements
-# and refreshes without changes 35-45. A count excludes the user's statement and the queries on
-# duckdb_logs.
+# the measured count plus at least 3 statements of slack (exactly 3 for refreshes without changes, up to
+# 6 elsewhere); the counts are deterministic (delta sources are read in table_name order). Before
+# metadata was read once per refresh, refreshes issued 94-136 statements and refreshes without changes
+# 35-45. A count excludes the user's statement and the queries on duckdb_logs.
 
 # The counts depend on these settings; pin them so a changed default cannot silently shift the bounds.
 statement ok
