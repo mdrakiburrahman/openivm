@@ -1351,7 +1351,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (view_model.HasCountDistinctAux()) {
 		const auto &meta = view_model.count_distinct_aux;
 		emit_aux("create_mv_count_distinct_aux", meta.aux_table, "count_distinct_aux_meta_json",
-		         RefreshMetadata::CountDistinctAuxMetaToJson(meta), [&](const string &aux_target) {
+		         RefreshMetadata::ToJson(meta), [&](const string &aux_target) {
 			         return BuildCountDistinctAuxStateCreateSQL(
 			             aux_target, qualify_source(meta.source), meta.group_cols, meta.group_source_exprs,
 			             meta.distinct_col, meta.distinct_expr, meta.filter, replace_aux);
@@ -1361,7 +1361,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		const auto &req = view_model.filtered_group_count_aux;
 		const auto &meta = req.meta;
 		emit_aux("create_mv_filtered_group_count_aux", meta.aux_table, "aggregate_decomposition_json",
-		         RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), [&](const string &aux_target) {
+		         RefreshMetadata::ToJson(meta), [&](const string &aux_target) {
 			         return BuildFilteredGroupCountAuxStateCreateSQL(
 			             aux_target, qualify_source(req.create_source), meta.group_col, meta.sum_col,
 			             meta.source_group_expr, meta.source_sum_expr, meta.filter, replace_aux);
@@ -1369,8 +1369,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	if (view_model.HasSemiAntiAux()) {
 		const auto &meta = view_model.semi_anti_aux;
-		emit_aux("create_mv_semi_anti_aux", meta.aux_table, "semi_anti_aux_meta_json",
-		         RefreshMetadata::SemiAntiAuxMetaToJson(meta), [&](const string &aux_target) {
+		emit_aux("create_mv_semi_anti_aux", meta.aux_table, "semi_anti_aux_meta_json", RefreshMetadata::ToJson(meta),
+		         [&](const string &aux_target) {
 			         return BuildSemiAntiAuxStateCreateSQL(
 			             aux_target, qualify_source(meta.left_table), meta.left_alias, qualify_source(meta.right_table),
 			             meta.right_alias, meta.predicate, meta.post_filter, meta.right_filter, meta.left_cols,
@@ -1382,9 +1382,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// time and store it; refresh appends it between the primary-delta INSERT and the MERGE.
 	if (!leftjoin_secondary.sql.empty()) {
 		add_profile_marker("create_mv_leftjoin_secondary");
-		aux_metadata_ddl.push_back(
-		    BuildUpdateViewJsonSQL("leftjoin_secondary_meta_json",
-		                           RefreshMetadata::LeftJoinSecondaryMetaToJson(leftjoin_secondary), view_name));
+		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("leftjoin_secondary_meta_json",
+		                                                  RefreshMetadata::ToJson(leftjoin_secondary), view_name));
 	}
 
 	const auto &source_table_info = facts.source_table_info;

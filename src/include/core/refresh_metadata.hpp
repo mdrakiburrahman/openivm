@@ -392,8 +392,11 @@ public:
 		string filter;
 	};
 
+	// JSON encoding of a metadata struct without nested objects (CountDistinctAuxMeta, SemiAntiAuxMeta,
+	// LeftJoinKeySource, LeftJoinNullableSources, FilteredGroupCountAuxMeta, LeftJoinSecondaryMeta).
+	template <class T>
+	static string ToJson(const T &meta);
 	bool GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out);
-	static string CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta);
 
 	struct SemiAntiAuxMeta {
 		string aux_table;
@@ -414,7 +417,6 @@ public:
 	};
 
 	bool GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out);
-	static string SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta);
 
 	struct WindowPartitionLineageOp {
 		WindowLineageKind kind = WindowLineageKind::DIRECT;
@@ -467,7 +469,6 @@ public:
 	};
 
 	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);
-	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
 
 	// Nested outer-join inputs used to discover NULL-padding keys of a FULL projection.
 	struct FullOuterScopeInput {
@@ -492,7 +493,6 @@ public:
 	};
 
 	bool GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out);
-	static string LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src);
 
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
@@ -508,7 +508,6 @@ public:
 	};
 
 	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);
-	static string FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta);
 
 	// LEFT JOIN pipeline secondary-delta maintenance (Larson & Zhou). The secondary-delta SQL is
 	// generated once at CREATE time (from the plan) and stored; refresh substitutes the per-source
@@ -526,7 +525,6 @@ public:
 	};
 
 	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);
-	static string LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta);
 
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
 	static vector<pair<string, string>> DistinctSignCountColumns(const DistinctAuxMeta &meta);

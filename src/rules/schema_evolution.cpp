@@ -446,15 +446,13 @@ static void RewriteAuxMetas(Connection &con, RefreshMetadata &metadata, const st
 	RefreshMetadata::FilteredGroupCountAuxMeta filtered;
 	if (metadata.GetFilteredGroupCountAuxMeta(view_name, filtered) &&
 	    RewriteFilteredGroupCountMetaFields(filtered, table_name, old_name, new_name)) {
-		UpdateViewMetadataValue(con, view_name, "aggregate_decomposition_json",
-		                        RefreshMetadata::FilteredGroupCountAuxMetaToJson(filtered));
+		UpdateViewMetadataValue(con, view_name, "aggregate_decomposition_json", RefreshMetadata::ToJson(filtered));
 	}
 	RefreshMetadata::SemiAntiAuxMeta semi_anti;
 	if (metadata.GetSemiAntiAuxMeta(view_name, semi_anti) &&
 	    RewriteSemiAntiAuxMetaFields(semi_anti, table_name, old_name, new_name,
 	                                 /*include_stable_left_predicate=*/false)) {
-		UpdateViewMetadataValue(con, view_name, "semi_anti_aux_meta_json",
-		                        RefreshMetadata::SemiAntiAuxMetaToJson(semi_anti));
+		UpdateViewMetadataValue(con, view_name, "semi_anti_aux_meta_json", RefreshMetadata::ToJson(semi_anti));
 	}
 }
 

@@ -2298,20 +2298,23 @@ string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
 	return writer.Finish();
 }
 
+template <class T>
+string RefreshMetadata::ToJson(const T &meta) {
+	return MetadataJson::Write(meta);
+}
+template string RefreshMetadata::ToJson(const CountDistinctAuxMeta &);
+template string RefreshMetadata::ToJson(const SemiAntiAuxMeta &);
+template string RefreshMetadata::ToJson(const LeftJoinKeySource &);
+template string RefreshMetadata::ToJson(const LeftJoinNullableSources &);
+template string RefreshMetadata::ToJson(const FilteredGroupCountAuxMeta &);
+template string RefreshMetadata::ToJson(const LeftJoinSecondaryMeta &);
+
 bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "count_distinct_aux_meta_json"), out);
 }
 
-string RefreshMetadata::CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta) {
-	return MetadataJson::Write(meta);
-}
-
 bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "semi_anti_aux_meta_json"), out);
-}
-
-string RefreshMetadata::SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta) {
-	return MetadataJson::Write(meta);
 }
 
 bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
@@ -2392,10 +2395,6 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 	    ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_key_source"), out);
 }
 
-string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
-	return MetadataJson::Write(source);
-}
-
 vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(const string &view_name) {
 	vector<FullOuterScope> scopes;
 	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "full_outer_scopes");
@@ -2447,25 +2446,13 @@ bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJo
 	                          out);
 }
 
-string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
-	return MetadataJson::Write(src);
-}
-
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "aggregate_decomposition_json"), out);
-}
-
-string RefreshMetadata::FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta) {
-	return MetadataJson::Write(meta);
 }
 
 // Metadata written before the side lists were JSON arrays fails to parse; refresh then group-recomputes.
 bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out) {
 	return MetadataJson::Read(ReadViewString(view_name, "leftjoin_secondary_meta_json"), out);
-}
-
-string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {
-	return MetadataJson::Write(meta);
 }
 
 string RefreshMetadata::DistinctAuxMeta::InternalColumn(const string &name) const {
