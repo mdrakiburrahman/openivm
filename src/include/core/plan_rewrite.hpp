@@ -22,12 +22,17 @@ struct OutputSpine {
 	vector<LogicalProjection *> projections; // root first
 	LogicalOperator *parent = nullptr;       // operator directly above `bottom`, nullptr when `bottom` is the root
 	LogicalOperator *bottom = nullptr;
+	unordered_map<TableIndex, const LogicalProjection *> ProjectionMap() const;
 };
 OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(const LogicalOperator &)> &pass_through);
 // Follow ORDER BY/LIMIT/TOP_N and materialized CTE consumers above aggregate state.
 OutputSpine FindAggregateOutputSpine(LogicalOperator *root);
 /// The aggregate at the bottom of the spine, directly or below a HAVING filter.
 LogicalAggregate *SpineAggregate(const OutputSpine &spine);
+/// Visit each aggregate binding reached from the spine's output projection; `computed` is set below any expression
+/// that is not a column pass-through.
+void VisitSpineAggregateInputs(const OutputSpine &spine, TableIndex aggregate_index,
+                               const std::function<void(ColumnBinding, bool)> &visit);
 
 /// Keep the first usable projection refresh key whose lineage stays on
 /// preserved inputs; search its preserved subtree when that key is unsafe.

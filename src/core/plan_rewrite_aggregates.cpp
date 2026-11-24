@@ -226,28 +226,12 @@ void RewriteNonFiniteSumInputs(ClientContext &context, Binder &binder, unique_pt
 	if (!aggregate || spine.projections.empty()) {
 		return;
 	}
-	unordered_map<TableIndex, LogicalProjection *> projections;
-	for (auto *projection : spine.projections) {
-		projections.emplace(projection->table_index, projection);
-	}
 	std::set<idx_t> computed_inputs;
-	std::function<void(const Expression &, bool)> collect = [&](const Expression &expression, bool computed) {
-		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-			auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
-			if (binding.table_index == aggregate->aggregate_index) {
-				if (computed) {
-					computed_inputs.insert(binding.column_index.GetIndex());
-				}
-			} else if (projections.count(binding.table_index)) {
-				collect(*projections.at(binding.table_index)->expressions[binding.column_index], computed);
-			}
-			return;
+	VisitSpineAggregateInputs(spine, aggregate->aggregate_index, [&](ColumnBinding binding, bool computed) {
+		if (computed) {
+			computed_inputs.insert(binding.column_index.GetIndex());
 		}
-		ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) { collect(child, true); });
-	};
-	for (auto &expression : spine.projections.front()->expressions) {
-		collect(*expression, false);
-	}
+	});
 	// Preserve the existing derived-only path; a computed aggregate needs recoverable
 	// state for every floating SUM it shares the MERGE with, including AVG helpers.
 	if (std::none_of(computed_inputs.begin(), computed_inputs.end(), [&](idx_t index) {

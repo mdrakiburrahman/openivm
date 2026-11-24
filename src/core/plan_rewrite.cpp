@@ -1035,6 +1035,35 @@ OutputSpine FindAggregateOutputSpine(LogicalOperator *root) {
 	});
 }
 
+unordered_map<TableIndex, const LogicalProjection *> OutputSpine::ProjectionMap() const {
+	unordered_map<TableIndex, const LogicalProjection *> map;
+	for (auto *projection : projections) {
+		map.emplace(projection->table_index, projection);
+	}
+	return map;
+}
+
+void VisitSpineAggregateInputs(const OutputSpine &spine, TableIndex aggregate_index,
+                               const std::function<void(ColumnBinding, bool)> &visit) {
+	auto projections = spine.ProjectionMap();
+	std::function<void(const Expression &, bool)> collect = [&](const Expression &expression, bool computed) {
+		if (expression.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) { collect(child, true); });
+			return;
+		}
+		auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
+		auto projection = projections.find(binding.table_index);
+		if (binding.table_index == aggregate_index) {
+			visit(binding, computed);
+		} else if (projection != projections.end()) {
+			collect(*projection->second->expressions[binding.column_index], computed);
+		}
+	};
+	for (auto &expression : spine.projections.front()->expressions) {
+		collect(*expression, false);
+	}
+}
+
 LogicalAggregate *SpineAggregate(const OutputSpine &spine) {
 	auto *node = spine.bottom;
 	if (node && node->type == LogicalOperatorType::LOGICAL_FILTER && node->children.size() == 1) {
@@ -1202,33 +1231,13 @@ void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan) {
 	if (!aggregate || spine.projections.empty()) {
 		return;
 	}
-	unordered_map<TableIndex, LogicalProjection *> projections;
-	for (auto *projection : spine.projections) {
-		projections.emplace(projection->table_index, projection);
-	}
 	column_binding_set_t visited;
 	vector<ColumnBinding> inputs;
-	std::function<void(const Expression &)> collect = [&](const Expression &expression) {
-		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-			auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
-			if (!visited.insert(binding).second) {
-				return;
-			}
-			if (binding.table_index == aggregate->aggregate_index) {
-				inputs.push_back(binding);
-			} else {
-				auto projection = projections.find(binding.table_index);
-				if (projection != projections.end()) {
-					collect(*projection->second->expressions[binding.column_index]);
-				}
-			}
-			return;
+	VisitSpineAggregateInputs(spine, aggregate->aggregate_index, [&](ColumnBinding binding, bool) {
+		if (visited.insert(binding).second) {
+			inputs.push_back(binding);
 		}
-		ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) { collect(child); });
-	};
-	for (auto &expression : spine.projections.front()->expressions) {
-		collect(*expression);
-	}
+	});
 	bool changed = false;
 	for (auto binding : inputs) {
 		auto &expression = aggregate->expressions[binding.column_index]->Cast<BoundAggregateExpression>();
@@ -2070,10 +2079,7 @@ void InjectGroupSignCounts(ClientContext &context, Binder &binder, unique_ptr<Lo
 	if (!aggregate || spine.projections.empty()) {
 		return;
 	}
-	DerivedOutputProjectionMap projections;
-	for (auto *projection : spine.projections) {
-		projections.emplace(projection->table_index, projection);
-	}
+	auto projections = spine.ProjectionMap();
 	Optimizer optimizer(binder, context);
 	auto &output = *spine.projections.front();
 	const auto output_count = output.expressions.size();
@@ -2166,10 +2172,7 @@ vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vec
 	if (!aggregate) {
 		return {};
 	}
-	DerivedOutputProjectionMap projections;
-	for (auto *projection : spine.projections) {
-		projections.emplace(projection->table_index, projection);
-	}
+	auto projections = spine.ProjectionMap();
 	vector<string> names;
 	auto bindings = plan.GetColumnBindings();
 	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
@@ -2370,10 +2373,7 @@ string StripHavingFilter(ClientContext &context, unique_ptr<LogicalOperator> &pl
 	if (parent && parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		// The spine pushes every projection it passes, so the parent is the last one.
 		proj_ptr = &parent->Cast<LogicalProjection>();
-		DerivedOutputProjectionMap projections;
-		for (auto *projection : proj_chain) {
-			projections[projection->table_index] = projection;
-		}
+		auto projections = spine.ProjectionMap();
 		auto *output_projection = proj_chain.front();
 		for (idx_t i = 0; i < output_projection->expressions.size() && i < output_names.size(); i++) {
 			auto *resolved = ResolveDerivedOutputPassThrough(*output_projection->expressions[i], projections);
