@@ -2084,18 +2084,19 @@ static column_binding_map_t<string> BuildOutputBindingNames(LogicalOperator &pla
 		projections[projection->table_index] = projection;
 	}
 	column_binding_map_t<string> binding_to_column;
-	auto bindings = plan.GetColumnBindings();
-	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
-		BoundColumnRefExpression output(LogicalType::SQLNULL, bindings[i]);
+	// Every binding on a resolved pass-through path denotes the published value,
+	// including when the path ends at a computed expression.
+	auto publish = [&](const Expression &expression, const string &name) {
 		vector<ColumnBinding> path;
-		auto resolved = ResolveDerivedOutputPassThrough(output, projections, &path);
-		// Every binding on this pass-through path denotes the published value,
-		// including when the path ends at a computed expression.
-		if (resolved) {
+		if (ResolveDerivedOutputPassThrough(expression, projections, &path)) {
 			for (auto key : path) {
-				binding_to_column.emplace(key, output_names[i]);
+				binding_to_column.emplace(key, name);
 			}
 		}
+	};
+	auto bindings = plan.GetColumnBindings();
+	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
+		publish(BoundColumnRefExpression(LogicalType::SQLNULL, bindings[i]), output_names[i]);
 	}
 	// DISTINCT normalization replaces pass-through bindings with group outputs.
 	// ORDER BY can still reference the corresponding input binding, so expose
@@ -2103,16 +2104,8 @@ static column_binding_map_t<string> BuildOutputBindingNames(LogicalOperator &pla
 	for (auto *aggregate : facts.aggregates) {
 		for (idx_t i = 0; i < aggregate->groups.size(); i++) {
 			auto entry = binding_to_column.find(ColumnBinding(TableIndex(aggregate->group_index), ProjectionIndex(i)));
-			if (entry == binding_to_column.end()) {
-				continue;
-			}
-			auto name = entry->second;
-			vector<ColumnBinding> path;
-			auto resolved = ResolveDerivedOutputPassThrough(*aggregate->groups[i], projections, &path);
-			if (resolved) {
-				for (auto input_key : path) {
-					binding_to_column.emplace(input_key, name);
-				}
+			if (entry != binding_to_column.end()) {
+				publish(*aggregate->groups[i], string(entry->second));
 			}
 		}
 	}
