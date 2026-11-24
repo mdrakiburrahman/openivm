@@ -10,36 +10,23 @@
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/planner/operator/logical_secure_view.hpp>
-#include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_delim_get.hpp>
 #include <duckdb/planner/operator/logical_dependent_join.hpp>
-#include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
 #include <duckdb/planner/operator/logical_unnest.hpp>
 
 namespace duckdb {
-
-static new_idx GetOrCreateTableIndex(old_idx old_index, Binder &binder,
-                                     std::unordered_map<old_idx, new_idx> &table_reassign) {
-	auto entry = table_reassign.find(old_index);
-	if (entry != table_reassign.end()) {
-		OPENIVM_DEBUG_PRINT("Index regen: Reuse %llu -> %llu\n", static_cast<unsigned long long>(old_index.index),
-		                    static_cast<unsigned long long>(entry->second.index));
-		return entry->second;
-	}
-	auto fresh_index = binder.GenerateTableIndex();
-	table_reassign.emplace(old_index, fresh_index);
-	OPENIVM_DEBUG_PRINT("Index regen: Remap %llu -> %llu\n", static_cast<unsigned long long>(old_index.index),
-	                    static_cast<unsigned long long>(fresh_index.index));
-	return fresh_index;
-}
 
 static void RenumberTableIndices(LogicalOperator &plan, Binder &binder, RenumberWrapper &result) {
 	for (auto &child : plan.children) {
 		RenumberTableIndices(*child, binder, result);
 	}
 	auto remap = [&](TableIndex &index) {
-		index = GetOrCreateTableIndex(index, binder, result.idx_map);
+		auto entry = result.idx_map.find(index);
+		if (entry == result.idx_map.end()) {
+			entry = result.idx_map.emplace(index, binder.GenerateTableIndex()).first;
+		}
+		index = entry->second;
 	};
 	switch (plan.type) {
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
@@ -134,6 +121,7 @@ RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Bi
 	RenumberWrapper res {std::move(plan), {}};
 	RenumberTableIndices(*res.op, binder, res);
 	RemapOperatorBindings(*res.op, res.idx_map);
+	OPENIVM_DEBUG_PRINT("Index regen: remapped %zu table indexes\n", res.idx_map.size());
 	return res;
 }
 
