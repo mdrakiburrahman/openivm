@@ -3598,29 +3598,23 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 	auto &pres_ref = condition.LeftReference()->Cast<BoundColumnRefExpression>();
 	auto &inner_ref = condition.RightReference()->Cast<BoundColumnRefExpression>();
 	ColumnBinding key_pres = pres_ref.Binding();
-	LogicalGet *inner_get = nullptr;
-	string inner_col;
-	if (!ResolveBindingToGetColumn(inner_ref.Binding(), facts, inner_get, inner_col) || !inner_get) {
-		return false;
-	}
-	auto inner_identity = ResolveSourceBase(facts, *inner_get);
-	if (inner_identity.empty()) {
-		return false;
-	}
-	string qcol = SqlUtils::QuoteIdentifier(inner_col);
-
+	auto resolve_side = [&](ColumnBinding binding, LogicalGet *&get, string &col, string &identity) {
+		if (!ResolveBindingToGetColumn(binding, facts, get, col) || !get) {
+			return false;
+		}
+		identity = ResolveSourceBase(facts, *get);
+		return !identity.empty();
+	};
 	// Losing the last inner match creates a NULL-padded row for every current preserved row,
 	// including rows inserted in this batch. Gaining the first match must retract a NULL pad
 	// for old preserved rows; new rows never materialized that pad.
-	LogicalGet *pres_get = nullptr;
-	string pres_col;
-	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get) {
+	LogicalGet *inner_get = nullptr, *pres_get = nullptr;
+	string inner_col, inner_identity, pres_col, pres_identity;
+	if (!resolve_side(inner_ref.Binding(), inner_get, inner_col, inner_identity) ||
+	    !resolve_side(key_pres, pres_get, pres_col, pres_identity)) {
 		return false;
 	}
-	auto pres_identity = ResolveSourceBase(facts, *pres_get);
-	if (pres_identity.empty()) {
-		return false;
-	}
+	string qcol = SqlUtils::QuoteIdentifier(inner_col);
 	if (pres_get->table_index == inner_get->table_index || StringUtil::CIEquals(pres_identity, inner_identity)) {
 		// This transition program assumes independently tracked preserved and nullable inputs.
 		return false;
@@ -3662,12 +3656,8 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 					// Preserved-side COUNT: the MERGE must NOT gate it by the (inner-side) match_count.
 					preserved_cols.push_back(output_names[G + j]);
 				}
-			} else if (fn == "sum") {
-				if (is_inner) {
-					contribs.push_back("0");
-				} else {
-					return false; // preserved-side SUM needs the value; defer to a later generalization
-				}
+			} else if (fn == "sum" && is_inner) {
+				contribs.push_back("0"); // preserved-side SUM needs the value; unsupported
 			} else {
 				return false;
 			}
