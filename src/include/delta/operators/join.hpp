@@ -1,6 +1,7 @@
 #ifndef OPENIVM_DELTA_JOIN_HPP
 #define OPENIVM_DELTA_JOIN_HPP
 
+#include "compile_facts.hpp"
 #include "delta/delta_helpers.hpp"
 #include "delta/delta_operator.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -26,6 +27,8 @@ struct DeltaJoinKeyProbe {
 LogicalGet *FindGetInSubtree(LogicalOperator *node, vector<LogicalOperator *> *chain = nullptr);
 // The leaf's own scan, or the scan at the bottom of its unary chain.
 LogicalGet *GetLeafScan(const JoinLeafInfo &leaf);
+// The compile-fact delta shape recorded for table (empty when none is), matching partially qualified names.
+string FactDeltaShape(const openivm::CompileFacts &facts, TableCatalogEntry &table);
 
 // The delta of one join leaf inside a term: a delta scan for a bare GET, otherwise the compiled copied subtree.
 DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context, Binder &binder,

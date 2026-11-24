@@ -174,23 +174,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		size_t reused_activity_count = 0;
 		// Compile facts are an optimization cache; skipping this scan falls back to authoritative metadata probes.
 		for (size_t i = 0; i < N; i++) { // mull-ignore: cxx_lt_to_ge
-			for (auto &entry : compile_facts.delta_shape) {
-				if (!StringUtil::CIEquals(entry.first,
-				                          SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_names[i]))) {
-					continue;
-				}
-				if (StringUtil::CIEquals(entry.second, "UNCHANGED")) {
-					empty_table_delta[i] = true;
-					activity_known[i] = true;
-				} else if (StringUtil::CIEquals(entry.second, "INSERT_ONLY") ||
-				           StringUtil::CIEquals(entry.second, "MIXED")) {
-					activity_known[i] = true;
-				}
-				// This counter is used only by the debug summary below.
-				// mull-ignore-next: cxx_arithmetic
-				reused_activity_count += activity_known[i] ? 1 : 0;
-				break;
-			}
+			auto shape = FactDeltaShape(compile_facts, *GetLeafScan(leaves[i])->GetTable());
+			empty_table_delta[i] = StringUtil::CIEquals(shape, "UNCHANGED");
+			activity_known[i] = empty_table_delta[i] || StringUtil::CIEquals(shape, "INSERT_ONLY") ||
+			                    StringUtil::CIEquals(shape, "MIXED");
+			// This counter is used only by the debug summary below.
+			// mull-ignore-next: cxx_arithmetic
+			reused_activity_count += activity_known[i] ? 1 : 0;
 		}
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Reused source activity for %zu/%zu leaves\n", reused_activity_count, N);
 		RefreshMetadata metadata(con);

@@ -1280,6 +1280,15 @@ static bool SourceFactMatches(const string &fact, TableCatalogEntry &table) {
 	       (parts.size() < 3 || StringUtil::CIEquals(parts[0], table.ParentCatalog().GetName().GetIdentifierName()));
 }
 
+string FactDeltaShape(const openivm::CompileFacts &facts, TableCatalogEntry &table) {
+	for (auto &entry : facts.delta_shape) {
+		if (SourceFactMatches(entry.first, table)) {
+			return entry.second;
+		}
+	}
+	return "";
+}
+
 static bool DeltaShapeIsInsertOnlyForPruning(const string &shape) {
 	return StringUtil::CIEquals(shape, "INSERT_ONLY") || StringUtil::CIEquals(shape, "UNCHANGED");
 }
@@ -1295,11 +1304,8 @@ static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, c
 			mask |= (1ULL << i);
 			continue;
 		}
-		for (auto &entry : facts.delta_shape) {
-			if (SourceFactMatches(entry.first, *get->GetTable()) && DeltaShapeIsInsertOnlyForPruning(entry.second)) {
-				mask |= (1ULL << i);
-				break;
-			}
+		if (DeltaShapeIsInsertOnlyForPruning(FactDeltaShape(facts, *get->GetTable()))) {
+			mask |= (1ULL << i);
 		}
 	}
 	return mask;
@@ -1318,17 +1324,7 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 				if (get.GetTable().get() == nullptr) {
 					continue;
 				}
-				bool table_unchanged = false;
-				for (auto &entry : facts.delta_shape) {
-					if (SourceFactMatches(entry.first, *get.GetTable()) &&
-					    StringUtil::CIEquals(entry.second, "UNCHANGED")) {
-						table_unchanged = true;
-						break;
-					}
-				}
-				if (!table_unchanged) {
-					all_unchanged = false;
-				}
+				all_unchanged = StringUtil::CIEquals(FactDeltaShape(facts, *get.GetTable()), "UNCHANGED");
 			}
 			for (auto &child : node->children) {
 				pending.push_back(child.get());
