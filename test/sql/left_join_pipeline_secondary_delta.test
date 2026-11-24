@@ -948,3 +948,79 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Metadata written before the preserved-side fields were dropped still carries
+# pres_tables/pres_keys. The reader ignores them; refresh must stay incremental and exact.
+statement ok
+CREATE TABLE lj_legacy_keys_left (id INT);
+
+statement ok
+CREATE TABLE lj_legacy_keys_right (id INT, val INT);
+
+statement ok
+INSERT INTO lj_legacy_keys_left VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO lj_legacy_keys_right VALUES (1, 10), (1, 11), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW lj_legacy_keys_mv AS
+    SELECT l.id, COUNT(r.val) AS matches, SUM(r.val) AS total
+    FROM lj_legacy_keys_left l LEFT JOIN lj_legacy_keys_right r ON l.id = r.id
+    GROUP BY l.id;
+
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json = replace(leftjoin_secondary_meta_json, '"inner_keys":["id"]',
+    '"inner_keys":["id"],"pres_tables":["memory.main.lj_legacy_keys_left"],"pres_keys":["id"]')
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f6b6579735f6d76_';
+
+query I
+SELECT (contains(leftjoin_secondary_meta_json, '"pres_tables":["memory.main.lj_legacy_keys_left"]')
+        AND contains(leftjoin_secondary_meta_json, '"pres_keys":["id"]'))::INT
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f6c65676163795f6b6579735f6d76_';
+----
+1
+
+statement ok
+DELETE FROM lj_legacy_keys_right WHERE id = 2;
+
+statement ok
+INSERT INTO lj_legacy_keys_right VALUES (3, 30), (3, 31);
+
+statement ok
+UPDATE lj_legacy_keys_right SET val = 12 WHERE id = 1 AND val = 11;
+
+statement ok
+DELETE FROM lj_legacy_keys_right WHERE id = 3 AND val = 31;
+
+statement ok
+INSERT INTO lj_legacy_keys_left VALUES (4);
+
+statement ok
+DELETE FROM lj_legacy_keys_left WHERE id = 1;
+
+statement ok
+PRAGMA refresh('lj_legacy_keys_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_legacy_keys_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_keys_left l LEFT JOIN lj_legacy_keys_right r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_legacy_keys_left l LEFT JOIN lj_legacy_keys_right r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM lj_legacy_keys_mv
+);
+----
+0
