@@ -174,7 +174,7 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
                                   const string &recompute_temp_table = "",
                                   RefreshPublicationScope *publication_scope = nullptr,
-                                  const vector<string> &upsert_columns = {});
+                                  const vector<string> &upsert_columns = {}, SqlDialect dialect = SqlDialect::DUCKDB);
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
 // Insert column list plus the select lists that project a row as a retraction (-1) or an insertion (+1).

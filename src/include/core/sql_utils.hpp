@@ -142,7 +142,7 @@ public:
 	// Upserts `source` rows into a data table keyed by a UNIQUE index. Callers delete NULL-containing
 	// keys first. Matched rows are updated in the target's storage order (see the definition).
 	static string BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
-	                                  const vector<string> &columns);
+	                                  const vector<string> &columns, SqlDialect dialect = SqlDialect::DUCKDB);
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);

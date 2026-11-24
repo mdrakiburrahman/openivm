@@ -806,16 +806,19 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 }
 
 string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
-                                     const vector<string> &columns) {
+                                     const vector<string> &columns, SqlDialect dialect) {
 	if (keys.empty() || columns.empty()) {
 		throw InternalException("Keyed upsert into %s needs its key and column names", data_table);
 	}
 	// Only non-key columns are assigned: an indexed key assignment turns every update into
 	// delete+insert.
+	const string rowid_column = "openivm_target_rowid";
 	vector<string> updates;
-	bool shadows_rowid = false;
+	// Only DuckDB tables expose `rowid`, and an output column named like it or the helper alias
+	// would shadow it in the row-id form.
+	bool key_match_only = dialect != SqlDialect::DUCKDB;
 	for (auto &column : columns) {
-		shadows_rowid |= StringUtil::CIEquals(column, "rowid");
+		key_match_only |= StringUtil::CIEquals(column, "rowid") || StringUtil::CIEquals(column, rowid_column);
 		if (std::find(keys.begin(), keys.end(), column) == keys.end()) {
 			auto quoted = QuoteIdentifier(column);
 			updates.push_back(quoted + " = d." + quoted);
@@ -823,8 +826,8 @@ string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &sou
 	}
 	auto not_matched = "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
 	                   JoinQualifiedQuotedColumns(columns, "d") + ");\n";
-	if (updates.empty() || shadows_rowid) {
-		// Nothing is updated, or a `rowid` column hides the row id: match on the key directly.
+	if (updates.empty() || key_match_only) {
+		// Nothing is updated, or the row-id form is unavailable: match on the key directly.
 		auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
 		return "MERGE INTO " + data_table + " v USING " + source + " d ON " +
 		       BuildNullSafeKeyPredicate(keys, "v.", "d.") + matched + not_matched;
@@ -834,7 +837,6 @@ string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &sou
 	// uncorrelated with the target's storage makes every update chunk touch many row groups (~100x
 	// slower). Resolve each source row's target row id and sort by it first: matching on the row id
 	// then follows storage order whichever side probes. Unmatched rows get a NULL row id and insert.
-	const string rowid_column = "openivm_target_rowid";
 	auto ordered_source = "(SELECT openivm_src.*, openivm_old.rowid AS " + rowid_column + " FROM " + source +
 	                      " openivm_src LEFT JOIN " + data_table + " openivm_old ON " +
 	                      BuildNullSafeKeyPredicate(keys, "openivm_old.", "openivm_src.") + " ORDER BY " +

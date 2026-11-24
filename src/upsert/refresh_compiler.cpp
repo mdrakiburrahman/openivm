@@ -843,7 +843,7 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		return BuildAffectedKeyRefreshSQL(data_table, options.view_query_sql, "  " + affected, "openivm_tgt",
 		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert,
 		                                  /*affected_temp_table=*/"", upsert_keys, recompute_temp, nullptr,
-		                                  SqlUtils::WithoutMultiplicity(column_names)) +
+		                                  SqlUtils::WithoutMultiplicity(column_names), options.dialect) +
 		       sign_fixup;
 	}
 
