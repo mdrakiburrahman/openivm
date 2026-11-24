@@ -36,11 +36,15 @@ public:
 	bool TryLock(const void *owner);
 	void Unlock(const void *owner);
 
-	// Source delta ownership changes only under a non-capture lock or in a
-	// transaction that writes an ownership registry. Each such change bumps the
-	// epoch when it starts and again after its transaction ends, so a lookup made
-	// while no change was active and before the epoch moves again reflects every
-	// committed change, and reads the same state any such transaction would.
+	// Cached ownership lookups. Ownership rows change only in transactions that
+	// write an ownership registry; each is marked from its first registry write
+	// until it has ended, bumping the epoch at both ends. Delta table entries are
+	// pinned by the catalog version in the cache key and re-resolved (with their
+	// oid) in the caller's snapshot. So a lookup made while no registry write is
+	// active, before the epoch moves again, reads the committed ownership that
+	// every transaction with that catalog version reads. Non-capture gate holds
+	// also bump the epoch, but only as a conservative extra: some scoped holds
+	// end before their caller's transaction commits.
 	struct CachedSourceDelta {
 		bool tracked = false;
 		string schema;
