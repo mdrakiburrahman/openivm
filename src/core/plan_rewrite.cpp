@@ -1438,12 +1438,10 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
                                                 LogicalType &type, const string &alias = "") {
 	plan->ResolveOperatorTypes();
 	auto top_bindings = plan->GetColumnBindings();
-	auto top_types = plan->types;
-	for (idx_t i = 0; i < top_bindings.size(); i++) {
-		if (top_bindings[i] == binding) {
-			type = top_types[i];
-			return;
-		}
+	auto top = std::find(top_bindings.begin(), top_bindings.end(), binding);
+	if (top != top_bindings.end()) {
+		type = plan->types[top - top_bindings.begin()];
+		return;
 	}
 
 	struct PathEntry {
@@ -1451,24 +1449,20 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 		idx_t child_idx;
 	};
 	vector<PathEntry> path;
-	std::function<bool(LogicalOperator *, bool)> find_path = [&](LogicalOperator *node, bool is_root) -> bool {
+	std::function<bool(LogicalOperator *)> find_path = [&](LogicalOperator *node) -> bool {
 		auto bindings = node->GetColumnBindings();
-		for (auto &candidate : bindings) {
-			if (candidate == binding) {
-				return true;
-			}
+		if (std::find(bindings.begin(), bindings.end(), binding) != bindings.end()) {
+			return true;
 		}
 		for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
-			if (find_path(node->children[child_idx].get(), false)) {
-				if (!is_root) {
-					path.push_back({node, child_idx});
-				}
+			if (find_path(node->children[child_idx].get())) {
+				path.push_back({node, child_idx});
 				return true;
 			}
 		}
 		return false;
 	};
-	find_path(plan.get(), false);
+	find_path(plan.get());
 
 	ColumnBinding current = binding;
 	for (auto &entry : path) {
@@ -1520,38 +1514,23 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 			current = ColumnBinding(setop.table_index, ProjectionIndex(column));
 			setop.ResolveOperatorTypes();
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
-			auto &filter = entry.op->Cast<LogicalFilter>();
-			if (!filter.projection_map.empty()) {
-				bool in_map = false;
-				for (auto &idx : filter.projection_map) {
-					if (idx == current.column_index) {
-						in_map = true;
-						break;
-					}
-				}
-				if (!in_map) {
-					filter.projection_map.push_back(current.column_index);
-				}
+			auto &map = entry.op->Cast<LogicalFilter>().projection_map;
+			if (!map.empty() && std::find(map.begin(), map.end(), current.column_index) == map.end()) {
+				map.push_back(current.column_index);
 			}
-			filter.ResolveOperatorTypes();
-		} else if (entry.op->type == LogicalOperatorType::LOGICAL_UNION ||
-		           entry.op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
+			entry.op->ResolveOperatorTypes();
+		} else if (entry.op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
 		           entry.op->type == LogicalOperatorType::LOGICAL_INTERSECT) {
 			// Set operations expose a fresh table index. A binding from either input
 			// remains visible only through its positional set-operation output; carrying
 			// the branch-local binding above this boundary produces invalid SQL when the
 			// hidden outer-join key is projected at the root.
 			auto child_bindings = entry.op->children[entry.child_idx]->GetColumnBindings();
-			idx_t output_idx = DConstants::INVALID_INDEX;
-			for (idx_t i = 0; i < child_bindings.size(); i++) {
-				if (child_bindings[i] == current) {
-					output_idx = i;
-					break;
-				}
-			}
-			if (output_idx == DConstants::INVALID_INDEX) {
+			auto input = std::find(child_bindings.begin(), child_bindings.end(), current);
+			if (input == child_bindings.end()) {
 				throw InternalException("OpenIVM could not propagate hidden binding through set-operation input");
 			}
+			idx_t output_idx = input - child_bindings.begin();
 			entry.op->ResolveOperatorTypes();
 			auto output_bindings = entry.op->GetColumnBindings();
 			if (output_idx >= output_bindings.size() || output_idx >= entry.op->types.size()) {
@@ -1570,12 +1549,12 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 /// Add openivm_left_key (and openivm_right_key for FULL OUTER) projection at
 /// the top of the plan.
 static void RewriteLeftJoinKey(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                               const OuterJoinBindings &outer_join) {
+                               OuterJoinBindings outer_join) {
 	bool is_full_outer = outer_join.is_full_outer;
-	auto key_binding = outer_join.preserved_key_binding;
-	auto key_type = outer_join.preserved_key_type;
-	auto right_key_binding = outer_join.right_key_binding;
-	auto right_key_type = outer_join.right_key_type;
+	auto &key_binding = outer_join.preserved_key_binding;
+	auto &key_type = outer_join.preserved_key_type;
+	auto &right_key_binding = outer_join.right_key_binding;
+	auto &right_key_type = outer_join.right_key_type;
 
 	// Outer-join key bindings originate inside the join subtree. User projections,
 	// filters with projection maps, and CTE/projection stacks can hide either key
@@ -1619,14 +1598,8 @@ static void RewriteLeftJoinKey(ClientContext &context, Binder &binder, unique_pt
 /// openivm_right_match_count. These hidden aggregates track how many rows match
 /// from each side (Larson & Zhou / Zhang & Larson). When match_count=0,
 /// aggregate columns from that side should be NULL.
-static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+static void RewriteLeftJoinMatchCount(ClientContext &context, unique_ptr<LogicalOperator> &plan,
                                       const OuterJoinBindings &outer_join) {
-	bool is_full_outer = outer_join.is_full_outer;
-	auto null_side_binding = outer_join.null_side_binding;
-	auto null_side_type = outer_join.null_side_type;
-	auto left_side_binding = outer_join.left_side_binding;
-	auto left_side_type = outer_join.left_side_type;
-
 	// Only applies to aggregate plans (PROJECTION → [PROJECTION ...] → AGGREGATE → ...).
 	// For SIMPLE_PROJECTION outer JOINs, match count isn't needed (partial recompute via keys).
 	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &) { return false; });
@@ -1635,47 +1608,25 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	    spine.bottom->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		return;
 	}
-	auto *agg_search = spine.bottom;
-	auto &agg = agg_search->Cast<LogicalAggregate>();
-
-	// Add COUNT(null_side_key) as openivm_match_count (tracks right-side matches for LEFT/OUTER).
-	idx_t match_count_idx = agg.expressions.size();
-	agg.expressions.push_back(MakeAggregate(context, "count",
-	                                        make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding),
-	                                        openivm::MATCH_COUNT_COL));
-
-	// For FULL OUTER: add COUNT(left_key) as openivm_right_match_count (tracks left-side matches).
-	idx_t right_match_count_idx = 0;
-	if (is_full_outer) {
-		right_match_count_idx = agg.expressions.size();
-		agg.expressions.push_back(MakeAggregate(context, "count",
-		                                        make_uniq<BoundColumnRefExpression>(left_side_type, left_side_binding),
-		                                        openivm::RIGHT_MATCH_COUNT_COL));
+	auto &agg = spine.bottom->Cast<LogicalAggregate>();
+	// Expose the COUNT through every projection between the aggregate and the root. PIVOT and other
+	// planner rewrites can introduce several projection layers; adding the hidden binding only to the
+	// top projection leaves LPTS with a reference to a column that no child CTE emits.
+	auto add_count = [&](ColumnBinding input, const LogicalType &input_type, const char *alias) {
+		ColumnBinding binding(agg.aggregate_index, ProjectionIndex(agg.expressions.size()));
+		agg.expressions.push_back(
+		    MakeAggregate(context, "count", make_uniq<BoundColumnRefExpression>(input_type, input), alias));
+		agg.ResolveOperatorTypes();
+		PropagateHiddenBindingThroughProjectionPath(projection_path, binding, agg.expressions.back()->GetReturnType(),
+		                                            alias);
+	};
+	// COUNT(null_side_key) tracks right-side matches; FULL OUTER also tracks left-side matches.
+	add_count(outer_join.null_side_binding, outer_join.null_side_type, openivm::MATCH_COUNT_COL);
+	if (outer_join.is_full_outer) {
+		add_count(outer_join.left_side_binding, outer_join.left_side_type, openivm::RIGHT_MATCH_COUNT_COL);
 	}
-
-	agg.ResolveOperatorTypes();
-
-	// Add passthrough through every projection between the aggregate and the root.
-	// PIVOT and other planner rewrites can introduce several projection layers; adding
-	// the hidden binding only to the top projection leaves LPTS with a reference to a
-	// column that no child CTE emits.
-	auto agg_bindings = agg_search->GetColumnBindings();
-	const auto &agg_types = agg_search->types;
-	idx_t group_count = agg.groups.size();
-
-	ColumnBinding match_binding = agg_bindings[group_count + match_count_idx];
-	const LogicalType &match_type = agg_types[group_count + match_count_idx];
-	PropagateHiddenBindingThroughProjectionPath(projection_path, match_binding, match_type, openivm::MATCH_COUNT_COL);
-
-	if (is_full_outer) {
-		ColumnBinding right_match_binding = agg_bindings[group_count + right_match_count_idx];
-		const LogicalType &right_match_type = agg_types[group_count + right_match_count_idx];
-		PropagateHiddenBindingThroughProjectionPath(projection_path, right_match_binding, right_match_type,
-		                                            openivm::RIGHT_MATCH_COUNT_COL);
-	}
-
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Added openivm_match_count%s for outer join aggregate\n",
-	                    is_full_outer ? " + openivm_right_match_count" : "");
+	                    outer_join.is_full_outer ? " + openivm_right_match_count" : "");
 }
 
 static ColumnBinding AddScopePresence(Binder &binder, unique_ptr<LogicalOperator> &plan,
@@ -1717,7 +1668,7 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 	}
 
 	if (has_aggregate) {
-		RewriteLeftJoinMatchCount(context, binder, plan, outer_join);
+		RewriteLeftJoinMatchCount(context, plan, outer_join);
 		return;
 	}
 
@@ -1743,32 +1694,33 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 		}
 	};
 	collect(*selected);
-	if (!nested_outer.empty()) {
-		idx_t source_index = 0;
-		for (auto &input : selected->children) {
-			vector<std::pair<ColumnBinding, string>> sources;
-			std::function<void(unique_ptr<LogicalOperator> &, bool)> mark_inputs =
-			    [&](unique_ptr<LogicalOperator> &node, bool in_scope) {
-				    if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-				        IsOuterJoin(node->Cast<LogicalComparisonJoin>().join_type)) {
-					    in_scope = true;
-				    }
-				    if (in_scope && node->type == LogicalOperatorType::LOGICAL_GET) {
-					    auto name = string(openivm::FULL_SCOPE_PREFIX) + "source_" + to_string(source_index++);
-					    sources.emplace_back(AddScopePresence(binder, plan, node, name), name);
-					    return;
-				    }
-				    for (auto &child : node->children) {
-					    mark_inputs(child, in_scope);
-				    }
-			    };
-			mark_inputs(input, false);
-			for (auto &source : sources) {
-				LogicalType type = LogicalType::BOOLEAN;
-				// Source participation is needed inside the scoped input only;
-				// it is not an extra persisted output of the materialized view.
-				PropagateBindingThroughOperatorPath(context, binder, input, source.first, type, source.second);
+	if (nested_outer.empty()) {
+		return;
+	}
+	idx_t source_index = 0;
+	for (auto &input : selected->children) {
+		vector<std::pair<ColumnBinding, string>> sources;
+		std::function<void(unique_ptr<LogicalOperator> &, bool)> mark_inputs = [&](unique_ptr<LogicalOperator> &node,
+		                                                                           bool in_scope) {
+			if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+			    IsOuterJoin(node->Cast<LogicalComparisonJoin>().join_type)) {
+				in_scope = true;
 			}
+			if (in_scope && node->type == LogicalOperatorType::LOGICAL_GET) {
+				auto name = string(openivm::FULL_SCOPE_PREFIX) + "source_" + to_string(source_index++);
+				sources.emplace_back(AddScopePresence(binder, plan, node, name), name);
+				return;
+			}
+			for (auto &child : node->children) {
+				mark_inputs(child, in_scope);
+			}
+		};
+		mark_inputs(input, false);
+		for (auto &source : sources) {
+			LogicalType type = LogicalType::BOOLEAN;
+			// Source participation is needed inside the scoped input only;
+			// it is not an extra persisted output of the materialized view.
+			PropagateBindingThroughOperatorPath(context, binder, input, source.first, type, source.second);
 		}
 	}
 	for (idx_t index = 0; index < nested_outer.size(); index++) {
@@ -1785,10 +1737,7 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 			root.expressions[presence.column_index]->SetAlias(Identifier(name));
 		}
 	}
-	if (!nested_outer.empty()) {
-		OPENIVM_DEBUG_PRINT("[PlanRewrite] Added presence columns for %zu nested outer JOIN scopes\n",
-		                    nested_outer.size());
-	}
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Added presence columns for %zu nested outer JOIN scopes\n", nested_outer.size());
 }
 
 struct PlanRewriteContext {
