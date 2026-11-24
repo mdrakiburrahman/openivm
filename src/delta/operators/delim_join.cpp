@@ -27,7 +27,7 @@ static void CollectBaseLeaves(LogicalOperator *node, vector<size_t> path, vector
 	if (node->type == LogicalOperatorType::LOGICAL_GET) {
 		auto *get = dynamic_cast<LogicalGet *>(node);
 		if (get && get->GetTable().get() != nullptr) {
-			leaves.push_back({std::move(path), get, node, false});
+			leaves.push_back({std::move(path), get, node});
 		}
 		return;
 	}

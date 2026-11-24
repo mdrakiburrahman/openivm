@@ -283,11 +283,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// term's delta. Preserved joins elsewhere in a left-deep star must remain
 		// outer joins so unmatched rows continue to flow to later dimensions.
 		if (has_left_join) {
-			if (flattened_leaves || guard || input.context.model.type == RefreshType::SIMPLE_PROJECTION) {
-				DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << i), input.context.model.type);
-			} else if (leaves[i].is_right_of_left_join) {
-				DemoteLeftJoins(term.get());
-			}
+			DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << i), input.context.model.type);
 		}
 
 		// Replace leaf[i] with its delta: a bare GET directly, a GET wrapped in projections/filters by rewriting the

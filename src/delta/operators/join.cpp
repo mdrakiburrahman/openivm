@@ -309,7 +309,7 @@ struct JoinPlanFacts {
 
 // Collect join leaves and the properties needed to select a compilation strategy. Non-join wrappers remain leaves,
 // but their descendants are still inspected for validation and existing multiplicity bindings.
-static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool is_right_of_left, bool collect_leaf,
+static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool collect_leaf,
                                  bool collect_ducklake_leaf, JoinPlanFacts &facts) {
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
@@ -355,36 +355,25 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		}
 	}
 	if ((collect_leaf || collect_ducklake_leaf) && is_join_tree_node) {
-		bool left_is_nullable = is_right_of_left;
-		bool right_is_nullable = is_right_of_left;
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join) {
-			left_is_nullable =
-			    left_is_nullable || join->join_type == JoinType::RIGHT || join->join_type == JoinType::OUTER;
-			right_is_nullable =
-			    right_is_nullable || join->join_type == JoinType::LEFT || join->join_type == JoinType::OUTER;
-		}
 		D_ASSERT(node->children.size() == 2);
 		path.push_back(0);
-		CollectJoinPlanFacts(node->children[0].get(), path, left_is_nullable, collect_leaf, collect_ducklake_leaf,
-		                     facts);
+		CollectJoinPlanFacts(node->children[0].get(), path, collect_leaf, collect_ducklake_leaf, facts);
 		path.pop_back();
 		path.push_back(1);
-		CollectJoinPlanFacts(node->children[1].get(), path, right_is_nullable, collect_leaf, collect_ducklake_leaf,
-		                     facts);
+		CollectJoinPlanFacts(node->children[1].get(), path, collect_leaf, collect_ducklake_leaf, facts);
 		path.pop_back();
 		return;
 	}
 	if (collect_leaf) {
 		auto *get = node->type == LogicalOperatorType::LOGICAL_GET ? dynamic_cast<LogicalGet *>(node) : nullptr;
-		facts.leaves.push_back({path, get, node, is_right_of_left});
+		facts.leaves.push_back({path, get, node});
 	}
 	if (collect_ducklake_leaf) {
 		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
 		    node->type == LogicalOperatorType::LOGICAL_FILTER) {
 			if (node->children.size() == 1) {
 				path.push_back(0);
-				CollectJoinPlanFacts(node->children[0].get(), path, is_right_of_left, false, true, facts);
+				CollectJoinPlanFacts(node->children[0].get(), path, false, true, facts);
 				path.pop_back();
 				return;
 			}
@@ -394,7 +383,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		} else if (node->type == LogicalOperatorType::LOGICAL_GET) {
 			auto *get = dynamic_cast<LogicalGet *>(node);
 			if (get && get->function.GetName().GetIdentifierName() == "ducklake_scan" && get->function.function_info) {
-				facts.ducklake_leaves.push_back({path, get, node, is_right_of_left});
+				facts.ducklake_leaves.push_back({path, get, node});
 				return;
 			}
 			if (facts.ducklake_fallback_reason.empty()) {
@@ -406,7 +395,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 	}
 	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
 		path.push_back(child_idx);
-		CollectJoinPlanFacts(node->children[child_idx].get(), path, is_right_of_left, false, false, facts);
+		CollectJoinPlanFacts(node->children[child_idx].get(), path, false, false, facts);
 		path.pop_back();
 	}
 }
@@ -419,18 +408,6 @@ static bool IsNullSupplyingJoin(JoinType join_type) {
 		return true;
 	default:
 		return false;
-	}
-}
-
-void DemoteLeftJoins(LogicalOperator *node) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (j && IsNullSupplyingJoin(j->join_type)) {
-			j->join_type = JoinType::INNER;
-		}
-	}
-	for (auto &child : node->children) {
-		DemoteLeftJoins(child.get());
 	}
 }
 
@@ -1788,7 +1765,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	bool collect_ducklake_leaves = ducklake_nterm_enabled && input.context.model.type == RefreshType::SIMPLE_PROJECTION;
 	JoinPlanFacts join_facts;
 	vector<size_t> join_path;
-	CollectJoinPlanFacts(input.plan.get(), join_path, false, true, collect_ducklake_leaves, join_facts);
+	CollectJoinPlanFacts(input.plan.get(), join_path, true, collect_ducklake_leaves, join_facts);
 	vector<ColumnBinding> original_bindings;
 	vector<LogicalType> output_types;
 	FilterInternalMultiplicityColumns(all_original_bindings, input.plan->types,
