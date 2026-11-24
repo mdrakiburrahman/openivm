@@ -754,7 +754,8 @@ static void SetSourceDelta(const string &delta_key, const string &schema, const 
 	    stored_name.empty() ? RefreshMetadata::SourceDeltaTableName(schema, base, delta_schema) : stored_name;
 }
 
-enum class SourceDeltaLookup { LOCAL, LOCAL_LEGACY_CANDIDATE, LOCAL_LEGACY, REGISTERED };
+// LOCAL reads the source catalog's routing table; REGISTERED reads every metadata registry.
+enum class SourceDeltaLookup { LOCAL, REGISTERED };
 
 static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &context, const string &catalog,
                                                            const string &schema, const string &table,
@@ -766,8 +767,6 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(SqlUtils::DeltaName(table))),
 		    OnEntryNotFound::RETURN_NULL);
 	}
-	const auto delta_key_name = SqlUtils::DeltaName(table);
-	const auto qualified_delta_key = SqlUtils::FullName(catalog, schema, delta_key_name);
 	optional_ptr<TableCatalogEntry> delta;
 	unordered_map<string, unordered_set<string>> delta_owners;
 	auto consume = [&](const vector<Value> &values, const string &metadata_catalog) {
@@ -805,16 +804,6 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 	vector<MetadataLocation> locations;
 	if (lookup == SourceDeltaLookup::REGISTERED) {
 		locations = RefreshMetadata::MetadataLocations(context, openivm::DELTA_TABLES_TABLE);
-	} else if (lookup == SourceDeltaLookup::LOCAL_LEGACY || lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-		// Older native ownership rows can be read locally without following a
-		// controller marker or contacting a detached/remote metadata catalog.
-		auto &source_catalog = Catalog::GetCatalog(context, Identifier(catalog));
-		if (!source_catalog.IsDuckCatalog()) {
-			return nullptr;
-		}
-		for (auto &source_schema : duckdb::FindMetadataSchemas(context, source_catalog, openivm::DELTA_TABLES_TABLE)) {
-			locations.emplace_back(catalog, source_schema);
-		}
 	} else {
 		locations.emplace_back(catalog, DEFAULT_SCHEMA);
 	}
@@ -875,7 +864,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			                                                            Value(StringUtil::Lower(schema))));
 		}
 		// DuckDB 2.0 requires a non-null TableFilterSet to contain at least one
-		// filter. Legacy/registered ownership scans intentionally read all rows.
+		// filter. Registered ownership scans intentionally read all rows.
 		storage.InitializeScan(context, transaction, scan, columns,
 		                       lookup == SourceDeltaLookup::LOCAL ? &filters : nullptr);
 		DataChunk rows;
@@ -886,24 +875,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			if (!rows.size()) {
 				break;
 			}
-			UnifiedVectorFormat names;
-			if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-				rows.data[positions[0].GetIndex()].ToUnifiedFormat(names);
-			}
 			for (idx_t row = 0; row < rows.size(); row++) {
-				if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-					auto index = names.sel->get_index(row);
-					if (!names.validity.RowIsValid(index)) {
-						continue;
-					}
-					auto name = UnifiedVectorFormat::GetData<string_t>(names)[index];
-					auto matches = [&](const string &key) {
-						return StringUtil::CIEquals(name.GetData(), name.GetSize(), key.data(), key.size());
-					};
-					if (!matches(delta_key_name) && !matches(qualified_delta_key)) {
-						continue;
-					}
-				}
 				for (idx_t field = 0; field < values.size(); field++) {
 					values[field] =
 					    positions[field].IsValid() ? rows.GetValue(positions[field].GetIndex(), row) : Value();
@@ -911,10 +883,6 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 				consume(values, location.catalog);
 			}
 		}
-	}
-	if (delta && lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-		// Only legacy tracked sources need the complete cross-registry ownership check.
-		return FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL_LEGACY);
 	}
 	if (delta) {
 		auto physical_key = StringUtil::Lower(SqlUtils::FullName(catalog, delta->schema.name, delta->name));
@@ -932,9 +900,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 
 optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &context, const string &catalog,
                                                                  const string &schema, const string &table) {
-	auto delta = FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL);
-	return delta ? delta
-	             : FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE);
+	return FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL);
 }
 
 optional_ptr<TableCatalogEntry> RefreshMetadata::FindRegisteredSourceDelta(ClientContext &context,
