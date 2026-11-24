@@ -343,11 +343,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    auto &fs = FileSystem::GetFileSystem(context);
 		    auto cwd = FileSystem::GetWorkingDirectory();
 		    vector<string> rows;
-		    const vector<pair<string, string>> files = {
-		        {"system", "openivm_system_tables.sql"},
-		        {"create", "openivm_compiled_queries_" + view_name + ".sql"},
-		        {"refresh", "openivm_upsert_queries_" + view_name + ".sql"},
-		        {"explain", "openivm_initial_load_explain_" + view_name + ".txt"}};
+		    const vector<pair<string, string>> files = {{"system", "openivm_system_tables.sql"},
+		                                                {"create", "openivm_compiled_queries_" + view_name + ".sql"},
+		                                                {"refresh", "openivm_upsert_queries_" + view_name + ".sql"}};
 		    for (const auto &file : files) {
 			    string path;
 			    bool exists = false;

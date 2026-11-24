@@ -17,7 +17,6 @@ PRAGMA openivm_files('file_probe');
 system	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
 create	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
 refresh	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
-explain	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
 
 statement error
 PRAGMA openivm_files('missing_view');
@@ -687,7 +686,6 @@ PRAGMA openivm_files('file_probe');
 system	<REGEX>:.*[/\\]openivm_system_tables.sql	true	exists; may be from an earlier compilation	<REGEX>:.*
 create	<REGEX>:.*[/\\]openivm_compiled_queries___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.sql	false	not generated at this path	<REGEX>:.*
 refresh	<REGEX>:.*[/\\]openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.sql	false	not generated at this path	<REGEX>:.*
-explain	<REGEX>:.*[/\\]openivm_initial_load_explain___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.txt	false	not generated at this path	<REGEX>:.*
 
 # Capture SQL into an ordinary table without requiring a file or executing the refresh.
 statement ok
