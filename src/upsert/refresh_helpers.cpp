@@ -117,34 +117,14 @@ struct FojJoinInfo {
 	static vector<FojJoinInfo> ParseAll(RefreshMetadata &metadata, const string &view_name,
 	                                    const vector<string> &delta_table_names) {
 		vector<FojJoinInfo> joins;
-		string raw = metadata.GetFullOuterJoinCols(view_name);
-		if (StringUtil::StartsWith(raw, "{")) {
-			for (const auto &object : MetadataJson::ExtractJsonObjectsFromArray(raw, "edges")) {
-				FojJoinInfo info;
-				if (!MetadataJson::ExtractJsonString(object, "left_table", info.left_table) ||
-				    !MetadataJson::ExtractJsonString(object, "left_column", info.left_col) ||
-				    !MetadataJson::ExtractJsonString(object, "right_table", info.right_table) ||
-				    !MetadataJson::ExtractJsonString(object, "right_column", info.right_col)) {
-					continue;
-				}
+		auto raw = metadata.GetFullOuterJoinCols(view_name);
+		for (const auto &object : MetadataJson::ExtractJsonObjectsFromArray(raw, "edges")) {
+			FojJoinInfo info;
+			if (MetadataJson::ExtractJsonString(object, "left_table", info.left_table) &&
+			    MetadataJson::ExtractJsonString(object, "left_column", info.left_col) &&
+			    MetadataJson::ExtractJsonString(object, "right_table", info.right_table) &&
+			    MetadataJson::ExtractJsonString(object, "right_column", info.right_col)) {
 				joins.push_back(std::move(info));
-			}
-		} else {
-			// Databases created before multi-boundary metadata used one table:column pair.
-			auto comma_pos = raw.find(',');
-			if (comma_pos != string::npos) {
-				FojJoinInfo info;
-				string left_part = raw.substr(0, comma_pos);
-				string right_part = raw.substr(comma_pos + 1);
-				auto lc = left_part.find(':');
-				auto rc = right_part.find(':');
-				if (lc != string::npos && rc != string::npos) {
-					info.left_table = left_part.substr(0, lc);
-					info.left_col = left_part.substr(lc + 1);
-					info.right_table = right_part.substr(0, rc);
-					info.right_col = right_part.substr(rc + 1);
-					joins.push_back(std::move(info));
-				}
 			}
 		}
 		auto resolve_source = [&](string &table, string &delta_name) {
