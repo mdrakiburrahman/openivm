@@ -1393,14 +1393,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			if (!aux_meta.selected_input_sql.empty()) {
 				input_columns = &aux_meta.selected_input_columns;
 				if (aux_meta.representative_input) {
-					vector<string> candidates;
-					for (auto &column : aux_meta.selected_source_columns) {
-						candidates.push_back("openivm_candidates." + SqlUtils::QuoteIdentifier(column));
-					}
 					string candidate_bag =
-					    "(SELECT " + StringUtil::Join(candidates, ", ") + " FROM " + aux_table_sql(aux_meta.aux_table) +
-					    " openivm_candidates SEMI JOIN " + SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) +
-					    " i ON " +
+					    "(SELECT " +
+					    SqlUtils::JoinQualifiedQuotedColumns(aux_meta.selected_source_columns, "openivm_candidates") +
+					    " FROM " + aux_table_sql(aux_meta.aux_table) + " openivm_candidates SEMI JOIN " +
+					    SqlUtils::QuoteIdentifier("openivm_dinput_" + view_name) + " i ON " +
 					    SqlUtils::BuildNullSafeMatch(aux_meta.selected_source_columns, "openivm_candidates", "i") +
 					    " WHERE " + SqlUtils::QuoteIdentifier(aux_meta.InternalColumn("_count")) + " > 0 AND " +
 					    SqlUtils::QuoteIdentifier(aux_meta.InternalColumn("openivm_selected")) + ")";
