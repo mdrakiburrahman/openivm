@@ -203,6 +203,8 @@ public:
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
+	// Refresh order of a single-view cascade: upstream views, the view itself, then downstream views.
+	vector<string> CascadeOrder(const string &view_name, const string &cascade_mode);
 	bool HasDownstreamViews(const string &view_name, bool include_published = true,
 	                        optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr);
 

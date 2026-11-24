@@ -1559,6 +1559,19 @@ vector<string> RefreshMetadata::GetDownstreamViewsStrict(const string &view_name
 	return GetDownstreamViewsInternal(con, view_name, true);
 }
 
+vector<string> RefreshMetadata::CascadeOrder(const string &view_name, const string &cascade_mode) {
+	vector<string> order;
+	if (cascade_mode == "upstream" || cascade_mode == "both") {
+		order = GetUpstreamViews(view_name);
+	}
+	order.push_back(view_name);
+	if (cascade_mode == "downstream" || cascade_mode == "both") {
+		auto downstream = GetDownstreamViews(view_name);
+		order.insert(order.end(), downstream.begin(), downstream.end());
+	}
+	return order;
+}
+
 vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode) {
 	if (cascade_mode != "off" && cascade_mode != "upstream" && cascade_mode != "downstream" && cascade_mode != "both") {
 		throw InvalidInputException("refresh_pipeline: unknown cascade mode '%s'", cascade_mode);

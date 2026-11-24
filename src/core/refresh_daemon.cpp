@@ -166,16 +166,8 @@ void RefreshDaemon::Run() {
 				}
 
 				// Mark this view and any cascaded views as done for this cycle
-				refreshed_this_cycle.insert(view_key);
-				if (cascade_mode == "downstream" || cascade_mode == "both") {
-					for (auto &dep : metadata.GetDownstreamViews(sv.view_name)) {
-						refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, dep));
-					}
-				}
-				if (cascade_mode == "upstream" || cascade_mode == "both") {
-					for (auto &dep : metadata.GetUpstreamViews(sv.view_name)) {
-						refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, dep));
-					}
+				for (auto &node : metadata.CascadeOrder(sv.view_name, cascade_mode)) {
+					refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, node));
 				}
 
 				auto after = std::chrono::steady_clock::now();
