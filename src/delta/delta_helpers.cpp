@@ -62,8 +62,8 @@ DeltaSourceState &LoadDeltaWatermark(Connection &con, const string &view_name, T
 	return state;
 }
 
-static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalOperator> delta_node,
-                                     TableIndex output_table_index, ColumnBinding mul_binding) {
+static DeltaPlanFragment RemapDeltaNode(ClientContext &context, unique_ptr<LogicalOperator> delta_node,
+                                        TableIndex output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
 	auto input_types = delta_node->types;
 	// Logical operators expose one type per binding; equality is the required valid shape.
@@ -107,8 +107,9 @@ static void CopyTableFilters(const LogicalGet &source, LogicalGet &target) {
 	}
 }
 
-static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
-                                       TableIndex output_table_index, ColumnBinding mul_binding) {
+static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder,
+                                          unique_ptr<LogicalOperator> delta_node, TableIndex output_table_index,
+                                          ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
 	auto input_types = delta_node->types;
 	if (input_bindings.empty() || input_bindings.size() != input_types.size()) {
@@ -172,9 +173,9 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 
 /// Build a DuckLake delta scan by directly constructing LogicalGet nodes
 /// with SCAN_INSERTIONS / SCAN_DELETIONS, avoiding SQL string round-trips.
-static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection &con, Binder &binder,
-                                              LogicalGet *old_get, const string &view_name, DeltaSourceState &state,
-                                              bool honor_source_projection) {
+static DeltaPlanFragment CreateDuckLakeDeltaNode(ClientContext &context, Connection &con, Binder &binder,
+                                                 LogicalGet *old_get, const string &view_name, DeltaSourceState &state,
+                                                 bool honor_source_projection) {
 	// Copied DuckDB 2.0 scans can expose their projected bindings before their
 	// cached type vector has been resolved. The no-snapshot-change fast path must
 	// have the same visible layout as a real change scan, including multiplicity.
@@ -226,16 +227,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	if (start_snap > cur_snap) {
 		vector<LogicalType> empty_types = old_get->types;
 		empty_types.push_back(LogicalType::INTEGER);
-		vector<ColumnBinding> bindings;
-		auto table_index = binder.GenerateTableIndex();
-		// >= leaves the empty result without bindings and <= creates one more binding than types.
-		for (idx_t i = 0; i < empty_types.size(); i++) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-			bindings.emplace_back(table_index, ProjectionIndex(i));
-		}
-		auto mul_binding = bindings.back();
-		auto empty = make_uniq<LogicalEmptyResult>(empty_types, std::move(bindings));
-		empty->ResolveOperatorTypes();
-		return {std::move(empty), mul_binding};
+		return EmptyDeltaResult(binder, empty_types);
 	}
 
 	// DuckLake's table_insertions/deletions functions treat the start snapshot as
@@ -333,7 +325,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 
 	auto compacted = CompactDeltaNode(context, binder, std::move(union_op), old_get->table_index, mul_binding);
 	OPENIVM_DEBUG_PRINT("[DuckLake] Delta plan built: %zu output cols, mul_binding: table=%lu col=%lu\n",
-	                    compacted.node->types.size(), (unsigned long)compacted.mul_binding.table_index.index,
+	                    compacted.op->types.size(), (unsigned long)compacted.mul_binding.table_index.index,
 	                    (unsigned long)compacted.mul_binding.column_index.GetIndex());
 	return compacted;
 }
@@ -342,8 +334,20 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 // Standard DuckDB delta scan (existing logic)
 // ============================================================================
 
-DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
-                                  const string &view_name, DeltaSourceCache *cache, bool honor_source_projection) {
+DeltaPlanFragment EmptyDeltaResult(Binder &binder, const vector<LogicalType> &types) {
+	vector<ColumnBinding> bindings;
+	auto table_index = binder.GenerateTableIndex();
+	for (idx_t i = 0; i < types.size(); i++) {
+		bindings.emplace_back(table_index, ProjectionIndex(i));
+	}
+	auto mul_binding = bindings.back();
+	auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
+	empty->ResolveOperatorTypes();
+	return {std::move(empty), mul_binding};
+}
+
+DeltaPlanFragment CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
+                                     const string &view_name, DeltaSourceCache *cache, bool honor_source_projection) {
 	DeltaSourceCache local_cache;
 	auto &sources = cache ? *cache : local_cache;
 	// DuckLake tables: use native change tracking via direct plan construction

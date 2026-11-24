@@ -335,12 +335,12 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			}
 			auto &leaf_ref = GetNodeAtPath(term, leaves[i].path);
 			auto leaf_bindings = leaf_ref->GetColumnBindings();
-			DeltaGetResult delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder, leaves[i].get,
-			                                            input.context.view, &source_cache, true);
-			auto delta_bindings = delta_i.node->GetColumnBindings();
+			auto delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder, leaves[i].get,
+			                                  input.context.view, &source_cache, true);
+			auto delta_bindings = delta_i.op->GetColumnBindings();
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
-			leaf_ref = std::move(delta_i.node);
+			leaf_ref = std::move(delta_i.op);
 			AppendMultiplicityToAncestorProjectionMaps(term, leaves[i].path, delta_i.mul_binding, "DeltaDelimJoin",
 			                                           true);
 		}

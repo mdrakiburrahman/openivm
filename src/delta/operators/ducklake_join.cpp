@@ -42,18 +42,7 @@ static string DuckLakeChangesSQL(const string &select_list, const string &catalo
 
 static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator> &term,
                                                       const vector<size_t> &leaf_path, ColumnBinding mul_binding) {
-	vector<LogicalOperator *> ancestors;
-	ancestors.reserve(leaf_path.size());
-	LogicalOperator *node = term.get();
-	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
-		if (leaf_path[depth] >= node->children.size()) { // mull-ignore: cxx_ge_to_gt
-			throw InternalException("DuckLakeJoin: leaf path child %llu out of bounds at depth %llu",
-			                        static_cast<idx_t>(leaf_path[depth]), static_cast<idx_t>(depth));
-		}
-		ancestors.push_back(node);
-		node = node->children[leaf_path[depth]].get();
-	}
-
+	auto ancestors = LeafPathAncestors(*term, leaf_path, "DuckLakeJoin");
 	for (size_t depth = leaf_path.size(); depth-- > 0;) {
 		auto *parent = ancestors[depth];
 		size_t child_side = leaf_path[depth];
@@ -88,11 +77,7 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 		}
 		if (parent->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 			// A new left column shifts the right side in any ancestor's positional map.
-			idx_t insertion_idx = mul_idx;
-			if (child_side == 1) {
-				insertion_idx += parent->children[0]->GetColumnBindings().size();
-			}
-			shift_parent_projection(insertion_idx);
+			shift_parent_projection(mul_idx + JoinChildOutputOffset(*parent, child_side));
 			parent->ResolveOperatorTypes();
 			continue;
 		}
@@ -104,21 +89,12 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 			}
 			OPENIVM_DEBUG_PRINT("\n");
 			if (projection_map.empty()) {
-				idx_t insertion_idx = mul_idx;
-				if (child_side == 1) {
-					insertion_idx += join->children[0]->GetColumnBindings().size();
-				}
-				shift_parent_projection(insertion_idx);
+				shift_parent_projection(mul_idx + JoinChildOutputOffset(*join, child_side));
 			} else {
 				// Numeric map positions can alias a different column after a deeper join grows.
 				auto exposed = join->GetColumnBindings();
 				if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
-					idx_t insertion_idx = projection_map.size();
-					if (child_side == 1) {
-						insertion_idx += join->left_projection_map.empty()
-						                     ? join->children[0]->GetColumnBindings().size()
-						                     : join->left_projection_map.size();
-					}
+					auto insertion_idx = projection_map.size() + JoinChildOutputOffset(*join, child_side);
 					projection_map.push_back(ProjectionIndex(mul_idx));
 					shift_parent_projection(insertion_idx);
 				}

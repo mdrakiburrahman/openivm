@@ -514,7 +514,7 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
                                                                     Binder &binder, LogicalGet *base_get, idx_t key_pos,
                                                                     const string &view_name, bool old_state) {
 	auto delta_result = CreateDeltaGetNode(context, con, binder, base_get, view_name, nullptr, true);
-	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.node), binder);
+	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.op), binder);
 	auto delta_bindings = delta_renumbered.op->GetColumnBindings();
 	auto delta_types = delta_renumbered.op->types;
 	// These mutations admit the appended multiplicity as a data key; valid plans must reject it.
@@ -828,6 +828,35 @@ static void GuardKeptOuterJoinsForMask(ClientContext &context, Connection &con, 
 	                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
 }
 
+vector<LogicalOperator *> LeafPathAncestors(LogicalOperator &root, const vector<size_t> &leaf_path,
+                                            const char *context_label) {
+	vector<LogicalOperator *> ancestors;
+	ancestors.reserve(leaf_path.size());
+	LogicalOperator *node = &root;
+	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
+		// Equality is the first invalid child index and is handled by this exception.
+		// mull-ignore-next: cxx_ge_to_gt
+		if (leaf_path[depth] >= node->children.size()) {
+			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
+			                        (idx_t)leaf_path[depth], (idx_t)depth);
+		}
+		ancestors.push_back(node);
+		node = node->children[leaf_path[depth]].get();
+	}
+	return ancestors;
+}
+
+idx_t JoinChildOutputOffset(LogicalOperator &join, size_t child_side) {
+	if (child_side == 0) {
+		return 0;
+	}
+	auto *logical_join = dynamic_cast<LogicalJoin *>(&join);
+	if (logical_join && !logical_join->left_projection_map.empty()) {
+		return logical_join->left_projection_map.size();
+	}
+	return join.children[0]->GetColumnBindings().size();
+}
+
 void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, const vector<size_t> &leaf_path,
                                 size_t depth, idx_t insertion_idx, idx_t added) {
 	if (added == 0 || depth == 0) {
@@ -858,19 +887,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 	if (leaf_path.empty()) {
 		return;
 	}
-	vector<LogicalOperator *> ancestors;
-	ancestors.reserve(leaf_path.size());
-	LogicalOperator *node = term.get();
-	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
-		// Equality is the first invalid child index and is handled by this exception.
-		// mull-ignore-next: cxx_ge_to_gt
-		if (leaf_path[depth] >= node->children.size()) {
-			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
-			                        (idx_t)leaf_path[depth], (idx_t)depth);
-		}
-		ancestors.push_back(node);
-		node = node->children[leaf_path[depth]].get();
-	}
+	auto ancestors = LeafPathAncestors(*term, leaf_path, context_label);
 	for (size_t depth = leaf_path.size(); depth-- > 0;) {
 		size_t child_side = leaf_path[depth];
 		auto *join = dynamic_cast<LogicalJoin *>(ancestors[depth]);
@@ -916,12 +933,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 					continue;
 				}
 				idx_t old_width = proj_map.size();
-				idx_t insertion_idx = old_width;
-				if (child_side == 1) {
-					auto left_bindings = join->children[0]->GetColumnBindings();
-					insertion_idx +=
-					    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
-				}
+				idx_t insertion_idx = old_width + JoinChildOutputOffset(*join, child_side);
 				// Appending to this join's own left_projection_map grows its LEFT
 				// contribution width, which shifts the absolute position where its RIGHT
 				// contribution starts within its own combined GetColumnBindings(). A
@@ -968,12 +980,8 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 			if (mul_binding_it == child_bindings.end()) {
 				continue;
 			}
-			idx_t insertion_idx = idx_t(mul_binding_it - child_bindings.begin());
-			if (child_side == 1) {
-				auto left_bindings = join->children[0]->GetColumnBindings();
-				insertion_idx +=
-				    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
-			}
+			idx_t insertion_idx =
+			    idx_t(mul_binding_it - child_bindings.begin()) + JoinChildOutputOffset(*join, child_side);
 			// An empty map passes the child's bindings through unchanged, so the
 			// multiplicity is inserted in-place and shifts every later binding.
 			shift_parent_projection(insertion_idx, 1);
@@ -1674,14 +1682,14 @@ DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, Clien
 		auto original_bindings = leaf_node->GetColumnBindings();
 		auto delta = CreateDeltaGetNode(context, input.context.metadata_con, binder, &get, input.context.view,
 		                                &source_cache, true);
-		auto delta_bindings = delta.node->GetColumnBindings();
+		auto delta_bindings = delta.op->GetColumnBindings();
 		// DuckDB 2.0 can expose projected GET bindings using their sparse physical
 		// positions (for example 1,2,3 when position 0 is filter-only). Delta
 		// compaction emits contiguous bindings. Rebind conditions and expressions
 		// above the leaf before replacing it; join projection maps are positional and
 		// remain the responsibility of UpdateParentProjectionMap.
 		RebindRegularLeafParent(*term_root, *leaf_node, original_bindings, delta_bindings);
-		return {std::move(delta.node), delta.mul_binding};
+		return delta;
 	}
 	return input.CompileCopiedSubtree(leaf_node, term_root);
 }

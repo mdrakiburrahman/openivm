@@ -78,14 +78,7 @@ unique_ptr<LogicalOperator> FinalizeJoinTerm(Binder &binder, unique_ptr<LogicalO
 unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                  const vector<LogicalType> &types, Binder &binder) {
 	if (terms.empty()) {
-		vector<ColumnBinding> bindings;
-		auto table_index = binder.GenerateTableIndex();
-		for (idx_t i = 0; i < types.size(); i++) {
-			bindings.emplace_back(table_index, ProjectionIndex(i));
-		}
-		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
-		empty->ResolveOperatorTypes();
-		return std::move(empty);
+		return EmptyDeltaResult(binder, types).op;
 	}
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {

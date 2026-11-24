@@ -51,6 +51,12 @@ void DemoteOuterJoinsForMask(LogicalOperator *node, const vector<JoinLeafInfo> &
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding, idx_t original_leaf_width);
 
+// The operators along leaf_path from root (exclusive of the leaf), outermost first.
+vector<LogicalOperator *> LeafPathAncestors(LogicalOperator &root, const vector<size_t> &leaf_path,
+                                            const char *context_label);
+// Where child_side's first column lands in a binary operator's output, honoring the left projection map.
+idx_t JoinChildOutputOffset(LogicalOperator &join, size_t child_side);
+
 void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, const vector<size_t> &leaf_path,
                                 size_t depth, idx_t insertion_idx, idx_t added);
 
