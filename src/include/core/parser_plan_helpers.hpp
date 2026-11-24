@@ -127,9 +127,8 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, TableIndex
 // (internal_catalog_prefix). Without it the generated INSERT targets an unqualified delta table,
 // which fails for MVs whose state lives in another catalog -- e.g. DuckLake-backed views, where the
 // delta table is dl.main.openivm_delta_<view>.
-// The returned SQL carries LJSEC_INNER_DELTA_PLACEHOLDER / LJSEC_PRES_DELTA_PLACEHOLDER where each
-// side's pending changes belong; refresh substitutes them (see openivm_constants.hpp). The out_*
-// params report the two sides' identities so refresh can pick the right row source per backend.
+// The returned SQL carries one LJSEC_INNER_DELTA_ placeholder per level where the inner side's pending
+// changes belong; refresh substitutes it (see openivm_constants.hpp) using the recorded inner identity.
 // The Larson & Zhou secondary-delta correction for every LEFT JOIN level; empty sql when unsupported.
 RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(Binder &binder, const CreateMVPlanFacts &facts,
                                                                       const vector<string> &output_names,

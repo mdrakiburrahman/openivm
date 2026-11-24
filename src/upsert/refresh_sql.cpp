@@ -1193,29 +1193,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					lj_delta_source_cache[cache_key] = result;
 					return result;
 				};
-				// One placeholder pair PER LEFT JOIN level; identities are index-aligned arrays.
+				// One inner-delta placeholder PER LEFT JOIN level; identities are index-aligned arrays.
 				auto &lj_it = ljsec.inner_tables;
 				auto &lj_ik = ljsec.inner_keys;
-				auto &lj_pt = ljsec.pres_tables;
-				auto &lj_pk = ljsec.pres_keys;
-				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size() && lj_it.size() == lj_pt.size() &&
-				             lj_it.size() == lj_pk.size();
+				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size();
 				for (size_t lvl = 0; lj_ok && lvl < lj_it.size(); lvl++) {
 					string inner_src = build_ljsec_delta_source(lj_it[lvl], lj_ik[lvl]);
-					string pres_src = build_ljsec_delta_source(lj_pt[lvl], lj_pk[lvl]);
-					if (inner_src.empty() || pres_src.empty()) {
-						lj_ok = false;
-						break;
-					}
-					string lvl_str = to_string(lvl);
-					ljsec.sql = SqlUtils::ReplaceAllOccurrences(ljsec.sql,
-					                                            string(openivm::LJSEC_INNER_DELTA_PREFIX) + lvl_str +
-					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
-					                                            inner_src);
-					ljsec.sql = SqlUtils::ReplaceAllOccurrences(ljsec.sql,
-					                                            string(openivm::LJSEC_PRES_DELTA_PREFIX) + lvl_str +
-					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
-					                                            pres_src);
+					lj_ok = !inner_src.empty();
+					ljsec.sql =
+					    SqlUtils::ReplaceAllOccurrences(ljsec.sql,
+					                                    string(openivm::LJSEC_INNER_DELTA_PREFIX) + to_string(lvl) +
+					                                        string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
+					                                    inner_src);
 				}
 				unordered_map<string, string> previous_sources;
 				ljsec.sql = SqlUtils::RewriteTableReferences(ljsec.sql, [&](const vector<string> &parts) -> string {

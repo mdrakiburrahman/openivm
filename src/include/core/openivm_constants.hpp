@@ -93,7 +93,6 @@ constexpr const char *INDEX_SUFFIX = "openivm_index";
 // is itself a join needs its own secondary delta. Handling only the outermost level left deeper
 // preserved-side counts undercounted for 4+ table chains.
 constexpr const char *LJSEC_INNER_DELTA_PREFIX = "__OPENIVM_LJSEC_INNER_DELTA_";
-constexpr const char *LJSEC_PRES_DELTA_PREFIX = "__OPENIVM_LJSEC_PRES_DELTA_";
 constexpr const char *LJSEC_PLACEHOLDER_SUFFIX = "__";
 // Quoted relation placeholder followed by the qualified source identity.
 constexpr const char *LJSEC_OLD_SOURCE_PREFIX = "__OPENIVM_LJSEC_OLD_SOURCE_";
