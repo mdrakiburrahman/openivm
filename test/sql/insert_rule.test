@@ -1941,3 +1941,180 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# UPDATE/DELETE preimages read from the target scan
+# ==========================================
+# Plain UPDATE/DELETE capture reads each row's preimage from the scan feeding
+# the DML; UPDATE ... FROM and other shapes fetch it by row id. Cover both,
+# generated and nested columns, indexed-key updates (DuckDB's delete+insert),
+# transaction-local rows, prepared statements, RETURNING and rollback.
+statement ok
+CREATE TABLE scan_pre_src (
+    id INTEGER PRIMARY KEY,
+    k INTEGER,
+    v INTEGER DEFAULT 7,
+    g INTEGER GENERATED ALWAYS AS (v * 2 + k),
+    s STRUCT(a INTEGER, b VARCHAR),
+    name VARCHAR
+);
+
+statement ok
+INSERT INTO scan_pre_src (id, k, v, s, name)
+SELECT i, i % 10, i, {'a': i % 13, 'b': 'b' || (i % 5)}, 'n' || i FROM range(50000) r(i);
+
+statement ok
+CREATE TABLE scan_pre_lookup (id INTEGER, w INTEGER);
+
+# Duplicate lookup keys: UPDATE ... FROM keeps the first match for a target row.
+statement ok
+INSERT INTO scan_pre_lookup SELECT i % 40, i FROM range(80) r(i);
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_rows AS
+SELECT id, k, v, g, s, name FROM scan_pre_src WHERE v % 3 <> 1;
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_agg AS
+SELECT k, SUM(v) AS sv, SUM(g) AS sg, COUNT(*) AS c, MAX(name) AS mn, SUM(s.a) AS sa
+FROM scan_pre_src GROUP BY k;
+
+# Exact delta rows for a plain UPDATE: full preimage (-1) and postimage (+1).
+statement ok
+UPDATE scan_pre_src SET v = v + 100, name = name || '!' WHERE id = 3;
+
+query IIIIII
+SELECT id, k, v, s, name, openivm_multiplicity
+FROM openivm_delta_scan_pre_src ORDER BY openivm_multiplicity, id;
+----
+3	3	3	{'a': 3, 'b': b3}	n3	-1
+3	3	103	{'a': 3, 'b': b3}	n3!	1
+
+statement ok
+PRAGMA refresh('scan_pre_rows');
+
+statement ok
+PRAGMA refresh('scan_pre_agg');
+
+statement ok
+SET threads = 4;
+
+statement ok
+PREPARE scan_pre_bump AS UPDATE scan_pre_src SET v = v + $1 WHERE k = $2;
+
+# A rolled-back batch must leave no captured rows behind.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE scan_pre_src SET v = 0 WHERE k = 1;
+
+statement ok
+DELETE FROM scan_pre_src WHERE s.a = 4;
+
+statement ok
+EXECUTE scan_pre_bump(5, 2);
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_delta_scan_pre_src;
+----
+0
+
+# One batch of conflicting DML on overlapping rows before a single refresh.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO scan_pre_src (id, k, v, s, name)
+SELECT 100000 + i, i % 10, i * 3, {'a': i % 13, 'b': 'new'}, 'm' || i FROM range(3000) r(i);
+
+statement ok
+UPDATE scan_pre_src SET v = v + 1 WHERE k < 4;
+
+statement ok
+UPDATE scan_pre_src SET v = v * 2 WHERE id >= 100000 AND id % 7 = 0;
+
+statement ok
+DELETE FROM scan_pre_src WHERE id >= 100000 AND id % 11 = 0;
+
+statement ok
+DELETE FROM scan_pre_src WHERE s.a = 5 AND k = 3;
+
+statement ok
+UPDATE scan_pre_src SET v = scan_pre_lookup.w, name = 'from'
+FROM scan_pre_lookup WHERE scan_pre_src.id = scan_pre_lookup.id;
+
+statement ok
+UPDATE scan_pre_src SET id = id + 1000000 WHERE id % 97 = 0;
+
+statement ok
+UPDATE scan_pre_src SET v = DEFAULT, s = {'a': 99, 'b': 'dflt'} WHERE k = 6 AND id % 5 = 0;
+
+statement ok
+UPDATE scan_pre_src SET k = (k + 1) % 10 WHERE id % 13 = 0 RETURNING id, k, g;
+
+statement ok
+DELETE FROM scan_pre_src WHERE k = 8 AND id % 3 = 0 RETURNING id, g;
+
+statement ok
+EXECUTE scan_pre_bump(5, 2);
+
+statement ok
+EXECUTE scan_pre_bump(-2, 2);
+
+statement ok
+UPDATE scan_pre_src SET name = upper(name) WHERE id IN (SELECT id FROM scan_pre_lookup);
+
+statement ok
+DELETE FROM scan_pre_src WHERE k = 9 AND v > 40000;
+
+statement ok
+COMMIT;
+
+statement ok
+SET threads = 1;
+
+statement ok
+PRAGMA refresh('scan_pre_rows');
+
+statement ok
+PRAGMA refresh('scan_pre_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_rows
+    EXCEPT ALL
+    SELECT id, k, v, g, s, name FROM scan_pre_src WHERE v % 3 <> 1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, k, v, g, s, name FROM scan_pre_src WHERE v % 3 <> 1
+    EXCEPT ALL
+    SELECT * FROM scan_pre_rows
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_agg
+    EXCEPT ALL
+    SELECT k, SUM(v), SUM(g), COUNT(*), MAX(name), SUM(s.a) FROM scan_pre_src GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, SUM(v), SUM(g), COUNT(*), MAX(name), SUM(s.a) FROM scan_pre_src GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM scan_pre_agg
+);
+----
+0

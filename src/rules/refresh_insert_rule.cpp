@@ -18,6 +18,8 @@
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_execute.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -235,18 +237,141 @@ static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert 
 	insert.expected_types = insert.table.GetTypes();
 }
 
+static idx_t FindBindingIndex(const vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
+	for (idx_t index = 0; index < bindings.size(); index++) {
+		if (bindings[index] == binding) {
+			return index;
+		}
+	}
+	throw InternalException("OpenIVM could not resolve a DML input binding");
+}
+
 static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression &expression) {
 	if (expression.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		throw InternalException("OpenIVM expected a bound row-id column reference");
 	}
-	auto &column_ref = expression.Cast<BoundColumnRefExpression>();
-	auto bindings = child.GetColumnBindings();
-	for (idx_t index = 0; index < bindings.size(); index++) {
-		if (bindings[index] == column_ref.Binding()) {
-			return index;
+	return FindBindingIndex(child.GetColumnBindings(), expression.Cast<BoundColumnRefExpression>().Binding());
+}
+
+// The target-table scan feeding an UPDATE/DELETE through projections and filters
+// only. Other inputs (e.g. UPDATE ... FROM joins) can repeat target rows.
+static optional_ptr<LogicalGet> FindTargetScan(LogicalOperator &op, TableCatalogEntry &table) {
+	reference<LogicalOperator> current(op);
+	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	       current.get().type == LogicalOperatorType::LOGICAL_FILTER) {
+		if (current.get().children.size() != 1) {
+			return nullptr;
+		}
+		current = *current.get().children[0];
+	}
+	if (current.get().type != LogicalOperatorType::LOGICAL_GET) {
+		return nullptr;
+	}
+	auto &get = current.get().Cast<LogicalGet>();
+	if (get.GetTable().get() != &table || !get.children.empty() || !get.projected_input.empty()) {
+		return nullptr;
+	}
+	for (auto &column_id : get.GetColumnIds()) {
+		// A struct-pushdown or retyped scan column is not the stored value.
+		if (!column_id.IsVirtualColumn() &&
+		    (column_id.HasChildren() || column_id.HasType() || column_id.IsPushdownExtract())) {
+			return nullptr;
 		}
 	}
-	throw InternalException("OpenIVM could not resolve the DML row-id binding");
+	return &get;
+}
+
+// Make every physical column of the scanned table an output of `op`, appending
+// to scans, filter projection maps and projections without moving existing
+// outputs. Returns the bindings in physical column order.
+static vector<ColumnBinding> ExposeTargetColumns(LogicalOperator &op, LogicalGet &get, TableCatalogEntry &table) {
+	if (&op == &get) {
+		vector<ColumnBinding> bindings;
+		for (auto &column : table.GetColumns().Physical()) {
+			auto logical_index = column.Logical().index;
+			optional_idx position;
+			auto &column_ids = get.GetColumnIds();
+			for (idx_t index = 0; index < column_ids.size(); index++) {
+				if (!column_ids[index].IsVirtualColumn() && column_ids[index].GetPrimaryIndex() == logical_index) {
+					position = index;
+					break;
+				}
+			}
+			if (!position.IsValid()) {
+				position = get.AddColumnId(logical_index).GetIndex();
+			}
+			ProjectionIndex projection(position.GetIndex());
+			if (!get.projection_ids.empty() && std::find(get.projection_ids.begin(), get.projection_ids.end(),
+			                                             projection) == get.projection_ids.end()) {
+				get.projection_ids.push_back(projection);
+			}
+			bindings.emplace_back(get.table_index, projection);
+		}
+		if (get.projection_ids.size() == get.GetColumnIds().size()) {
+			// Table scans treat a full-size projection list as the identity order.
+			// Bindings name scan columns, so outputting all of them in order is equivalent.
+			get.projection_ids.clear();
+		}
+		return bindings;
+	}
+	auto child_bindings = ExposeTargetColumns(*op.children[0], get, table);
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &filter = op.Cast<LogicalFilter>();
+		if (!filter.projection_map.empty()) {
+			auto all_bindings = op.children[0]->GetColumnBindings();
+			for (auto &binding : child_bindings) {
+				ProjectionIndex child_index(FindBindingIndex(all_bindings, binding));
+				if (std::find(filter.projection_map.begin(), filter.projection_map.end(), child_index) ==
+				    filter.projection_map.end()) {
+					filter.projection_map.push_back(child_index);
+				}
+			}
+		}
+		return child_bindings;
+	}
+	D_ASSERT(op.type == LogicalOperatorType::LOGICAL_PROJECTION);
+	auto &projection = op.Cast<LogicalProjection>();
+	auto types = table.GetTypes();
+	vector<ColumnBinding> bindings;
+	for (idx_t column = 0; column < child_bindings.size(); column++) {
+		optional_idx position;
+		for (idx_t index = 0; index < projection.expressions.size(); index++) {
+			auto &expression = *projection.expressions[index];
+			if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+			    expression.Cast<BoundColumnRefExpression>().Binding() == child_bindings[column]) {
+				position = index;
+				break;
+			}
+		}
+		if (!position.IsValid()) {
+			position = projection.expressions.size();
+			projection.expressions.push_back(
+			    make_uniq<BoundColumnRefExpression>(types[column], child_bindings[column]));
+		}
+		bindings.emplace_back(projection.table_index, ProjectionIndex(position.GetIndex()));
+	}
+	return bindings;
+}
+
+// Capture fetches each UPDATE/DELETE preimage by row id unless its input is a
+// plain target scan, which can carry the whole row at columnar scan cost.
+static void CaptureScannedPreimages(LogicalTransactionalDeltaCapture &capture) {
+	auto &child = *capture.children[0];
+	auto get = FindTargetScan(child, capture.base_table);
+	if (!get) {
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] '%s' capture fetches preimages by row id\n",
+		                    capture.base_table.name.GetIdentifierName().c_str());
+		return;
+	}
+	auto output_column_count = child.GetColumnBindings().size();
+	auto exposed = ExposeTargetColumns(child, *get, capture.base_table);
+	auto bindings = child.GetColumnBindings();
+	for (auto &binding : exposed) {
+		capture.old_row_columns.push_back(FindBindingIndex(bindings, binding));
+	}
+	capture.output_column_count = output_column_count;
+	OPENIVM_DEBUG_PRINT("[INSERT RULE] '%s' capture reads %zu preimage columns from its scan\n",
+	                    capture.base_table.name.GetIdentifierName().c_str(), exposed.size());
 }
 
 static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate &update) {
@@ -567,6 +692,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
 			    vector<PhysicalIndex> {}, optional_idx(row_id_index));
 			capture->children.push_back(std::move(delete_op.children[0]));
+			CaptureScannedPreimages(*capture);
 			delete_op.children[0] = std::move(capture);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
 			break;
@@ -597,6 +723,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			    update.table, *delta_table, DeltaCaptureMode::UPDATE, std::move(update_expressions), update.columns,
 			    optional_idx(row_id_index));
 			capture->children.push_back(std::move(update.children[0]));
+			CaptureScannedPreimages(*capture);
 			update.children[0] = std::move(capture);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
 			break;

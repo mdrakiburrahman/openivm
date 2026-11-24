@@ -63,6 +63,11 @@ public:
 	DeltaCaptureMode mode;
 	vector<PhysicalIndex> update_columns;
 	optional_idx row_id_index;
+	// Input index of each physical base column when the child scan already
+	// produces the preimage. Empty: fetch preimages by row id instead.
+	vector<idx_t> old_row_columns;
+	// Columns the DML consumes; extra preimage columns follow them in the input.
+	optional_idx output_column_count;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 	vector<ColumnBinding> GetColumnBindings() override;
