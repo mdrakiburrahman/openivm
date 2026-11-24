@@ -11,30 +11,17 @@
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "core/time_travel_pins.hpp"
-#include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
 #include "upsert/refresh_internal.hpp"
 
-#include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
-#include "duckdb/parser/query_error_context.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/planner_extension.hpp"
 #include "core/parser.hpp"
@@ -43,9 +30,6 @@
 #include "rules/incremental_rewrite_rule.hpp"
 #include "rules/refresh_insert_rule.hpp"
 #include "core/openivm_debug.hpp"
-
-#include <map>
-#include <mutex>
 
 namespace duckdb {
 
