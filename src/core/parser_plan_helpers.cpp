@@ -1479,16 +1479,14 @@ static bool FindGroupColumns(const CreateMVPlanFacts &facts, TableIndex group_in
 	for (auto node_id : root_facts->group_column_search_ids) {
 		D_ASSERT(node_id < facts.plan_nodes_post_order.size());
 		auto *candidate = facts.plan_nodes_post_order[node_id].plan_node;
-		if (candidate->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			if (AddGroupColumnsFromProjection(candidate->Cast<LogicalProjection>(), facts, group_index, group_count,
-			                                  output_names, group_names)) {
-				return true;
-			}
-		} else {
-			D_ASSERT(candidate->type == LogicalOperatorType::LOGICAL_UNION);
-			if (AddGroupColumnsFromBindings(*candidate, facts, group_index, group_count, output_names, group_names)) {
-				return true;
-			}
+		// Candidates are projections or UNIONs.
+		bool matched =
+		    candidate->type == LogicalOperatorType::LOGICAL_PROJECTION
+		        ? AddGroupColumnsFromProjection(candidate->Cast<LogicalProjection>(), facts, group_index, group_count,
+		                                        output_names, group_names)
+		        : AddGroupColumnsFromBindings(*candidate, facts, group_index, group_count, output_names, group_names);
+		if (matched) {
+			return true;
 		}
 	}
 	return false;
