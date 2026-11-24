@@ -3722,13 +3722,9 @@ static bool BuildLeftJoinSecondaryForLevel(Binder &binder, const CreateMVPlanFac
 	// delta_mv columns: group cols + aggregate cols + openivm_multiplicity (matches the primary INSERT).
 	string col_list;
 	string sel;
-	for (size_t gi = 0; gi < G; gi++) {
-		col_list += SqlUtils::QuoteIdentifier(output_names[gi]) + ", ";
-		sel += "X.\"__g" + std::to_string(gi) + "\", ";
-	}
-	for (size_t j = 0; j < contribs.size(); j++) {
-		col_list += SqlUtils::QuoteIdentifier(output_names[G + j]) + ", ";
-		sel += contribs[j] + ", ";
+	for (size_t j = 0; j < G + contribs.size(); j++) {
+		col_list += SqlUtils::QuoteIdentifier(output_names[j]) + ", ";
+		sel += (j < G ? "X.\"__g" + std::to_string(j) + "\"" : contribs[j - G]) + ", ";
 	}
 	col_list += "openivm_multiplicity";
 
