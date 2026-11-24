@@ -85,8 +85,7 @@ static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const
 }
 
 static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, const CreateMVPlanFacts &facts,
-                                              const vector<string> &output_names, idx_t visible_output_count,
-                                              const vector<string> &aggregate_columns) {
+                                              const vector<string> &output_names, idx_t visible_output_count) {
 	idx_t visible_count = GetVisibleOutputCount(output_names, visible_output_count);
 	auto bindings = facts.root ? facts.root->GetColumnBindings() : vector<ColumnBinding>();
 	for (idx_t output_idx = 0; output_idx < visible_count; output_idx++) {
@@ -95,7 +94,8 @@ static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, con
 		    VisibleOutputResolvesToAggregateValue(facts, bindings, output_idx)) {
 			continue;
 		}
-		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) && ContainsCI(aggregate_columns, name)) {
+		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) &&
+		    ContainsCI(facts.analysis.aggregate_columns, name)) {
 			continue;
 		}
 		group_columns.push_back(name);
@@ -104,15 +104,10 @@ static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, con
 
 static bool HasVisibleNonGroupNonAggregateOutput(const DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                                  const vector<string> &output_names, idx_t visible_output_count) {
-	vector<string> non_aggregate_outputs;
-	AddVisibleNonAggregateOutputNames(non_aggregate_outputs, facts, output_names, visible_output_count,
-	                                  facts.analysis.aggregate_columns);
-	for (auto &name : non_aggregate_outputs) {
-		if (!ContainsCI(model.group_columns, name)) {
-			return true;
-		}
-	}
-	return false;
+	vector<string> names;
+	AddVisibleNonAggregateOutputNames(names, facts, output_names, visible_output_count);
+	return std::any_of(names.begin(), names.end(),
+	                   [&](const string &name) { return !ContainsCI(model.group_columns, name); });
 }
 
 static bool GroupColumnsAreVisibleOutputs(const vector<string> &group_columns, const vector<string> &output_names,
@@ -349,8 +344,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	if (analysis.found_join && analysis.found_aggregation &&
 	    !GroupColumnsAreVisibleOutputs(model.group_columns, output_names, visible_output_count)) {
 		model.group_columns.clear();
-		AddVisibleNonAggregateOutputNames(model.group_columns, facts, output_names, visible_output_count,
-		                                  analysis.aggregate_columns);
+		AddVisibleNonAggregateOutputNames(model.group_columns, facts, output_names, visible_output_count);
 		if (!model.group_columns.empty()) {
 			AddUnique(model.strategy_reasons, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Join-over-aggregate projection: using %zu visible non-aggregate "
