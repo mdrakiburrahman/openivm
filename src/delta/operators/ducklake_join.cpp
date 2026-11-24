@@ -29,17 +29,6 @@ static string DuckLakeQualifiedTable(const string &catalog, const string &schema
 	return result;
 }
 
-// Rows inserted into or deleted from a DuckLake table between two snapshots, projected to select_list.
-static string DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
-                                 const string &table_name, int64_t old_snapshot, int64_t current_snapshot) {
-	auto rows = [&](const char *function_name) {
-		return "SELECT " + select_list + " FROM " +
-		       SqlUtils::DuckLakeTableFunction(function_name, catalog, schema, table_name, old_snapshot,
-		                                       current_snapshot);
-	};
-	return rows("ducklake_table_insertions") + " UNION ALL " + rows("ducklake_table_deletions");
-}
-
 static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator> &term,
                                                       const vector<size_t> &leaf_path, ColumnBinding mul_binding) {
 	auto ancestors = LeafPathAncestors(*term, leaf_path, "DuckLakeJoin");
@@ -228,8 +217,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				}
 				continue;
 			}
-			auto changes = DuckLakeChangesSQL("1", table_catalogs[i], table_schemas[i], table_names[i],
-			                                  old_snapshots[i], current_snapshots[i]);
+			auto changes = SqlUtils::DuckLakeChangesSQL("1", table_catalogs[i], table_schemas[i], table_names[i],
+			                                            old_snapshots[i], current_snapshots[i]);
 			// Failed probes fail open; the metadata path normally handles this before the SQL fallback.
 			if (!DeltaJoinProbeExists(con, "(" + changes + ") openivm_delta_probe", "DuckLakeJoin")) {
 				empty_table_delta[i] = true;
@@ -262,9 +251,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				size_t other = probe.other_leaf;
 				// A probe always targets another leaf, so > and >= differ only for an impossible self-probe.
 				int64_t other_snapshot = other > i ? old_snapshots[other] : -1; // mull-ignore: cxx_gt_to_ge
-				auto changes = DuckLakeChangesSQL(SqlUtils::QuoteIdentifier(probe.delta_column) + " AS openivm_key",
-				                                  table_catalogs[i], table_schemas[i], table_names[i], old_snapshots[i],
-				                                  current_snapshots[i]);
+				auto changes = SqlUtils::DuckLakeChangesSQL(
+				    SqlUtils::QuoteIdentifier(probe.delta_column) + " AS openivm_key", table_catalogs[i],
+				    table_schemas[i], table_names[i], old_snapshots[i], current_snapshots[i]);
 				auto other_relation = DuckLakeQualifiedTable(table_catalogs[other], table_schemas[other],
 				                                             table_names[other], other_snapshot);
 				if (!DeltaJoinProbeExists(con,

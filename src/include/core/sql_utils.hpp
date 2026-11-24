@@ -66,6 +66,9 @@ public:
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
+	/// Rows inserted into or deleted from a DuckLake table between two snapshots, projected to select_list.
+	static string DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
+	                                 const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
 	/// Run sql and throw EXCEPTION(format, args..., error) when it fails; format's last %s receives the error.
 	template <class EXCEPTION = CatalogException, class... ARGS>
 	static unique_ptr<QueryResult> QueryOrThrow(Connection &con, const string &sql, const string &format,

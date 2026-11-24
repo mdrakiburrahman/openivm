@@ -462,13 +462,9 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 		return SqlUtils::QuoteIdentifier(parsed.second) + " AS " + SqlUtils::QuoteIdentifier(parsed.first);
 	});
 	string qtemp_affected = AffectedPartitionsTempTable(view_name);
-	string insertions = "SELECT " + affected_select + " FROM " +
-	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-	                                                    loc.table_name, old_snap, current_snap);
-	string deletions = "SELECT " + affected_select + " FROM " +
-	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-	                                                   loc.table_name, old_snap, current_snap);
-	string affected_keys = ChangedPartitionKeysSQL(affected_cols, {"(" + insertions + ")", "(" + deletions + ")"});
+	auto changes = SqlUtils::DuckLakeChangesSQL(affected_select, loc.catalog_name, loc.schema_name, loc.table_name,
+	                                            old_snap, current_snap);
+	string affected_keys = ChangedPartitionKeysSQL(affected_cols, {"(" + changes + ")"});
 	if (!order_cols.empty()) {
 		auto compact_diff =
 		    BuildDuckLakeWindowRowDiffRefreshSQL(view_name, data_table, view_query_sql, affected_keys, partition_cols,

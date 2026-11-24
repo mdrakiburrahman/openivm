@@ -663,16 +663,11 @@ bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const 
 string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const string &source_col,
                                      const string &source_cast, const string &output_col) {
 	string source_expr = SqlUtils::ApplyCastSpec(SqlUtils::QuoteIdentifier(source_col), source_cast);
-	string qoutput_col = SqlUtils::QuoteIdentifier(output_col);
-	string insertions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	string deletions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	return "(" + insertions + " UNION ALL " + deletions + ")";
+	return "(" +
+	       SqlUtils::DuckLakeChangesSQL(source_expr + " AS " + SqlUtils::QuoteIdentifier(output_col),
+	                                    spec.loc.catalog_name, spec.loc.schema_name, spec.loc.table_name, spec.old_snap,
+	                                    spec.current_snap) +
+	       ")";
 }
 
 static string BuildProjectionLineageArmSQL(const RefreshMetadata::ProjectionKeyLineageArm &arm,
@@ -836,35 +831,26 @@ bool IsEmptyDeltaPlan(LogicalOperator *op) {
 }
 
 static string NullLiteralForDialect(const LogicalType &type, SqlDialect dialect) {
-	if (dialect == SqlDialect::SPARK) {
-		switch (type.id()) {
-		case LogicalTypeId::BOOLEAN:
-			return "CAST(NULL AS BOOLEAN)";
-		case LogicalTypeId::TINYINT:
-			return "CAST(NULL AS TINYINT)";
-		case LogicalTypeId::SMALLINT:
-			return "CAST(NULL AS SMALLINT)";
-		case LogicalTypeId::INTEGER:
-			return "CAST(NULL AS INTEGER)";
-		case LogicalTypeId::BIGINT:
-			return "CAST(NULL AS BIGINT)";
-		case LogicalTypeId::FLOAT:
-			return "CAST(NULL AS FLOAT)";
-		case LogicalTypeId::DOUBLE:
-			return "CAST(NULL AS DOUBLE)";
-		case LogicalTypeId::DECIMAL:
-			return "CAST(NULL AS " + type.ToString() + ")";
-		case LogicalTypeId::VARCHAR:
-			return "CAST(NULL AS VARCHAR)";
-		case LogicalTypeId::DATE:
-			return "CAST(NULL AS DATE)";
-		case LogicalTypeId::TIMESTAMP:
-			return "CAST(NULL AS TIMESTAMP)";
-		default:
-			return "CAST(NULL AS STRING)";
-		}
+	if (dialect != SqlDialect::SPARK) {
+		return "NULL::" + type.ToString();
 	}
-	return "NULL::" + type.ToString();
+	switch (type.id()) {
+	case LogicalTypeId::DECIMAL:
+		return "CAST(NULL AS " + type.ToString() + ")";
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+		return "CAST(NULL AS " + LogicalTypeIdToString(type.id()) + ")";
+	default:
+		return "CAST(NULL AS STRING)";
+	}
 }
 
 string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &column_names,
@@ -1581,16 +1567,7 @@ static string NormalizeTableToken(string token) {
 	while (!token.empty() && (token.back() == '"' || token.back() == '`' || token.back() == '\'')) {
 		token.pop_back();
 	}
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	static const string delta_prefix(openivm::DELTA_PREFIX);
-	token = SqlUtils::LastIdentifierPart(token);
-	if (token.size() > data_prefix.size() && token.rfind(data_prefix, 0) == 0) {
-		token = token.substr(data_prefix.size());
-	}
-	if (token.size() > delta_prefix.size() && token.rfind(delta_prefix, 0) == 0) {
-		token = token.substr(delta_prefix.size());
-	}
-	return StringUtil::Lower(token);
+	return StringUtil::Lower(BaseTableNameFromDeltaKey(StripOpenIVMDataPrefix(token)));
 }
 
 static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
