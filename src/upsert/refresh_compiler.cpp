@@ -6,7 +6,10 @@
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_internal.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -14,6 +17,7 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
 #include <algorithm>
@@ -121,6 +125,92 @@ static bool TryBuildGroupRecomputeAffectedQuery(const string &view_query_sql, st
 		return false;
 	}
 	return true;
+}
+
+// A joined tuple survives in a candidate superset only when the joins consume rows
+// positively. Reject subqueries, outer joins and other row-selecting join types.
+static bool IsPositiveJoinInput(const TableRef &ref) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		return true;
+	}
+	if (ref.type != TableReferenceType::JOIN) {
+		return false;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	return join.type == JoinType::INNER &&
+	       (join.ref_type == JoinRefType::REGULAR || join.ref_type == JoinRefType::CROSS) &&
+	       (!join.condition || !join.condition->HasSubquery()) && IsPositiveJoinInput(*join.left) &&
+	       IsPositiveJoinInput(*join.right);
+}
+
+static bool IsPositiveJoinSelect(const SelectNode &select) {
+	return select.from_table && IsPositiveJoinInput(*select.from_table) && select.modifiers.empty() && !select.having &&
+	       !select.qualify && !select.sample && (!select.where_clause || !select.where_clause->HasSubquery());
+}
+
+static bool CanIncludeDeletedJoinRows(ClientContext &context, const string &sql, const vector<string> &group_columns) {
+	auto parser = Parser::GetBuiltinParser();
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return false;
+	}
+	auto &root = *parser.statements[0]->Cast<SelectStatement>().node;
+	if (root.type != QueryNodeType::SELECT_NODE) {
+		return false;
+	}
+	auto &select = root.Cast<SelectNode>();
+	auto &groups = select.groups.group_expressions;
+	if (!IsPositiveJoinSelect(select) || groups.empty() || select.groups.grouping_sets.size() != 1) {
+		return false;
+	}
+	for (auto &name : group_columns) {
+		auto key = std::find_if(select.select_list.begin(), select.select_list.end(), [&](const auto &expr) {
+			return StringUtil::CIEquals(expr->GetName().GetIdentifierName(), name);
+		});
+		// The same row-local expression yields the same key on an old joined tuple.
+		if (key == select.select_list.end() || (*key)->HasSubquery() ||
+		    std::none_of(groups.begin(), groups.end(), [&](const auto &group) { return (*key)->Equals(*group); })) {
+			return false;
+		}
+	}
+	// A lower projection may compute a key before the join. Its expressions must
+	// be row-local: an ungrouped aggregate changes when its input is widened.
+	vector<reference<const FunctionExpression>> functions;
+	for (auto &cte : root.cte_map.map) {
+		auto &node = *cte.second->query_node;
+		if (node.type != QueryNodeType::SELECT_NODE || !node.cte_map.map.empty()) {
+			return false;
+		}
+		auto &input = node.Cast<SelectNode>();
+		if (!IsPositiveJoinSelect(input) || !input.groups.group_expressions.empty()) {
+			return false;
+		}
+		for (auto &expr : input.select_list) {
+			if (expr->IsWindow() || expr->HasSubquery() || expr->GetExpressionClass() == ExpressionClass::STAR) {
+				return false;
+			}
+			ParsedExpressionIterator::VisitExpression<FunctionExpression>(
+			    *expr, [&](const FunctionExpression &function) { functions.emplace_back(function); });
+		}
+	}
+	if (functions.empty()) {
+		return true;
+	}
+	bool scalar_projections = false;
+	context.RunFunctionInTransaction([&] {
+		scalar_projections = std::all_of(functions.begin(), functions.end(), [&](const FunctionExpression &function) {
+			EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, function.GetQualifiedName());
+			auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+			if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+				return false;
+			}
+			auto &overloads = entry->Cast<ScalarFunctionCatalogEntry>().functions.functions;
+			return std::all_of(overloads.begin(), overloads.end(), [](const auto &overload) {
+				return overload->GetStability() == FunctionStability::CONSISTENT;
+			});
+		});
+	});
+	return scalar_projections;
 }
 
 static string AffectedGroupFilter(const string &affected_temp, const vector<string> &group_columns) {
@@ -651,8 +741,10 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			if (outcome) {
 				outcome->handled_cascade_delta = true;
 			}
-			return CompileGroupRecompute(view_name, options.view_query_sql, options.group_column_names,
-			                             *options.cascade_delta_specs, options.catalog_prefix,
+			D_ASSERT(options.cascade_context);
+			return CompileGroupRecompute(*options.cascade_context, view_name, options.view_query_sql,
+			                             options.group_column_names, *options.cascade_delta_specs,
+			                             options.catalog_prefix,
 			                             /*emit_cascade_delta=*/true, GroupRecomputeAffectedMode::SOURCE_DELTA);
 		}
 		// Group-recompute strategy: delete affected groups, re-insert from original query.
@@ -1311,10 +1403,12 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 	return sql;
 }
 
-string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
+string CompileGroupRecompute(ClientContext &context, const string &view_name, const string &view_query_sql,
+                             const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
                              bool emit_cascade_delta, GroupRecomputeAffectedMode affected_mode,
-                             const string &additional_affected_groups, const string &affected_query_sql) {
+                             const string &additional_affected_groups, const string &affected_query_sql,
+                             bool has_source_deletes) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -1351,6 +1445,14 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		                                         emit_cascade_delta);
 	}
 
+	const bool include_deleted_join_rows =
+	    has_source_deletes && affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA && affected_query_sql.empty() &&
+	    EstimateGroupRecomputeAffectedVariants(delta_table_specs) > 1 &&
+	    CanIncludeDeletedJoinRows(context, affected_view_query_sql, group_columns);
+	if (include_deleted_join_rows) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] Including deleted rows in join key discovery for %s\n",
+		                    view_name.c_str());
+	}
 	// For each source table T_i, build a "view query restricted to T_i's delta" variant by
 	// substituting the qualified `cat.schema.<base>` reference with a delta-filtered subquery,
 	// then project DISTINCT group_columns. Union across sources gives the affected-keys set.
@@ -1383,40 +1485,26 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			continue;
 		}
 
-		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when
-		// the catalog is the default `memory` (so `catalog_prefix` is empty for SQL output, but
-		// `lpts_table_prefix` is still `memory.main.` here). Build one affected-key query per
-		// source occurrence. Self-joins must replace only one occurrence at a time; replacing every
-		// occurrence with the delta would miss base rows affected by a delta row on another arm.
-		// Original-SQL recompute paths (e.g. ROLLUP/GROUPING SETS) can contain unqualified
-		// table names, so fall back to identifier-safe bare replacement when the exact LPTS
-		// form is absent.
-		const string &source_full = spec.source_sql;
+		// Replace one scan at a time, including each arm of a self-join. Source
+		// references have already been catalog-qualified, including legacy SQL.
 		auto filtered_variants =
-		    SqlUtils::ReplaceEachPlainOccurrence(affected_view_query_sql, source_full, delta_subselect);
+		    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, spec.source_sql, delta_subselect);
 		if (filtered_variants.empty()) {
-			filtered_variants =
-			    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, source_full, delta_subselect);
-		}
-		if (filtered_variants.empty()) {
-			string filtered = SqlUtils::ReplaceAllOccurrences(affected_view_query_sql, source_full, delta_subselect);
-			if (filtered == affected_view_query_sql) {
-				filtered = SqlUtils::ReplaceTableReferences(affected_view_query_sql, source_full, delta_subselect);
-			}
-			filtered_variants.push_back(std::move(filtered));
+			filtered_variants.push_back(affected_view_query_sql);
 		}
 
 		for (idx_t occurrence = 0; occurrence < filtered_variants.size(); occurrence++) {
-			if (!affected_query_sql.empty()) {
-				// Both joined rows may have been deleted in the same batch. Remaining
-				// occurrences need current rows plus both delta images to recover old keys.
+			if (!affected_query_sql.empty() || include_deleted_join_rows) {
+				// A deleted join tuple can need deleted rows on several source occurrences.
+				// Current rows already contain new images; a DISTINCT ON discovery query
+				// retains its existing wider support for finding candidate winners.
 				for (const auto &other : delta_table_specs) {
 					string source_ref = SqlUtils::FindTableReference(filtered_variants[occurrence], other.source_sql);
 					if (source_ref.empty()) {
 						continue;
 					}
 					string candidates = "(SELECT * FROM " + source_ref + " UNION ALL SELECT * FROM " +
-					                    BuildGroupRecomputeDeltaRowsSQL(other) + ")";
+					                    BuildGroupRecomputeDeltaRowsSQL(other, include_deleted_join_rows) + ")";
 					filtered_variants[occurrence] =
 					    SqlUtils::ReplaceTableReferences(filtered_variants[occurrence], source_ref, candidates);
 				}

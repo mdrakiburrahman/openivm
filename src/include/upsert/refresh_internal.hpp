@@ -200,7 +200,7 @@ bool IsSummableLogicalType(const LogicalType &type);
 string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
                                const vector<string> &delta_table_names);
 string BaseTableNameFromDeltaKey(const string &delta_key);
-string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
+string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec, bool deleted_only = false);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
                                      const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);

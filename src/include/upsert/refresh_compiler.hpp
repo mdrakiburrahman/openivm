@@ -53,6 +53,7 @@ struct AggregateGroupsOptions {
 	bool use_current_diff_affected_keys = false;
 	//! Non-null requests a cascade delta from the group-recompute fallback.
 	const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr;
+	ClientContext *cascade_context = nullptr;
 	//! Replace the compact inline companion with an exact affected-group multiset.
 	bool inline_cascade_delta = false;
 	unordered_map<string, string> derived_output_expressions;
@@ -108,11 +109,13 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 /// the source is a standard DuckDB delta table or a DuckLake snapshot-diff
 /// source. `catalog_prefix` is the SQL prefix used for the MV's data table —
 /// empty for the default catalog, "<cat>.<schema>." otherwise.
-string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
+string CompileGroupRecompute(ClientContext &context, const string &view_name, const string &view_query_sql,
+                             const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
                              const string &catalog_prefix = "", bool emit_cascade_delta = false,
                              GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF,
-                             const string &additional_affected_groups = "", const string &affected_query_sql = "");
+                             const string &additional_affected_groups = "", const string &affected_query_sql = "",
+                             bool has_source_deletes = true);
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM
 /// aggregate. Generates a multi-statement SQL batch:

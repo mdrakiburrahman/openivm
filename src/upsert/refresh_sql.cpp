@@ -1253,6 +1253,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto options = aggregate_options(has_minmax, aggregate_insert_only);
 			if (!aggregate_recompute_delta_specs.empty()) {
 				options.cascade_delta_specs = &aggregate_recompute_delta_specs;
+				options.cascade_context = con.context.get();
 			}
 			options.inline_cascade_delta = inline_merge_cascade;
 			options.preserved_side_cols = std::move(ljsec.preserved_cols);
@@ -1488,9 +1489,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_cols,
 			                                                 view_query_sql, delta_specs);
 		}
-		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_cols, delta_specs,
+		const bool has_source_deletes = active_facts.compile_only
+		                                    ? !active_facts.assume_insert_only
+		                                    : !refresh_delta_activity || refresh_delta_activity->any_has_deletes;
+		upsert_query = CompileGroupRecompute(*con.context, view_name, view_query_sql, group_cols, delta_specs,
 		                                     internal_catalog_prefix, emit_cascade_delta_for_recompute, affected_mode,
-		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name));
+		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name),
+		                                     has_source_deletes);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE "
 		                    "(%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
