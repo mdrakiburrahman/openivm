@@ -187,27 +187,6 @@ static string NormalizeColumnNameForMatch(const string &name) {
 	return normalized;
 }
 
-bool IsSummableLogicalType(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::UHUGEINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-	case LogicalTypeId::DECIMAL:
-		return true;
-	default:
-		return false;
-	}
-}
-
 string BaseTableNameFromDeltaKey(const string &delta_key) {
 	static const string prefix(openivm::DELTA_PREFIX);
 	if (delta_key.size() > prefix.size() && delta_key.rfind(prefix, 0) == 0) {

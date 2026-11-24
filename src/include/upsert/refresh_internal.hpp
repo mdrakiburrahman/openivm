@@ -195,7 +195,6 @@ AffectedGroupSignedDelta BuildAffectedGroupSignedDelta(const string &data_table,
 string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
                                     const string &old_table, const string &new_table, const string &filter,
                                     bool use_data_modifying_ctes = false);
-bool IsSummableLogicalType(const LogicalType &type);
 // Resolve a logical source to its metadata key using catalog and schema as well as its name.
 string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
                                const vector<string> &delta_table_names);
