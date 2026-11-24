@@ -208,8 +208,8 @@ string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &vi
 
 // `upsert_columns` lists the data table's columns when it carries a unique key index.
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           const string &ducklake_checkpoints, const vector<string> &upsert_columns,
-                           bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
+                           const string &ducklake_checkpoints, const vector<string> &upsert_columns, bool cross_system,
+                           const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
                            const vector<string> &delta_metadata_tables = {}, const string &data_catalog = "");
