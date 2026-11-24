@@ -1342,7 +1342,7 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 	D_ASSERT(column_names.size() == column_types.size());
 	string group_columns = select_columns;
 	for (idx_t index = 0; index < column_names.size(); index++) {
-		if (column_types[index].id() == LogicalTypeId::FLOAT || column_types[index].id() == LogicalTypeId::DOUBLE) {
+		if (column_types[index].IsFloating()) {
 			auto column = SqlUtils::QuoteIdentifier(column_names[index]);
 			group_columns += ", " + SqlUtils::NegativeZeroSQL(column);
 			match_conditions += " AND (" + SqlUtils::NegativeZeroSQL("v." + column) + ") = (" +

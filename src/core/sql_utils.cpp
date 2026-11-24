@@ -51,7 +51,7 @@ string SqlUtils::FloatingRepresentativeSQL(const string &value, const string &ne
 }
 
 string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation) {
-	if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+	if (type.IsFloating()) {
 		return NegativeZeroSQL(value);
 	}
 	if (type.id() == LogicalTypeId::VARCHAR &&

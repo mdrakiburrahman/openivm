@@ -130,7 +130,7 @@ static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder
 	// support counts can observe them. Retain their signs through compaction.
 	Optimizer optimizer(binder, context);
 	for (idx_t i = 0; i < base_col_count; i++) {
-		if (input_types[i].id() == LogicalTypeId::DOUBLE || input_types[i].id() == LogicalTypeId::FLOAT) {
+		if (input_types[i].IsFloating()) {
 			groups.push_back(MakeNegativeZeroExpression(
 			    context, optimizer, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i])));
 		}
