@@ -1218,19 +1218,11 @@ public:
 			for (auto &statement : parser.statements) {
 				// Internal DROP already has a compiled ownership/cleanup program.
 				// Bind only its physical executor, without recursively compiling cleanup.
-				if (statement->type == StatementType::DROP_STATEMENT) {
-					auto &drop = statement->Cast<DropStatement>();
-					if (drop.info->type == CatalogType::TABLE_ENTRY || drop.info->type == CatalogType::VIEW_ENTRY) {
-						Parser drop_parser(options);
-						drop_parser.ParseQuery(drop.info->type == CatalogType::TABLE_ENTRY
-						                           ? BuildDropTableStatement(*drop.info)
-						                           : BuildDropViewStatement(*drop.info));
-						statement = std::move(drop_parser.statements[0]);
-					} else if (drop.info->type == CatalogType::SCHEMA_ENTRY) {
-						Parser drop_parser(options);
-						drop_parser.ParseQuery(BuildDropSchemaStatement(*drop.info));
-						statement = std::move(drop_parser.statements[0]);
-					}
+				if (statement->type == StatementType::DROP_STATEMENT &&
+				    HasDropExecutor(statement->Cast<DropStatement>().info->type)) {
+					Parser drop_parser(options);
+					drop_parser.ParseQuery(BuildDropStatement(*statement->Cast<DropStatement>().info));
+					statement = std::move(drop_parser.statements[0]);
 				}
 				// Binding is deliberately here, after all prior physical steps finish.
 				// CREATE SCHEMA/TABLE, replacement and DROP dependencies are now visible
@@ -1372,25 +1364,28 @@ unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder 
 	return make_uniq<LogicalLifecycleProgram>(bind_index, program, staged);
 }
 
-static string BuildDropEntryStatement(const DropInfo &drop_info, const string &function) {
-	return "SELECT * FROM " + function + "('" +
+static const char *DropExecutorName(CatalogType type) {
+	switch (type) {
+	case CatalogType::TABLE_ENTRY:
+		return "openivm_execute_drop_table";
+	case CatalogType::SCHEMA_ENTRY:
+		return "openivm_execute_drop_schema";
+	default:
+		return "openivm_execute_drop_view";
+	}
+}
+
+bool HasDropExecutor(CatalogType type) {
+	return type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY || type == CatalogType::SCHEMA_ENTRY;
+}
+
+string BuildDropStatement(const DropInfo &drop_info) {
+	return "SELECT * FROM " + string(DropExecutorName(drop_info.type)) + "('" +
 	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Catalog().GetIdentifierName()) + "', '" +
 	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Schema().GetIdentifierName()) + "', '" +
 	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Name().GetIdentifierName()) + "', " +
 	       (drop_info.cascade ? "true" : "false") + ", " +
 	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
-}
-
-string BuildDropViewStatement(const DropInfo &drop_info) {
-	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_view");
-}
-
-string BuildDropTableStatement(const DropInfo &drop_info) {
-	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_table");
-}
-
-string BuildDropSchemaStatement(const DropInfo &drop_info) {
-	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_schema");
 }
 
 struct DropViewBindData : public TableFunctionData {
@@ -1560,14 +1555,8 @@ vector<string> RenderTransactionalStatement(const string &input, const string &m
 		parser.ParseQuery(statement);
 		if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::DROP_STATEMENT) {
 			auto &drop = parser.statements[0]->Cast<DropStatement>();
-			if (drop.info->type == CatalogType::VIEW_ENTRY) {
-				return {BuildDropViewStatement(*drop.info)};
-			}
-			if (drop.info->type == CatalogType::TABLE_ENTRY) {
-				return {BuildDropTableStatement(*drop.info)};
-			}
-			if (drop.info->type == CatalogType::SCHEMA_ENTRY) {
-				return {BuildDropSchemaStatement(*drop.info)};
+			if (HasDropExecutor(drop.info->type)) {
+				return {BuildDropStatement(*drop.info)};
 			}
 		}
 	} catch (std::exception &) {
@@ -1625,12 +1614,11 @@ static unique_ptr<FunctionData> DeserializeDropEntry(Deserializer &deserializer,
 }
 
 TableFunction DropEntryFunction(CatalogType type) {
-	D_ASSERT(type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY || type == CatalogType::SCHEMA_ENTRY);
+	D_ASSERT(HasDropExecutor(type));
 	const bool is_table = type == CatalogType::TABLE_ENTRY;
 	const bool is_schema = type == CatalogType::SCHEMA_ENTRY;
 	TableFunction function(
-	    is_schema ? "openivm_execute_drop_schema"
-	              : (is_table ? "openivm_execute_drop_table" : "openivm_execute_drop_view"),
+	    DropExecutorName(type),
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	    ExecuteDropView, is_schema ? BindDropSchema : (is_table ? BindDropTable : BindDropView), InitDropView);
 	function.serialize = SerializeDropEntry;

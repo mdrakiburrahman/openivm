@@ -1235,7 +1235,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			view_drop.SetSchema(Identifier(view_target_schema));
 			view_drop.SetName(Identifier(sql_view_name));
 			view_drop.if_not_found = OnEntryNotFound::RETURN_NULL;
-			ddl.push_back(BuildDropViewStatement(view_drop));
+			ddl.push_back(BuildDropStatement(view_drop));
 		} else {
 			ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
 		}
@@ -2193,7 +2193,7 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	// rejects CASCADE syntax even when no dependencies remain.
 	view_drop.cascade = cascade && !metadata.IsDuckLakeCatalog(location.catalog_name);
 	view_drop.if_not_found = if_not_found;
-	program += BuildDropViewStatement(view_drop) + ";\n";
+	program += BuildDropStatement(view_drop) + ";\n";
 	program += "DROP TABLE IF EXISTS " + data_ref + ";\n";
 	program +=
 	    "DROP TABLE IF EXISTS " + internal_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name)) + ";\n";
@@ -2410,7 +2410,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 
 	const bool schema_drop = drop_info.type == CatalogType::SCHEMA_ENTRY;
 	auto drop_statement = [&]() {
-		return (schema_drop ? BuildDropSchemaStatement(drop_info) : BuildDropTableStatement(drop_info)) + ";\n";
+		return BuildDropStatement(drop_info) + ";\n";
 	};
 	if (schema_drop) {
 		// Schema paths are [catalog, schema] in DuckDB 2.0. Resolve the catalog
@@ -2531,14 +2531,14 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			// replacement has a new id, which forces a full recompute on refresh.
 			OPENIVM_DEBUG_PRINT("[DROP] Retaining MVs of DuckLake source '%s'\n",
 			                    drop_info.GetQualifiedName().Name().GetIdentifierName().c_str());
-			return BuildDropTableStatement(drop_info) + ";\n";
+			return drop_statement();
 		}
 		if (!drop_info.cascade) {
 			// Retained MVs must observe removal before a same-named replacement.
 			auto source = SqlUtils::FullName(drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
 			                                 drop_info.GetQualifiedName().Schema().GetIdentifierName(),
 			                                 drop_info.GetQualifiedName().Name().GetIdentifierName());
-			return "DELETE FROM " + source + ";\n" + BuildDropTableStatement(drop_info) + ";\n";
+			return "DELETE FROM " + source + ";\n" + BuildDropStatement(drop_info) + ";\n";
 		}
 		if (ducklake && !context.transaction.IsAutoCommit()) {
 			throw CatalogException("Cannot run DROP TABLE %s CASCADE inside an explicit transaction: its materialized "
@@ -2652,9 +2652,9 @@ static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo 
 		                                            drop_info.GetQualifiedName().Name().GetIdentifierName());
 	}
 	if (view_key.empty()) {
-		return BuildDropViewStatement(drop_info) + ";\n";
+		return BuildDropStatement(drop_info) + ";\n";
 	}
-	string program = BuildDropViewStatement(drop_info) + ";\n";
+	string program = BuildDropStatement(drop_info) + ";\n";
 
 	auto tracked = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
 	                         " WHERE view_name = '" + SqlUtils::EscapeValue(view_key) + "'");
@@ -2744,8 +2744,7 @@ void BindMaterializedViewLifecycle(PlannerExtensionInput &input, BoundStatement 
 		return;
 	}
 	auto &drop = statement.plan->Cast<LogicalDrop>().info->Cast<DropInfo>();
-	if (drop.type != CatalogType::TABLE_ENTRY && drop.type != CatalogType::VIEW_ENTRY &&
-	    drop.type != CatalogType::SCHEMA_ENTRY) {
+	if (!HasDropExecutor(drop.type)) {
 		return;
 	}
 	auto program = BuildMaterializedViewDropProgram(input.context, drop);
