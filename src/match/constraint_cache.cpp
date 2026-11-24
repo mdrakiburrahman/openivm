@@ -34,10 +34,12 @@ static string Generation(ClientContext &context, TableCatalogEntry &table) {
 	}
 	if (table.catalog.GetCatalogType() == "ducklake") {
 		Connection con(*context.db);
-		auto identity = RefreshMetadata(con).ResolveDuckLakeSourceIdentity("", table.name.GetIdentifierName(),
-		                                                                   table.catalog.GetName().GetIdentifierName(),
-		                                                                   table.schema.name.GetIdentifierName());
-		return identity.current_table_id < 0 ? string() : "ducklake:" + to_string(identity.current_table_id);
+		RefreshMetadata metadata(con);
+		auto catalog = table.catalog.GetName().GetIdentifierName();
+		auto table_id =
+		    metadata.GetDuckLakeTableIdAt(catalog, table.schema.name.GetIdentifierName(),
+		                                  table.name.GetIdentifierName(), metadata.GetCurrentDuckLakeSnapshot(catalog));
+		return table_id < 0 ? string() : "ducklake:" + to_string(table_id);
 	}
 	// Other external engines have no verified durable incarnation identifier.
 	return "";

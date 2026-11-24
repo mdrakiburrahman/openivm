@@ -34,12 +34,8 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
 	if (current_snapshot_id < 0 || last_snapshot_id < 0) {
 		return activity;
 	}
-	if (last_snapshot_id == current_snapshot_id) {
-		activity.ok = true;
-		return activity;
-	}
-
-	auto identity = metadata.ResolveDuckLakeSourceIdentity(view_name, table_name, catalog_name, schema_name);
+	auto identity = metadata.ResolveDuckLakeSourceIdentity(view_name, table_name, catalog_name, schema_name,
+	                                                       last_snapshot_id, current_snapshot_id);
 	if (!identity.resolved || identity.current_table_id < 0) {
 		return activity;
 	}
@@ -49,6 +45,16 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
 		activity.has_deletes = true;
 		activity.requires_full_refresh = true;
 		return activity;
+	}
+
+	// Older transactional refreshes could advance the watermark and leave the old ID.
+	// Equal snapshots prove there are no deltas only after verifying the identity.
+	if (last_snapshot_id == current_snapshot_id) {
+		activity.ok = true;
+		return activity;
+	}
+	if (identity.stored_table_id < 0) {
+		activity.source_table_id_to_backfill = identity.current_table_id;
 	}
 
 	// `ducklake_snapshots().changes` is a cheap catalog-level manifest keyed by DuckLake table id.
@@ -144,13 +150,13 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 	source.ducklake = true;
 	source.last_snapshot_id = last_snap;
 	source.current_snapshot_id = cur_snap;
-	if (cur_snap < 0 || last_snap < 0 || last_snap == cur_snap) {
-		source.ok = last_snap == cur_snap && cur_snap >= 0;
+	if (cur_snap < 0 || last_snap < 0) {
 		AddDeltaSource(summary, std::move(source));
 		return;
 	}
 	auto metadata_activity = ProbeDuckLakeSnapshotActivity(metadata, con, view_name, delta_table, loc.catalog_name,
 	                                                       loc.schema_name, last_snap, cur_snap);
+	source.backfill_source_table_id = metadata_activity.source_table_id_to_backfill >= 0;
 	if (metadata_activity.ok) {
 		source.ok = true;
 		source.has_changes = metadata_activity.has_changes;
@@ -159,9 +165,10 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 	} else {
 		ApplyChangeStats(source, GetDuckLakeDeltaChangeStats(metadata, loc, last_snap, cur_snap));
 	}
-	if (source.ok && !source.has_changes) {
+	if (source.ok && !source.has_changes && last_snap != cur_snap) {
 		// Nothing in the range touched this table; consume the unrelated snapshots.
-		summary.ducklake_snapshot_advances.push_back({delta_table, cur_snap});
+		summary.ducklake_snapshot_advances.emplace_back(delta_table, cur_snap,
+		                                                metadata_activity.source_table_id_to_backfill);
 	}
 	AddDeltaSource(summary, std::move(source));
 }
