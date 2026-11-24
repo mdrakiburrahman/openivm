@@ -3353,15 +3353,15 @@ using LeftJoinInnerTableMap = unordered_map<const LogicalComparisonJoin *, std::
 // null-padded row; aggregates over the preserved side still contribute.
 static std::set<TableIndex> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts, LogicalComparisonJoin *oj,
                                                       const LeftJoinInnerTableMap &inner_tables) {
-	std::set<TableIndex> null_tables;
-	if (!oj || oj->children.size() != 2) {
-		return null_tables;
-	}
-	auto initial = inner_tables.find(oj);
-	if (initial == inner_tables.end()) {
-		return null_tables;
-	}
-	null_tables = initial->second;
+	// The caller passes only binary LEFT joins, all of which are in inner_tables.
+	auto null_tables = inner_tables.at(oj);
+	auto touches_null = [&](Expression *side) {
+		auto *cref = GetColumnRefThroughCasts(side);
+		LogicalGet *g = nullptr;
+		string c;
+		return cref && ResolveBindingToGetColumn(cref->Binding(), facts, g, c) && g &&
+		       null_tables.count(g->table_index);
+	};
 	bool changed = true;
 	while (changed) {
 		changed = false;
@@ -3369,45 +3369,16 @@ static std::set<TableIndex> ComputeNullTablesForLevel(const CreateMVPlanFacts &f
 			if (other == oj || other->join_type != JoinType::LEFT || other->children.size() != 2) {
 				continue;
 			}
-			auto other_entry = inner_tables.find(other);
-			D_ASSERT(other_entry != inner_tables.end());
-			auto &other_inner = other_entry->second;
-			bool already_null = true;
-			for (auto idx : other_inner) {
-				if (!null_tables.count(idx)) {
-					already_null = false;
-					break;
-				}
-			}
-			if (already_null || other_inner.empty()) {
+			auto &other_inner = inner_tables.at(other);
+			if (std::all_of(other_inner.begin(), other_inner.end(),
+			                [&](TableIndex idx) { return null_tables.count(idx) > 0; })) {
 				continue;
 			}
-			bool touches_null = false;
-			for (auto &cond : other->conditions) {
-				if (!cond.IsComparison()) {
-					continue;
-				}
-				for (auto *side : {cond.LeftReference().get(), cond.RightReference().get()}) {
-					auto *cref = GetColumnRefThroughCasts(side);
-					if (!cref) {
-						continue;
-					}
-					LogicalGet *g = nullptr;
-					string c;
-					if (ResolveBindingToGetColumn(cref->Binding(), facts, g, c) && g &&
-					    null_tables.count(g->table_index)) {
-						touches_null = true;
-						break;
-					}
-				}
-				if (touches_null) {
-					break;
-				}
-			}
-			if (touches_null) {
-				for (auto idx : other_inner) {
-					null_tables.insert(idx);
-				}
+			if (std::any_of(other->conditions.begin(), other->conditions.end(), [&](const JoinCondition &cond) {
+				    return cond.IsComparison() &&
+				           (touches_null(cond.LeftReference().get()) || touches_null(cond.RightReference().get()));
+			    })) {
+				null_tables.insert(other_inner.begin(), other_inner.end());
 				changed = true;
 			}
 		}
