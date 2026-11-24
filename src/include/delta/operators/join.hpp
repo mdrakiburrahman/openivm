@@ -78,6 +78,9 @@ unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperat
 ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bindings,
                                         unique_ptr<LogicalOperator> &result, LogicalOperator &root);
 
+// Position of `binding` among op's output bindings; throws when op does not expose it.
+idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label);
+
 // Keep `bindings` (multiplicity columns) visible through every non-empty join projection map below op.
 void AppendBindingsToJoinProjectionMaps(LogicalOperator &op, const column_binding_set_t &bindings);
 

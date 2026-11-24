@@ -1,5 +1,6 @@
 #include "delta/delta_operator.hpp"
 #include "core/openivm_debug.hpp"
+#include "delta/operators/join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 
 namespace duckdb {
@@ -43,21 +44,8 @@ DeltaPlanFragment CompileFilterDelta(DeltaOperatorInput input) {
 	plan_as_filter->ResolveOperatorTypes();
 	if (!plan_as_filter->projection_map.empty()) {
 		OPENIVM_DEBUG_PRINT("[DeltaFilter] Filter has projection_map, adding mul column index\n");
-		auto child_binds = plan_as_filter->children[0]->GetColumnBindings();
-		idx_t mul_index = child_binds.size();
-		bool mul_found = false;
-		// CompileChild guarantees the binding exists. The zero boundary prevents unsigned underflow only when that
-		// internal contract is broken; SQL cannot construct such a plan.
-		while (!mul_found && mul_index > 0) { // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
-			--mul_index;
-			if (child_binds[mul_index] == child_mul_binding) {
-				mul_found = true;
-			}
-		}
-		if (!mul_found) {
-			throw InternalException("Filter's child does not have multiplicity column!");
-		}
-		plan_as_filter->projection_map.emplace_back(mul_index);
+		plan_as_filter->projection_map.emplace_back(
+		    FindBindingPosition(*plan_as_filter->children[0], child_mul_binding, "DeltaFilter"));
 	}
 	OPENIVM_DEBUG_PRINT("[DeltaFilter] Done, mul_binding: table=%lu col=%lu\n",
 	                    (unsigned long)child_mul_binding.table_index.index,

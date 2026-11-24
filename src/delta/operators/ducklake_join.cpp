@@ -21,8 +21,7 @@ namespace duckdb {
 
 static string DuckLakeQualifiedTable(const string &catalog, const string &schema, const string &table_name,
                                      int64_t snapshot_id) {
-	string result = SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(schema) + "." +
-	                SqlUtils::QuoteIdentifier(table_name);
+	auto result = SqlUtils::FullName(catalog, schema, table_name);
 	// -1 is the only sentinel; snapshot zero, if supplied by DuckLake, is valid.
 	if (snapshot_id >= 0) { // mull-ignore: cxx_ge_to_gt,cxx_ge_to_lt
 		result += " AT (VERSION => " + to_string(snapshot_id) + ")";
@@ -39,18 +38,6 @@ static string DuckLakeChangesSQL(const string &select_list, const string &catalo
 		                                       current_snapshot);
 	};
 	return rows("ducklake_table_insertions") + " UNION ALL " + rows("ducklake_table_deletions");
-}
-
-static idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
-	auto bindings = op.GetColumnBindings();
-	// The <= mutant indexes one past bindings.
-	for (idx_t binding_idx = 0; binding_idx < bindings.size(); binding_idx++) { // mull-ignore: cxx_lt_to_le
-		if (bindings[binding_idx] == binding) {
-			return binding_idx;
-		}
-	}
-	throw InternalException("%s: multiplicity binding %s is not exposed by %s", context_label,
-	                        binding.ToString().c_str(), op.GetName().c_str());
 }
 
 static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator> &term,

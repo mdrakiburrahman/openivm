@@ -1132,23 +1132,17 @@ static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafIn
 }
 
 static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, const string &table_name, size_t &leaf) {
-	auto assign_leaf = [&](unordered_map<string, size_t>::const_iterator it) {
-		if (it == table_to_leaf.end()) {
-			return false;
-		}
-		switch (it->second) {
-		case size_t(-1):
-			return false;
-		default:
-			leaf = it->second;
-			return true;
-		}
-	};
 	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
 	for (auto &part : parts) {
 		part = SqlUtils::QuoteIdentifier(part);
 	}
-	return assign_leaf(table_to_leaf.find(StringUtil::Lower(StringUtil::Join(parts, "."))));
+	auto it = table_to_leaf.find(StringUtil::Lower(StringUtil::Join(parts, ".")));
+	// size_t(-1) marks an ambiguous alias.
+	if (it == table_to_leaf.end() || it->second == size_t(-1)) {
+		return false;
+	}
+	leaf = it->second;
+	return true;
 }
 
 static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes, size_t child_leaf,
@@ -1179,7 +1173,7 @@ static bool AllFKColumnsJoined(const vector<vector<DeltaJoinKeyProbe>> &key_prob
 	return true;
 }
 
-static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
+static vector<FKRelation> DetectFKRelations(const vector<JoinLeafInfo> &leaves,
                                             const vector<vector<DeltaJoinKeyProbe>> &key_probes,
                                             const vector<openivm::CachedConstraint> &declarations) {
 	vector<FKRelation> relations;
@@ -1443,7 +1437,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	    has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1; // mull-ignore: cxx_eq_to_ne
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = has_compile_fk_facts ? DetectCompileFactsFKRelations(compile_facts, leaves, key_probes)
-		                                         : DetectFKRelations(context, leaves, key_probes, declarations);
+		                                         : DetectFKRelations(leaves, key_probes, declarations);
 		if (!fk_relations.empty()) {
 			uint64_t insert_only_mask = has_compile_fk_facts ? ComputeFactsInsertOnlyMask(compile_facts, leaves)
 			                                                 : delta_status.insert_only_mask;
@@ -1814,11 +1808,6 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (N == 0) {
 		throw InternalException("DeltaJoin: no leaves found in join tree");
 	}
-	// MAX_JOIN_TABLES is inclusive; >= would reject the documented 16-table boundary.
-	if (N > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
-		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
-	}
-
 	// 2. Output types
 	auto types = output_types;
 	D_ASSERT(types.size() == original_bindings.size());
@@ -1870,7 +1859,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (!flattened_ducklake && !ducklake_fallback_reason.empty()) {
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Flattening fallback: %s\n", ducklake_fallback_reason.c_str());
 	}
-	// DuckLake flattening may change N, but the same inclusive boundary applies.
+	// Checked after DuckLake flattening, which may change N. MAX_JOIN_TABLES is inclusive.
 	if (N > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
 		throw NotImplementedException("IVM not supported for joins with more than 16 tables");
 	}

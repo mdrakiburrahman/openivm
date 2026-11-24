@@ -125,6 +125,18 @@ ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bi
 	return union_bindings.back();
 }
 
+idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
+	auto bindings = op.GetColumnBindings();
+	// The <= mutant indexes one past bindings.
+	for (idx_t binding_idx = 0; binding_idx < bindings.size(); binding_idx++) { // mull-ignore: cxx_lt_to_le
+		if (bindings[binding_idx] == binding) {
+			return binding_idx;
+		}
+	}
+	throw InternalException("%s: multiplicity binding %s is not exposed by %s", context_label,
+	                        binding.ToString().c_str(), op.GetName().c_str());
+}
+
 void AppendBindingsToJoinProjectionMaps(LogicalOperator &op, const column_binding_set_t &bindings) {
 	// Children first: a join's child bindings already reflect the child's own projection maps.
 	for (auto &child : op.children) {
