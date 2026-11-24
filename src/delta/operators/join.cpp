@@ -1281,12 +1281,20 @@ static bool SourceFactMatches(const string &fact, TableCatalogEntry &table) {
 }
 
 string FactDeltaShape(const openivm::CompileFacts &facts, TableCatalogEntry &table) {
+	// Several keys can name one table (bare, schema- or fully-qualified). Independent of map order, the least
+	// optimistic shape wins: UNCHANGED < INSERT_ONLY < anything else (a change of unknown or mixed kind); equally
+	// ranked shapes tie-break by name so the result never depends on hash order.
+	auto rank = [](const string &shape) {
+		return StringUtil::CIEquals(shape, "UNCHANGED") ? 1 : StringUtil::CIEquals(shape, "INSERT_ONLY") ? 2 : 3;
+	};
+	string result;
 	for (auto &entry : facts.delta_shape) {
-		if (SourceFactMatches(entry.first, table)) {
-			return entry.second;
+		if (SourceFactMatches(entry.first, table) && (result.empty() || rank(entry.second) > rank(result) ||
+		                                              (rank(entry.second) == rank(result) && entry.second > result))) {
+			result = entry.second;
 		}
 	}
-	return "";
+	return result;
 }
 
 static bool DeltaShapeIsInsertOnlyForPruning(const string &shape) {

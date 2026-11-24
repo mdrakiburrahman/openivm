@@ -28,6 +28,7 @@ LogicalGet *FindGetInSubtree(LogicalOperator *node, vector<LogicalOperator *> *c
 // The leaf's own scan, or the scan at the bottom of its unary chain.
 LogicalGet *GetLeafScan(const JoinLeafInfo &leaf);
 // The compile-fact delta shape recorded for table (empty when none is), matching partially qualified names.
+// When several keys match, the least optimistic shape wins.
 string FactDeltaShape(const openivm::CompileFacts &facts, TableCatalogEntry &table);
 
 // The delta of one join leaf inside a term: a delta scan for a bare GET, otherwise the compiled copied subtree.
