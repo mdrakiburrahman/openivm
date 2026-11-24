@@ -194,8 +194,7 @@ internal key derived from the view's catalog, schema, and name.
 These contain system-table DDL, view setup SQL, and the SQL compiled for the refresh,
 respectively. The refresh file is overwritten when a new refresh is compiled and
 contains that refresh's catalog names and delta cutoff timestamps. It is an
-inspection artifact, not the demo's input script. The optional
-`openivm_initial_load_explain_<internal_key>.txt` contains the initial-load plan. A refresh
+inspection artifact, not the demo's input script. A refresh
 that skips empty deltas may not compile a new file. Setting the path after CREATE
 does not retroactively create the setup files; do not replace an existing MV just
 to obtain an inspection file.

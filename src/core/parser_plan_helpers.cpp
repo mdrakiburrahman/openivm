@@ -846,37 +846,6 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
 	       table_name;
 }
 
-static string StripTrailingSemicolon(string sql) {
-	StringUtil::Trim(sql);
-	if (!sql.empty() && sql.back() == ';') {
-		sql.pop_back();
-		StringUtil::Trim(sql);
-	}
-	return sql;
-}
-
-string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query) {
-	string sql = StripTrailingSemicolon(query);
-	if (sql.empty()) {
-		return label + "\n<empty query>\n";
-	}
-	auto old_explain = con.Query("SELECT current_setting('explain_output')");
-	con.Query("SET explain_output='all'");
-	auto explain = con.Query("EXPLAIN " + sql);
-	if (old_explain && !old_explain->HasError() && old_explain->RowCount() > 0 &&
-	    !old_explain->Collection().GetValue(0, 0).IsNull()) {
-		con.Query("SET explain_output='" +
-		          SqlUtils::EscapeSingleQuotes(old_explain->Collection().GetValue(0, 0).ToString()) + "'");
-	}
-	string result = label + "\n";
-	if (!explain || explain->HasError()) {
-		result += "<EXPLAIN failed: " + (explain ? explain->GetError() : string("no result")) + ">\n";
-	} else {
-		result += explain->ToString() + "\n";
-	}
-	return result;
-}
-
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
                       unordered_map<TableIndex, unordered_set<ProjectionIndex>> &join_key_cols) {
 	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {

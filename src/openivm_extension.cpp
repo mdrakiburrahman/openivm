@@ -162,11 +162,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"openivm_profile_retention_days",
 	     "delete refresh profile rows older than this many days when profiling is written", LogicalType::BIGINT,
 	     Value::BIGINT(31)},
-	    {"openivm_explain_initial_load", "print CREATE MATERIALIZED VIEW initial-load SQL and EXPLAIN plans",
-	     LogicalType::BOOLEAN, off},
 	    {"openivm_snapshot_publication", "publish unordered DuckLake materialized views through retained snapshots",
-	     LogicalType::BOOLEAN, off},
-	    {"openivm_explain_initial_load_only", "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	     LogicalType::BOOLEAN, off},
 	    {openivm::INTERNAL_SCHEMA_SETTING,
 	     "schema for OpenIVM internal maintenance tables within each data catalog; empty keeps them beside the "

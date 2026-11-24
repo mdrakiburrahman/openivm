@@ -1548,37 +1548,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// OpenIVM metadata in the physical default catalog. CREATE/REFRESH split metadata
 	// writes from DuckLake data writes because DuckDB cannot commit one transaction
 	// across both catalogs.
-	if (SqlUtils::GetBoolSetting(context, "openivm_explain_initial_load", false)) {
-		// This diagnostic intentionally reports the exact first heavy statement that
-		// CREATE MV will run. DuckLake-targeted MVs should now write openivm_data_*
-		// directly; if staging reappears, this output makes the extra copy visible.
-		if (caller_location_differs) {
-			con.Query("USE " + current_catalog_schema);
-		}
-		string local_initial_load_query = time_travel_pins.StripFrom(context, view_query);
-		string initial_load_statement = "CREATE TABLE " + initial_load_target + " AS " + local_initial_load_query;
-		string diagnostic;
-		diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
-		diagnostic += "view_name: " + view_name + "\n";
-		diagnostic += "refresh_type: " + string(RefreshTypeName(refresh_type)) + "\n";
-		diagnostic += "lpts_fallback: " + string(lpts_fallback ? "true" : "false") + "\n";
-		diagnostic += "uses_staging_table: false\n";
-		diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
-		diagnostic += "original_view_query:\n" + original_view_query + "\n\n";
-		diagnostic += "generated_view_query:\n" + view_query + "\n\n";
-		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN original_view_query:", local_view_query);
-		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN generated_view_query:", local_initial_load_query);
-		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN initial_load_statement:", initial_load_statement);
-		Printer::Print(diagnostic);
-
-		if (has_files_path) {
-			SqlUtils::WriteFile(files_path + "/openivm_initial_load_explain_" + view_name + ".txt", false, diagnostic);
-		}
-		if (SqlUtils::GetBoolSetting(context, "openivm_explain_initial_load_only", false)) {
-			ConfigureDDLExecutorResult(result, DDLExecutionMode::CALLER_TRANSACTION);
-			return result;
-		}
-	}
 	// The view_query may contain unqualified base-table references (e.g. `FROM WAREHOUSE`
 	// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
 	// Connection starts in the physical-default catalog, so apply USE before CREATE
