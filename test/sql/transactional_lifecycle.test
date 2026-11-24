@@ -2125,6 +2125,14 @@ SELECT count(*) FROM openivm_delta_oc_reg;
 2
 
 statement ok con2
+CREATE TABLE oc_reg_saved AS SELECT * FROM openivm_source_deltas WHERE table_name = 'openivm_delta_oc_reg';
+
+# Restores the mapping later from a cached plan (a batch insert): the optimizer
+# rule does not see it, but the write must still invalidate cached lookups.
+statement ok con2
+PREPARE oc_reg_restore AS INSERT INTO openivm_source_deltas SELECT * FROM oc_reg_saved;
+
+statement ok con2
 DELETE FROM openivm_source_deltas WHERE table_name = 'openivm_delta_oc_reg';
 
 statement ok con2
@@ -2137,3 +2145,46 @@ query I con1
 SELECT count(*) FROM openivm_delta_oc_reg;
 ----
 2
+
+statement ok con2
+EXECUTE oc_reg_restore;
+
+statement ok con1
+INSERT INTO oc_reg VALUES (4, 4);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+3
+
+query IIII con2
+SELECT source_schema, table_name, delta_schema, delta_table_name FROM oc_reg_saved;
+----
+main	openivm_delta_oc_reg	main	openivm_delta_oc_reg
+
+# A cached VALUES insert runs without rebinding, so only plan admission sees it.
+statement ok con2
+PREPARE oc_reg_restore_values AS INSERT INTO openivm_source_deltas
+VALUES ('main', 'openivm_delta_oc_reg', 'main', 'openivm_delta_oc_reg');
+
+statement ok con2
+DELETE FROM openivm_source_deltas WHERE table_name = 'openivm_delta_oc_reg';
+
+statement ok con1
+INSERT INTO oc_reg VALUES (5, 5);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+3
+
+statement ok con2
+EXECUTE oc_reg_restore_values;
+
+statement ok con1
+INSERT INTO oc_reg VALUES (6, 6);
+
+query I con1
+SELECT count(*) FROM openivm_delta_oc_reg;
+----
+4

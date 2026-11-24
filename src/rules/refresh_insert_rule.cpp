@@ -187,6 +187,25 @@ static TableCatalogEntry &GetDMLTarget(LogicalOperator &dml) {
 	return *table;
 }
 
+// Registry writes anywhere in a plan, not only the statement's top-level DML.
+static void MarkOwnershipRegistryWrites(ClientContext &context, LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_DELETE:
+	case LogicalOperatorType::LOGICAL_UPDATE:
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		if (TransactionalMVLockState::IsOwnershipRegistry(GetDMLTarget(op).name.GetIdentifierName())) {
+			TransactionalMVLockState::Get(context).MarkOwnershipMetadataWrite();
+		}
+		break;
+	default:
+		break;
+	}
+	for (auto &child : op.children) {
+		MarkOwnershipRegistryWrites(context, *child);
+	}
+}
+
 static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
 	optional_ptr<TableCatalogEntry> table = GetDMLTarget(dml);
 	if (table->name.GetIdentifierName().empty() ||
@@ -573,8 +592,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			wrap_generation();
 			return;
 		}
-		// Schema evolution rewrites the delta: treat it as an ownership change.
-		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
+		// Schema evolution rewrites the delta: an ownership change until commit. The
+		// tracked lookup above already holds the gate, so this never waits.
+		TransactionalMVLockState::Get(input.context).MarkOwnershipMetadataWrite();
 		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
 		auto delta_locus =
 		    std::make_pair(delta_entry->schema.name.GetIdentifierName(), delta_entry->name.GetIdentifierName());
@@ -685,6 +705,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	if (plan->children.empty()) {
 		return;
 	}
+	MarkOwnershipRegistryWrites(input.context, *plan);
 
 	auto dml_owner = &plan;
 	auto dml = dml_owner->get();
@@ -705,9 +726,6 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 	if (dml->type == LogicalOperatorType::LOGICAL_UPDATE) {
 		PreserveGroupRepresentatives(dml->Cast<LogicalUpdate>());
-	}
-	if (TransactionalMVLockState::IsOwnershipRegistry(GetDMLTarget(*dml).name.GetIdentifierName())) {
-		TransactionalMVLockState::Get(input.context).MarkOwnershipMetadataWrite();
 	}
 	auto table = GetNativeDMLTable(*dml);
 	if (!table) {

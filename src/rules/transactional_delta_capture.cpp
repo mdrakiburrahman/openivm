@@ -12,6 +12,7 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/operator/persistent/physical_batch_insert.hpp"
 #include "duckdb/execution/operator/persistent/physical_delete.hpp"
 #include "duckdb/execution/operator/persistent/physical_insert.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
@@ -1185,6 +1186,8 @@ void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op) {
 	optional_ptr<TableCatalogEntry> target;
 	if (op.type == PhysicalOperatorType::INSERT) {
 		target = op.Cast<PhysicalInsert>().insert_table.get();
+	} else if (op.type == PhysicalOperatorType::BATCH_INSERT) {
+		target = op.Cast<PhysicalBatchInsert>().insert_table.get();
 	} else if (op.type == PhysicalOperatorType::UPDATE) {
 		target = op.Cast<PhysicalUpdate>().tableref;
 	} else if (op.type == PhysicalOperatorType::DELETE_OPERATOR) {
