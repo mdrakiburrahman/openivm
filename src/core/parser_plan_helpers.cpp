@@ -2912,15 +2912,12 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 		}
 	}
 
+	auto is_output = [&](const string &column) {
+		return std::any_of(output_names.begin(), output_names.end(),
+		                   [&](const string &output_col) { return StringUtil::CIEquals(column, output_col); });
+	};
 	for (auto &group_col : aggregate_columns) {
-		bool already_visible = false;
-		for (auto &output_col : output_names) {
-			if (StringUtil::CIEquals(group_col, output_col)) {
-				already_visible = true;
-				break;
-			}
-		}
-		if (already_visible) {
+		if (is_output(group_col)) {
 			continue;
 		}
 		for (auto *ref : facts.join_refs) {
@@ -2939,14 +2936,7 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 				break;
 			}
 		}
-		bool resolved = false;
-		for (auto &output_col : output_names) {
-			if (StringUtil::CIEquals(group_col, output_col)) {
-				resolved = true;
-				break;
-			}
-		}
-		if (resolved) {
+		if (is_output(group_col)) {
 			continue;
 		}
 		string suffix = group_col;
