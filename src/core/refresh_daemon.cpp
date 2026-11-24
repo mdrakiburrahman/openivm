@@ -103,7 +103,7 @@ void RefreshDaemon::Run() {
 				MetadataLocation location;
 				location.catalog = sv.metadata_catalog;
 				location.schema = sv.metadata_schema;
-				MetadataLocator::Use(con, location);
+				RefreshMetadata::UseLocation(con, location);
 				auto view_key = SqlUtils::FullName(sv.catalog_name, sv.schema_name, sv.view_name);
 
 				// Skip if already refreshed via cascade from an earlier view in this cycle

@@ -212,28 +212,6 @@ MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &co
 	                   !configured_catalog.empty());
 }
 
-void MetadataLocator::Use(Connection &con, const MetadataLocation &location) {
-	string target = SqlUtils::QuoteIdentifier(location.schema.empty() ? string(DEFAULT_SCHEMA) : location.schema);
-	if (!location.catalog.empty()) {
-		target = SqlUtils::QuoteIdentifier(location.catalog) + "." + target;
-	}
-	auto result = con.Query("USE " + target);
-	if (result->HasError() && location.explicit_placement) {
-		// The selected schema is part of the placement; create it on first use.
-		if (location.read_only) {
-			throw CatalogException("OpenIVM metadata schema %s does not exist and its catalog is attached read-only",
-			                       location.DisplayName());
-		}
-		SqlUtils::QueryOrThrow(con, "CREATE SCHEMA IF NOT EXISTS " + target,
-		                       "OpenIVM could not create metadata schema %s: %s", location.DisplayName());
-		result = con.Query("USE " + target);
-	}
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
-	}
-	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s\n", target.c_str());
-}
-
 vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &table) {
 	vector<MetadataLocation> result;
 	auto add = [&](const MetadataLocation &location) {
