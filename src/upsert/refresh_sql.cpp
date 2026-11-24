@@ -752,6 +752,25 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		return RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, source.table_name, snapshot_expr,
 		                                                        delta_metadata_table, source_table_id);
 	};
+	// A keyed recompute upsert writes the data table's own columns, and needs their types to keep
+	// floating zero keys in sync. Only indexed native data tables use that form.
+	vector<string> upsert_columns;
+	vector<LogicalType> upsert_types;
+	auto read_upsert_columns = [&]() {
+		if (!index_delta_view_catalog_entry || active_facts.target_dialect != SqlDialect::DUCKDB ||
+		    !upsert_columns.empty()) {
+			return;
+		}
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+			    *con.context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                                Identifier(data_table_bare)));
+			upsert_columns = entry.GetColumns().GetColumnNames();
+			for (auto &column : entry.GetColumns().Logical()) {
+				upsert_types.push_back(column.GetType());
+			}
+		});
+	};
 	// Recompute the whole view. A recovery also clears the interruption marker; under the split protocol
 	// the marker stays durable until the recomputed state and its watermarks have both committed.
 	auto build_full_recompute = [&](bool recovering) {
@@ -767,21 +786,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				ducklake_checkpoints += build_ducklake_checkpoint(source, true);
 			}
 		}
-		// The data table shares the delta table's columns, minus the multiplicity and timestamp.
-		vector<string> upsert_columns;
-		if (index_delta_view_catalog_entry && delta_view_catalog_entry &&
-		    active_facts.target_dialect == SqlDialect::DUCKDB) {
-			for (auto &name : delta_view_catalog_entry->GetColumns().GetColumnNames()) {
-				if (name != openivm::MULTIPLICITY_COL && name != openivm::TIMESTAMP_COL) {
-					upsert_columns.push_back(name);
-				}
-			}
-		}
-		auto query =
-		    aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql, ducklake_checkpoints, upsert_columns,
-		                                      cross_system, attached_db_catalog_name, attached_db_schema_name,
-		                                      internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup,
-		                                      delta_metadata_tables, cleanup_data_catalog);
+		read_upsert_columns();
+		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql, ducklake_checkpoints,
+		                                               upsert_columns, upsert_types, cross_system,
+		                                               attached_db_catalog_name, attached_db_schema_name,
+		                                               internal_catalog_prefix, metadata_prefix, out_post_meta,
+		                                               deferred_cleanup, delta_metadata_tables, cleanup_data_catalog);
 		if (cross_system && out_pre_meta && out_post_meta) {
 			*out_pre_meta = in_progress_sql(true);
 			*out_post_meta += in_progress_sql(false);
@@ -1535,10 +1545,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (index_delta_view_catalog_entry && active_facts.target_dialect == SqlDialect::DUCKDB &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = group_cols;
+			read_upsert_columns();
 		}
-		upsert_query =
-		    aux_rebuild + CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix, false,
-		                                       recompute_unique_keys, SqlUtils::WithoutMultiplicity(column_names));
+		upsert_query = aux_rebuild + CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix,
+		                                                  false, recompute_unique_keys, upsert_columns, upsert_types);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}

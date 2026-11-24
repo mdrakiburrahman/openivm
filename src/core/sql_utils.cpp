@@ -769,15 +769,15 @@ string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &sou
 			updates.push_back(quoted + " = d." + quoted);
 		}
 	}
-	auto matched = updates.empty() ? string("DO NOTHING") : "UPDATE SET " + StringUtil::Join(updates, ", ");
+	auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
 	return "MERGE INTO " + data_table + " v USING " + source + " d ON " + BuildNullSafeKeyPredicate(keys, "v.", "d.") +
-	       "\nWHEN MATCHED THEN " + matched + "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) +
-	       ") VALUES (" + JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+	       matched + "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
+	       JoinQualifiedQuotedColumns(columns, "d") + ");\n";
 }
 
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
                                        const vector<string> &unique_keys, const string &temp_table,
-                                       const vector<string> &columns) {
+                                       const vector<string> &columns, const vector<LogicalType> &column_types) {
 	if (unique_keys.empty() || temp_table.empty()) {
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
@@ -793,6 +793,29 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE (" + nullable_key +
 	       ")\n   OR NOT EXISTS (\n  SELECT 1 FROM " + temp_table + " AS openivm_new WHERE " + keep_match + "\n);\n";
 	sql += BuildKeyedUpsertSQL(data_table, temp_table, unique_keys, columns);
+	// The upsert never rewrites a matched key, so a floating zero key would keep a sign that
+	// the recomputed group no longer has. Adopt the recomputed representative, as the plain
+	// DELETE+INSERT form does. The indexed key makes this update a delete+insert.
+	vector<string> zero_keys;
+	vector<string> sign_changes;
+	vector<string> assignments;
+	for (idx_t index = 0; index < columns.size() && index < column_types.size(); index++) {
+		auto id = column_types[index].id();
+		if ((id != LogicalTypeId::FLOAT && id != LogicalTypeId::DOUBLE) ||
+		    std::find(unique_keys.begin(), unique_keys.end(), columns[index]) == unique_keys.end()) {
+			continue;
+		}
+		auto key = QuoteIdentifier(columns[index]);
+		zero_keys.push_back("v." + key + " = 0");
+		sign_changes.push_back(NegativeZeroSQL("v." + key, SqlDialect::DUCKDB) + " <> " +
+		                       NegativeZeroSQL("openivm_new." + key, SqlDialect::DUCKDB));
+		assignments.push_back(key + " = openivm_new." + key);
+	}
+	if (!assignments.empty()) {
+		sql += "UPDATE " + data_table + " AS v SET " + StringUtil::Join(assignments, ", ") + " FROM " + temp_table +
+		       " AS openivm_new WHERE " + BuildNullSafeKeyPredicate(unique_keys, "v.", "openivm_new.") + " AND (" +
+		       StringUtil::Join(zero_keys, " OR ") + ") AND (" + StringUtil::Join(sign_changes, " OR ") + ");\n";
+	}
 	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
 	return sql;
 }

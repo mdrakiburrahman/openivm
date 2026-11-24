@@ -953,9 +953,10 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 }
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           const string &ducklake_checkpoints, const vector<string> &upsert_columns, bool cross_system,
-                           const string &attached_catalog, const string &attached_schema, const string &catalog_prefix,
-                           const string &metadata_prefix, string *out_post_meta, vector<string> *deferred_cleanup,
+                           const string &ducklake_checkpoints, const vector<string> &upsert_columns,
+                           const vector<LogicalType> &upsert_types, bool cross_system, const string &attached_catalog,
+                           const string &attached_schema, const string &catalog_prefix, const string &metadata_prefix,
+                           string *out_post_meta, vector<string> *deferred_cleanup,
                            const vector<string> &delta_metadata_tables, const string &data_catalog) {
 	string qdt = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	// Indexed keys cannot be deleted and reinserted in the same on-disk transaction.
@@ -968,8 +969,9 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
 		}
 	}
-	string query =
-	    SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp, upsert_columns) + "\n";
+	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp, upsert_columns,
+	                                               upsert_types) +
+	               "\n";
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
 	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = " + string(openivm::UTC_NOW_SQL) +
 	                       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";

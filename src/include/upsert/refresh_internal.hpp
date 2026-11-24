@@ -206,9 +206,10 @@ string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &vi
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
                                      const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);
 
-// `upsert_columns` lists the data table's columns when it carries a unique key index.
+// `upsert_columns` and `upsert_types` describe the data table when it carries a unique key index.
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           const string &ducklake_checkpoints, const vector<string> &upsert_columns, bool cross_system,
+                           const string &ducklake_checkpoints, const vector<string> &upsert_columns,
+                           const vector<LogicalType> &upsert_types, bool cross_system,
                            const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,

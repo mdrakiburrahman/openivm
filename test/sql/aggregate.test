@@ -6692,7 +6692,8 @@ UPDATE complex_key_src SET v=200 WHERE id=99;
 DELETE FROM complex_key_src WHERE id=99;
 
 query I
-SELECT (bool_or(contains(sql,'MERGE INTO') AND contains(sql,'openivm_full_recompute_'))=('{key}'='int_key'))::INT
+SELECT ((bool_or(contains(sql,'MERGE INTO') AND contains(sql,'openivm_full_recompute_'))=('{key}'='int_key'))
+    AND NOT bool_or(contains(sql,'INSERT OR REPLACE')))::INT
 FROM openivm_compile_with_facts('complex_key_mv',
     '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}');
 ----
@@ -7096,3 +7097,138 @@ SELECT k, signbit(v), c FROM fz_merge WHERE v = 0 ORDER BY k;
 3	true	2
 6	false	1
 8	true	1
+
+# Issue #197: a full refresh adopts the recomputed zero sign of an indexed float key, and the change
+# reaches the visible view and a downstream view, also through a later incremental refresh.
+statement ok
+CREATE TABLE fzr(id INT, k DOUBLE, v INT);
+
+statement ok
+INSERT INTO fzr VALUES (1,'-0.0',1),(2,'-0.0',2),(3,1.5,3),(4,2.5,4);
+
+statement ok
+CREATE MATERIALIZED VIEW fzr_mv AS SELECT k, COUNT(*) c, SUM(v) s FROM fzr GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW fzr_down AS SELECT k, signbit(k) neg, c FROM fzr_mv;
+
+statement ok
+CREATE VIEW fzr_expected AS SELECT k, COUNT(*) c, SUM(v) s FROM fzr GROUP BY k;
+
+statement ok
+CREATE VIEW fzr_down_expected AS SELECT k, signbit(k) neg, COUNT(*) c FROM fzr GROUP BY k;
+
+statement ok
+DELETE FROM fzr WHERE k = 0;
+
+statement ok
+INSERT INTO fzr VALUES (5,0.0,5),(6,0.0,6),(7,3.5,7);
+
+statement ok
+UPDATE fzr SET v = v + 10 WHERE id IN (3, 5);
+
+statement ok
+DELETE FROM fzr WHERE id IN (6, 4);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach view mv down
+
+statement ok
+PRAGMA refresh('fzr_{view}');
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fzr_mv EXCEPT ALL SELECT * FROM fzr_expected) UNION ALL (SELECT * FROM fzr_expected EXCEPT ALL SELECT * FROM fzr_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fzr_down EXCEPT ALL SELECT * FROM fzr_down_expected) UNION ALL (SELECT * FROM fzr_down_expected EXCEPT ALL SELECT * FROM fzr_down));
+----
+0
+
+query IIT
+SELECT signbit(k), c, neg FROM fzr_down WHERE k = 0;
+----
+false	1	false
+
+query I
+SELECT signbit(k)::INT FROM fzr_mv WHERE k = 0;
+----
+0
+
+# An unrelated batch refreshed incrementally keeps the corrected sign everywhere.
+statement ok
+INSERT INTO fzr VALUES (8,4.5,8),(9,4.5,9);
+
+statement ok
+DELETE FROM fzr WHERE id = 9;
+
+statement ok
+UPDATE fzr SET v = v + 1 WHERE id = 7;
+
+foreach view mv down
+
+statement ok
+PRAGMA refresh('fzr_{view}');
+
+endloop
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fzr_mv EXCEPT ALL SELECT * FROM fzr_expected) UNION ALL (SELECT * FROM fzr_expected EXCEPT ALL SELECT * FROM fzr_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fzr_down EXCEPT ALL SELECT * FROM fzr_down_expected) UNION ALL (SELECT * FROM fzr_down_expected EXCEPT ALL SELECT * FROM fzr_down));
+----
+0
+
+query IIT
+SELECT signbit(k), c, neg FROM fzr_down WHERE k = 0;
+----
+false	1	false
+
+# Back to -0.0 through another full refresh.
+statement ok
+DELETE FROM fzr WHERE k = 0;
+
+statement ok
+INSERT INTO fzr VALUES (10,'-0.0',10),(11,'-0.0',11);
+
+statement ok
+UPDATE fzr SET v = v * 2 WHERE id = 10;
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach view mv down
+
+statement ok
+PRAGMA refresh('fzr_{view}');
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fzr_mv EXCEPT ALL SELECT * FROM fzr_expected) UNION ALL (SELECT * FROM fzr_expected EXCEPT ALL SELECT * FROM fzr_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fzr_down EXCEPT ALL SELECT * FROM fzr_down_expected) UNION ALL (SELECT * FROM fzr_down_expected EXCEPT ALL SELECT * FROM fzr_down));
+----
+0
+
+query IIT
+SELECT signbit(k), c, neg FROM fzr_down WHERE k = 0;
+----
+true	2	true

@@ -423,13 +423,14 @@ static unordered_map<string, string> DetectIndexedStateColumns(const vector<stri
 }
 
 // SQL equality merges -0.0 and +0.0 into one group, and neither the incremental MERGE nor the
-// keyed upsert rewrites a matched key. Keep a stored zero key's sign while that sign has support and flip it
-// once its last supporting row disappears. Assigning the complete row lets the insert rule turn
-// this into delete-and-insert, since an in-place update drops SQL-equal assignments.
+// keyed upsert rewrites a matched key. Keep a stored zero key's sign while that sign has support and
+// flip it once its last supporting row disappears. Only groups in the delta can lose support, which
+// also keeps every flipped key inside the publication scope. Assigning the complete row lets the
+// insert rule turn this into delete-and-insert, since an in-place update drops SQL-equal assignments.
 static string BuildGroupSignFixupSQL(const string &data_table, const vector<string> &keys,
                                      const vector<string> &aggregates,
                                      const unordered_map<string, string> &group_sign_counts,
-                                     const string &group_count_column, SqlDialect dialect) {
+                                     const string &group_count_column, const string &delta_rows, SqlDialect dialect) {
 	vector<string> flips;
 	vector<string> assignments;
 	for (auto &key : keys) {
@@ -439,7 +440,9 @@ static string BuildGroupSignFixupSQL(const string &data_table, const vector<stri
 			assignments.push_back(quoted_key + " = " + quoted_key);
 			continue;
 		}
-		D_ASSERT(!group_count_column.empty());
+		if (group_count_column.empty()) {
+			throw InternalException("Floating group key %s has no group count to anchor its sign", quoted_key);
+		}
 		auto &negative = count->second;
 		auto is_negative = SqlUtils::NegativeZeroSQL(quoted_key, dialect);
 		auto flip = "(" + quoted_key + " = 0 AND CASE WHEN " + negative + " = 0 THEN " + is_negative + " ELSE " +
@@ -456,8 +459,9 @@ static string BuildGroupSignFixupSQL(const string &data_table, const vector<stri
 		assignments.push_back(column + " = " + column);
 	}
 	OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] maintaining zero signs of %zu floating keys\n", flips.size());
-	return "UPDATE " + data_table + " SET " + StringUtil::Join(assignments, ", ") + " WHERE " +
-	       StringUtil::Join(flips, " OR ") + ";\n";
+	return "UPDATE " + data_table + " AS openivm_target SET " + StringUtil::Join(assignments, ", ") + " WHERE (" +
+	       StringUtil::Join(flips, " OR ") + ") AND EXISTS (SELECT 1 FROM " + delta_rows + " AND " +
+	       SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_target.", "openivm_touched.") + ");\n";
 }
 
 string CompileAggregateGroups(const string &view_name, const vector<string> &column_names,
@@ -768,8 +772,13 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		group_count_column = openivm::COUNT_STAR_COL;
 	}
 	auto group_sign_counts = DetectIndexedStateColumns(column_names, openivm::GROUP_SIGN_COUNT_COL_PREFIX);
-	auto sign_fixup =
-	    BuildGroupSignFixupSQL(data_table, keys, aggregates, group_sign_counts, group_count_column, options.dialect);
+	// Insertions only add support, so an insert-only refresh never flips a stored zero key.
+	string sign_fixup;
+	if (!insert_only) {
+		auto delta_rows = delta_view + " openivm_touched WHERE " + (delta_ts_filter.empty() ? "TRUE" : delta_ts_filter);
+		sign_fixup = BuildGroupSignFixupSQL(data_table, keys, aggregates, group_sign_counts, group_count_column,
+		                                    delta_rows, options.dialect);
+	}
 
 	if (needs_group_recompute || (has_minmax && !insert_only)) {
 		// Tell the caller this call recomputes affected groups from the base tables rather than
@@ -1095,8 +1104,6 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		               data_table + " (" + insert_cols + ") SELECT " + key_insert_values + ", " + insert_vals +
 		               " FROM " + matched + " d WHERE d." + target_rowid + " IS NULL;\n" + "DROP TABLE " + matched +
 		               ";\n";
-		// No zero-sign fix-up: insertions only add support, so no stored zero key loses its sign,
-		// and a new group inserts the delta's representative.
 	}
 	if (insert_only && options.cascade_delta_specs && options.inline_cascade_delta) {
 		// The inline companion emitted by refresh_sql.cpp is a compact aggregate-delta
@@ -1389,14 +1396,16 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 }
 
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix,
-                            bool emit_cascade_delta, const vector<string> &unique_keys, const vector<string> &columns) {
+                            bool emit_cascade_delta, const vector<string> &unique_keys, const vector<string> &columns,
+                            const vector<LogicalType> &column_types) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string recompute_temp;
 	if (!unique_keys.empty()) {
 		recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
 	}
 	if (!emit_cascade_delta) {
-		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp, columns);
+		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp, columns,
+		                                       column_types);
 	}
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
@@ -1407,7 +1416,7 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
 	       ") openivm_recompute;\n\n";
 	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp,
-	                                       columns);
+	                                       columns, column_types);
 	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
