@@ -1063,6 +1063,15 @@ void VisitSpineAggregateInputs(const OutputSpine &spine, TableIndex aggregate_in
 	}
 }
 
+OutputSpine ViewOutputSpine(LogicalOperator *root) {
+	return FindOutputSpine(root, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
+		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
+}
+
 LogicalAggregate *SpineAggregate(const OutputSpine &spine) {
 	auto *node = spine.bottom;
 	if (node && node->type == LogicalOperatorType::LOGICAL_FILTER && node->children.size() == 1) {
@@ -1075,12 +1084,7 @@ LogicalAggregate *SpineAggregate(const OutputSpine &spine) {
 }
 
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
-	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
-		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
-		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
-		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
-	});
+	auto spine = ViewOutputSpine(plan.get());
 	if (!spine.bottom || spine.projections.empty()) {
 		return;
 	}

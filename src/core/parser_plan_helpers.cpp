@@ -1397,15 +1397,6 @@ static bool ResolvesToGroupBinding(TableIndex table_index, ProjectionIndex colum
 	return ResolvesToOutputBinding(table_index, column_index, group_index, group_count, facts, false);
 }
 
-static OutputSpine ViewOutputSpine(LogicalOperator *root) {
-	return FindOutputSpine(root, [](const LogicalOperator &op) {
-		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
-		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
-		       op.type == LogicalOperatorType::LOGICAL_FILTER || op.type == LogicalOperatorType::LOGICAL_ORDER_BY ||
-		       op.type == LogicalOperatorType::LOGICAL_LIMIT || op.type == LogicalOperatorType::LOGICAL_TOP_N;
-	});
-}
-
 LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root) {
 	return SpineAggregate(ViewOutputSpine(root));
 }
