@@ -137,6 +137,8 @@ void AppendBindingsToJoinProjectionMaps(LogicalOperator &op, const column_bindin
 			AppendBindingsToJoinProjectionMaps(*child, bindings);
 		}
 	}
+	// Every LogicalJoin (comparison, ANY, DELIM) applies its projection maps in GetColumnBindings the same way.
+	// The UNNEST walker already covered all of them; the DELIM_JOIN walker saw only comparison joins.
 	auto *join = dynamic_cast<LogicalJoin *>(&op);
 	if (!join) {
 		return;
@@ -148,6 +150,14 @@ void AppendBindingsToJoinProjectionMaps(LogicalOperator &op, const column_bindin
 			continue;
 		}
 		auto child_bindings = op.children[child_idx]->GetColumnBindings();
+		for (auto projected_idx : proj_map) {
+			// Equality is valid: the largest valid index is size - 1.
+			if (projected_idx >= child_bindings.size()) { // mull-ignore: cxx_ge_to_gt
+				throw InternalException(
+				    "Join projection map index %llu out of bounds for child %llu with %llu bindings",
+				    (idx_t)projected_idx, child_idx, (idx_t)child_bindings.size());
+			}
+		}
 		for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
 			if (bindings.count(child_bindings[binding_idx]) &&
 			    std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
