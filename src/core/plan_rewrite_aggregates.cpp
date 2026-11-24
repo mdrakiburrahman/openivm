@@ -395,6 +395,7 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 	};
 	vector<SumCountOutput> outputs;
 	column_binding_set_t exposed_sums;
+	auto projection_map = spine.ProjectionMap();
 	for (idx_t projection_index = 0; projection_index < output_projection.expressions.size(); projection_index++) {
 		Expression *resolved = output_projection.expressions[projection_index].get();
 		bool has_cast = false;
@@ -410,18 +411,13 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 			if (ref.Binding().table_index == agg.aggregate_index) {
 				break;
 			}
-			LogicalProjection *referenced_projection = nullptr;
-			for (idx_t projection_depth = 1; projection_depth < projections.size(); projection_depth++) {
-				if (projections[projection_depth]->table_index == ref.Binding().table_index) {
-					referenced_projection = projections[projection_depth];
-					break;
-				}
-			}
-			if (!referenced_projection || ref.Binding().column_index >= referenced_projection->expressions.size()) {
+			auto referenced = projection_map.find(ref.Binding().table_index);
+			if (referenced == projection_map.end() ||
+			    ref.Binding().column_index >= referenced->second->expressions.size()) {
 				resolved = nullptr;
 				break;
 			}
-			resolved = referenced_projection->expressions[ref.Binding().column_index].get();
+			resolved = referenced->second->expressions[ref.Binding().column_index].get();
 		}
 		if (!resolved || resolved->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			continue;
