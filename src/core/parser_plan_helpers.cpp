@@ -2154,7 +2154,8 @@ static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const C
                                                   bool allow_seed_normalization = false) {
 	LogicalGet *get = nullptr;
 	ProjectionIndex base_column;
-	if (!ResolveBindingToGetColumn(binding, facts, get, out.column, &base_column, &cast_type, allow_seed_normalization) ||
+	if (!ResolveBindingToGetColumn(binding, facts, get, out.column, &base_column, &cast_type,
+	                               allow_seed_normalization) ||
 	    !SetOccurrenceRef(*get, facts, out)) {
 		return false;
 	}

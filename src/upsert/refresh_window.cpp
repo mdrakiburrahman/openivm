@@ -269,8 +269,8 @@ BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name, c
 		scoped = SqlUtils::ReplaceTableReferences(scoped, base_ref, delta_rows);
 		replaced_tables.push_back(UnquotedLastIdentifier(base_table));
 		// ReplaceTableReferences keeps an unaliased table's implicit alias on the replacement.
-		implicit_aliases.emplace_back(
-		    delta_rows + " AS " + SqlUtils::QuoteIdentifier(UnquotedLastIdentifier(base_ref)), delta_rows);
+		implicit_aliases.emplace_back(delta_rows + " AS " + SqlUtils::QuoteIdentifier(UnquotedLastIdentifier(base_ref)),
+		                              delta_rows);
 		covered_sources.insert(ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names));
 	}
 	string residual = scoped;
