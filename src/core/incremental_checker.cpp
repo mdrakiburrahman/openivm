@@ -17,18 +17,15 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
-#include "duckdb/planner/operator/logical_positional_join.hpp"
 #include "duckdb/planner/operator/logical_sample.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
-#include "duckdb/planner/operator/logical_unnest.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <unordered_set>
 
@@ -119,8 +116,7 @@ private:
 			}
 			identifier_set_t parameters;
 			for (auto &parameter : macro->parameters) {
-				auto &name = parameter->Cast<ColumnRefExpression>().GetColumnName();
-				parameters.insert(name);
+				parameters.insert(parameter->Cast<ColumnRefExpression>().GetColumnName());
 			}
 			if (HasQueryDependentValue(*macro->Cast<ScalarMacroFunction>().expression, parameters, true)) {
 				return true;
@@ -161,7 +157,6 @@ private:
 		return found;
 	}
 
-private:
 	LogicalOperator &plan;
 	Binder &binder;
 	unique_ptr<unordered_set<uint32_t>> bound_column_locations;
@@ -169,10 +164,7 @@ private:
 };
 
 bool HasQueryDependentBinding(QueryNode &query, LogicalOperator &plan, Binder &binder, bool always_require_rebind) {
-	if (!always_require_rebind) {
-		return false;
-	}
-	return QueryDependentBindingDetector(plan, binder).HasQueryDependentValue(query);
+	return always_require_rebind && QueryDependentBindingDetector(plan, binder).HasQueryDependentValue(query);
 }
 
 static bool WindowColumn(const Expression &expr, string &name) {
@@ -186,15 +178,9 @@ static bool WindowColumn(const Expression &expr, string &name) {
 }
 
 static bool SameWindowColumns(const vector<string> &left, const vector<string> &right) {
-	if (left.size() != right.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < left.size(); i++) {
-		if (!StringUtil::CIEquals(left[i], right[i])) {
-			return false;
-		}
-	}
-	return true;
+	return left.size() == right.size() &&
+	       std::equal(left.begin(), left.end(), right.begin(),
+	                  [](const string &l, const string &r) { return StringUtil::CIEquals(l, r); });
 }
 
 static vector<string> IntersectWindowColumns(const vector<string> &left, const vector<string> &right) {
@@ -289,12 +275,9 @@ static vector<unique_ptr<Expression>> *VolatileCheckedExpressions(LogicalOperato
 }
 
 // Safety facts that propagate from a materialized CTE body regardless of how the outer query consumes it.
+// Unsupported constructs propagate through incremental_compatible instead.
 static bool PlanAnalysis::*const NON_LOCAL_FACTS[] = {
-    &PlanAnalysis::found_volatile_expression,   &PlanAnalysis::found_non_foldable_unnest,
-    &PlanAnalysis::found_unsupported_aggregate, &PlanAnalysis::found_unsupported_filtered_aggregate,
-    &PlanAnalysis::found_unsupported_join_type, &PlanAnalysis::found_unsupported_order_by,
-    &PlanAnalysis::found_unsupported_operator,  &PlanAnalysis::found_asof_join,
-    &PlanAnalysis::found_positional_join,       &PlanAnalysis::found_sample};
+    &PlanAnalysis::found_asof_join, &PlanAnalysis::found_positional_join, &PlanAnalysis::found_sample};
 
 // Query-shape facts a pass-through CTE consumer inherits from the body.
 static bool PlanAnalysis::*const SHAPE_FACTS[] = {&PlanAnalysis::found_aggregation,
@@ -322,7 +305,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	auto *volatile_checked = VolatileCheckedExpressions(op);
 	if (volatile_checked && AnyExpression(*volatile_checked, IsVolatileExpression)) {
 		result.incremental_compatible = false;
-		result.found_volatile_expression = true;
 	}
 	switch (node->type) {
 	// Infrastructure nodes — always compatible, no metadata
@@ -336,8 +318,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
 	case LogicalOperatorType::LOGICAL_ORDER_BY:
-		break;
-
 	case LogicalOperatorType::LOGICAL_UNNEST:
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 		break;
@@ -353,7 +333,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		result.found_projection = true;
 		if (AnyExpression(node->expressions, IsNonFoldableUnnestExpression)) {
 			result.incremental_compatible = false;
-			result.found_non_foldable_unnest = true;
 		}
 		break;
 
@@ -369,7 +348,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		auto &sample = node->Cast<LogicalSample>();
 		if (!sample.sample_options || !sample.sample_options->seed.IsValid()) {
 			result.incremental_compatible = false;
-			result.found_volatile_expression = true;
 		}
 		break;
 	}
@@ -411,29 +389,17 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		    node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 			result.found_delim_join = true;
 		}
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join) {
-			if (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
-			    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
-			    join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI &&
-			    join->join_type != JoinType::MARK && join->join_type != JoinType::SINGLE) {
+		if (auto *join = dynamic_cast<LogicalJoin *>(node)) {
+			auto type = join->join_type;
+			if (type != JoinType::INNER && type != JoinType::LEFT && type != JoinType::RIGHT &&
+			    type != JoinType::OUTER && type != JoinType::SEMI && type != JoinType::ANTI && type != JoinType::MARK &&
+			    type != JoinType::SINGLE) {
 				result.incremental_compatible = false;
-				result.found_unsupported_join_type = true;
 			}
-			if (join->join_type == JoinType::SINGLE) {
-				result.found_single_join = true;
-			}
-			if (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
-			    join->join_type == JoinType::MARK) {
-				result.found_semi_anti_join = true;
-			}
-			if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
-			    join->join_type == JoinType::OUTER) {
-				result.found_left_join = true;
-			}
-			if (join->join_type == JoinType::OUTER) {
-				result.found_full_outer = true;
-			}
+			result.found_single_join |= type == JoinType::SINGLE;
+			result.found_semi_anti_join |= type == JoinType::SEMI || type == JoinType::ANTI || type == JoinType::MARK;
+			result.found_left_join |= type == JoinType::LEFT || type == JoinType::RIGHT || type == JoinType::OUTER;
+			result.found_full_outer |= type == JoinType::OUTER;
 		}
 		break;
 	}
@@ -451,18 +417,16 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		if (agg.grouping_sets.size() > 1) {
 			result.found_grouping_sets = true;
 		}
+		const auto &supported = GetSupportedAggregates();
 		for (auto &expr : agg.expressions) {
 			if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
 				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-				const auto &supported = GetSupportedAggregates();
-				const bool scalar_subquery_first =
-				    bound_agg.Function().GetName().GetIdentifierName() == "first" && result.group_index.IsValid();
+				const auto &name = bound_agg.Function().GetName().GetIdentifierName();
+				// A scalar subquery's FIRST is supported below an outer aggregate.
 				const bool supported_aggregate =
-				    supported.find(bound_agg.Function().GetName().GetIdentifierName()) != supported.end() ||
-				    scalar_subquery_first;
+				    supported.count(name) || (name == "first" && result.group_index.IsValid());
 				if (!supported_aggregate) {
 					result.incremental_compatible = false;
-					result.found_unsupported_aggregate = true;
 				}
 				// COUNT(DISTINCT x) can't be summed from delta counts, but group-recompute
 				// (delete affected groups + re-insert from original query) is correct.
@@ -476,30 +440,22 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 						result.found_retained_aggregate_filter = true;
 					} else {
 						result.incremental_compatible = false;
-						result.found_unsupported_filtered_aggregate = true;
 					}
 				}
-				if (bound_agg.Function().GetName().GetIdentifierName() == "min" ||
-				    bound_agg.Function().GetName().GetIdentifierName() == "max" ||
-				    bound_agg.Function().GetName().GetIdentifierName() == "arg_min" ||
-				    bound_agg.Function().GetName().GetIdentifierName() == "arg_max") {
-					result.found_minmax = true;
-				}
+				result.found_minmax |= name == "min" || name == "max" || name == "arg_min" || name == "arg_max";
 				// LIST aggregates aren't element-wise summable — different deltas
 				// produce lists of different lengths/contents. Mark the view so the
 				// upsert compiler uses group-recompute (delete affected groups,
 				// re-insert from the original query) rather than the failing
 				// list_reduce/lambda path.
-				if (bound_agg.Function().GetName().GetIdentifierName() == "list") {
-					result.found_list = true;
-				}
+				result.found_list |= name == "list";
 				// Record aggregate function types only for the outermost aggregate in the plan.
 				// Nested aggregates (CTE re-aggregate, subquery-join inner agg) would misalign
 				// aggregate_types with the output column count and confuse CompileAggregateGroups.
 				// Compatibility flags (found_minmax, found_list, found_count_distinct) are
 				// recorded for all aggregates above so unsafe inner aggs still gate classification.
 				if (!result.group_index.IsValid()) {
-					result.aggregate_types.push_back(bound_agg.Function().GetName().GetIdentifierName());
+					result.aggregate_types.push_back(name);
 				}
 			}
 		}
@@ -570,7 +526,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		auto &top_n = node->Cast<LogicalTopN>();
 		if (!HasSimpleOrderBy(top_n.orders)) {
 			result.incremental_compatible = false; // non-column ORDER BY: fall through to FULL_REFRESH
-			result.found_unsupported_order_by = true;
 		}
 		break;
 	}
@@ -582,7 +537,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		// cannot refill the boundary after a deletion, so it requires full refresh.
 		if (node->children.empty() || node->children[0]->type != LogicalOperatorType::LOGICAL_ORDER_BY) {
 			result.incremental_compatible = false;
-			result.found_unsupported_operator = true;
 		}
 		break;
 	}
@@ -590,15 +544,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	default:
 		// Unsupported operator type
 		result.incremental_compatible = false;
-		result.found_unsupported_operator = true;
 		break;
-	}
-}
-
-static void MergeWindowAnalysis(PlanAnalysis &result, PlanAnalysis &body) {
-	if (body.found_window) {
-		MergeWindowKeys(result, !result.found_window, std::move(body.window_partition_columns),
-		                std::move(body.window_order_columns), body.window_row_key_compatible);
 	}
 }
 
@@ -611,7 +557,10 @@ void MergeMaterializedCteBodyAnalysis(PlanAnalysis &result, PlanAnalysis body) {
 	if (!outer_passthrough) {
 		return;
 	}
-	MergeWindowAnalysis(result, body);
+	if (body.found_window) {
+		MergeWindowKeys(result, !result.found_window, std::move(body.window_partition_columns),
+		                std::move(body.window_order_columns), body.window_row_key_compatible);
+	}
 	for (auto fact : SHAPE_FACTS) {
 		result.*fact = result.*fact || body.*fact;
 	}

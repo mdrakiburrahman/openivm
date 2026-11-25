@@ -181,11 +181,8 @@ static bool HasUnsupportedConstruct(const DeltaViewModel &model, const CreateMVP
                                     const DeltaViewModelInput &input) {
 	const auto &analysis = facts.analysis;
 	const bool no_group_keys = model.group_columns.empty();
-	return facts.has_unsupported_set_operation || facts.has_pivot || analysis.found_volatile_expression ||
-	       analysis.found_non_foldable_unnest || analysis.found_unsupported_aggregate ||
-	       analysis.found_unsupported_filtered_aggregate || analysis.found_unsupported_join_type ||
-	       analysis.found_unsupported_order_by || analysis.found_unsupported_operator ||
-	       (analysis.found_grouping_sets && no_group_keys) ||
+	// Every unsupported operator, aggregate, join type, ORDER BY or volatile expression clears incremental_compatible.
+	return facts.has_unsupported_set_operation || facts.has_pivot || (analysis.found_grouping_sets && no_group_keys) ||
 	       (analysis.found_retained_aggregate_filter && no_group_keys && !analysis.found_minmax) ||
 	       (analysis.found_semi_anti_join && analysis.found_aggregation && no_group_keys) ||
 	       (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) ||

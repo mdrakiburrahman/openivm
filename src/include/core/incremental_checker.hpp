@@ -35,13 +35,6 @@ struct PlanAnalysis {
 	bool found_grouping_sets = false;    // ROLLUP/CUBE/GROUPING SETS — handled via RECOMPUTE
 	bool found_nested_aggregate = false; // outer aggregate over inner aggregate (CTE re-agg); COUNT(*) in outer is
 	                                     // non-linear over source deltas → group-recompute
-	bool found_volatile_expression = false;
-	bool found_non_foldable_unnest = false;
-	bool found_unsupported_aggregate = false;
-	bool found_unsupported_filtered_aggregate = false;
-	bool found_unsupported_join_type = false;
-	bool found_unsupported_order_by = false;
-	bool found_unsupported_operator = false;
 	vector<string> aggregate_columns;
 	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
 	vector<string> window_partition_columns; // PARTITION BY source columns from window functions
