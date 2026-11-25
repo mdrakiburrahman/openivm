@@ -320,6 +320,19 @@ WHERE stmt_kind = 'data';
 ----
 1
 
+# Spark can finalize derived columns inside each MERGE action, using its existing target lookup.
+query I
+SELECT count(*) FILTER (WHERE lower(sql) LIKE '%using refresh_cte d%'
+                         AND lower(sql) LIKE '%status = case when%'
+                         AND lower(sql) NOT LIKE '%from refresh_cte d left join%')
+FROM openivm_compile_with_facts(
+    'mv_compile_only_watches',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":false,"assume_insert_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
 query I
 SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":true%' THEN 1 ELSE 0 END
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f77617463686573_';

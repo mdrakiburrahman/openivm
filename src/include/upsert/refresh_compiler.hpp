@@ -47,6 +47,7 @@ struct AggregateGroupsOptions {
 	vector<string> group_column_names;
 	string catalog_prefix;
 	bool insert_only = false;
+	bool spark_merge_actions = false;
 	bool use_ducklake_rowid_upsert = false;
 	vector<string> aggregate_types;
 	vector<AggregateInput> aggregate_inputs;
