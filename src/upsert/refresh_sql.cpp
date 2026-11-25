@@ -1114,6 +1114,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		options.use_ducklake_rowid_upsert = target_is_ducklake && insert_only && !source_has_full_outer &&
 		                                    dispatch_refresh_type == RefreshType::AGGREGATE_GROUP &&
 		                                    active_facts.target_dialect == SqlDialect::DUCKDB;
+		options.multi_action_merge = direct_native_refresh;
 		options.aggregate_types = agg_types;
 		options.aggregate_inputs = derived_output_info.inputs;
 		options.derived_output_expressions = derived_output_expressions;
