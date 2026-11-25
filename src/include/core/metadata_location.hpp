@@ -55,7 +55,6 @@ struct MetadataLocation {
 	string Prefix() const;
 	string Table(const string &table_name) const;
 	string DisplayName() const;
-	bool Matches(const string &catalog_name, const string &schema_name) const;
 	bool Matches(const MetadataLocation &other) const;
 };
 
@@ -128,8 +127,6 @@ public:
 	bool Active() const {
 		return !token.empty();
 	}
-	// A renewal found the lease taken over or failed.
-	bool Lost() const;
 	// Lost, or the local deadline passed: the last successful renewal was sent more than
 	// two thirds of the lease ago, so another client may take over soon. A hung renewal
 	// never reports back; only this deadline detects it.

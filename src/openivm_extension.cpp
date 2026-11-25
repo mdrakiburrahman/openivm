@@ -267,17 +267,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	}
 
 	RegisterMaterializedViewGrammar(instance);
-	auto materialized_view_parser = duckdb::MaterializedViewParserExtension();
-
-	auto incremental_rewrite_rule = duckdb::IncrementalRewriteRule();
-	auto refresh_insert_rule = duckdb::RefreshInsertRule();
-
-	ParserExtension::Register(db_config, std::move(materialized_view_parser));
+	ParserExtension::Register(db_config, MaterializedViewParserExtension());
 	PlannerExtension mv_lifecycle;
 	mv_lifecycle.post_bind_function = BindMaterializedViewLifecycle;
 	PlannerExtension::Register(db_config, std::move(mv_lifecycle));
-	OptimizerExtension::Register(db_config, std::move(incremental_rewrite_rule));
-	OptimizerExtension::Register(db_config, std::move(refresh_insert_rule));
+	OptimizerExtension::Register(db_config, IncrementalRewriteRule());
+	OptimizerExtension::Register(db_config, RefreshInsertRule());
 
 	loader.RegisterFunction(SourceWatermarkFunction());
 	loader.RegisterFunction(SourceColumnsFunction());
@@ -304,12 +299,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                      openivm::OpenIvmCompileWithFactsExecute, openivm::OpenIvmCompileWithFactsBind,
 	                                      openivm::OpenIvmCompileWithFactsInit));
 
-	auto refresh_options =
+	loader.RegisterFunction(
 	    PragmaFunction::PragmaCall("refresh_options", TransactionalRefreshQuery,
-	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
-	loader.RegisterFunction(refresh_options);
-	auto refresh = PragmaFunction::PragmaCall("refresh", TransactionalRefreshQuery, {LogicalType::VARCHAR});
-	loader.RegisterFunction(refresh);
+	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall("refresh", TransactionalRefreshQuery, {LogicalType::VARCHAR}));
 	loader.RegisterFunction(PragmaFunction::PragmaCall("refresh_pipeline", RefreshPipelineQuery, {LogicalType::VARCHAR},
 	                                                   LogicalType::VARCHAR));
 	loader.RegisterFunction(openivm::DeclareRelyFKFunction());
@@ -323,15 +316,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    return "SELECT * FROM openivm_register_rely_fk(" + StringUtil::Join(arguments, ",") + ")";
 	    },
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
-	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", RefreshCostQuery, {LogicalType::VARCHAR});
-	loader.RegisterFunction(refresh_cost);
-	auto refresh_history =
-	    PragmaFunction::PragmaCall("refresh_history", RefreshCostHistoryQuery, {LogicalType::VARCHAR});
-	loader.RegisterFunction(refresh_history);
-	auto refresh_cross_system = PragmaFunction::PragmaCall(
-	    "refresh_cross_system", TransactionalRefreshQuery,
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
-	loader.RegisterFunction(refresh_cross_system);
+	loader.RegisterFunction(PragmaFunction::PragmaCall("refresh_cost", RefreshCostQuery, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(
+	    PragmaFunction::PragmaCall("refresh_history", RefreshCostHistoryQuery, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(
+	    PragmaFunction::PragmaCall("refresh_cross_system", TransactionalRefreshQuery,
+	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                LogicalType::VARCHAR, LogicalType::VARCHAR}));
 
 	loader.RegisterFunction(PragmaFunction::PragmaCall(
 	    "openivm_files",
@@ -373,7 +364,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR}));
 
 	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.
-	auto refresh_status = PragmaFunction::PragmaCall(
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
 	    "refresh_status",
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string view_name = StringValue::Get(parameters.values[0]);
@@ -393,8 +384,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		        !last_update_result->Collection().GetValue(0, 0).IsNull()) {
 			    last_refresh = "'" + last_update_result->Collection().GetValue(0, 0).ToString() + "'";
 			    if (interval > 0) {
-				    next_refresh = "'" + last_update_result->Collection().GetValue(0, 0).ToString() +
-				                   "'::TIMESTAMP + INTERVAL '" + to_string(interval) + " seconds'";
+				    next_refresh = last_refresh + "::TIMESTAMP + INTERVAL '" + to_string(interval) + " seconds'";
 			    }
 		    }
 
@@ -425,11 +415,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 		           " AS next_refresh, " + status + " AS status, " + effective_interval + " AS effective_interval, " +
 		           strategy_str + " AS refresh_strategy;";
 	    },
-	    {LogicalType::VARCHAR});
-	loader.RegisterFunction(refresh_status);
+	    {LogicalType::VARCHAR}));
 
 	// PRAGMA refresh_start_daemon — (re)start the daemon on the caller's DB instance.
-	auto refresh_start_daemon = PragmaFunction::PragmaCall(
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
 	    "refresh_start_daemon",
 	    [](ClientContext &context, const FunctionParameters &) -> string {
 		    if (!context.transaction.IsAutoCommit()) {
@@ -443,8 +432,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    global_daemon->Wake();
 		    return "SELECT true AS started;";
 	    },
-	    {});
-	loader.RegisterFunction(refresh_start_daemon);
+	    {}));
 
 	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).
 	if (!SqlUtils::GetBoolSetting(*con.context, "openivm_disable_daemon", false)) {
