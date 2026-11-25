@@ -120,23 +120,6 @@ inline bool ExtractJsonBool(const string &json, const string &key, bool &val) {
 	return false;
 }
 
-inline bool ExtractJsonInt(const string &json, const string &key, int &val) {
-	size_t start = FindValue(json, key);
-	if (start == string::npos) {
-		return false;
-	}
-	size_t pos = start + (json[start] == '-' || json[start] == '+' ? 1 : 0);
-	while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-		pos++;
-	}
-	try {
-		val = std::stoi(json.substr(start, pos - start));
-		return true;
-	} catch (...) {
-		return false;
-	}
-}
-
 inline bool ParseIndex(const string &text, idx_t &val) {
 	try {
 		val = static_cast<idx_t>(std::stoull(text));
