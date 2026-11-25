@@ -1360,6 +1360,8 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 	// path. Cross-system refresh delegates to a helper that acquires its own view
 	// lock; retaining that non-recursive view lock here would self-deadlock.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
+	// The returned program runs in the caller's transaction, outside RefreshViewAttempt's scope.
+	TransactionalMVLockState::Get(context).DisableRefreshOptimizers(context);
 	if (target.cross_system) {
 		// DuckDB cannot commit writes to the native metadata catalog and an
 		// attached external catalog in one transaction. Keep the staged path for
