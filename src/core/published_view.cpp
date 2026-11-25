@@ -114,11 +114,22 @@ string PublishedSourceViewName(string source_name) {
 	return source_name;
 }
 
+bool PublishedDeltaHasConsumers(Connection &con, const string &view_name, const string &prefix,
+                                const string &metadata_table, const vector<string> &delta_metadata_tables) {
+	auto delta_name = SqlUtils::DeltaName(PublishedViewName(view_name));
+	auto consumers = RefreshMetadata::BuildDeltaConsumersSQL(prefix + SqlUtils::QuoteIdentifier(delta_name), delta_name,
+	                                                         metadata_table, delta_metadata_tables);
+	auto probe = SqlUtils::QueryOrThrow(con, "SELECT EXISTS (" + consumers + ")",
+	                                    "Could not read consumers of published view '%s': %s", view_name);
+	return probe->Collection().GetValue(0, 0).GetValue<bool>();
+}
+
 string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, const vector<LogicalType> &column_types, bool ducklake,
                            const string &metadata_table, const vector<string> &scope_columns,
                            const string &timestamp_sql, SqlDialect dialect, const string &appended_rows,
-                           const string &scope_rows, const vector<string> &delta_metadata_tables) {
+                           const string &scope_rows, const vector<string> &delta_metadata_tables,
+                           bool consumers_absent) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -128,6 +139,10 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	auto consumers = RefreshMetadata::BuildDeltaConsumersSQL(delta, delta_name, metadata_table, delta_metadata_tables);
 	auto next = (dialect == SqlDialect::SPARK ? prefix : "") + quote("openivm_publish_next_" + view_name);
 	auto changes = (dialect == SqlDialect::SPARK ? prefix : "") + quote("openivm_publish_changes_" + view_name);
+	// Without consumers the guarded delta INSERT writes nothing and the cleanup deletes every
+	// row, which a plain DELETE does without either statement's work.
+	string clear_delta = consumers_absent && !ducklake ? "DELETE FROM " + delta + ";\n" : "";
+	bool write_delta = !ducklake && clear_delta.empty();
 	vector<string> quoted_columns;
 	for (auto &column : columns) {
 		quoted_columns.push_back(quote(column));
@@ -144,7 +159,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		}
 		auto rows = "SELECT " + StringUtil::Join(projection, ", ") + " FROM (" + appended_rows + ") appended_rows";
 		string sql = "INSERT INTO " + visible + " " + rows + ";\n";
-		if (!ducklake) {
+		if (write_delta) {
 			auto timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
 			sql += "INSERT INTO " + delta + " (" + column_list +
 			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
@@ -153,7 +168,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 			                                             delta_metadata_tables);
 		}
 		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
-		return sql;
+		return sql + clear_delta;
 	}
 	auto null_safe_match = [&](const vector<string> &match_columns) {
 		return StringUtil::Join(match_columns, match_columns.size(), " AND ", [&](const string &column) {
@@ -198,7 +213,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	       " FROM (SELECT *, CAST(-1 AS BIGINT) AS " + weight + " FROM (" + old_query +
 	       ") old_rows UNION ALL SELECT *, CAST(1 AS BIGINT) FROM " + next + ") signed_rows GROUP BY " + group_list +
 	       " HAVING SUM(" + weight + ") <> 0;\n";
-	if (!ducklake) {
+	if (write_delta) {
 		string timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
 		vector<string> delta_columns;
 		for (auto &column : quoted_columns) {
@@ -222,11 +237,11 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		       " d WHERE " + equality + ");\n";
 	}
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
-	if (!ducklake) {
+	if (write_delta) {
 		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, delta_metadata_tables);
 	}
 	OPENIVM_DEBUG_PRINT("[PUBLISH] Compiled visible-row publication for %s\n", view_name.c_str());
-	return sql;
+	return sql + clear_delta;
 }
 
 } // namespace duckdb

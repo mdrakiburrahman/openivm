@@ -598,6 +598,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                            attached_db_catalog_name, attached_db_schema_name);
 	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
 	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
+	// A direct native refresh executes this program at once, under the mutation gate and in one
+	// transaction, so publication consumers can be read now. Reusable programs keep the runtime check.
+	bool direct_native_refresh = !facts_in && owned_connection && !active_facts.compile_only && !cross_system &&
+	                             !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB;
 	string publication_sql;
 	vector<string> publication_columns;
 	vector<LogicalType> publication_types;
@@ -613,7 +617,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		throw NotImplementedException("Snapshot publication is only supported by "
 		                              "the native DuckLake executor");
 	}
+	bool publication_consumers_absent = false;
 	if (!snapshot_publication && !published_query.IsNull()) {
+		publication_consumers_absent =
+		    direct_native_refresh && !PublishedDeltaHasConsumers(con, view_name, publication_prefix,
+		                                                         delta_metadata_table, delta_metadata_tables);
 		auto record_column = [&](const ColumnDefinition &column) {
 			publication_columns.push_back(column.Name().GetIdentifierName());
 			publication_types.push_back(column.Type());
@@ -656,10 +664,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                     DialectQuoteIdent(internal_schema_name, SqlDialect::SPARK) + ".";
 			}
 		}
-		publication_sql =
-		    BuildPublishViewSQL(view_name, publication_prefix, publication_source_query, publication_columns,
-		                        publication_types, target_is_ducklake, delta_metadata_table, {}, "",
-		                        active_facts.target_dialect, "", "", delta_metadata_tables);
+		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
+		                                      publication_columns, publication_types, target_is_ducklake,
+		                                      delta_metadata_table, {}, "", active_facts.target_dialect, "", "",
+		                                      delta_metadata_tables, publication_consumers_absent);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -1931,10 +1939,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                                         signed_publication_filter);
 			OPENIVM_DEBUG_PRINT("[PUBLISH] Applying exact signed row changes for %s\n", view_name.c_str());
 		} else {
-			publication_sql = BuildPublishViewSQL(
-			    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
-			    target_is_ducklake, delta_metadata_table, scope_columns, "", active_facts.target_dialect,
-			    appended_projection_rows, retained_publication_scope.rows, delta_metadata_tables);
+			publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
+			                                      publication_columns, publication_types, target_is_ducklake,
+			                                      delta_metadata_table, scope_columns, "", active_facts.target_dialect,
+			                                      appended_projection_rows, retained_publication_scope.rows,
+			                                      delta_metadata_tables, publication_consumers_absent);
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}
