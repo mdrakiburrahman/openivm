@@ -36,6 +36,10 @@ DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, Clien
                                           unique_ptr<LogicalOperator> &leaf_node, LogicalOperator *&term_root,
                                           DeltaSourceCache &source_cache);
 
+// The pre-delta state of a single-table-index subtree as a signed relation: current rows with weight 1 UNION ALL the
+// subtree's delta with negated weight. The result reuses the subtree's table index; its multiplicity is last.
+DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<LogicalOperator> current_node,
+                                       DeltaPlanFragment delta, const LogicalType &mul_type);
 // For each leaf, the INNER-join equalities between one of its scan columns and another leaf's scan column. Leaves
 // wrapped above their scan are traced only when trace_wrapped_leaves is set.
 vector<vector<DeltaJoinKeyProbe>> BuildJoinKeyProbes(LogicalOperator *root, const vector<JoinLeafInfo> &leaves,

@@ -107,9 +107,8 @@ static void CopyTableFilters(const LogicalGet &source, LogicalGet &target) {
 	}
 }
 
-static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder,
-                                          unique_ptr<LogicalOperator> delta_node, TableIndex output_table_index,
-                                          ColumnBinding mul_binding) {
+DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
+                                   TableIndex output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
 	auto input_types = delta_node->types;
 	if (input_bindings.empty() || input_bindings.size() != input_types.size()) {

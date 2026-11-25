@@ -109,6 +109,12 @@ struct CreateMVPlanFacts {
 
 void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
                                string &suffix, string &ordering);
+// Append every input column of a TOP_N, or of the ORDER BY under a LIMIT, as an ascending tie-breaker. Returns
+// whether keys were added. A nested top-k is maintained by diffing its selection over current and pre-delta input,
+// which is only sound when both pick the same tuples among ties.
+bool TotalizeTopKOrder(LogicalOperator &selection);
+// Totalize every top-k below the output path; the output path's ORDER BY/LIMIT is published by the user view.
+void TotalizeNestedTopKOrders(LogicalOperator &plan);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 // Qualify an auxiliary-state source by the catalog and schema the view bound it to.

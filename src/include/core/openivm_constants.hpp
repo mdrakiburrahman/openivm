@@ -108,7 +108,10 @@ static constexpr idx_t MAX_JOIN_TABLES = 16;
 // column_lifetime is structural/data-independent and stays enabled.
 // Partial aggregate pushdown introduces opaque EXPORT_STATE aggregates below joins.
 // Rewrite the original aggregates first; native final-plan optimization can still push them down.
-constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation,partial_aggregate_pushdown";
+// Late materialization turns a top-k into a rowid self-SEMI-join that CREATE-time classification never
+// saw and that delta tables (which have no rowid) cannot answer.
+constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS =
+    "statistics_propagation,partial_aggregate_pushdown,late_materialization";
 
 // Disabled wherever the deeply-nested generated refresh SQL is planned/executed. deliminator
 // recurses through OpenIVM's chained CTE/subquery expansions (N-term telescoping over many tables)

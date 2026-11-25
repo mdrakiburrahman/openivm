@@ -484,6 +484,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Hidden sort outputs need the same aggregate state as visible outputs.
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 		StripPublicationModifiers(context, select_plan, output_names, top_k_suffix, top_k_order_suffix);
+		TotalizeNestedTopKOrders(*select_plan);
 		RewriteNonFiniteSumInputs(context, *select_planner.binder, select_plan);
 		// HAVING must reuse these state bindings without replacing their semantic aliases.
 		InjectDerivedAggregateInputs(select_plan);

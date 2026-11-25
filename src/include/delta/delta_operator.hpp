@@ -21,6 +21,7 @@ namespace duckdb {
 	X(DISTINCT_COUNT_AGGREGATE)                                                                                        \
 	X(WINDOW_PASSTHROUGH)                                                                                              \
 	X(TOPK_STRIP)                                                                                                      \
+	X(TOPK_DIFF)                                                                                                       \
 	X(CTE_MATERIALIZED)                                                                                                \
 	X(CTE_REF)                                                                                                         \
 	X(UNNEST_LINEAR)                                                                                                   \

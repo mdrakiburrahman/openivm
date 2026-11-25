@@ -1,0 +1,414 @@
+# name: test/sql/issue_192_topn_aggregate.test
+# description: Issue #192: aggregates, filters, joins and unions over ORDER BY ... LIMIT subqueries maintain the
+# group: [sql]
+
+#              nested top-k incrementally (current selection minus pre-delta selection)
+
+require openivm
+
+statement ok
+CREATE TABLE topn_t(id INT, y INT);
+
+statement ok
+INSERT INTO topn_t VALUES (1, 1), (2, 2), (3, 2), (4, 3), (5, 4), (6, 1), (6, 1), (7, NULL);
+
+statement ok
+CREATE TABLE topn_dim(y INT, label VARCHAR);
+
+statement ok
+INSERT INTO topn_dim VALUES (1, 'one'), (2, 'two'), (3, 'three'), (5, 'five');
+
+# Rows tied on k share v but differ in an unselected column, so every tie-break selects the same bag.
+statement ok
+CREATE TABLE topn_tie_t(k INT, v INT, pad VARCHAR);
+
+statement ok
+INSERT INTO topn_tie_t VALUES (1, 10, 'a'), (2, 20, 'b'), (2, 20, 'c'), (2, 20, 'd'), (3, 30, 'e'), (NULL, 40, 'f');
+
+# Rows tied on k differ in the selected v, so the base query alone is nondeterministic. The view breaks such ties
+# by the remaining input columns in ascending order, and is compared against that deterministic order.
+statement ok
+CREATE TABLE topn_payload_t(k INT, v INT);
+
+statement ok
+INSERT INTO topn_payload_t VALUES (1, 10), (2, 25), (2, 20), (2, 21), (3, 30);
+
+# The issue's repro: every refresh failed with a binder error on a *_materialized_for_join CTE.
+statement ok
+CREATE TABLE issue_t(id INT, y INT);
+
+statement ok
+INSERT INTO issue_t VALUES (1, 1), (2, 2), (3, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW issue_mv AS SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM issue_t ORDER BY id LIMIT 2) q;
+
+statement ok
+INSERT INTO issue_t VALUES (0, 5);
+
+statement ok
+PRAGMA refresh('issue_mv');
+
+query I
+SELECT c FROM issue_mv;
+----
+2
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM issue_mv EXCEPT ALL SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM issue_t ORDER BY id LIMIT 2) q)
+    UNION ALL
+    (SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM issue_t ORDER BY id LIMIT 2) q EXCEPT ALL SELECT * FROM issue_mv)
+);
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW topn_count AS SELECT COUNT(y) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE VIEW expected_topn_count AS SELECT COUNT(y) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_count_distinct AS SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE VIEW expected_topn_count_distinct AS SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_sum_distinct AS SELECT SUM(DISTINCT y) AS s FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE VIEW expected_topn_sum_distinct AS SELECT SUM(DISTINCT y) AS s FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_group AS SELECT y, COUNT(*) AS c, SUM(id) AS s FROM (SELECT y, id FROM topn_t ORDER BY id LIMIT 3) q GROUP BY y;
+
+statement ok
+CREATE VIEW expected_topn_group AS SELECT y, COUNT(*) AS c, SUM(id) AS s FROM (SELECT y, id FROM topn_t ORDER BY id LIMIT 3) q GROUP BY y;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_min AS SELECT y, MIN(id) AS m, COUNT(*) AS c FROM (SELECT y, id FROM topn_t ORDER BY id LIMIT 4) q GROUP BY y;
+
+statement ok
+CREATE VIEW expected_topn_min AS SELECT y, MIN(id) AS m, COUNT(*) AS c FROM (SELECT y, id FROM topn_t ORDER BY id LIMIT 4) q GROUP BY y;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_having AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 4) q GROUP BY y HAVING COUNT(*) > 1;
+
+statement ok
+CREATE VIEW expected_topn_having AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 4) q GROUP BY y HAVING COUNT(*) > 1;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_offset AS SELECT COUNT(*) AS c, SUM(y) AS s FROM (SELECT y FROM topn_t ORDER BY id DESC LIMIT 2 OFFSET 1) q;
+
+statement ok
+CREATE VIEW expected_topn_offset AS SELECT COUNT(*) AS c, SUM(y) AS s FROM (SELECT y FROM topn_t ORDER BY id DESC LIMIT 2 OFFSET 1) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_percent AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 40 PERCENT) q GROUP BY y;
+
+statement ok
+CREATE VIEW expected_topn_percent AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 40 PERCENT) q GROUP BY y;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_filter AS SELECT id, y FROM (SELECT id, y FROM topn_t ORDER BY id LIMIT 3) q WHERE y > 1;
+
+statement ok
+CREATE VIEW expected_topn_filter AS SELECT id, y FROM (SELECT id, y FROM topn_t ORDER BY id LIMIT 3) q WHERE y > 1;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_join AS SELECT d.label, COUNT(*) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q JOIN topn_dim d ON q.y = d.y GROUP BY d.label;
+
+statement ok
+CREATE VIEW expected_topn_join AS SELECT d.label, COUNT(*) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q JOIN topn_dim d ON q.y = d.y GROUP BY d.label;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_nested AS SELECT COUNT(*) AS c, SUM(y) AS s FROM (SELECT y FROM (SELECT id, y FROM topn_t ORDER BY id LIMIT 4) a ORDER BY y DESC LIMIT 2) b;
+
+statement ok
+CREATE VIEW expected_topn_nested AS SELECT COUNT(*) AS c, SUM(y) AS s FROM (SELECT y FROM (SELECT id, y FROM topn_t ORDER BY id LIMIT 4) a ORDER BY y DESC LIMIT 2) b;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_union AS SELECT y FROM (SELECT y FROM topn_t ORDER BY id LIMIT 2) a UNION ALL SELECT y FROM (SELECT y FROM topn_t ORDER BY id DESC LIMIT 2) b;
+
+statement ok
+CREATE VIEW expected_topn_union AS SELECT y FROM (SELECT y FROM topn_t ORDER BY id LIMIT 2) a UNION ALL SELECT y FROM (SELECT y FROM topn_t ORDER BY id DESC LIMIT 2) b;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_tie AS SELECT v, COUNT(*) AS c FROM (SELECT v FROM topn_tie_t ORDER BY k LIMIT 3) q GROUP BY v;
+
+statement ok
+CREATE VIEW expected_topn_tie AS SELECT v, COUNT(*) AS c FROM (SELECT v FROM topn_tie_t ORDER BY k LIMIT 3) q GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_tie_desc AS SELECT v, COUNT(*) AS c FROM (SELECT v FROM topn_tie_t ORDER BY k DESC NULLS FIRST LIMIT 3) q GROUP BY v;
+
+statement ok
+CREATE VIEW expected_topn_tie_desc AS SELECT v, COUNT(*) AS c FROM (SELECT v FROM topn_tie_t ORDER BY k DESC NULLS FIRST LIMIT 3) q GROUP BY v;
+
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_count_distinct_aux AS SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE VIEW expected_topn_count_distinct_aux AS SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_sum_distinct_aux AS SELECT SUM(DISTINCT y) AS s FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE VIEW expected_topn_sum_distinct_aux AS SELECT SUM(DISTINCT y) AS s FROM (SELECT y FROM topn_t ORDER BY id LIMIT 3) q;
+
+statement ok
+SET openivm_distinct_aux_state = false;
+
+statement ok
+CREATE MATERIALIZED VIEW topn_tie_payload AS SELECT v, COUNT(*) AS c FROM (SELECT v FROM topn_payload_t ORDER BY k LIMIT 2) q GROUP BY v;
+
+statement ok
+CREATE VIEW expected_topn_tie_payload AS SELECT v, COUNT(*) AS c FROM (SELECT v FROM topn_payload_t ORDER BY k, v LIMIT 2) q GROUP BY v;
+
+# Every shape stays incremental; none is demoted to FULL_REFRESH (3).
+query II
+SELECT view_sql_name, type FROM openivm_views WHERE view_sql_name LIKE 'topn_%' ORDER BY view_sql_name;
+----
+topn_count	1
+topn_count_distinct	1
+topn_count_distinct_aux	1
+topn_filter	2
+topn_group	0
+topn_having	4
+topn_join	0
+topn_min	0
+topn_nested	1
+topn_offset	1
+topn_percent	0
+topn_sum_distinct	1
+topn_sum_distinct_aux	1
+topn_tie	0
+topn_tie_desc	0
+topn_tie_payload	0
+topn_union	2
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE type = 3;
+----
+0
+
+foreach mv topn_count topn_count_distinct topn_sum_distinct topn_group topn_min topn_having topn_offset topn_percent topn_filter topn_join topn_nested topn_union topn_tie topn_tie_desc topn_count_distinct_aux topn_sum_distinct_aux topn_tie_payload
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 1: rows enter above the boundary (one is a duplicate of an existing tuple), the first row is deleted so a
+# row below is promoted, an ORDER BY key update moves a row out, a selected row's payload changes, and a
+# transient row is inserted and deleted in the same batch.
+statement ok
+INSERT INTO topn_t VALUES (0, 5), (-1, 3), (6, 1);
+
+statement ok
+DELETE FROM topn_t WHERE id = 1;
+
+statement ok
+UPDATE topn_t SET id = 10 WHERE id = 2;
+
+statement ok
+UPDATE topn_t SET y = 7 WHERE id = 3;
+
+statement ok
+INSERT INTO topn_t VALUES (-5, 9);
+
+statement ok
+DELETE FROM topn_t WHERE id = -5;
+
+statement ok
+INSERT INTO topn_dim VALUES (7, 'seven');
+
+statement ok
+UPDATE topn_dim SET label = 'THREE' WHERE y = 3;
+
+statement ok
+DELETE FROM topn_dim WHERE y = 1;
+
+statement ok
+UPDATE topn_tie_t SET pad = 'z' WHERE pad = 'b';
+
+statement ok
+INSERT INTO topn_tie_t VALUES (2, 20, 'g'), (NULL, 50, 'h');
+
+statement ok
+INSERT INTO topn_payload_t VALUES (2, 19), (2, 26);
+
+statement ok
+DELETE FROM topn_payload_t WHERE v = 20;
+
+statement ok
+DELETE FROM topn_tie_t WHERE k = 1;
+
+foreach mv topn_count topn_count_distinct topn_sum_distinct topn_group topn_min topn_having topn_offset topn_percent topn_filter topn_join topn_nested topn_union topn_tie topn_tie_desc topn_count_distinct_aux topn_sum_distinct_aux topn_tie_payload
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 2: ORDER BY key updates move rows from below the boundary to the top and back, a selected row is deleted,
+# NULL values enter, and the same rows are updated twice.
+statement ok
+UPDATE topn_t SET id = id - 20 WHERE id >= 5;
+
+statement ok
+DELETE FROM topn_t WHERE id = 0;
+
+statement ok
+INSERT INTO topn_t VALUES (-30, NULL), (100, 2), (-25, 2);
+
+statement ok
+UPDATE topn_t SET y = y + 1 WHERE id < -10;
+
+statement ok
+UPDATE topn_t SET id = id + 200 WHERE id = -30;
+
+statement ok
+INSERT INTO topn_dim VALUES (2, 'deux');
+
+statement ok
+UPDATE topn_tie_t SET k = 0 WHERE pad = 'e';
+
+statement ok
+DELETE FROM topn_tie_t WHERE pad IN ('c', 'g');
+
+statement ok
+UPDATE topn_payload_t SET v = 18 WHERE v = 26;
+
+statement ok
+UPDATE topn_payload_t SET k = 1 WHERE v = 21;
+
+foreach mv topn_count topn_count_distinct topn_sum_distinct topn_group topn_min topn_having topn_offset topn_percent topn_filter topn_join topn_nested topn_union topn_tie topn_tie_desc topn_count_distinct_aux topn_sum_distinct_aux topn_tie_payload
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 3: the source is emptied and refilled with duplicates in one batch.
+statement ok
+DELETE FROM topn_t;
+
+statement ok
+INSERT INTO topn_t VALUES (3, 2), (3, 2), (1, 4), (2, NULL), (9, 9);
+
+statement ok
+UPDATE topn_t SET id = 0 WHERE y = 9;
+
+statement ok
+DELETE FROM topn_tie_t WHERE k IS NULL;
+
+statement ok
+INSERT INTO topn_tie_t VALUES (1, 10, 'x'), (1, 10, 'y');
+
+statement ok
+DELETE FROM topn_payload_t WHERE k = 1;
+
+foreach mv topn_count topn_count_distinct topn_sum_distinct topn_group topn_min topn_having topn_offset topn_percent topn_filter topn_join topn_nested topn_union topn_tie topn_tie_desc topn_count_distinct_aux topn_sum_distinct_aux topn_tie_payload
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 4: the source is left empty.
+statement ok
+DELETE FROM topn_t;
+
+statement ok
+DELETE FROM topn_tie_t;
+
+statement ok
+DELETE FROM topn_payload_t;
+
+foreach mv topn_count topn_count_distinct topn_sum_distinct topn_group topn_min topn_having topn_offset topn_percent topn_filter topn_join topn_nested topn_union topn_tie topn_tie_desc topn_count_distinct_aux topn_sum_distinct_aux topn_tie_payload
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 5: rows return after the empty state.
+statement ok
+INSERT INTO topn_t VALUES (5, 5), (4, 4), (3, 3), (2, 2), (1, 1);
+
+statement ok
+DELETE FROM topn_t WHERE id = 1;
+
+statement ok
+UPDATE topn_t SET id = -id WHERE id = 5;
+
+statement ok
+INSERT INTO topn_tie_t VALUES (1, 10, 'a'), (1, 10, 'b'), (2, 20, 'c');
+
+statement ok
+INSERT INTO topn_payload_t VALUES (1, 11), (1, 10), (1, 12), (0, 5);
+
+foreach mv topn_count topn_count_distinct topn_sum_distinct topn_group topn_min topn_having topn_offset topn_percent topn_filter topn_join topn_nested topn_union topn_tie topn_tie_desc topn_count_distinct_aux topn_sum_distinct_aux topn_tie_payload
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
