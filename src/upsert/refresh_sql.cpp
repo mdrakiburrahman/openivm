@@ -1662,8 +1662,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
 		// deliminator: overflow guard on the deep generated SQL. Template set: keep the serialized
 		// delta plan data-independent (the rewrite rule fires within this Optimize()).
-		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "," +
-		                                                          FinalPlanDisabledOptimizers(con_ctx, cross_system));
+		auto disabled =
+		    string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "," + FinalPlanDisabledOptimizers(con_ctx, cross_system);
+		// Projection pullup merges join subtrees across projections. Keep those
+		// boundaries when Spark can reuse unchanged joins outside the delta union.
+		if (active_facts.target_dialect == SqlDialect::SPARK &&
+		    std::any_of(active_facts.delta_shape.begin(), active_facts.delta_shape.end(),
+		                [](const auto &source) { return StringUtil::CIEquals(source.second, "UNCHANGED"); })) {
+			disabled += ",projection_pullup";
+			OPENIVM_DEBUG_PRINT("[UPSERT] Preserving join boundaries for Spark refresh with unchanged sources\n");
+		}
+		ScopedDisabledOptimizers disabled_optimizers(con_ctx, disabled);
 		Optimizer optimizer(*planner.binder, con_ctx);
 		plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");

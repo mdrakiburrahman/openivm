@@ -723,3 +723,32 @@ SELECT count(*) FROM ((SELECT * FROM sph_minmax_mv
         EXCEPT ALL SELECT * FROM sph_minmax_mv));
 ----
 0
+
+# With two changing inputs, keep the unchanged dimension scan outside the union
+# of delta arms. DuckDB projection pullup otherwise puts that join in both arms.
+statement ok
+CREATE TABLE sph_changing_fact(id INT, d INT, e INT);
+
+statement ok
+CREATE TABLE sph_changing_dim(id INT, v INT);
+
+statement ok
+CREATE TABLE sph_steady_dim(id INT, v INT);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_shared_dim_mv AS
+SELECT f.id, d.v AS changing_value, e.v AS steady_value
+FROM sph_changing_fact f
+JOIN sph_changing_dim d ON f.d = d.id
+JOIN sph_steady_dim e ON f.e = e.id;
+
+query TI
+SELECT refresh_type_name,
+       len(regexp_extract_all(sql, '(?i)from\s+`[^`]+`\.`main`\.`sph_steady_dim`'))
+FROM openivm_compile_with_facts(
+    'sph_shared_dim_mv',
+    '{"target_dialect":"spark","compile_only":true,"delta_shape":{"sph_changing_fact":"GENERAL","sph_changing_dim":"GENERAL","sph_steady_dim":"UNCHANGED"}}'
+)
+WHERE stmt_kind = 'data' AND starts_with(sql, 'WITH') AND contains(sql, '`openivm_delta_sph_changing_fact`');
+----
+SIMPLE_PROJECTION	1
