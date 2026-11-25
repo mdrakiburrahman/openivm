@@ -5,6 +5,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "core/sql_utils.hpp"
+#include "core/vector_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -537,10 +538,7 @@ void TransactionalMVLockState::SetMutationOwner(const void *owner_token) {
 void TransactionalMVLockState::DeferDeltaCleanup(vector<string> statements) {
 	lock_guard<mutex> guard(state_lock);
 	for (auto &statement : statements) {
-		if (std::find(deferred_delta_cleanup.begin(), deferred_delta_cleanup.end(), statement) ==
-		    deferred_delta_cleanup.end()) {
-			deferred_delta_cleanup.push_back(std::move(statement));
-		}
+		AddUnique(deferred_delta_cleanup, std::move(statement));
 	}
 }
 
