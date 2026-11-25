@@ -1172,6 +1172,8 @@ public:
 		auto &executor = Executor::Get(client);
 		state.metrics = make_uniq<LifecycleMetricsScope>(client);
 		try {
+			// The program plans and runs generated SQL, including the population query.
+			ScopedDisabledOptimizers program_optimizers(client, openivm::REFRESH_DISABLED_OPTIMIZERS);
 			ParserOptions options = ParserOptions::Builtin();
 			options.extensions = nullptr;
 			Parser parser(options);
