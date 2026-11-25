@@ -2007,12 +2007,19 @@ string RefreshMetadata::BuildDeltaConsumersSQL(const string &target, const strin
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
                                              const string &delta_metadata_table, vector<string> *deferred_cleanup,
                                              const vector<string> &delta_metadata_tables, const string &source_catalog,
-                                             const string &source_schema, const string &data_catalog) {
+                                             const string &source_schema, const string &data_catalog,
+                                             bool join_consumers) {
 	string qtarget = target.find('.') == string::npos ? SqlUtils::QuoteIdentifier(target) : target;
 	auto consumers = BuildDeltaConsumersSQL(qtarget, metadata_key, delta_metadata_table, delta_metadata_tables,
 	                                        source_catalog, source_schema);
-	auto sql = "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
-	           " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
+	// Rows no consumer still needs: all of them without consumers, else those before the minimum watermark.
+	auto sql =
+	    join_consumers
+	        ? "DELETE FROM " + qtarget + " AS openivm_d USING (SELECT COUNT(*) AS n, MIN(last_update) AS m FROM (" +
+	              consumers + ") consumers) openivm_c WHERE openivm_c.n = 0 OR openivm_d." +
+	              string(openivm::TIMESTAMP_COL) + " < openivm_c.m;\n"
+	        : "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
+	              " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
 	auto parts = SqlUtils::ParseQualifiedIdentifier(qtarget);
 	if (deferred_cleanup && parts.size() == 3) {
 		auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;

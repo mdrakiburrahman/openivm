@@ -164,8 +164,9 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 			sql += "INSERT INTO " + delta + " (" + column_list +
 			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
 			       ") published_rows WHERE EXISTS (" + consumers + ");\n";
-			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr,
-			                                             delta_metadata_tables);
+			sql +=
+			    RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, delta_metadata_tables,
+			                                          "", "", "", dialect == SqlDialect::DUCKDB);
 		}
 		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
 		return sql + clear_delta;
@@ -238,7 +239,8 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	}
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
 	if (write_delta) {
-		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, delta_metadata_tables);
+		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, delta_metadata_tables,
+		                                             "", "", "", dialect == SqlDialect::DUCKDB);
 	}
 	OPENIVM_DEBUG_PRINT("[PUBLISH] Compiled visible-row publication for %s\n", view_name.c_str());
 	return sql + clear_delta;

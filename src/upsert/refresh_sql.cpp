@@ -1823,7 +1823,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 		}
 		delete_from_view_query = RefreshMetadata::BuildDeltaCleanupSQL(
-		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, delta_metadata_tables);
+		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, delta_metadata_tables, "", "", "",
+		    !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB);
 	} else {
 		delete_from_view_query = inline_mv_delta          ? ""
 		                         : use_transient_mv_delta ? "DROP TABLE IF EXISTS " + transient_delta_name + ";"
@@ -1872,7 +1873,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (!cross_system || split_native_metadata || deferred_cleanup) {
 			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
 			    resolved, dt, delta_metadata_table, deferred_cleanup, delta_metadata_tables, catalog_name, schema_name,
-			    cleanup_data_catalog);
+			    cleanup_data_catalog, active_facts.target_dialect == SqlDialect::DUCKDB);
 		}
 	}
 	if (!publication_query.empty()) {
