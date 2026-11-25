@@ -238,10 +238,6 @@ static string StabilizeTransactionalMetadata(const string &statement, const stri
 }
 
 struct DDLExecutorBindData : public TableFunctionData {
-	explicit DDLExecutorBindData(bool result) : result(result) {
-	}
-
-	bool result;
 	vector<string> ddl;
 };
 
@@ -428,8 +424,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
 	SqlUtils::CopySessionSetting(context, *conn->context, "TimeZone");
-	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
-	helper_lock_state.SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *conn->context);
 	MutationLockGuard mutation_guard(context);
 	StagedSourceDeltaCleanup source_delta_cleanup(context);
 	bool suspended_autocommit_transaction = false;
@@ -447,10 +442,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	string current_profile_step = "create_mv_unclassified";
 	string current_profile_detail;
 	vector<string> pending_ddl;
-	auto preserve_result = conn->Query("SET preserve_insertion_order=false");
-	if (preserve_result->HasError()) {
-		throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
-	}
+	// SQL SET uses this setting's GLOBAL_DEFAULT scope; keep the helper override private.
+	Settings::Set<PreserveInsertionOrderSetting>(*conn->context, SetScope::SESSION, Value::BOOLEAN(false));
 	auto depth_result = conn->Query("SET max_expression_depth=10000");
 	if (depth_result->HasError()) {
 		throw CatalogException("Failed to configure OpenIVM DDL connection: " + depth_result->GetError());
@@ -477,11 +470,14 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			}
 		}
 	};
-	auto fail_ddl = [&](const string &message) {
-		run_cleanup();
+	auto finish = [&]() {
 		profiler.AddTotal();
 		profiler.Flush();
 		restore_outer_transaction();
+	};
+	auto fail_ddl = [&](const string &message) {
+		run_cleanup();
+		finish();
 		throw CatalogException("Failed to execute IVM DDL: " + message);
 	};
 	auto require_lifecycle = [&]() {
@@ -684,9 +680,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			if (!conn->context->transaction.IsAutoCommit()) {
 				conn->Rollback();
 			}
-			profiler.AddTotal();
-			profiler.Flush();
-			restore_outer_transaction();
+			finish();
 			throw CatalogException("CREATE OR REPLACE MATERIALIZED VIEW committed, but OpenIVM could not archive "
 			                       "its compiled SQL: " +
 			                       error);
@@ -694,14 +688,12 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		pending_ddl.push_back(q);
 	}
 	flush_pending();
-	profiler.AddTotal();
-	profiler.Flush();
-	restore_outer_transaction();
+	finish();
 }
 
 unique_ptr<FunctionData> DDLExecutorBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
-	auto bind_data = make_uniq<DDLExecutorBindData>(true);
+	auto bind_data = make_uniq<DDLExecutorBindData>();
 	for (auto &param : input.inputs) {
 		auto q = param.GetValue<string>();
 		if (!q.empty()) {
@@ -720,7 +712,7 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 		return;
 	}
 	ExecuteDDL(context, bind_data.ddl);
-	output.data[0].SetValue(0, Value::BOOLEAN(bind_data.result));
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
 	output.SetCardinalityUnsafe(1);
 	gdata.offset++;
 }
@@ -817,8 +809,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	// Replayed ALTER statements enter the maintenance optimizer. Every replay
 	// helper, including ownership-inventory readers, belongs to the caller that
 	// already holds the mutation gate, rather than a competing transaction.
-	TransactionalMVLockState::Get(*connection.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(owner).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(owner, *connection.context);
 	// Seed from the durable tables in the connection's metadata schema.
 	auto metadata_location = RefreshMetadata::CurrentLocation(connection);
 	vector<string> local_statements;
@@ -853,11 +844,8 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		if (!IsMetadataSchemaStatement(statement)) {
 			continue;
 		}
-		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
-		if (result->HasError()) {
-			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata schema: %s",
-			                       result->GetError());
-		}
+		SqlUtils::QueryOrThrow(connection, MakeTemporaryMetadataDDL(statement),
+		                       "Could not reconstruct transaction-local OpenIVM metadata schema: %s");
 	}
 	auto seed_table = [&](const string &table, const string &filter) {
 		bool has_constrained_schema = false;
@@ -882,10 +870,8 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		}
 	};
 	auto replay_statement = [&](const string &statement) {
-		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
-		if (result->HasError()) {
-			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata: %s", result->GetError());
-		}
+		SqlUtils::QueryOrThrow(connection, MakeTemporaryMetadataDDL(statement),
+		                       "Could not reconstruct transaction-local OpenIVM metadata: %s");
 	};
 
 	// Cascade dependencies are recorded both explicitly for view matching and
@@ -1227,19 +1213,11 @@ public:
 			for (auto &statement : parser.statements) {
 				// Internal DROP already has a compiled ownership/cleanup program.
 				// Bind only its physical executor, without recursively compiling cleanup.
-				if (statement->type == StatementType::DROP_STATEMENT) {
-					auto &drop = statement->Cast<DropStatement>();
-					if (drop.info->type == CatalogType::TABLE_ENTRY || drop.info->type == CatalogType::VIEW_ENTRY) {
-						Parser drop_parser(options);
-						drop_parser.ParseQuery(drop.info->type == CatalogType::TABLE_ENTRY
-						                           ? BuildDropTableStatement(*drop.info)
-						                           : BuildDropViewStatement(*drop.info));
-						statement = std::move(drop_parser.statements[0]);
-					} else if (drop.info->type == CatalogType::SCHEMA_ENTRY) {
-						Parser drop_parser(options);
-						drop_parser.ParseQuery(BuildDropSchemaStatement(*drop.info));
-						statement = std::move(drop_parser.statements[0]);
-					}
+				if (statement->type == StatementType::DROP_STATEMENT &&
+				    HasDropExecutor(statement->Cast<DropStatement>().info->type)) {
+					Parser drop_parser(options);
+					drop_parser.ParseQuery(BuildDropStatement(*statement->Cast<DropStatement>().info));
+					statement = std::move(drop_parser.statements[0]);
 				}
 				// Binding is deliberately here, after all prior physical steps finish.
 				// CREATE SCHEMA/TABLE, replacement and DROP dependencies are now visible
@@ -1381,25 +1359,28 @@ unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder 
 	return make_uniq<LogicalLifecycleProgram>(bind_index, program, staged);
 }
 
-static string BuildDropEntryStatement(const DropInfo &drop_info, const string &function) {
-	return "SELECT * FROM " + function + "('" +
+static const char *DropExecutorName(CatalogType type) {
+	switch (type) {
+	case CatalogType::TABLE_ENTRY:
+		return "openivm_execute_drop_table";
+	case CatalogType::SCHEMA_ENTRY:
+		return "openivm_execute_drop_schema";
+	default:
+		return "openivm_execute_drop_view";
+	}
+}
+
+bool HasDropExecutor(CatalogType type) {
+	return type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY || type == CatalogType::SCHEMA_ENTRY;
+}
+
+string BuildDropStatement(const DropInfo &drop_info) {
+	return "SELECT * FROM " + string(DropExecutorName(drop_info.type)) + "('" +
 	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Catalog().GetIdentifierName()) + "', '" +
 	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Schema().GetIdentifierName()) + "', '" +
 	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Name().GetIdentifierName()) + "', " +
 	       (drop_info.cascade ? "true" : "false") + ", " +
 	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
-}
-
-string BuildDropViewStatement(const DropInfo &drop_info) {
-	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_view");
-}
-
-string BuildDropTableStatement(const DropInfo &drop_info) {
-	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_table");
-}
-
-string BuildDropSchemaStatement(const DropInfo &drop_info) {
-	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_schema");
 }
 
 struct DropViewBindData : public TableFunctionData {
@@ -1569,14 +1550,8 @@ vector<string> RenderTransactionalStatement(const string &input, const string &m
 		parser.ParseQuery(statement);
 		if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::DROP_STATEMENT) {
 			auto &drop = parser.statements[0]->Cast<DropStatement>();
-			if (drop.info->type == CatalogType::VIEW_ENTRY) {
-				return {BuildDropViewStatement(*drop.info)};
-			}
-			if (drop.info->type == CatalogType::TABLE_ENTRY) {
-				return {BuildDropTableStatement(*drop.info)};
-			}
-			if (drop.info->type == CatalogType::SCHEMA_ENTRY) {
-				return {BuildDropSchemaStatement(*drop.info)};
+			if (HasDropExecutor(drop.info->type)) {
+				return {BuildDropStatement(*drop.info)};
 			}
 		}
 	} catch (std::exception &) {
@@ -1634,12 +1609,11 @@ static unique_ptr<FunctionData> DeserializeDropEntry(Deserializer &deserializer,
 }
 
 TableFunction DropEntryFunction(CatalogType type) {
-	D_ASSERT(type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY || type == CatalogType::SCHEMA_ENTRY);
+	D_ASSERT(HasDropExecutor(type));
 	const bool is_table = type == CatalogType::TABLE_ENTRY;
 	const bool is_schema = type == CatalogType::SCHEMA_ENTRY;
 	TableFunction function(
-	    is_schema ? "openivm_execute_drop_schema"
-	              : (is_table ? "openivm_execute_drop_table" : "openivm_execute_drop_view"),
+	    DropExecutorName(type),
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	    ExecuteDropView, is_schema ? BindDropSchema : (is_table ? BindDropTable : BindDropView), InitDropView);
 	function.serialize = SerializeDropEntry;
@@ -1657,9 +1631,9 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 		}
 		sql += statement;
 		if (statement.back() != ';') {
-			sql += ";";
+			sql += ';';
 		}
-		sql += "\n";
+		sql += '\n';
 		if (logical_statement) {
 			logical_statement_count++;
 		}

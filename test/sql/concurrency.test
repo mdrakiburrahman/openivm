@@ -785,3 +785,72 @@ statement error
 CREATE MATERIALIZED VIEW dup_mv AS SELECT k, SUM(v) AS total FROM dup_src GROUP BY k;
 ----
 <REGEX>:.*materialized view "dup_mv" already exists.*
+
+# ==========================================
+# Cached ownership lookups under consumer churn
+# ==========================================
+# Writers batch conflicting DML on their own rows of a source while another
+# thread repeatedly creates and drops a second consumer of it. Every create and
+# drop invalidates cached ownership; the long-lived view must stay exact.
+# Autocommit writers may still be asked to retry a racing statement.
+
+statement ok
+CREATE TABLE churn_src (id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO churn_src SELECT i, i % 7, i FROM range(1000) r(i);
+
+statement ok
+CREATE MATERIALIZED VIEW churn_keep AS SELECT k, SUM(v) AS sv, COUNT(*) AS c FROM churn_src GROUP BY k;
+
+concurrentloop threadid 0 4
+
+loop round 0 8
+
+onlyif threadid=0
+statement ok
+CREATE MATERIALIZED VIEW churn_extra AS SELECT id, v FROM churn_src WHERE k = 3;
+
+onlyif threadid=0
+statement ok
+DROP MATERIALIZED VIEW churn_extra;
+
+onlyif threadid>=1
+statement maybe
+INSERT INTO churn_src SELECT 100000 * ${threadid} + 100 * ${round} + i, i % 7, i FROM range(20) r(i);
+----
+retry
+
+onlyif threadid>=1
+statement maybe
+UPDATE churn_src SET v = v + 1, k = (k + 1) % 7 WHERE id >= 100000 * ${threadid} AND id < 100000 * (${threadid} + 1) AND id % 3 = 0;
+----
+retry
+
+onlyif threadid>=1
+statement maybe
+DELETE FROM churn_src WHERE id >= 100000 * ${threadid} AND id < 100000 * (${threadid} + 1) AND id % 5 = ${round} % 5;
+----
+retry
+
+endloop
+
+endloop
+
+statement ok
+PRAGMA refresh('churn_keep');
+
+query I
+SELECT count(*) FROM (SELECT * FROM churn_keep EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM churn_src GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM churn_src GROUP BY k EXCEPT ALL SELECT * FROM churn_keep);
+----
+0
+
+query I
+SELECT count(*) > 1000 FROM churn_src;
+----
+true

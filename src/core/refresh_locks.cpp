@@ -1,4 +1,5 @@
 #include "core/refresh_locks.hpp"
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "rules/transactional_delta_capture.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -17,10 +18,14 @@
 
 namespace duckdb {
 
-void MutationGate::Lock(const void *owner) {
+void MutationGate::Lock(const void *owner, bool capture) {
 	std::unique_lock<mutex> guard(lock);
 	if (active_owner == owner) {
 		depth++;
+		if (!capture) {
+			capture_only_hold = false;
+			ownership_epoch++;
+		}
 		return;
 	}
 	// A lifecycle owner may be waiting for this transaction's untracked writes.
@@ -34,6 +39,10 @@ void MutationGate::Lock(const void *owner) {
 	waiting_owners--;
 	active_owner = owner;
 	depth = 1;
+	capture_only_hold = capture;
+	if (!capture) {
+		ownership_epoch++;
+	}
 }
 
 void MutationGate::Unlock(const void *owner) {
@@ -50,6 +59,10 @@ void MutationGate::Unlock(const void *owner) {
 	}
 	depth--;
 	if (depth == 0) {
+		if (!capture_only_hold) {
+			// The holder's transaction has ended: later lookups see its changes.
+			ownership_epoch++;
+		}
 		active_owner = nullptr;
 		// Global and source waiters share this condition variable.
 		condition.notify_all();
@@ -63,7 +76,68 @@ bool MutationGate::TryLock(const void *owner) {
 	}
 	active_owner = owner;
 	depth++;
+	capture_only_hold = false;
+	ownership_epoch++;
 	return true;
+}
+
+optional_idx MutationGate::ObserveOwnershipEpoch() {
+	std::lock_guard<mutex> guard(lock);
+	if (ownership_writers || (active_owner && !capture_only_hold)) {
+		return optional_idx();
+	}
+	return ownership_epoch;
+}
+
+bool MutationGate::OwnershipEpochIs(idx_t epoch) {
+	std::lock_guard<mutex> guard(lock);
+	return ownership_epoch == epoch;
+}
+
+void MutationGate::MarkOwnershipChange(const void *owner) {
+	std::lock_guard<mutex> guard(lock);
+	D_ASSERT(active_owner == owner);
+	capture_only_hold = false;
+	ownership_epoch++;
+}
+
+void MutationGate::BeginOwnershipWrite() {
+	std::lock_guard<mutex> guard(lock);
+	ownership_writers++;
+	ownership_epoch++;
+}
+
+void MutationGate::EndOwnershipWrite() {
+	std::lock_guard<mutex> guard(lock);
+	D_ASSERT(ownership_writers > 0);
+	ownership_writers--;
+	ownership_epoch++;
+}
+
+bool MutationGate::FindCachedSourceDelta(const string &key, idx_t epoch, CachedSourceDelta &result) {
+	std::lock_guard<mutex> guard(lock);
+	if (ownership_epoch != epoch || cached_epoch != epoch) {
+		return false;
+	}
+	auto entry = source_deltas.find(key);
+	if (entry == source_deltas.end()) {
+		return false;
+	}
+	result = entry->second;
+	return true;
+}
+
+void MutationGate::CacheSourceDelta(const string &key, idx_t epoch, CachedSourceDelta entry) {
+	static constexpr idx_t MAX_CACHED_SOURCE_DELTAS = 4096;
+	std::lock_guard<mutex> guard(lock);
+	if (ownership_epoch != epoch) {
+		return;
+	}
+	if (cached_epoch != epoch || source_deltas.size() >= MAX_CACHED_SOURCE_DELTAS) {
+		source_deltas.clear();
+		cached_epoch = epoch;
+	}
+	source_deltas[key] = std::move(entry);
 }
 
 void MutationGate::LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication) {
@@ -212,20 +286,104 @@ const void *TransactionalMVLockState::GetMutationOwner() {
 	return mutation_owner;
 }
 
-TransactionalMVLockState::TransactionalMVLockState(ClientContext &context) : owner(context), mutation_owner(&context) {
+TransactionalMVLockState::TransactionalMVLockState(ClientContext &context)
+    : gate(RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(context))), owner(context),
+      mutation_owner(&context) {
+}
+
+TransactionalMVLockState::~TransactionalMVLockState() {
+	// A context destroyed without a transaction callback must not disable caching forever.
+	if (ownership_writer) {
+		gate->EndOwnershipWrite();
+	}
+}
+
+void TransactionalMVLockState::TransactionBegin(MetaTransaction &transaction, ClientContext &context) {
+	// Source snapshots start lazily, after this observation.
+	auto epoch = gate->ObserveOwnershipEpoch();
+	lock_guard<mutex> guard(state_lock);
+	begin_ownership_epoch = epoch;
 }
 
 TransactionalMVLockState &TransactionalMVLockState::Get(ClientContext &context) {
 	return *context.registered_state->GetOrCreate<TransactionalMVLockState>("openivm_transactional_mv_locks", context);
 }
 
-void TransactionalMVLockState::AcquireMutationLock() {
+void TransactionalMVLockState::AcquireMutationLock(bool capture) {
 	// Parallel delta-capture workers share this state. Losing a guard here leaks its gate depth.
 	lock_guard<mutex> guard(state_lock);
 	if (!mutation_guard) {
-		mutation_guard = make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner);
-		OPENIVM_DEBUG_PRINT("[LOCK] acquired database mutation lock owner=%p\n", static_cast<void *>(&owner));
+		mutation_guard = make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner, capture);
+		OPENIVM_DEBUG_PRINT("[LOCK] acquired database mutation lock owner=%p capture=%d\n", static_cast<void *>(&owner),
+		                    capture ? 1 : 0);
+	} else if (!capture) {
+		// Lifecycle work after tracked DML in the same transaction.
+		gate->MarkOwnershipChange(mutation_owner);
 	}
+}
+
+void TransactionalMVLockState::MarkOwnershipMetadataWrite() {
+	lock_guard<mutex> guard(state_lock);
+	if (!ownership_writer) {
+		ownership_writer = true;
+		gate->BeginOwnershipWrite();
+		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Registry write disables cached lookups until transaction end\n");
+	}
+}
+
+bool TransactionalMVLockState::IsOwnershipRegistry(const string &table_name) {
+	return StringUtil::CIEquals(table_name, openivm::SOURCE_DELTA_MAP_TABLE) ||
+	       StringUtil::CIEquals(table_name, openivm::DELTA_TABLES_TABLE);
+}
+
+string TransactionalMVLockState::SourceDeltaCacheKey(const string &catalog, const string &schema, const string &table) {
+	auto &source_catalog = Catalog::GetCatalog(owner, Identifier(catalog));
+	if (!source_catalog.IsDuckCatalog()) {
+		return string();
+	}
+	// The catalog version pins the caller's structural snapshot, including its own DDL.
+	auto version = source_catalog.GetCatalogVersion(owner);
+	if (!version.IsValid()) {
+		return string();
+	}
+	return to_string(source_catalog.GetOid()) + ":" + to_string(version.GetIndex()) + ":" +
+	       StringUtil::Lower(SqlUtils::FullName(catalog, schema, table));
+}
+
+bool TransactionalMVLockState::FindCachedSourceDelta(const string &catalog, const string &key, optional_idx epoch,
+                                                     optional_ptr<TableCatalogEntry> &delta) {
+	MutationGate::CachedSourceDelta entry;
+	if (key.empty() || !epoch.IsValid() || !gate->FindCachedSourceDelta(key, epoch.GetIndex(), entry)) {
+		return false;
+	}
+	delta = nullptr;
+	if (entry.tracked) {
+		// Resolve in the caller's transaction; a different incarnation is a miss.
+		delta = Catalog::GetEntry<TableCatalogEntry>(
+		    owner, QualifiedName(Identifier(catalog), Identifier(entry.schema), Identifier(entry.name)),
+		    OnEntryNotFound::RETURN_NULL);
+		if (!delta || delta->oid != entry.oid) {
+			return false;
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Cached lookup %s -> %s\n", key.c_str(),
+	                    entry.tracked ? entry.name.c_str() : "untracked");
+	return true;
+}
+
+void TransactionalMVLockState::CacheSourceDelta(const string &key, optional_idx epoch,
+                                                optional_ptr<TableCatalogEntry> delta) {
+	if (key.empty() || !epoch.IsValid()) {
+		return;
+	}
+	MutationGate::CachedSourceDelta entry;
+	if (delta) {
+		entry.tracked = true;
+		entry.schema = delta->schema.name.GetIdentifierName();
+		entry.name = delta->name.GetIdentifierName();
+		entry.oid = delta->oid;
+	}
+	gate->CacheSourceDelta(key, epoch.GetIndex(), std::move(entry));
 }
 
 unique_ptr<SourceAdmissionGuard> TransactionalMVLockState::AcquireSourceWriteAdmission(const string &catalog,
@@ -254,9 +412,23 @@ TransactionalMVLockState::FindSourceDeltaForWrite(const string &catalog, const s
 	// Reserve only this source while deciding whether capture is needed. First
 	// publication excludes untracked writers, without serializing independent DML.
 	auto admission = AcquireSourceWriteAdmission(catalog, schema, table);
-	// Waiting does not advance the caller's metadata snapshot. Resolve committed
-	// ownership as well as its own writes, without adopting tables by name.
-	auto delta_table = RefreshMetadata::FindSourceDeltaForMutation(owner, catalog, schema, table);
+	optional_idx begin_epoch;
+	{
+		lock_guard<mutex> guard(state_lock);
+		begin_epoch = begin_ownership_epoch;
+	}
+	// No ownership change started since this transaction began: its snapshot
+	// and the committed state agree, as for any transaction at this epoch.
+	auto key = SourceDeltaCacheKey(catalog, schema, table);
+	optional_ptr<TableCatalogEntry> delta_table;
+	bool cached = FindCachedSourceDelta(catalog, key, begin_epoch, delta_table);
+	auto lookup_epoch = cached ? begin_epoch : gate->ObserveOwnershipEpoch();
+	if (!cached) {
+		// Waiting does not advance the caller's metadata snapshot. Resolve committed
+		// ownership as well as its own writes, without adopting tables by name.
+		delta_table = RefreshMetadata::FindSourceDeltaForMutation(owner, catalog, schema, table);
+		CacheSourceDelta(key, begin_epoch, delta_table);
+	}
 	if (!delta_table) {
 		RetainSourceWriteAdmission(std::move(admission));
 		return nullptr;
@@ -265,11 +437,20 @@ TransactionalMVLockState::FindSourceDeltaForWrite(const string &catalog, const s
 	// this temporary admission before waiting on that gate, then recheck because
 	// ownership may have changed in the gap. Prior untracked writes stay reserved.
 	admission.reset();
-	AcquireMutationLock();
+	AcquireMutationLock(true);
 	// Keep committed writes known even if the final consumer drops its delta
 	// before a transaction with an older source snapshot attempts a new CREATE.
 	RetainSourceWriteAdmission(AcquireSourceWriteAdmission(catalog, schema, table));
-	return RefreshMetadata::FindSourceDeltaForMutation(owner, catalog, schema, table);
+	if (lookup_epoch.IsValid() && gate->OwnershipEpochIs(lookup_epoch.GetIndex())) {
+		// No ownership change started or ended in the gap: the recheck would read
+		// the same committed state.
+		return delta_table;
+	}
+	OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Ownership changed while admitting %s.%s.%s; rechecking\n", catalog.c_str(),
+	                    schema.c_str(), table.c_str());
+	delta_table = RefreshMetadata::FindSourceDeltaForMutation(owner, catalog, schema, table);
+	CacheSourceDelta(key, begin_epoch, delta_table);
+	return delta_table;
 }
 
 void TransactionalMVLockState::MarkSourceWriteExecuted(const string &catalog, const string &schema, const string &table,
@@ -503,6 +684,10 @@ void TransactionalMVLockState::Release() {
 	source_write_admissions.clear();
 	source_publication_locks.clear();
 	mutation_guard.reset();
+	if (ownership_writer) {
+		ownership_writer = false;
+		gate->EndOwnershipWrite();
+	}
 }
 
 } // namespace duckdb

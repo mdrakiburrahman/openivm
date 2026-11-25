@@ -93,6 +93,91 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 | Any visible MV column with a non-summable type (VARCHAR literal, UPPER(group_col), CASE over aggregate, BOOLEAN predicate on aggregate, LIST) | Yes (via group-recompute) | The delta `SUM(openivm_multiplicity * col)` formula can't type-check for these columns; detected in `CompileAggregateGroups` via the delta-view column types and routed to group-recompute. Unified path with `LIST` and `MIN`/`MAX` above. |
 | `HAVING` | Partial | Group-recompute for affected groups; `openivm_having_merge=true` (default) uses the MERGE path when the stored data table holds all groups. |
 
+## Floating-point SUM state
+
+Computed expressions over a `DOUBLE` SUM (for example, `SUM(v) + 1`) retain two
+finite subtotals, plus support counts for NaN and each infinity. The same state
+protects floating SUM outputs and AVG helpers in a view with a computed SUM or
+COUNT. Values with magnitude at least `2^960` are accumulated after division by
+`2^64`; smaller values remain unscaled, preserving subnormal inputs. Each subtotal leaves room
+for up to `BIGINT_MAX` input rows without overflowing. The visible result is
+reconstructed from the subtotals after delta integration, so deleting values can
+recover a finite result even after the visible SUM has overflowed.
+
+Compared with a single finite subtotal, this adds one `DOUBLE` subtotal and its
+`BIGINT` non-NULL count per protected SUM, without per-value state or a scan of
+unchanged source rows. Floating-point reassociation can differ from a
+native DuckDB SUM, including when overflow happens before cancellation. For
+example, DuckDB may return infinity for `1e308 + 1e308 - 1e308`, while the maintained
+two-subtotal result is finite (`1e308`). Exact agreement with native floating-point
+SUM evaluation order is not guaranteed. This also applies to AVG when its SUM
+helper uses this state. Integer and DECIMAL SUMs do not use this decomposition.
+
+## Signed zero and NaN
+
+The sign and payload of NaN are unspecified. `+NaN` and `-NaN` are both NaN and
+compare equal in DuckDB, but `signbit()` and casts to VARCHAR can expose a
+different sign (`nan` versus `-nan`). OpenIVM does not retain extra delta state
+to preserve that representation. This applies to SUM/AVG results, floating group
+keys, DISTINCT representatives, and nested floating candidate values. Numerical
+NaN propagation and recovery to finite or NULL results remain maintained.
+
+Signed zero can affect numerical results: `1 / -0.0` and `1 / +0.0` produce
+opposite infinities. Floating GROUP BY keys retain a negative-zero support count. Refresh
+keeps the stored zero's sign while that sign still occurs in the group, and
+switches it when its last supporting row disappears. Only groups that change
+representation replace their stored row, including native tables without an
+index; ordinary group updates keep the in-place path. The support state adds
+one `BIGINT` count per published floating group key, without rescanning source
+rows. DuckDB serializes MERGE actions when both row replacement and insertion
+can append to the target. When both zero signs coexist, the representative can
+differ from DuckDB's input-order-dependent choice; exact agreement with that
+choice is not guaranteed.
+
+DISTINCT aux tuples use the same zero-sign policy for floating columns. A
+sign-only replacement emits a retraction and an insertion even when its total
+multiplicity stays unchanged. A tuple with one scalar floating column uses a
+`BIGINT` sign counter. Initial load and full refresh read the aggregate input
+from that counter state, so parallel DISTINCT execution cannot seed inconsistent
+representatives. Multiple floating columns retain joint candidate identities
+and a supported representative so their signs cannot form a nonexistent tuple.
+Ordinary refresh processes only delta-touched equivalence classes. Limited
+selections compare candidate identities, canonicalizing NaNs while preserving
+signed zero.
+Delta compaction retains a Boolean zero-sign key for each floating input column.
+Publication uses the same witness for floating output columns when consolidating
+old and new visible rows, so sign-only changes also reach dependent views.
+Projection refreshes use the witness for tuple consolidation and copy deletion
+to preserve the signs of duplicate zero rows.
+
+DISTINCT aux state retains supported representatives for collated strings,
+INTERVAL, VARIANT, and nested floating values when SQL equality can hide a
+different projected value (for example, `ascii('A')` versus `ascii('a')` under
+`NOCASE`). Removing the selected value switches to a surviving representative
+and updates the aggregate. When multiple representations coexist, the selected
+representation can differ from DuckDB's input-order-dependent choice. Only
+delta-touched equivalence classes participate in ordinary incremental refresh.
+Initial load and full refresh read the same selected representatives as the aux
+state. Existing aux-state MVs must be recreated with `CREATE OR REPLACE
+MATERIALIZED VIEW` to populate the identity and representative metadata.
+
+Complex or limited DISTINCT inputs additionally persist the exact selected
+aggregate-input bag in `<candidate_count_table>_selected`. Initial load and full
+refresh derive the aggregate from that snapshot. Incremental refresh applies the
+signed difference
+between the persisted and new selections, then saves the new snapshot in the same
+native transaction. For non-unary inputs, the selection query includes the joins
+or `UNION ALL` and is evaluated over the maintained candidate bag during refresh.
+This adds storage proportional to the selected input bag and a snapshot write per
+refresh; it does not rescan the source table.
+DROP and replacement clean up or replace this state alongside candidate counts.
+
+Limited FLOAT/DOUBLE DISTINCT exports use portable SQL witnesses for signed
+zero. Exports that require DuckDB's opaque value serialization (INTERVAL,
+VARIANT, or nested floating inputs), and the ordinary representative-state path,
+currently require native DuckDB execution and report an unsupported error for
+other dialects.
+
 ## Other limitations
 
 - **CREATE MATERIALIZED VIEW IF NOT EXISTS** is not supported. `DROP MATERIALIZED VIEW

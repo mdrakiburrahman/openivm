@@ -22,10 +22,19 @@ struct OutputSpine {
 	vector<LogicalProjection *> projections; // root first
 	LogicalOperator *parent = nullptr;       // operator directly above `bottom`, nullptr when `bottom` is the root
 	LogicalOperator *bottom = nullptr;
+	unordered_map<TableIndex, const LogicalProjection *> ProjectionMap() const;
 };
 OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(const LogicalOperator &)> &pass_through);
+// Follow ORDER BY/LIMIT/TOP_N and materialized CTE consumers above aggregate state.
+OutputSpine FindAggregateOutputSpine(LogicalOperator *root);
+// Also follow CREATE TABLE and HAVING filters from the stored view output.
+OutputSpine ViewOutputSpine(LogicalOperator *root);
 /// The aggregate at the bottom of the spine, directly or below a HAVING filter.
 LogicalAggregate *SpineAggregate(const OutputSpine &spine);
+/// Visit each aggregate binding reached from the spine's output projection; `computed` is set below any expression
+/// that is not a column pass-through.
+void VisitSpineAggregateInputs(const OutputSpine &spine, TableIndex aggregate_index,
+                               const std::function<void(ColumnBinding, bool)> &visit);
 
 /// Keep the first usable projection refresh key whose lineage stays on
 /// preserved inputs; search its preserved subtree when that key is unsafe.
@@ -43,6 +52,9 @@ struct PlanRewriteNeeds {
 	bool semi_anti_subqueries = false;
 	bool running_window_state = false;
 };
+
+/// Turn a copy of the stored DISTINCT ON plan into candidate-key discovery input.
+bool RemoveDistinctOnWinnerFilters(unique_ptr<LogicalOperator> &plan);
 
 /// Convert FILTER to a NULL-masked argument only for known NULL-ignoring unary
 /// aggregates and COUNT(*). Retain native FILTER for all other signatures.
@@ -77,8 +89,11 @@ void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOpera
 /// compact CTE graph emitted by LPTS for a stored materialized-view definition.
 void InlineMaterializedCteRefs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 
-bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
-                                const vector<string> &output_names, string &sql);
+bool RenderPlanOutputExpression(ClientContext &context, const Expression &expression, LogicalOperator &plan,
+                                const CreateMVPlanFacts &facts, const vector<string> &output_names, string &sql);
+vector<string> DirectDecomposedAggregateOutputs(LogicalOperator &plan, const vector<string> &output_names);
+string ResolvePlanOutputColumn(ColumnBinding binding, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                               const vector<string> &output_names);
 
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
 
@@ -90,14 +105,16 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
 /// added to the PROJECTION as hidden columns (named `openivm_having_N`) and
 /// `output_names` is extended accordingly — the predicate references the hidden
 /// column names instead of re-rendering the aggregate expression.
-string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &output_names);
+string StripHavingFilter(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names);
 
 /// Extract deterministic scalar outputs computed by the top projection from
 /// aggregate outputs that are also projected by name. `complete` is false when
 /// any user-visible expression cannot be rendered solely in terms of stored
 /// output columns, so refresh compilation can fail closed.
-DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,
-                                                          const vector<string> &output_names);
+DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(ClientContext &context, const LogicalOperator &plan,
+                                                          const CreateMVPlanFacts &facts,
+                                                          const vector<string> &output_names,
+                                                          const vector<string> &decomposed_outputs = {});
 
 } // namespace duckdb
 

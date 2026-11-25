@@ -17,7 +17,6 @@ PRAGMA openivm_files('file_probe');
 system	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
 create	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
 refresh	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
-explain	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
 
 statement error
 PRAGMA openivm_files('missing_view');
@@ -309,7 +308,9 @@ SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f77617463686573_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%status = case when%removed_at%'
+                 LIKE '%case when%removed_at%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%status = d.status%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_watches',
@@ -325,8 +326,7 @@ FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6
 ----
 1
 
-# Unsupported scalar functions are recorded as incomplete, so even a caller-
-# proven insert-only MIN/MAX batch must use exact affected-group recompute.
+# Scalar functions can now be evaluated from the updated MIN/MAX state.
 statement ok
 CREATE TABLE compile_only_round_events(grp INTEGER, value DOUBLE);
 
@@ -339,7 +339,7 @@ WITH grouped AS (
 SELECT grp, min_value, ROUND(min_value / 3.0, 2) AS rounded_value FROM grouped;
 
 query I
-SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%' THEN 1 ELSE 0 END
+SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":true%' THEN 1 ELSE 0 END
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_';
 ----
 1
@@ -360,6 +360,12 @@ SELECT grp,
        '"complete":true' AS marker,
        ROUND(min_value / 3.0, 2) AS rounded_value
 FROM grouped;
+
+statement ok
+UPDATE openivm_views
+SET derived_aggregate_outputs_json = replace(derived_aggregate_outputs_json,
+    '{"complete":true,', '{"complete":false,')
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f657363617065645f6d65746164617461_';
 
 query I
 SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%'
@@ -412,7 +418,9 @@ SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f6e6573746564_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%high_flag = case when%'
+                 LIKE '%case when%max_value%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%high_flag = d.high_flag%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_nested',
@@ -424,11 +432,11 @@ WHERE stmt_kind = 'data';
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 NOT LIKE '%merge into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
+                 LIKE '%merge into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
+                 NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%insert into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
+                 LIKE '%round(%min_value%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_round',
@@ -678,7 +686,6 @@ PRAGMA openivm_files('file_probe');
 system	<REGEX>:.*[/\\]openivm_system_tables.sql	true	exists; may be from an earlier compilation	<REGEX>:.*
 create	<REGEX>:.*[/\\]openivm_compiled_queries___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.sql	false	not generated at this path	<REGEX>:.*
 refresh	<REGEX>:.*[/\\]openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.sql	false	not generated at this path	<REGEX>:.*
-explain	<REGEX>:.*[/\\]openivm_initial_load_explain___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.txt	false	not generated at this path	<REGEX>:.*
 
 # Capture SQL into an ordinary table without requiring a file or executing the refresh.
 statement ok
@@ -737,3 +744,84 @@ SELECT count(*) FROM ((SELECT * FROM file_guard_b.file_guard EXCEPT ALL SELECT k
 UNION ALL (SELECT k+10 FROM file_probe_source EXCEPT ALL SELECT * FROM file_guard_b.file_guard));
 ----
 0
+
+# Floating zero group keys compile to the int-key MERGE plus a zero-sign fix-up, and recompute
+# views upsert with a keyed MERGE, in every dialect. Only DuckDB output tests the sign with signbit;
+# Spark and PostgreSQL keep the portable string test. Aux-state DISTINCT nests its single join in ddist.
+statement ok
+CREATE TABLE cfz(id INT, k DOUBLE, v INT);
+
+statement ok
+INSERT INTO cfz VALUES (1,'-0.0',1),(2,'-0.0',2),(3,1.5,3);
+
+statement ok
+CREATE MATERIALIZED VIEW cfz_group AS SELECT k, COUNT(*) c, SUM(v) s FROM cfz GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW cfz_having AS SELECT k, COUNT(*) c, SUM(v) s FROM cfz GROUP BY k HAVING SUM(v) > 1;
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE MATERIALIZED VIEW cfz_distinct AS SELECT id, SUM(k) s FROM (SELECT DISTINCT id, k FROM cfz) d GROUP BY id;
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+statement ok
+DELETE FROM cfz WHERE id = 1;
+
+statement ok
+INSERT INTO cfz VALUES (4,0.0,4);
+
+statement ok
+UPDATE cfz SET v = v + 1 WHERE id = 3;
+
+foreach view group having
+
+foreach dialect spark postgres
+
+query I
+SELECT (contains(s, 'MERGE INTO') AND contains(s, 'AS openivm_target SET') AND contains(s, 'LIKE ''-%''')
+        AND NOT contains(s, 'INSERT OR REPLACE') AND NOT contains(s, 'signbit(')
+        AND NOT contains(s, 'openivm_group_representative'))::INT
+FROM (SELECT string_agg(sql, ' ' ORDER BY stmt_order) s
+      FROM openivm_compile_with_facts('cfz_{view}', '{"target_dialect":"{dialect}","compile_only":true}')
+      WHERE stmt_kind = 'data');
+----
+1
+
+endloop
+
+query I
+SELECT (contains(s, 'MERGE INTO') AND contains(s, 'AS openivm_target SET') AND contains(s, 'signbit(')
+        AND NOT contains(s, 'INSERT OR REPLACE') AND NOT contains(s, 'concat('))::INT
+FROM (SELECT string_agg(sql, ' ' ORDER BY stmt_order) s
+      FROM openivm_compile_with_facts('cfz_{view}', '{"target_dialect":"duckdb","compile_only":true}')
+      WHERE stmt_kind = 'data');
+----
+1
+
+endloop
+
+foreach dialect spark postgres
+
+query I
+SELECT (contains(s, 'WITH ddist AS (WITH openivm_dj AS (SELECT') AND NOT contains(s, 'MATERIALIZED')
+        AND NOT contains(s, 'signbit('))::INT
+FROM (SELECT string_agg(sql, ' ' ORDER BY stmt_order) s
+      FROM openivm_compile_with_facts('cfz_distinct', '{"target_dialect":"{dialect}","compile_only":true}')
+      WHERE stmt_kind = 'data');
+----
+1
+
+endloop
+
+query I
+SELECT (contains(s, 'WITH ddist AS (WITH openivm_dj AS MATERIALIZED (SELECT') AND contains(s, 'signbit('))::INT
+FROM (SELECT string_agg(sql, ' ' ORDER BY stmt_order) s
+      FROM openivm_compile_with_facts('cfz_distinct', '{"target_dialect":"duckdb","compile_only":true}')
+      WHERE stmt_kind = 'data');
+----
+1

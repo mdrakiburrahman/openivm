@@ -117,34 +117,14 @@ struct FojJoinInfo {
 	static vector<FojJoinInfo> ParseAll(RefreshMetadata &metadata, const string &view_name,
 	                                    const vector<string> &delta_table_names) {
 		vector<FojJoinInfo> joins;
-		string raw = metadata.GetFullOuterJoinCols(view_name);
-		if (StringUtil::StartsWith(raw, "{")) {
-			for (const auto &object : MetadataJson::ExtractJsonObjectsFromArray(raw, "edges")) {
-				FojJoinInfo info;
-				if (!MetadataJson::ExtractJsonString(object, "left_table", info.left_table) ||
-				    !MetadataJson::ExtractJsonString(object, "left_column", info.left_col) ||
-				    !MetadataJson::ExtractJsonString(object, "right_table", info.right_table) ||
-				    !MetadataJson::ExtractJsonString(object, "right_column", info.right_col)) {
-					continue;
-				}
+		auto raw = metadata.GetFullOuterJoinCols(view_name);
+		for (const auto &object : MetadataJson::ExtractJsonObjectsFromArray(raw, "edges")) {
+			FojJoinInfo info;
+			if (MetadataJson::ExtractJsonString(object, "left_table", info.left_table) &&
+			    MetadataJson::ExtractJsonString(object, "left_column", info.left_col) &&
+			    MetadataJson::ExtractJsonString(object, "right_table", info.right_table) &&
+			    MetadataJson::ExtractJsonString(object, "right_column", info.right_col)) {
 				joins.push_back(std::move(info));
-			}
-		} else {
-			// Databases created before multi-boundary metadata used one table:column pair.
-			auto comma_pos = raw.find(',');
-			if (comma_pos != string::npos) {
-				FojJoinInfo info;
-				string left_part = raw.substr(0, comma_pos);
-				string right_part = raw.substr(comma_pos + 1);
-				auto lc = left_part.find(':');
-				auto rc = right_part.find(':');
-				if (lc != string::npos && rc != string::npos) {
-					info.left_table = left_part.substr(0, lc);
-					info.left_col = left_part.substr(lc + 1);
-					info.right_table = right_part.substr(0, rc);
-					info.right_col = right_part.substr(rc + 1);
-					joins.push_back(std::move(info));
-				}
 			}
 		}
 		auto resolve_source = [&](string &table, string &delta_name) {
@@ -185,27 +165,6 @@ static string NormalizeColumnNameForMatch(const string &name) {
 		}
 	}
 	return normalized;
-}
-
-bool IsSummableLogicalType(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::UHUGEINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-	case LogicalTypeId::DECIMAL:
-		return true;
-	default:
-		return false;
-	}
 }
 
 string BaseTableNameFromDeltaKey(const string &delta_key) {
@@ -281,14 +240,15 @@ string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &la
 	       ") FROM " + delta_table_sql + where_clause + ")";
 }
 
-string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec) {
+string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec, bool deleted_only) {
+	string predicate = deleted_only ? string(openivm::MULTIPLICITY_COL) + " < 0" : "";
 	if (!spec.is_ducklake) {
-		return BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update);
+		return BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update, predicate);
 	}
 	return BuildStandardDeltaRowsSQL(
 	    BuildDuckLakeSignedDeltaRelation({spec.ducklake_catalog, spec.ducklake_schema, spec.base_table},
 	                                     spec.last_snapshot_id, spec.current_snapshot_id),
-	    "");
+	    "", predicate);
 }
 
 // Delta substitution finds matched groups, but not the null-extended groups that
@@ -489,7 +449,7 @@ SignedRowLists BuildSignedRowLists(const vector<string> &columns, const string &
 		lists.columns += quoted;
 		if (column == openivm::MULTIPLICITY_COL) {
 			lists.old_rows += "-1";
-			lists.new_rows += "1";
+			lists.new_rows += '1';
 		} else {
 			lists.old_rows += old_alias + quoted;
 			lists.new_rows += new_alias + quoted;
@@ -579,7 +539,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table, const vector<string> &upsert_keys,
-                                  const string &recompute_temp_table, RefreshPublicationScope *publication_scope) {
+                                  const string &recompute_temp_table, RefreshPublicationScope *publication_scope,
+                                  const vector<string> &upsert_columns, SqlDialect dialect) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -596,10 +557,10 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 		// the affected groups ONCE (the recompute is the expensive part), then:
 		//   1. delete only the affected groups that no longer produce a row (a group can disappear
 		//      entirely, e.g. when every preserved-side row for it is deleted), and
-		//   2. INSERT OR REPLACE the survivors.
+		//   2. upsert the survivors.
 		// The two key sets are disjoint for non-NULL keys, so those are not deleted and re-inserted
 		// in the same transaction. NULL-containing keys do not conflict in the UNIQUE index and must
-		// be removed explicitly before INSERT OR REPLACE to avoid duplicate groups.
+		// be removed explicitly before the upsert to avoid duplicate groups.
 		string keep_match = SqlUtils::BuildNullSafeKeyPredicate(upsert_keys, "openivm_keep.", target_alias + ".");
 		string nullable_key = SqlUtils::BuildAnyNullPredicate(upsert_keys, target_alias + ".");
 		result += "CREATE OR REPLACE TEMP TABLE " + recompute_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
@@ -607,7 +568,7 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + "\n  AND ((" +
 		          nullable_key + ")\n    OR NOT EXISTS (\n  SELECT 1 FROM " + recompute_temp_table +
 		          " AS openivm_keep WHERE " + keep_match + "\n));\n\n";
-		result += "INSERT OR REPLACE INTO " + data_table + "\nSELECT * FROM " + recompute_temp_table + ";\n";
+		result += SqlUtils::BuildKeyedUpsertSQL(data_table, recompute_temp_table, upsert_keys, upsert_columns, dialect);
 		result += "\nDROP TABLE IF EXISTS " + recompute_temp_table + ";\n";
 	} else {
 		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
@@ -683,16 +644,11 @@ bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const 
 string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const string &source_col,
                                      const string &source_cast, const string &output_col) {
 	string source_expr = SqlUtils::ApplyCastSpec(SqlUtils::QuoteIdentifier(source_col), source_cast);
-	string qoutput_col = SqlUtils::QuoteIdentifier(output_col);
-	string insertions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	string deletions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	return "(" + insertions + " UNION ALL " + deletions + ")";
+	return "(" +
+	       SqlUtils::DuckLakeChangesSQL(source_expr + " AS " + SqlUtils::QuoteIdentifier(output_col),
+	                                    spec.loc.catalog_name, spec.loc.schema_name, spec.loc.table_name, spec.old_snap,
+	                                    spec.current_snap) +
+	       ")";
 }
 
 static string BuildProjectionLineageArmSQL(const RefreshMetadata::ProjectionKeyLineageArm &arm,
@@ -856,35 +812,26 @@ bool IsEmptyDeltaPlan(LogicalOperator *op) {
 }
 
 static string NullLiteralForDialect(const LogicalType &type, SqlDialect dialect) {
-	if (dialect == SqlDialect::SPARK) {
-		switch (type.id()) {
-		case LogicalTypeId::BOOLEAN:
-			return "CAST(NULL AS BOOLEAN)";
-		case LogicalTypeId::TINYINT:
-			return "CAST(NULL AS TINYINT)";
-		case LogicalTypeId::SMALLINT:
-			return "CAST(NULL AS SMALLINT)";
-		case LogicalTypeId::INTEGER:
-			return "CAST(NULL AS INTEGER)";
-		case LogicalTypeId::BIGINT:
-			return "CAST(NULL AS BIGINT)";
-		case LogicalTypeId::FLOAT:
-			return "CAST(NULL AS FLOAT)";
-		case LogicalTypeId::DOUBLE:
-			return "CAST(NULL AS DOUBLE)";
-		case LogicalTypeId::DECIMAL:
-			return "CAST(NULL AS " + type.ToString() + ")";
-		case LogicalTypeId::VARCHAR:
-			return "CAST(NULL AS VARCHAR)";
-		case LogicalTypeId::DATE:
-			return "CAST(NULL AS DATE)";
-		case LogicalTypeId::TIMESTAMP:
-			return "CAST(NULL AS TIMESTAMP)";
-		default:
-			return "CAST(NULL AS STRING)";
-		}
+	if (dialect != SqlDialect::SPARK) {
+		return "NULL::" + type.ToString();
 	}
-	return "NULL::" + type.ToString();
+	switch (type.id()) {
+	case LogicalTypeId::DECIMAL:
+		return "CAST(NULL AS " + type.ToString() + ")";
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+		return "CAST(NULL AS " + LogicalTypeIdToString(type.id()) + ")";
+	default:
+		return "CAST(NULL AS STRING)";
+	}
 }
 
 string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &column_names,
@@ -938,11 +885,11 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 			return view_catalog_name;
 		}
 	}
-	auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
-	if (probe && !probe->HasError() && probe->RowCount() == 1 && !probe->Collection().GetValue(0, 0).IsNull()) {
-		return probe->Collection().GetValue(0, 0).ToString();
+	auto ducklake_catalogs = MetadataLocator::AttachedCatalogs(*con.context->db, "ducklake");
+	if (ducklake_catalogs.size() == 1) {
+		return ducklake_catalogs[0].name;
 	}
-	if (probe && !probe->HasError() && probe->RowCount() > 1) {
+	if (ducklake_catalogs.size() > 1) {
 		throw Exception(ExceptionType::CATALOG,
 		                "Could not resolve DuckLake catalog unambiguously; pass the materialized view catalog "
 		                "explicitly or use PRAGMA refresh_options");
@@ -951,44 +898,21 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 }
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           bool cross_system, const string &attached_catalog, const string &attached_schema,
-                           const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta,
-                           vector<string> *deferred_cleanup, const vector<string> &delta_metadata_tables,
-                           const string &data_catalog) {
-	string qdt = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
-	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
-	// transaction, which DuckDB's on-disk unique index rejects, so those views need the upsert form.
-	auto recompute_view_type = metadata.GetViewType(view_name);
-	vector<string> unique_keys;
-	string recompute_temp;
-	auto view_location = metadata.GetStoredViewLocation(view_name, attached_catalog, attached_schema);
-	if (!metadata.IsDuckLakeCatalog(view_location.catalog_name) &&
-	    (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING)) {
-		unique_keys = metadata.GetGroupColumns(view_name);
-		if (!unique_keys.empty()) {
-			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
-		}
-	}
-	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp) + "\n";
+                           const string &ducklake_checkpoints, const vector<string> &upsert_columns,
+                           const vector<LogicalType> &upsert_types, bool cross_system, const string &attached_catalog,
+                           const string &attached_schema, const string &catalog_prefix, const string &metadata_prefix,
+                           string *out_post_meta, vector<string> *deferred_cleanup,
+                           const vector<string> &delta_metadata_tables, const string &data_catalog) {
+	// Indexed keys cannot be deleted and reinserted in the same on-disk transaction.
+	// Non-indexable group keys use the ordinary DELETE/INSERT full-refresh form.
+	string query = CompileFullRecompute(view_name, view_query_sql, catalog_prefix, false,
+	                                    upsert_columns.empty() ? vector<string>() : metadata.GetGroupColumns(view_name),
+	                                    upsert_columns, upsert_types) +
+	               "\n";
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
 	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = " + string(openivm::UTC_NOW_SQL) +
 	                       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
-	auto delta_tables = metadata.GetDeltaTables(view_name);
-	for (auto &dt : delta_tables) {
-		if (!metadata.IsDuckLakeTable(view_name, dt)) {
-			continue;
-		}
-		auto loc = metadata.GetSourceLocation(view_name, dt, attached_catalog, attached_schema);
-		if (loc.catalog_name.empty()) {
-			continue;
-		}
-		string snapshot_expr =
-		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
-		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
-		update_ts_sql +=
-		    RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr, delta_metadata_table);
-	}
+	update_ts_sql += ducklake_checkpoints;
 	string update_ts;
 	if (!cross_system) {
 		update_ts = update_ts_sql;
@@ -997,7 +921,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	}
 
 	string delta_cleanup;
-	for (auto &dt : delta_tables) {
+	for (auto &dt : metadata.GetDeltaTables(view_name)) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			continue;
 		}
@@ -1132,18 +1056,8 @@ static FullOuterScopeRows ReadScopeRows(RefreshMetadata &metadata, const string 
 		        ResolveFullOuterDeltaSource(metadata, view_name, name)};
 	}
 	auto delta = metadata.ResolveDeltaQualifiedName(view_name, name);
-	auto weighted_delta = [&](const string &comparison) {
-		return "SELECT openivm_scope_delta.* EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
-		       string(openivm::TIMESTAMP_COL) + ") FROM " + delta + " openivm_scope_delta" +
-		       SqlUtils::BuildRowRepetitionSQL("abs(openivm_scope_delta." + string(openivm::MULTIPLICITY_COL) + ")",
-		                                       "openivm_scope_weights", SqlDialect::DUCKDB) +
-		       BuildGuardedDeltaWhere(delta_ts_filter, string(openivm::MULTIPLICITY_COL) + comparison);
-	};
-	// Add deletions before subtracting insertions: conflicting DML can insert
-	// and delete a transient row whose count is zero in the current table.
-	auto previous = "((SELECT * FROM " + current + " UNION ALL " + weighted_delta(" < 0") + ") EXCEPT ALL " +
-	                weighted_delta(" > 0") + ")";
-	return {current, previous, BuildStandardDeltaRowsSQL(delta, "", delta_ts_filter)};
+	return {current, SqlUtils::BuildPreviousSourceRowsSQL(current, delta, delta_ts_filter),
+	        BuildStandardDeltaRowsSQL(delta, "", delta_ts_filter)};
 }
 
 static string BuildScopeChanges(const FullOuterScopeRelation &relation,
@@ -1446,7 +1360,7 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	if (!delta_ts_filter.empty()) {
 		delta_source += " WHERE " + delta_ts_filter;
 	}
-	delta_source += ")";
+	delta_source += ')';
 
 	auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
 	if (data_columns.empty()) {
@@ -1629,16 +1543,7 @@ static string NormalizeTableToken(string token) {
 	while (!token.empty() && (token.back() == '"' || token.back() == '`' || token.back() == '\'')) {
 		token.pop_back();
 	}
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	static const string delta_prefix(openivm::DELTA_PREFIX);
-	token = SqlUtils::LastIdentifierPart(token);
-	if (token.size() > data_prefix.size() && token.rfind(data_prefix, 0) == 0) {
-		token = token.substr(data_prefix.size());
-	}
-	if (token.size() > delta_prefix.size() && token.rfind(delta_prefix, 0) == 0) {
-		token = token.substr(delta_prefix.size());
-	}
-	return StringUtil::Lower(token);
+	return StringUtil::Lower(BaseTableNameFromDeltaKey(StripOpenIVMDataPrefix(token)));
 }
 
 static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
@@ -1662,8 +1567,8 @@ static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &
 }
 
 string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                                const vector<string> &delta_table_names, const string &data_table,
-                                const string &view_query_sql, const string &delta_ts_filter,
+                                const vector<LogicalType> &column_types, const vector<string> &delta_table_names,
+                                const string &data_table, const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete, bool insert_only, const vector<string> &active_delta_table_names,
                                 bool can_use_runtime_delta_shape, ProjectionDeleteRetryPlan *delete_retry_plan,
@@ -1677,23 +1582,15 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 		if (insert_only && nullable_side_quiet) {
 			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN insert-only append for %s (nullable side quiet)\n",
 			                    view_name.c_str());
-			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
+			return CompileProjectionsFilters(view_name, column_names, column_types, delta_ts_filter, catalog_prefix,
 			                                 /*insert_only=*/true, appended_rows);
 		}
 		return BuildLeftJoinProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
 		                                      view_query_sql, delta_ts_filter, catalog_prefix,
 		                                      can_use_runtime_delta_shape, nullable_side_quiet, delete_retry_plan);
 	}
-	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete,
-	                                 appended_rows);
-}
-
-static string CurrentDatabase(Connection &con) {
-	auto res = con.Query("SELECT current_database()");
-	if (!res->HasError() && res->RowCount() > 0 && !res->Collection().GetValue(0, 0).IsNull()) {
-		return res->Collection().GetValue(0, 0).ToString();
-	}
-	return "";
+	return CompileProjectionsFilters(view_name, column_names, column_types, delta_ts_filter, catalog_prefix,
+	                                 skip_proj_delete, appended_rows);
 }
 
 ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name) {
@@ -1759,7 +1656,7 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	resolved.view_catalog_name = location.catalog_name;
 	resolved.view_schema_name = location.schema_name;
 	resolved.view_name = key;
-	resolved.cross_system = resolved.view_catalog_name != CurrentDatabase(con);
+	resolved.cross_system = resolved.view_catalog_name != SqlUtils::CurrentDatabase(con);
 	return resolved;
 }
 
@@ -1768,7 +1665,7 @@ ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const
 	auto location = RefreshMetadata(con).GetStoredViewLocation(view_name, fallback_catalog, fallback_schema);
 	auto &catalog_name = location.catalog_name;
 	auto &schema_name = location.schema_name;
-	auto current_database = CurrentDatabase(con);
+	auto current_database = SqlUtils::CurrentDatabase(con);
 	bool cross_system = !catalog_name.empty() && !current_database.empty() && catalog_name != current_database;
 	return {catalog_name, schema_name, cross_system};
 }
@@ -1914,9 +1811,9 @@ static string HexEncodeToken(const string &input) {
 	string result;
 	result.reserve(input.size() * 2);
 	for (auto c : input) {
-		auto byte = static_cast<unsigned char>(c);
-		result.push_back(hex[(byte >> 4) & 0x0F]);
-		result.push_back(hex[byte & 0x0F]);
+		auto byte = static_cast<uint32_t>(static_cast<unsigned char>(c));
+		result.push_back(hex[(byte >> 4U) & 0x0FU]);
+		result.push_back(hex[byte & 0x0FU]);
 	}
 	return result;
 }

@@ -13,8 +13,6 @@ using col_idx = ProjectionIndex;
 struct RenumberWrapper {
 	unique_ptr<LogicalOperator> op;
 	std::unordered_map<old_idx, new_idx> idx_map;
-	std::vector<ColumnBinding> column_bindings;
-	bool contains_delim_operator;
 };
 
 RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Binder &binder);

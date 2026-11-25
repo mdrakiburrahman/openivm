@@ -63,6 +63,11 @@ public:
 	DeltaCaptureMode mode;
 	vector<PhysicalIndex> update_columns;
 	optional_idx row_id_index;
+	// Input index of each physical base column when the child scan already
+	// produces the preimage. Empty: fetch preimages by row id instead.
+	vector<idx_t> old_row_columns;
+	// Columns the DML consumes; extra preimage columns follow them in the input.
+	optional_idx output_column_count;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 	vector<ColumnBinding> GetColumnBindings() override;
@@ -76,11 +81,11 @@ protected:
 	void ResolveTypes() override;
 };
 
-// Transparent wrapper around a LogicalMergeInto. At physical-plan creation it decorates
-// DuckDB's resolved action sinks, so only rows that actually INSERT/UPDATE/DELETE are captured.
-class LogicalTransactionalMergeDeltaCapture : public LogicalExtensionOperator {
+// Decorate a native UPDATE sink or MERGE's resolved action sinks. In-place
+// postimages are fetched after the native write, including equality-preserving updates.
+class LogicalTransactionalActionDeltaCapture : public LogicalExtensionOperator {
 public:
-	LogicalTransactionalMergeDeltaCapture(TableCatalogEntry &base_table, TableCatalogEntry &delta_table);
+	LogicalTransactionalActionDeltaCapture(TableCatalogEntry &base_table, TableCatalogEntry &delta_table);
 
 	TableCatalogEntry &base_table;
 	TableCatalogEntry &delta_table;

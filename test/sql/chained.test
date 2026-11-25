@@ -4350,3 +4350,149 @@ query T
 WITH expected AS (SELECT k,SUM(v) total FROM identity_a.t GROUP BY k) SELECT CASE WHEN EXISTS ((SELECT * FROM identity_a.summary EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM identity_a.summary)) THEN error('drop isolation mismatch') ELSE 'drop isolation correct' END;
 ----
 drop isolation correct
+
+# A sign-only zero replacement must reach published rows and downstream bags.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+CREATE TABLE published_zero_source(id INT,v DOUBLE,x INT);
+
+statement ok
+INSERT INTO published_zero_source VALUES(1,'-0.0'::DOUBLE,10),(2,'-0.0'::DOUBLE,10),(3,2,30),(4,NULL,40);
+
+statement ok
+CREATE MATERIALIZED VIEW published_zero_group AS SELECT v,SUM(x)+1 a FROM published_zero_source GROUP BY v;
+
+statement ok
+CREATE VIEW published_zero_group_expected AS SELECT v,SUM(x)+1 a FROM published_zero_source GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW published_zero_float AS SELECT v::FLOAT v,SUM(x)+1 a FROM published_zero_source GROUP BY v::FLOAT;
+
+statement ok
+CREATE VIEW published_zero_float_expected AS SELECT v::FLOAT v,SUM(x)+1 a FROM published_zero_source GROUP BY v::FLOAT;
+
+statement ok
+CREATE MATERIALIZED VIEW published_zero_bag AS SELECT v,x a FROM published_zero_source;
+
+statement ok
+CREATE VIEW published_zero_bag_expected AS SELECT v,x a FROM published_zero_source;
+
+statement ok
+CREATE MATERIALIZED VIEW published_zero_top AS SELECT v,x a FROM published_zero_source ORDER BY id LIMIT 3;
+
+statement ok
+CREATE VIEW published_zero_top_expected AS SELECT v,x a FROM published_zero_source ORDER BY id LIMIT 3;
+
+foreach variant group float bag top
+
+statement ok
+CREATE MATERIALIZED VIEW published_zero_child_{variant} AS SELECT signbit(v) neg,a FROM published_zero_{variant};
+
+statement ok
+CREATE VIEW published_zero_child_{variant}_expected AS SELECT signbit(v) neg,a FROM published_zero_{variant}_expected;
+
+endloop
+
+foreach zero 0.0 -0.0 0.0
+
+# Keep the visible bag's numerical values unchanged while replacing both signs.
+statement ok
+INSERT INTO published_zero_source VALUES(99,'-0.0'::DOUBLE,10),(100,0,10);
+
+statement ok
+UPDATE published_zero_source SET x=12 WHERE id IN(1,99,100);
+
+statement ok
+DELETE FROM published_zero_source WHERE id IN(1,2,99,100);
+
+statement ok
+INSERT INTO published_zero_source VALUES(1,'{zero}'::DOUBLE,10),(2,'{zero}'::DOUBLE,10);
+
+foreach variant group float bag top
+
+statement ok
+PRAGMA refresh('published_zero_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT *,signbit(v) neg FROM published_zero_{variant} EXCEPT ALL SELECT *,signbit(v) neg FROM published_zero_{variant}_expected) UNION ALL (SELECT *,signbit(v) neg FROM published_zero_{variant}_expected EXCEPT ALL SELECT *,signbit(v) neg FROM published_zero_{variant}));
+----
+0
+
+statement ok
+PRAGMA refresh('published_zero_child_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM published_zero_child_{variant} EXCEPT ALL SELECT * FROM published_zero_child_{variant}_expected) UNION ALL (SELECT * FROM published_zero_child_{variant}_expected EXCEPT ALL SELECT * FROM published_zero_child_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# Replacement uses the same publisher and must preserve duplicate sign changes.
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW published_zero_bag AS SELECT -v v,x a FROM published_zero_source;
+
+statement ok
+CREATE OR REPLACE VIEW published_zero_bag_expected AS SELECT -v v,x a FROM published_zero_source;
+
+query I
+SELECT count(*) FROM((SELECT *,signbit(v) neg FROM published_zero_bag EXCEPT ALL SELECT *,signbit(v) neg FROM published_zero_bag_expected) UNION ALL (SELECT *,signbit(v) neg FROM published_zero_bag_expected EXCEPT ALL SELECT *,signbit(v) neg FROM published_zero_bag));
+----
+0
+
+statement ok
+PRAGMA refresh('published_zero_child_bag');
+
+query I
+SELECT count(*) FROM((SELECT * FROM published_zero_child_bag EXCEPT ALL SELECT * FROM published_zero_child_bag_expected) UNION ALL (SELECT * FROM published_zero_child_bag_expected EXCEPT ALL SELECT * FROM published_zero_child_bag));
+----
+0
+
+# SQL-equal copies with opposite signs must be ranked and deleted separately.
+statement ok
+CREATE TABLE published_mixed_zero_source(id INT,v DOUBLE);
+
+statement ok
+INSERT INTO published_mixed_zero_source VALUES(1,'-0.0'::DOUBLE),(2,0),(3,'-0.0'::DOUBLE);
+
+statement ok
+CREATE MATERIALIZED VIEW published_mixed_zero AS SELECT v FROM published_mixed_zero_source;
+
+statement ok
+CREATE MATERIALIZED VIEW published_mixed_zero_child AS SELECT signbit(v) neg FROM published_mixed_zero;
+
+foreach deleted_id 2 1
+
+statement ok
+INSERT INTO published_mixed_zero_source VALUES(99,0);
+
+statement ok
+UPDATE published_mixed_zero_source SET v=2 WHERE id=99;
+
+statement ok
+DELETE FROM published_mixed_zero_source WHERE id IN({deleted_id},99);
+
+statement ok
+PRAGMA refresh('published_mixed_zero');
+
+query I
+SELECT count(*) FROM((SELECT v,signbit(v) neg FROM published_mixed_zero EXCEPT ALL SELECT v,signbit(v) neg FROM published_mixed_zero_source) UNION ALL (SELECT v,signbit(v) neg FROM published_mixed_zero_source EXCEPT ALL SELECT v,signbit(v) neg FROM published_mixed_zero));
+----
+0
+
+statement ok
+PRAGMA refresh('published_mixed_zero_child');
+
+query I
+SELECT count(*) FROM((SELECT * FROM published_mixed_zero_child EXCEPT ALL SELECT signbit(v) neg FROM published_mixed_zero_source) UNION ALL (SELECT signbit(v) neg FROM published_mixed_zero_source EXCEPT ALL SELECT * FROM published_mixed_zero_child));
+----
+0
+
+endloop

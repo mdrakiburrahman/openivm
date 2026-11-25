@@ -1,5 +1,6 @@
 #include "core/incremental_checker.hpp"
 #include "core/spark_expression_marker.hpp"
+#include "core/vector_utils.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -200,14 +201,30 @@ static bool SameWindowColumns(const vector<string> &left, const vector<string> &
 static vector<string> IntersectWindowColumns(const vector<string> &left, const vector<string> &right) {
 	vector<string> intersection;
 	for (auto &left_column : left) {
-		for (auto &right_column : right) {
-			if (StringUtil::CIEquals(left_column, right_column)) {
-				intersection.push_back(left_column);
-				break;
-			}
+		if (ContainsCI(right, left_column)) {
+			intersection.push_back(left_column);
 		}
 	}
 	return intersection;
+}
+
+// Fold one window's partition/order keys into result. Row keys stay usable only while every window
+// uses the same partition and order columns; the partition keys shrink to those all windows share.
+static void MergeWindowKeys(PlanAnalysis &result, bool first, vector<string> partitions, vector<string> orders,
+                            bool row_key_compatible) {
+	if (first) {
+		result.window_partition_columns = std::move(partitions);
+		result.window_order_columns = std::move(orders);
+	} else {
+		row_key_compatible = row_key_compatible && result.window_row_key_compatible &&
+		                     SameWindowColumns(result.window_partition_columns, partitions) &&
+		                     SameWindowColumns(result.window_order_columns, orders);
+		result.window_partition_columns = IntersectWindowColumns(result.window_partition_columns, partitions);
+	}
+	result.window_row_key_compatible = row_key_compatible;
+	if (!row_key_compatible) {
+		result.window_order_columns.clear();
+	}
 }
 
 static bool HasSimpleOrderBy(const vector<BoundOrderByNode> &orders) {
@@ -286,16 +303,25 @@ static bool PlanAnalysis::*const NON_LOCAL_FACTS[] = {
     &PlanAnalysis::found_positional_join,       &PlanAnalysis::found_sample};
 
 // Query-shape facts a pass-through CTE consumer inherits from the body.
-static bool PlanAnalysis::*const SHAPE_FACTS[] = {
-    &PlanAnalysis::found_aggregation,    &PlanAnalysis::found_projection,
-    &PlanAnalysis::found_having,         &PlanAnalysis::found_distinct,
-    &PlanAnalysis::found_union_distinct, &PlanAnalysis::found_minmax,
-    &PlanAnalysis::found_list,           &PlanAnalysis::found_retained_aggregate_filter,
-    &PlanAnalysis::found_left_join,      &PlanAnalysis::found_full_outer,
-    &PlanAnalysis::found_semi_anti_join, &PlanAnalysis::found_join,
-    &PlanAnalysis::found_delim_join,     &PlanAnalysis::found_single_join,
-    &PlanAnalysis::found_window,         &PlanAnalysis::found_count_distinct,
-    &PlanAnalysis::found_grouping_sets,  &PlanAnalysis::found_nested_aggregate};
+static bool PlanAnalysis::*const SHAPE_FACTS[] = {&PlanAnalysis::found_aggregation,
+                                                  &PlanAnalysis::found_projection,
+                                                  &PlanAnalysis::found_having,
+                                                  &PlanAnalysis::found_distinct_on,
+                                                  &PlanAnalysis::found_distinct,
+                                                  &PlanAnalysis::found_union_distinct,
+                                                  &PlanAnalysis::found_minmax,
+                                                  &PlanAnalysis::found_list,
+                                                  &PlanAnalysis::found_retained_aggregate_filter,
+                                                  &PlanAnalysis::found_left_join,
+                                                  &PlanAnalysis::found_full_outer,
+                                                  &PlanAnalysis::found_semi_anti_join,
+                                                  &PlanAnalysis::found_join,
+                                                  &PlanAnalysis::found_delim_join,
+                                                  &PlanAnalysis::found_single_join,
+                                                  &PlanAnalysis::found_window,
+                                                  &PlanAnalysis::found_count_distinct,
+                                                  &PlanAnalysis::found_grouping_sets,
+                                                  &PlanAnalysis::found_nested_aggregate};
 
 void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	auto *node = &op;
@@ -362,6 +388,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		}
 		// DISTINCT columns become group-by keys after IVM rewrite
 		auto &distinct_node = node->Cast<LogicalDistinct>();
+		result.found_distinct_on |= distinct_node.distinct_type == DistinctType::DISTINCT_ON;
 		if (!distinct_node.distinct_targets.empty()) {
 			for (auto &target : distinct_node.distinct_targets) {
 				result.aggregate_columns.emplace_back(target->GetName());
@@ -535,22 +562,9 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 				if (current_partitions.empty() || current_orders.empty()) {
 					current_row_key_compatible = false;
 				}
-				if (first_window_expression) {
-					result.window_partition_columns = current_partitions;
-					result.window_order_columns = current_orders;
-					result.window_row_key_compatible = current_row_key_compatible;
-					first_window_expression = false;
-				} else {
-					result.window_row_key_compatible =
-					    result.window_row_key_compatible && current_row_key_compatible &&
-					    SameWindowColumns(result.window_partition_columns, current_partitions) &&
-					    SameWindowColumns(result.window_order_columns, current_orders);
-					result.window_partition_columns =
-					    IntersectWindowColumns(result.window_partition_columns, current_partitions);
-				}
-				if (!result.window_row_key_compatible) {
-					result.window_order_columns.clear();
-				}
+				MergeWindowKeys(result, first_window_expression, std::move(current_partitions),
+				                std::move(current_orders), current_row_key_compatible);
+				first_window_expression = false;
 			}
 		}
 		break;
@@ -588,23 +602,9 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 }
 
 static void MergeWindowAnalysis(PlanAnalysis &result, PlanAnalysis &body) {
-	if (!body.found_window) {
-		return;
-	}
-	if (!result.found_window) {
-		result.window_partition_columns = std::move(body.window_partition_columns);
-		result.window_order_columns = std::move(body.window_order_columns);
-		result.window_row_key_compatible = body.window_row_key_compatible;
-		return;
-	}
-	bool compatible = result.window_row_key_compatible && body.window_row_key_compatible &&
-	                  SameWindowColumns(result.window_partition_columns, body.window_partition_columns) &&
-	                  SameWindowColumns(result.window_order_columns, body.window_order_columns);
-	result.window_partition_columns =
-	    IntersectWindowColumns(result.window_partition_columns, body.window_partition_columns);
-	result.window_row_key_compatible = compatible;
-	if (!compatible) {
-		result.window_order_columns.clear();
+	if (body.found_window) {
+		MergeWindowKeys(result, !result.found_window, std::move(body.window_partition_columns),
+		                std::move(body.window_order_columns), body.window_row_key_compatible);
 	}
 }
 

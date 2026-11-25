@@ -907,3 +907,363 @@ query II
 SELECT last_outcome, committed_count FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake_cast' AND operation = 'refresh';
 ----
 unknown	0
+
+# #28: a compile-only refresh must leave a source replacement pending.
+statement ok
+CREATE TABLE dl.replaced_source(k INT, v INT);
+
+statement ok
+INSERT INTO dl.replaced_source VALUES (1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW replaced_source_mv AS
+    SELECT k, SUM(v) AS total FROM dl.replaced_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW replaced_source_upgrade_mv AS
+    SELECT k, SUM(v) AS total FROM dl.replaced_source GROUP BY k;
+
+statement ok
+CREATE TEMP TABLE replaced_source_before AS
+SELECT d.source_table_id, d.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'replaced_source_mv';
+
+statement ok
+DROP TABLE dl.replaced_source;
+
+statement ok
+CREATE TABLE dl.replaced_source(k INT, v INT);
+
+statement ok
+INSERT INTO dl.replaced_source VALUES (3,30),(3,10),(4,20);
+
+statement ok
+UPDATE dl.replaced_source SET v = 5 WHERE k = 3 AND v = 10;
+
+statement ok
+DELETE FROM dl.replaced_source WHERE k = 4;
+
+query I
+SELECT COUNT(*) > 0
+FROM openivm_compile_with_facts('replaced_source_mv', '{"target_dialect":"duckdb","compile_only":true}');
+----
+true
+
+query II
+SELECT d.source_table_id = b.source_table_id, d.last_snapshot_id = b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), replaced_source_before b
+WHERE v.view_sql_name = 'replaced_source_mv';
+----
+true	true
+
+statement ok
+PRAGMA refresh('replaced_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM replaced_source_mv EXCEPT ALL SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k)
+    UNION ALL
+    (SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k EXCEPT ALL SELECT * FROM replaced_source_mv)
+);
+----
+0
+
+query II
+SELECT d.source_table_id <> b.source_table_id, d.last_snapshot_id > b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), replaced_source_before b
+WHERE v.view_sql_name = 'replaced_source_mv';
+----
+true	true
+
+# Simulate an older build compiling a refresh and prematurely consuming the new table ID.
+statement ok
+UPDATE openivm_delta_tables AS pending
+SET source_table_id = completed.source_table_id
+FROM openivm_delta_tables AS completed
+WHERE pending.view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'replaced_source_upgrade_mv')
+  AND completed.view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'replaced_source_mv');
+
+query II
+SELECT d.source_table_id <> b.source_table_id, d.last_snapshot_id = b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), replaced_source_before b
+WHERE v.view_sql_name = 'replaced_source_upgrade_mv';
+----
+true	true
+
+statement ok
+PRAGMA refresh('replaced_source_upgrade_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM replaced_source_upgrade_mv EXCEPT ALL SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k)
+    UNION ALL
+    (SELECT k, SUM(v) FROM dl.replaced_source GROUP BY k EXCEPT ALL SELECT * FROM replaced_source_upgrade_mv)
+);
+----
+0
+
+# DuckDB resolves a replacement table even when its stored spelling changes case.
+statement ok
+CREATE TABLE dl.same_b."Case_Source"(k INT, v INT);
+
+statement ok
+INSERT INTO dl.same_b."Case_Source" VALUES (1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW case_source_mv AS
+    SELECT k, SUM(v) AS total FROM dl.same_b."Case_Source" GROUP BY k;
+
+statement ok
+DROP TABLE dl.same_b."Case_Source";
+
+statement ok
+CREATE TABLE dl.same_b.case_source(k INT, v INT);
+
+statement ok
+INSERT INTO dl.same_b.case_source VALUES (3,30),(3,10),(4,20);
+UPDATE dl.same_b.case_source SET v = 5 WHERE k = 3 AND v = 10;
+DELETE FROM dl.same_b.case_source WHERE k = 4;
+
+statement ok
+PRAGMA refresh('case_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM case_source_mv EXCEPT ALL SELECT k, SUM(v) FROM dl.same_b.case_source GROUP BY k)
+    UNION ALL
+    (SELECT k, SUM(v) FROM dl.same_b.case_source GROUP BY k EXCEPT ALL SELECT * FROM case_source_mv)
+);
+----
+0
+
+query I
+SELECT d.source_table_id = (
+    SELECT t.table_id
+    FROM __ducklake_metadata_dl.ducklake_table t
+    JOIN __ducklake_metadata_dl.ducklake_schema s ON t.schema_id = s.schema_id
+    WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL
+      AND t.table_name = 'case_source' AND s.schema_name = 'same_b'
+)
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'case_source_mv';
+----
+true
+
+# Legacy metadata without a source schema must use the view's DuckLake schema for checkpointing.
+statement ok
+CREATE TABLE dl.main.legacy_orders(k INT, v INT);
+INSERT INTO dl.main.legacy_orders VALUES (9,900);
+CREATE TABLE dl.same_b.legacy_orders(k INT, v INT);
+INSERT INTO dl.same_b.legacy_orders VALUES (1,10),(2,20);
+CREATE MATERIALIZED VIEW dl.same_b.legacy_totals AS
+    SELECT k, SUM(v) AS total FROM dl.same_b.legacy_orders GROUP BY k;
+CREATE VIEW legacy_expected AS SELECT k, SUM(v) AS total FROM dl.same_b.legacy_orders GROUP BY k;
+
+statement ok
+UPDATE openivm_delta_tables SET source_schema = NULL
+WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'legacy_totals');
+
+statement ok
+DROP TABLE dl.same_b.legacy_orders;
+CREATE TABLE dl.same_b.legacy_orders(k INT, v INT);
+INSERT INTO dl.same_b.legacy_orders VALUES (3,30),(3,10),(4,20);
+UPDATE dl.same_b.legacy_orders SET v = 5 WHERE v = 10;
+DELETE FROM dl.same_b.legacy_orders WHERE k = 4;
+SET openivm_profile_refresh = true;
+
+statement ok
+PRAGMA refresh('dl.same_b.legacy_totals');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM dl.same_b.legacy_totals EXCEPT ALL SELECT * FROM legacy_expected)
+    UNION ALL
+    (SELECT * FROM legacy_expected EXCEPT ALL SELECT * FROM dl.same_b.legacy_totals)
+);
+----
+0
+
+statement ok
+CREATE VIEW legacy_checkpoint AS
+SELECT d.source_table_id = t.table_id AS correct_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name),
+    __ducklake_metadata_dl.ducklake_table t JOIN __ducklake_metadata_dl.ducklake_schema s USING (schema_id)
+WHERE v.view_sql_name = 'legacy_totals' AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL
+  AND t.table_name = 'legacy_orders' AND s.schema_name = 'same_b';
+
+query I
+SELECT correct_id FROM legacy_checkpoint;
+----
+true
+
+# Incremental refresh backfills a missing ID using the same resolved schema.
+statement ok
+UPDATE openivm_delta_tables SET source_table_id = NULL
+WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'legacy_totals');
+INSERT INTO dl.same_b.legacy_orders VALUES (4,40),(3,10);
+UPDATE dl.same_b.legacy_orders SET v = 31 WHERE v = 30;
+DELETE FROM dl.same_b.legacy_orders WHERE v = 10;
+
+statement ok
+PRAGMA refresh('dl.same_b.legacy_totals');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM dl.same_b.legacy_totals EXCEPT ALL SELECT * FROM legacy_expected)
+    UNION ALL
+    (SELECT * FROM legacy_expected EXCEPT ALL SELECT * FROM dl.same_b.legacy_totals)
+);
+----
+0
+
+query I
+SELECT correct_id FROM legacy_checkpoint;
+----
+true
+
+query II
+SELECT COUNT(*) FILTER (WHERE detail LIKE '%metadata_requires_full_refresh=true%'),
+       COUNT(*) FILTER (WHERE detail LIKE 'refresh_type=AGGREGATE_GROUP;%')
+FROM openivm_refresh_profile p JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'legacy_totals' AND p.step_name = 'generate_refresh_sql.dispatch';
+----
+1	1
+
+statement ok
+RESET openivm_profile_refresh;
+
+# A native MV can recover a replaced DuckLake source inside an explicit transaction.
+statement ok
+CREATE TABLE dl.transactional_source(k INT, v INT);
+INSERT INTO dl.transactional_source VALUES (1,10),(2,20);
+CREATE MATERIALIZED VIEW transactional_source_mv AS
+    SELECT k, SUM(v) AS total FROM dl.transactional_source GROUP BY k;
+CREATE VIEW transactional_source_expected AS SELECT k, SUM(v) AS total FROM dl.transactional_source GROUP BY k;
+CREATE MATERIALIZED VIEW watermark_upgrade_auto AS
+    SELECT k, SUM(v) AS total FROM dl.transactional_source GROUP BY k;
+CREATE MATERIALIZED VIEW watermark_upgrade_tx AS
+    SELECT k, SUM(v) AS total FROM dl.transactional_source GROUP BY k;
+
+statement ok
+CREATE TEMP TABLE transactional_source_before AS
+SELECT d.source_table_id, d.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'transactional_source_mv';
+
+statement ok
+DROP TABLE dl.transactional_source;
+CREATE TABLE dl.transactional_source(k INT, v INT);
+INSERT INTO dl.transactional_source VALUES (3,30),(3,10),(4,20);
+UPDATE dl.transactional_source SET v = 5 WHERE v = 10;
+DELETE FROM dl.transactional_source WHERE k = 4;
+
+# Roll back both the recovered rows and the new identity checkpoint.
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('transactional_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM transactional_source_mv EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM transactional_source_mv)
+);
+----
+0
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT d.source_table_id = b.source_table_id, d.last_snapshot_id = b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), transactional_source_before b
+WHERE v.view_sql_name = 'transactional_source_mv';
+----
+true	true
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('transactional_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM transactional_source_mv EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM transactional_source_mv)
+);
+----
+0
+
+statement ok
+COMMIT;
+
+query II
+SELECT d.source_table_id <> b.source_table_id, d.last_snapshot_id > b.last_snapshot_id
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name), transactional_source_before b
+WHERE v.view_sql_name = 'transactional_source_mv';
+----
+true	true
+
+statement ok
+PRAGMA refresh('transactional_source_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM transactional_source_mv EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM transactional_source_mv)
+);
+----
+0
+
+# Simulate an older transactional refresh consuming the watermark while retaining the old source ID.
+statement ok
+UPDATE openivm_delta_tables
+SET last_snapshot_id = (SELECT id FROM dl.current_snapshot())
+WHERE view_name IN (SELECT view_name FROM openivm_views
+                    WHERE view_sql_name IN ('watermark_upgrade_auto', 'watermark_upgrade_tx'));
+
+statement ok
+PRAGMA refresh('watermark_upgrade_auto');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM watermark_upgrade_auto EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM watermark_upgrade_auto)
+);
+----
+0
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('watermark_upgrade_tx');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM watermark_upgrade_tx EXCEPT ALL SELECT * FROM transactional_source_expected)
+    UNION ALL
+    (SELECT * FROM transactional_source_expected EXCEPT ALL SELECT * FROM watermark_upgrade_tx)
+);
+----
+0
+
+statement ok
+COMMIT;
+
+query II
+SELECT COUNT(*) FILTER (WHERE d.source_table_id = fresh.source_table_id),
+       COUNT(*) FILTER (WHERE d.last_snapshot_id = (SELECT id FROM dl.current_snapshot()))
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name),
+     openivm_delta_tables fresh JOIN openivm_views f ON fresh.view_name = f.view_name
+WHERE v.view_sql_name IN ('watermark_upgrade_auto', 'watermark_upgrade_tx')
+  AND f.view_sql_name = 'transactional_source_mv';
+----
+2	2

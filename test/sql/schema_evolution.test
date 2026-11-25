@@ -1857,3 +1857,342 @@ statement error
 PRAGMA refresh('main.ike_mv_missing');
 ----
 check view_sql_name, view_catalog and view_schema
+
+# Representative history cannot be reconstructed from current row order. Use a
+# quotient so both initial representatives give the same public value, while a
+# later batch exposes any loss of the retained raw SUM input.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE se_rep_collated_source(id INT,v VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO se_rep_collated_source VALUES(1,'A'),(2,'a');
+
+statement ok
+CREATE MATERIALIZED VIEW se_rep_collated AS WITH d AS(SELECT DISTINCT v FROM se_rep_collated_source),p AS(SELECT ascii(v) n FROM d) SELECT SUM(n)//150 a FROM p;
+
+statement ok
+CREATE VIEW se_rep_collated_expected AS WITH d AS(SELECT DISTINCT v FROM se_rep_collated_source),p AS(SELECT ascii(v) n FROM d) SELECT SUM(n)//150 a FROM p;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='se_rep_collated';
+----
+8
+
+statement ok
+DELETE FROM se_rep_collated_source WHERE id=1;
+
+statement ok
+INSERT INTO se_rep_collated_source VALUES(1,'A'),(99,'A');
+
+statement ok
+UPDATE se_rep_collated_source SET v='C' WHERE id=99;
+
+statement ok
+DELETE FROM se_rep_collated_source WHERE id=99;
+
+statement ok
+PRAGMA refresh('se_rep_collated');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_collated EXCEPT ALL SELECT * FROM se_rep_collated_expected) UNION ALL(SELECT * FROM se_rep_collated_expected EXCEPT ALL SELECT * FROM se_rep_collated));
+----
+0
+
+statement ok
+CREATE TABLE se_rep_collated_backup AS SELECT * FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f636f6c6c61746564_;
+
+statement ok
+DROP TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f636f6c6c61746564_;
+
+statement error
+PRAGMA refresh('se_rep_collated');
+----
+Cannot repair DISTINCT representative state
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_collated EXCEPT ALL SELECT * FROM se_rep_collated_expected) UNION ALL(SELECT * FROM se_rep_collated_expected EXCEPT ALL SELECT * FROM se_rep_collated));
+----
+0
+
+# The rejected repair neither replaces state nor rewrites the materialized data.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name='openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f636f6c6c61746564_';
+----
+0
+
+statement ok
+CREATE TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f636f6c6c61746564_ AS SELECT * FROM se_rep_collated_backup;
+
+statement ok
+INSERT INTO se_rep_collated_source VALUES(99,'A'),(3,'C');
+
+statement ok
+UPDATE se_rep_collated_source SET v='a' WHERE id=99;
+
+statement ok
+DELETE FROM se_rep_collated_source WHERE id IN(1,99);
+
+statement ok
+PRAGMA refresh('se_rep_collated');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_collated EXCEPT ALL SELECT * FROM se_rep_collated_expected) UNION ALL(SELECT * FROM se_rep_collated_expected EXCEPT ALL SELECT * FROM se_rep_collated));
+----
+0
+
+statement ok
+ALTER TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f636f6c6c61746564_ ADD COLUMN unexpected INT;
+
+statement error
+PRAGMA refresh('se_rep_collated');
+----
+Cannot repair DISTINCT representative state
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_collated EXCEPT ALL SELECT * FROM se_rep_collated_expected) UNION ALL(SELECT * FROM se_rep_collated_expected EXCEPT ALL SELECT * FROM se_rep_collated));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE table_name='openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f636f6c6c61746564_' AND column_name='unexpected';
+----
+1
+
+statement ok
+ALTER TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f636f6c6c61746564_ DROP COLUMN unexpected;
+
+statement ok
+PRAGMA refresh('se_rep_collated');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_collated EXCEPT ALL SELECT * FROM se_rep_collated_expected) UNION ALL(SELECT * FROM se_rep_collated_expected EXCEPT ALL SELECT * FROM se_rep_collated));
+----
+0
+
+statement ok
+CREATE TABLE se_rep_float_source(id INT,v FLOAT);
+
+statement ok
+INSERT INTO se_rep_float_source VALUES(1,'-0.0'::FLOAT),(2,0::FLOAT);
+
+statement ok
+CREATE MATERIALIZED VIEW se_rep_float AS WITH d AS(SELECT DISTINCT v FROM se_rep_float_source),p AS(SELECT CASE WHEN signbit(v) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)//2 a FROM p;
+
+statement ok
+CREATE VIEW se_rep_float_expected AS WITH d AS(SELECT DISTINCT v FROM se_rep_float_source),p AS(SELECT CASE WHEN signbit(v) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)//2 a FROM p;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='se_rep_float';
+----
+8
+
+statement ok
+DELETE FROM se_rep_float_source WHERE id=1;
+
+statement ok
+INSERT INTO se_rep_float_source VALUES(1,'-0.0'::FLOAT),(99,'-0.0'::FLOAT);
+
+statement ok
+UPDATE se_rep_float_source SET v=-1::FLOAT WHERE id=99;
+
+statement ok
+DELETE FROM se_rep_float_source WHERE id=99;
+
+statement ok
+PRAGMA refresh('se_rep_float');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_float EXCEPT ALL SELECT * FROM se_rep_float_expected) UNION ALL(SELECT * FROM se_rep_float_expected EXCEPT ALL SELECT * FROM se_rep_float));
+----
+0
+
+statement ok
+CREATE TABLE se_rep_float_backup AS SELECT * FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f666c6f6174_;
+
+statement ok
+DROP TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f666c6f6174_;
+
+statement error
+PRAGMA refresh('se_rep_float');
+----
+Cannot repair DISTINCT representative state
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_float EXCEPT ALL SELECT * FROM se_rep_float_expected) UNION ALL(SELECT * FROM se_rep_float_expected EXCEPT ALL SELECT * FROM se_rep_float));
+----
+0
+
+# The rejected repair neither replaces state nor rewrites the materialized data.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name='openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f666c6f6174_';
+----
+0
+
+statement ok
+CREATE TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f666c6f6174_ AS SELECT * FROM se_rep_float_backup;
+
+statement ok
+INSERT INTO se_rep_float_source VALUES(99,'-0.0'::FLOAT),(3,-1::FLOAT);
+
+statement ok
+UPDATE se_rep_float_source SET v=0::FLOAT WHERE id=99;
+
+statement ok
+DELETE FROM se_rep_float_source WHERE id IN(1,99);
+
+statement ok
+PRAGMA refresh('se_rep_float');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_float EXCEPT ALL SELECT * FROM se_rep_float_expected) UNION ALL(SELECT * FROM se_rep_float_expected EXCEPT ALL SELECT * FROM se_rep_float));
+----
+0
+
+statement ok
+ALTER TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f666c6f6174_ ADD COLUMN unexpected INT;
+
+statement error
+PRAGMA refresh('se_rep_float');
+----
+Cannot repair DISTINCT representative state
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_float EXCEPT ALL SELECT * FROM se_rep_float_expected) UNION ALL(SELECT * FROM se_rep_float_expected EXCEPT ALL SELECT * FROM se_rep_float));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE table_name='openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f666c6f6174_' AND column_name='unexpected';
+----
+1
+
+statement ok
+ALTER TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f666c6f6174_ DROP COLUMN unexpected;
+
+statement ok
+PRAGMA refresh('se_rep_float');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_float EXCEPT ALL SELECT * FROM se_rep_float_expected) UNION ALL(SELECT * FROM se_rep_float_expected EXCEPT ALL SELECT * FROM se_rep_float));
+----
+0
+
+statement ok
+CREATE TABLE se_rep_double_source(id INT,v DOUBLE);
+
+statement ok
+INSERT INTO se_rep_double_source VALUES(1,'-0.0'::DOUBLE),(2,0::DOUBLE);
+
+statement ok
+CREATE MATERIALIZED VIEW se_rep_double AS WITH d AS(SELECT DISTINCT v FROM se_rep_double_source),p AS(SELECT CASE WHEN signbit(v) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)//2 a FROM p;
+
+statement ok
+CREATE VIEW se_rep_double_expected AS WITH d AS(SELECT DISTINCT v FROM se_rep_double_source),p AS(SELECT CASE WHEN signbit(v) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)//2 a FROM p;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='se_rep_double';
+----
+8
+
+statement ok
+DELETE FROM se_rep_double_source WHERE id=1;
+
+statement ok
+INSERT INTO se_rep_double_source VALUES(1,'-0.0'::DOUBLE),(99,'-0.0'::DOUBLE);
+
+statement ok
+UPDATE se_rep_double_source SET v=-1::DOUBLE WHERE id=99;
+
+statement ok
+DELETE FROM se_rep_double_source WHERE id=99;
+
+statement ok
+PRAGMA refresh('se_rep_double');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_double EXCEPT ALL SELECT * FROM se_rep_double_expected) UNION ALL(SELECT * FROM se_rep_double_expected EXCEPT ALL SELECT * FROM se_rep_double));
+----
+0
+
+statement ok
+CREATE TABLE se_rep_double_backup AS SELECT * FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f646f75626c65_;
+
+statement ok
+DROP TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f646f75626c65_;
+
+statement error
+PRAGMA refresh('se_rep_double');
+----
+Cannot repair DISTINCT representative state
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_double EXCEPT ALL SELECT * FROM se_rep_double_expected) UNION ALL(SELECT * FROM se_rep_double_expected EXCEPT ALL SELECT * FROM se_rep_double));
+----
+0
+
+# The rejected repair neither replaces state nor rewrites the materialized data.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name='openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f646f75626c65_';
+----
+0
+
+statement ok
+CREATE TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f646f75626c65_ AS SELECT * FROM se_rep_double_backup;
+
+statement ok
+INSERT INTO se_rep_double_source VALUES(99,'-0.0'::DOUBLE),(3,-1::DOUBLE);
+
+statement ok
+UPDATE se_rep_double_source SET v=0::DOUBLE WHERE id=99;
+
+statement ok
+DELETE FROM se_rep_double_source WHERE id IN(1,99);
+
+statement ok
+PRAGMA refresh('se_rep_double');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_double EXCEPT ALL SELECT * FROM se_rep_double_expected) UNION ALL(SELECT * FROM se_rep_double_expected EXCEPT ALL SELECT * FROM se_rep_double));
+----
+0
+
+statement ok
+ALTER TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f646f75626c65_ ADD COLUMN unexpected INT;
+
+statement error
+PRAGMA refresh('se_rep_double');
+----
+Cannot repair DISTINCT representative state
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_double EXCEPT ALL SELECT * FROM se_rep_double_expected) UNION ALL(SELECT * FROM se_rep_double_expected EXCEPT ALL SELECT * FROM se_rep_double));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE table_name='openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f646f75626c65_' AND column_name='unexpected';
+----
+1
+
+statement ok
+ALTER TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f7265705f646f75626c65_ DROP COLUMN unexpected;
+
+statement ok
+PRAGMA refresh('se_rep_double');
+
+query I
+SELECT count(*) FROM((SELECT * FROM se_rep_double EXCEPT ALL SELECT * FROM se_rep_double_expected) UNION ALL(SELECT * FROM se_rep_double_expected EXCEPT ALL SELECT * FROM se_rep_double));
+----
+0

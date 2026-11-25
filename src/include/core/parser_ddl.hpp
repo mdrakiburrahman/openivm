@@ -101,9 +101,10 @@ vector<string> BuildArchiveProgramOperation(const CompiledProgram &program, DDLA
 string BuildSourceWatermarkUpdate(const string &metadata_table, const string &view_name, const string &source_name,
                                   const string &watermark, const string &refresh_timestamp, bool record);
 ScalarFunction SourceWatermarkFunction();
-string BuildDropViewStatement(const DropInfo &drop_info);
-string BuildDropTableStatement(const DropInfo &drop_info);
-string BuildDropSchemaStatement(const DropInfo &drop_info);
+// Whether DROP of this catalog type runs through an OpenIVM drop executor.
+bool HasDropExecutor(CatalogType type);
+// The executor call for a TABLE, VIEW or SCHEMA drop.
+string BuildDropStatement(const DropInfo &drop_info);
 unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, const string &program);
 unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, TableIndex bind_index,
                                                  const string &program, bool staged);

@@ -5,6 +5,8 @@
 #include "core/metadata_location.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
+
+#include <atomic>
 #include "core/openivm_constants.hpp"
 
 namespace duckdb {
@@ -16,7 +18,37 @@ class TransactionalMVMetadataState;
 // Wraps all raw SQL queries to openivm_views and openivm_delta_tables
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class RefreshMetadata {
+public:
+	// One view's openivm_views row (without its canonical plan) and openivm_delta_tables rows, read with a
+	// single statement. Refresh compilation reads dozens of these columns, each of which would otherwise be
+	// a planned statement. Columns written while a refresh runs (the interruption marker, the after-hook
+	// flag, the lease epoch, schedules and pending-row estimates) are always read live. One refresh attempt
+	// shares a single record between the attempt, SQL generation and the planning connection: a metadata
+	// write through any RefreshMetadata serving it invalidates it for all of them, and their later reads go
+	// to SQL. The refresh program's own writes run after the attempt's last metadata read.
+	struct ViewRecord {
+		string view_name;
+		case_insensitive_map_t<Value> view;
+		vector<case_insensitive_map_t<Value>> deltas;
+		mutable std::atomic<bool> invalidated {false};
+	};
+
+private:
 	Connection &con;
+	// Explicit refreshes plan using a helper but execute at the caller's DuckLake snapshot.
+	optional_ptr<ClientContext> snapshot_context;
+	shared_ptr<const ViewRecord> view_record;
+	// The record serving reads of `view_name`, or null when they go to SQL.
+	const ViewRecord *Record(const string &view_name) const;
+	// The record's openivm_delta_tables row of `table_name` (null when it has none). `answered` is false
+	// when the record cannot answer for `column`, which then has to be read with SQL.
+	const case_insensitive_map_t<Value> *RecordDelta(const string &view_name, const string &table_name,
+	                                                 const string &column, bool &answered) const;
+	// The record's values of `columns` for the view row (`table_name` empty) or a delta row; false when
+	// the record cannot answer all of them. A missing delta row reads as NULLs, like SQL without a row.
+	bool RecordValues(const string &view_name, const string &table_name, const vector<string> &columns,
+	                  vector<Value> &values) const;
+	static RefreshType ParseViewType(const string &view_name, const Value &type_value);
 	Value ReadViewValue(const string &view_name, const string &column);
 	string ReadViewString(const string &view_name, const string &column);
 	bool ReadViewBool(const string &view_name, const string &column);
@@ -25,8 +57,29 @@ class RefreshMetadata {
 	vector<string> ReadViewList(const string &view_name, const string &column);
 
 public:
-	explicit RefreshMetadata(Connection &con) : con(con) {
+	explicit RefreshMetadata(Connection &con, optional_ptr<ClientContext> snapshot_context = nullptr)
+	    : con(con), snapshot_context(snapshot_context) {
 	}
+
+	// Reads `view_name`'s record through this connection and serves later reads of that view from it.
+	// Returns null (reads keep going to SQL) when the view is not registered or the record is unreadable.
+	shared_ptr<const ViewRecord> LoadView(const string &view_name);
+	// Serve reads of the record's view from `record` (read earlier in the same refresh); null clears it.
+	void UseView(shared_ptr<const ViewRecord> record);
+	// Every method that immediately writes openivm_views or openivm_delta_tables columns a record serves
+	// (anything but the volatile columns) must call this first. Writes emitted as refresh program text
+	// (watermark and DuckLake checkpoint UPDATEs) are exempt: they run after the attempt's last read.
+	void InvalidateView();
+	// Make `record` available to the optimizer rules planning ComputeDelta on `context` (a helper
+	// connection OpenIVM owns for one refresh), and look it up there.
+	static void RegisterPlanningView(ClientContext &context, shared_ptr<const ViewRecord> record);
+	static shared_ptr<const ViewRecord> PlanningView(ClientContext &context, const string &view_name);
+	// Whether the transaction of `context` can hold metadata changes a fresh helper connection cannot see.
+	// A helper connection OpenIVM opened to plan a refresh only reads committed metadata.
+	static bool TransactionMayHoldMetadata(ClientContext &context);
+	static void MarkPlanningHelper(ClientContext &context);
+	// The stored publication query, or NULL when the view has none or it cannot be read.
+	Value GetPublishedQuery(const string &view_name);
 
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.
 	// Within that catalog, metadata stays in the schema that already holds it. New metadata uses
@@ -49,9 +102,8 @@ public:
 	// In autocommit mode, move a catalog's metadata into the configured schema and, for a new
 	// materialized view, create that schema. Other metadata objects keep their placement.
 	static void PrepareMetadataSchema(ClientContext &context, const string &view_catalog, bool create_schema);
-	// Every native metadata location containing `table`, and the qualified table names.
-	static vector<MetadataLocation> MetadataLocations(Connection &con, const string &table);
-	// Caller-snapshot discovery includes uncommitted schemas and registries.
+	// Every native metadata location containing `table`; caller-snapshot discovery includes uncommitted schemas and
+	// registries.
 	static vector<MetadataLocation> MetadataLocations(ClientContext &context, const string &table);
 	static vector<string> MetadataTables(Connection &con, const string &table);
 
@@ -92,6 +144,7 @@ public:
 
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
+	Value GetLastUpdateValue(const string &view_name, const string &table_name);
 
 	// Every metadata location that may consume delta tables (see MetadataLocator::All).
 	static vector<MetadataLocation> MetadataLocations(Connection &con);
@@ -187,6 +240,9 @@ public:
 	};
 
 	DeltaChangeStats GetStandardDeltaChangeStats(const string &delta_table_sql, const string &last_update);
+	// The stats of several native deltas in one statement, in input order. An empty watermark, or a
+	// failure of the combined statement, falls back to GetStandardDeltaChangeStats per delta.
+	vector<DeltaChangeStats> GetStandardDeltaChangeStats(const vector<pair<string, string>> &deltas_and_watermarks);
 
 	vector<string> GetTableColumns(const string &catalog_name, const string &schema_name, const string &table_name);
 	bool TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,
@@ -200,6 +256,8 @@ public:
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
+	// Refresh order of a single-view cascade: upstream views, the view itself, then downstream views.
+	vector<string> CascadeOrder(const string &view_name, const string &cascade_mode);
 	bool HasDownstreamViews(const string &view_name, bool include_published = true,
 	                        optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr);
 
@@ -248,6 +306,7 @@ public:
 	                                   const string &data_catalog = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
+	static string SerializeViewList(const vector<string> &values);
 	vector<string> GetGroupColumns(const string &view_name);
 
 	// Get common window ORDER BY output/source mappings. Empty means the view
@@ -270,6 +329,7 @@ public:
 	};
 
 	GroupRecomputeAffectedMode GetGroupRecomputeAffectedMode(const string &view_name);
+	string GetGroupRecomputeAffectedQuery(const string &view_name);
 	vector<GroupRecomputeSourceOccurrence> GetGroupRecomputeSourceOccurrences(const string &view_name);
 	static string GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecomputeSourceOccurrence> &occurrences);
 
@@ -296,16 +356,21 @@ public:
 		bool changed = false;
 	};
 
-	// Resolve the DuckLake table id recorded for a source table and repair stale/missing metadata.
+	// Compare a source at the refresh boundaries without changing the recorded identity.
 	DuckLakeSourceIdentity ResolveDuckLakeSourceIdentity(const string &view_name, const string &table_name,
-	                                                     const string &catalog_name, const string &schema_name);
+	                                                     const string &catalog_name, const string &schema_name,
+	                                                     int64_t last_snapshot_id, int64_t current_snapshot_id);
 	// The DuckLake table id that `catalog.schema.table` named at `snapshot_id`; -1 if unknown.
 	int64_t GetDuckLakeTableIdAt(const string &catalog_name, const string &schema_name, const string &table_name,
 	                             int64_t snapshot_id);
 
+	static string BuildDuckLakeTableIdAtSQL(const string &catalog_name, const string &schema_name,
+	                                        const string &table_name, const string &snapshot_expr);
 	static string BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
-	                                              const string &snapshot_expr, const string &delta_metadata_table = "");
-	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id);
+	                                              const string &snapshot_expr, const string &delta_metadata_table = "",
+	                                              const string &source_table_id_expr = "");
+	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id,
+	                                   int64_t source_table_id = -1);
 
 	// --- Refresh history (learned cost model) ---
 
@@ -328,20 +393,39 @@ public:
 
 	// Metadata captured at CREATE-MV time for the aux-state DISTINCT pipeline.
 	// `aux_table` is the per-tuple count table (e.g. `openivm_distinct_count_<view>`);
-	// `cols` are the columns being deduplicated; `input_sql` is the DISTINCT subquery
-	// body with the DISTINCT keyword stripped; `source` is the base table referenced
-	// by `input_sql`'s FROM clause; `filter` is the WHERE predicate (empty if none);
+	// `cols` are the columns being deduplicated; `source_exprs` compute them from the
+	// base table `source`; `filter` is the WHERE predicate (empty if none);
 	// `sum_arg` and `sum_out` describe the parent aggregate's single SUM expression
-	// (`SUM(<sum_arg>) AS <sum_out>`). v0 supports exactly one SUM column.
+	// (`SUM(<sum_arg>) AS <sum_out>`); sum_out can name hidden state for a cast output.
+	// v0 supports exactly one SUM expression, with shared projected aliases.
 	struct DistinctAuxMeta {
 		string aux_table;
 		vector<string> cols;
 		vector<string> source_exprs;
-		string input_sql;
 		string source;
 		string filter;
 		string sum_arg;
 		string sum_out;
+		vector<DerivedAggregateOutput> group_inputs;
+		string sum_input_expr;
+		// Complex or limited inputs use cols/source_exprs for candidate counts. The stored selection
+		// reads openivm_topk_candidates through stable selected_source_columns aliases.
+		string selected_input_sql;
+		vector<string> selected_input_columns;
+		vector<string> selected_source_columns;
+		vector<string> sign_columns;
+		vector<string> selected_identity_exprs;
+		bool representative_input = false;
+		string selected_view_sql;
+		// Evaluated on representative transitions, after DISTINCT and before aggregation.
+		string post_filter;
+
+		// Stable across creation and refresh; separate from candidate/selection input names.
+		string InternalColumn(const string &name) const;
+
+		string SelectionTable() const {
+			return selected_input_sql.empty() || representative_input ? "" : aux_table + "_selected";
+		}
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL
@@ -360,8 +444,11 @@ public:
 		string filter;
 	};
 
+	// JSON encoding of a metadata struct without nested objects (CountDistinctAuxMeta, SemiAntiAuxMeta,
+	// LeftJoinKeySource, LeftJoinNullableSources, FilteredGroupCountAuxMeta, LeftJoinSecondaryMeta).
+	template <class T>
+	static string ToJson(const T &meta);
 	bool GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out);
-	static string CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta);
 
 	struct SemiAntiAuxMeta {
 		string aux_table;
@@ -382,7 +469,6 @@ public:
 	};
 
 	bool GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out);
-	static string SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta);
 
 	struct WindowPartitionLineageOp {
 		WindowLineageKind kind = WindowLineageKind::DIRECT;
@@ -441,7 +527,6 @@ public:
 	};
 
 	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);
-	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
 
 	// Nested outer-join inputs used to discover NULL-padding keys of a FULL projection.
 	struct FullOuterScopeInput {
@@ -466,7 +551,6 @@ public:
 	};
 
 	bool GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out);
-	static string LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src);
 
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
@@ -482,7 +566,6 @@ public:
 	};
 
 	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);
-	static string FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta);
 
 	// LEFT JOIN pipeline secondary-delta maintenance (Larson & Zhou). The secondary-delta SQL is
 	// generated once at CREATE time (from the plan) and stored; refresh substitutes the per-source
@@ -495,14 +578,12 @@ public:
 		// them to build the right row source per storage backend (delta table vs DuckLake snapshots).
 		vector<string> inner_tables; // qualified base-table names of the inner (null-supplying) sides
 		vector<string> inner_keys;   // join key columns on the inner sides
-		vector<string> pres_tables;  // qualified base-table names of the preserved sides
-		vector<string> pres_keys;    // join key columns on the preserved sides
 	};
 
 	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);
-	static string LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta);
 
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
+	static vector<pair<string, string>> DistinctSignCountColumns(const DistinctAuxMeta &meta);
 	static vector<string> ExpectedCountDistinctAuxColumns(const CountDistinctAuxMeta &meta);
 	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
 	static vector<string> ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta);

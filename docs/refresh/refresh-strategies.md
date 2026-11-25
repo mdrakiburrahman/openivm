@@ -105,7 +105,11 @@ Use `PRAGMA refresh_history('view_name')` to inspect the 20 most recent refresh 
 
 ### Explicit catalog arguments
 
-`PRAGMA refresh` also accepts a view located by catalog. `PRAGMA refresh_options(catalog, schema, view)` takes three VARCHAR arguments. `PRAGMA refresh_cross_system(view_catalog, view_schema, attached_catalog, attached_schema, view)` takes five VARCHAR arguments and refreshes the view as a cross-system view, using the attached catalog and schema given in the third and fourth arguments. For cross-system views the refresh is split into data statements in the view's catalog and metadata statements on a separate connection, because DuckDB does not allow writing two catalogs in one transaction. A native refresh runs in one transaction. A full cross-system guide (PostgreSQL setup, supported view shapes, limitations) is not yet written.
+`PRAGMA refresh` accepts a catalog-qualified view name.
+`PRAGMA refresh_options(catalog, schema, view)` also accepts the view location as
+three VARCHAR arguments. For an attached data catalog and separate control metadata,
+see the [cross-system refresh guide](cross-system-refresh.md) for PostgreSQL setup,
+explicit catalog arguments, supported view shapes, and limitations.
 
 For implementation details and preliminary validation results, see
 [Cost Model](../internals/cost_model.md).

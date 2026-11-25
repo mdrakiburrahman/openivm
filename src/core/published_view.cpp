@@ -57,19 +57,12 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 	vector<string> affected;
 	for (auto &views_table : RefreshMetadata::MetadataTables(con, openivm::VIEWS_TABLE)) {
 		// Publications live in the MV's internal location; report the user-facing name.
-		auto query = [&](const string &internal_expression) {
-			return con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name), " +
-			                 internal_expression + " FROM " + views_table + " WHERE " +
-			                 SqlUtils::IdentifierEqualsSQL("view_catalog", Value(catalog).ToSQLString()));
-		};
-		auto views = query("COALESCE(internal_schema, view_schema)");
-		if (views->HasError()) {
-			views = query("view_schema"); // Metadata written before internal schemas existed.
-		}
-		if (views->HasError()) {
-			throw CatalogException("Could not check snapshot publication before history deletion: %s",
-			                       views->GetError());
-		}
+		auto views = SqlUtils::QueryOrThrow(
+		    con,
+		    "SELECT view_name, view_schema, COALESCE(view_sql_name, view_name), COALESCE(internal_schema, "
+		    "view_schema) FROM " +
+		        views_table + " WHERE " + SqlUtils::IdentifierEqualsSQL("view_catalog", Value(catalog).ToSQLString()),
+		    "Could not check snapshot publication before history deletion: %s");
 		for (idx_t row = 0; row < views->RowCount(); row++) {
 			auto schema = views->Collection().GetValue(1, row).ToString();
 			auto internal_schema = views->Collection().GetValue(3, row).ToString();
@@ -122,10 +115,10 @@ string PublishedSourceViewName(string source_name) {
 }
 
 string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
-                           const vector<string> &columns, bool ducklake, const string &metadata_table,
-                           const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
-                           const string &appended_rows, const string &scope_rows,
-                           const vector<string> &delta_metadata_tables) {
+                           const vector<string> &columns, const vector<LogicalType> &column_types, bool ducklake,
+                           const string &metadata_table, const vector<string> &scope_columns,
+                           const string &timestamp_sql, SqlDialect dialect, const string &appended_rows,
+                           const string &scope_rows, const vector<string> &delta_metadata_tables) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -189,9 +182,21 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	string create = dialect == SqlDialect::SPARK ? "CREATE TABLE " : "CREATE TEMP TABLE ";
 	string sql = create + next + " AS " + scoped_query + ";\n";
 	auto weight = quote("openivm_publish_weight");
+	// SQL equality merges signed zeros. Keep their sign-only retractions and
+	// insertions so downstream expressions observe the newly published value.
+	D_ASSERT(columns.size() == column_types.size());
+	string group_list = column_list;
+	idx_t zero_sign_keys = 0;
+	for (idx_t index = 0; index < columns.size(); index++) {
+		if (column_types[index].IsFloating()) {
+			group_list += ", " + SqlUtils::NegativeZeroSQL(quoted_columns[index], dialect);
+			zero_sign_keys++;
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[PUBLISH] Retained %zu zero-sign grouping keys for %s\n", zero_sign_keys, view_name.c_str());
 	sql += create + changes + " AS SELECT " + column_list + ", SUM(" + weight + ") AS " + weight +
 	       " FROM (SELECT *, CAST(-1 AS BIGINT) AS " + weight + " FROM (" + old_query +
-	       ") old_rows UNION ALL SELECT *, CAST(1 AS BIGINT) FROM " + next + ") signed_rows GROUP BY " + column_list +
+	       ") old_rows UNION ALL SELECT *, CAST(1 AS BIGINT) FROM " + next + ") signed_rows GROUP BY " + group_list +
 	       " HAVING SUM(" + weight + ") <> 0;\n";
 	if (!ducklake) {
 		string timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;

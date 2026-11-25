@@ -99,3 +99,120 @@ SELECT count(*) FROM ((SELECT w, d, SUM(bal) AS s FROM cust GROUP BY w, d)
   (SELECT * FROM agg)) x;
 ----
 0
+
+# Representative changes must also replace native rows without an index.
+# Qualified MVs currently omit that index; the ordinary matched MERGE action
+# must still stay an in-place aggregate update.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE SCHEMA zero_keys;
+
+statement ok
+CREATE TABLE zero_keys.source(id INT,k INT,v DOUBLE,x INT);
+
+statement ok
+INSERT INTO zero_keys.source VALUES(1,1,'-0.0'::DOUBLE,10),(2,1,'-0.0'::DOUBLE,10),(3,2,2,30),(4,3,NULL,40);
+
+statement ok
+CREATE MATERIALIZED VIEW zero_indexed AS SELECT k,v,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v;
+
+statement ok
+CREATE VIEW zero_indexed_expected AS SELECT k,v,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v;
+
+statement ok
+CREATE MATERIALIZED VIEW zero_keys.unindexed AS SELECT k,v,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v;
+
+statement ok
+CREATE VIEW zero_keys.unindexed_expected AS SELECT k,v,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v;
+
+statement ok
+CREATE MATERIALIZED VIEW zero_keys.float_key AS SELECT k,v::FLOAT v,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v::FLOAT;
+
+statement ok
+CREATE VIEW zero_keys.float_key_expected AS SELECT k,v::FLOAT v,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v::FLOAT;
+
+foreach parent zero_indexed zero_keys.unindexed zero_keys.float_key
+
+statement ok
+CREATE MATERIALIZED VIEW {parent}_child AS SELECT k,signbit(v) neg,1/v reciprocal,a FROM {parent};
+
+statement ok
+CREATE VIEW {parent}_child_expected AS SELECT k,signbit(v) neg,1/v reciprocal,a FROM {parent}_expected;
+
+endloop
+
+statement ok
+CREATE MATERIALIZED VIEW zero_keys.hidden_key AS SELECT k,signbit(v) neg,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v;
+
+statement ok
+CREATE VIEW zero_keys.hidden_key_expected AS SELECT k,signbit(v) neg,SUM(x)+1 a FROM zero_keys.source GROUP BY k,v;
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE schema_name='zero_keys' AND starts_with(table_name,'openivm_data_');
+----
+0
+
+foreach zero 0.0 -0.0 0.0
+
+# Exercise both persisted and transaction-local source rows, and the on-disk
+# index for the unqualified parent, before each sign-only refresh.
+restart
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO zero_keys.source VALUES(99,1,'-0.0'::DOUBLE,10),(100,1,0,10);
+
+statement ok
+UPDATE zero_keys.source SET x=12 WHERE id IN(1,99,100);
+
+statement ok
+DELETE FROM zero_keys.source WHERE id IN(1,2,99,100);
+
+statement ok
+INSERT INTO zero_keys.source VALUES(1,1,'{zero}'::DOUBLE,10),(2,1,'{zero}'::DOUBLE,10);
+
+statement ok
+UPDATE zero_keys.source SET x=x+1 WHERE id=3;
+
+foreach parent zero_indexed zero_keys.unindexed zero_keys.float_key
+
+statement ok
+PRAGMA refresh('{parent}');
+
+query I
+SELECT count(*) FROM((SELECT *,signbit(v) neg FROM {parent} EXCEPT ALL SELECT *,signbit(v) neg FROM {parent}_expected) UNION ALL (SELECT *,signbit(v) neg FROM {parent}_expected EXCEPT ALL SELECT *,signbit(v) neg FROM {parent}));
+----
+0
+
+statement ok
+PRAGMA refresh('{parent}_child');
+
+query I
+SELECT count(*) FROM((SELECT * FROM {parent}_child EXCEPT ALL SELECT * FROM {parent}_child_expected) UNION ALL (SELECT * FROM {parent}_child_expected EXCEPT ALL SELECT * FROM {parent}_child));
+----
+0
+
+endloop
+
+statement ok
+PRAGMA refresh('zero_keys.hidden_key');
+
+query I
+SELECT count(*) FROM((SELECT * FROM zero_keys.hidden_key EXCEPT ALL SELECT * FROM zero_keys.hidden_key_expected) UNION ALL (SELECT * FROM zero_keys.hidden_key_expected EXCEPT ALL SELECT * FROM zero_keys.hidden_key));
+----
+0
+
+endloop

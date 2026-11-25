@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <bitset>
+#include <tuple>
 
 namespace duckdb {
 
@@ -308,7 +309,7 @@ struct JoinPlanFacts {
 
 // Collect join leaves and the properties needed to select a compilation strategy. Non-join wrappers remain leaves,
 // but their descendants are still inspected for validation and existing multiplicity bindings.
-static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool is_right_of_left, bool collect_leaf,
+static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool collect_leaf,
                                  bool collect_ducklake_leaf, JoinPlanFacts &facts) {
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
@@ -354,36 +355,25 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		}
 	}
 	if ((collect_leaf || collect_ducklake_leaf) && is_join_tree_node) {
-		bool left_is_nullable = is_right_of_left;
-		bool right_is_nullable = is_right_of_left;
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join) {
-			left_is_nullable =
-			    left_is_nullable || join->join_type == JoinType::RIGHT || join->join_type == JoinType::OUTER;
-			right_is_nullable =
-			    right_is_nullable || join->join_type == JoinType::LEFT || join->join_type == JoinType::OUTER;
-		}
 		D_ASSERT(node->children.size() == 2);
 		path.push_back(0);
-		CollectJoinPlanFacts(node->children[0].get(), path, left_is_nullable, collect_leaf, collect_ducklake_leaf,
-		                     facts);
+		CollectJoinPlanFacts(node->children[0].get(), path, collect_leaf, collect_ducklake_leaf, facts);
 		path.pop_back();
 		path.push_back(1);
-		CollectJoinPlanFacts(node->children[1].get(), path, right_is_nullable, collect_leaf, collect_ducklake_leaf,
-		                     facts);
+		CollectJoinPlanFacts(node->children[1].get(), path, collect_leaf, collect_ducklake_leaf, facts);
 		path.pop_back();
 		return;
 	}
 	if (collect_leaf) {
 		auto *get = node->type == LogicalOperatorType::LOGICAL_GET ? dynamic_cast<LogicalGet *>(node) : nullptr;
-		facts.leaves.push_back({path, get, node, is_right_of_left});
+		facts.leaves.push_back({path, get, node});
 	}
 	if (collect_ducklake_leaf) {
 		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
 		    node->type == LogicalOperatorType::LOGICAL_FILTER) {
 			if (node->children.size() == 1) {
 				path.push_back(0);
-				CollectJoinPlanFacts(node->children[0].get(), path, is_right_of_left, false, true, facts);
+				CollectJoinPlanFacts(node->children[0].get(), path, false, true, facts);
 				path.pop_back();
 				return;
 			}
@@ -393,7 +383,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		} else if (node->type == LogicalOperatorType::LOGICAL_GET) {
 			auto *get = dynamic_cast<LogicalGet *>(node);
 			if (get && get->function.GetName().GetIdentifierName() == "ducklake_scan" && get->function.function_info) {
-				facts.ducklake_leaves.push_back({path, get, node, is_right_of_left});
+				facts.ducklake_leaves.push_back({path, get, node});
 				return;
 			}
 			if (facts.ducklake_fallback_reason.empty()) {
@@ -405,7 +395,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 	}
 	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
 		path.push_back(child_idx);
-		CollectJoinPlanFacts(node->children[child_idx].get(), path, is_right_of_left, false, false, facts);
+		CollectJoinPlanFacts(node->children[child_idx].get(), path, false, false, facts);
 		path.pop_back();
 	}
 }
@@ -418,18 +408,6 @@ static bool IsNullSupplyingJoin(JoinType join_type) {
 		return true;
 	default:
 		return false;
-	}
-}
-
-void DemoteLeftJoins(LogicalOperator *node) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (j && IsNullSupplyingJoin(j->join_type)) {
-			j->join_type = JoinType::INNER;
-		}
-	}
-	for (auto &child : node->children) {
-		DemoteLeftJoins(child.get());
 	}
 }
 
@@ -501,6 +479,8 @@ struct TransitioningKeyCTEDefinition {
 	vector<string> names;
 };
 
+using TransitionKeyCTEIndexes = map<std::tuple<size_t, idx_t, bool>, idx_t>;
+
 // Build the set of DISTINCT key values (from base_get's column at key_pos) whose match-count within
 // base_get's own rows ACTUALLY transitions across zero between old (pre-delta) and new (current,
 // post-delta) state -- i.e. old_count>0 && new_count==0, or old_count==0 && new_count>0. A key merely
@@ -509,9 +489,9 @@ struct TransitioningKeyCTEDefinition {
 // still match.
 static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContext &context, Connection &con,
                                                                     Binder &binder, LogicalGet *base_get, idx_t key_pos,
-                                                                    const string &view_name) {
-	auto delta_result = CreateDeltaGetNode(context, con, binder, base_get, view_name);
-	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.node), binder);
+                                                                    const string &view_name, bool old_state) {
+	auto delta_result = CreateDeltaGetNode(context, con, binder, base_get, view_name, nullptr, true);
+	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.op), binder);
 	auto delta_bindings = delta_renumbered.op->GetColumnBindings();
 	auto delta_types = delta_renumbered.op->types;
 	// These mutations admit the appended multiplicity as a data key; valid plans must reject it.
@@ -520,25 +500,27 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 		                        delta_bindings.empty() ? 0 : delta_bindings.size() - 1); // mull-ignore: cxx_sub_to_add
 	}
 	idx_t mul_pos = delta_bindings.size() - 1; // CreateDeltaGetNode/CompactDeltaNode appends multiplicity last.
-	ColumnBinding delta_key_binding = delta_bindings[key_pos];
-	ColumnBinding delta_mul_binding = delta_bindings[mul_pos];
 	LogicalType key_type = delta_types[key_pos];
-	LogicalType mul_type = delta_types[mul_pos];
+	vector<unique_ptr<Expression>> delta_groups;
+	delta_groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, delta_bindings[key_pos]));
+	vector<unique_ptr<Expression>> delta_aggregates;
+	delta_aggregates.push_back(MakeAggregate(
+	    context, "sum", make_uniq<BoundColumnRefExpression>(delta_types[mul_pos], delta_bindings[mul_pos]),
+	    "net_multiplicity"));
+	// A payload UPDATE emits distinct old/new tuples with the same join key.
+	// Only their net weight can establish a key's zero-support transition.
+	delta_renumbered.op = MakeGroupedAggregate(binder, std::move(delta_groups), std::move(delta_aggregates),
+	                                           std::move(delta_renumbered.op));
+	delta_bindings = delta_renumbered.op->GetColumnBindings();
+	ColumnBinding delta_key_binding = delta_bindings[0];
+	ColumnBinding delta_mul_binding = delta_bindings[1];
+	LogicalType mul_type = delta_renumbered.op->types[1];
 
-	// Restrict the current-state count to keys present in this delta before
-	// aggregating. Without this join, every inclusion-exclusion term hashes every
-	// key in the nullable base table even when only one key changed.
+	// Restrict the current-state count to keys present in the delta before
+	// aggregating, rather than hashing every key in the nullable base table.
 	auto affected_delta = renumber_and_rebind_subtree(delta_renumbered.op->Copy(context), binder);
-	auto affected_bindings = affected_delta.op->GetColumnBindings();
-	// Equality is the first impossible binding index and is handled by this exception.
-	if (key_pos >= affected_bindings.size()) { // mull-ignore: cxx_ge_to_gt
-		throw InternalException("DeltaJoin: affected-key position %llu is outside %llu bindings", key_pos,
-		                        affected_bindings.size());
-	}
-	vector<unique_ptr<Expression>> affected_groups;
-	affected_groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, affected_bindings[key_pos]));
-	auto affected_keys = MakeGroupedAggregate(binder, std::move(affected_groups), {}, std::move(affected_delta.op));
-	ColumnBinding affected_key_binding = affected_keys->GetColumnBindings()[0];
+	ColumnBinding affected_key_binding = affected_delta.op->GetColumnBindings()[0];
+	auto affected_keys = std::move(affected_delta.op);
 
 	// Fresh scan of the SAME base table (current/post-delta state), filtered to
 	// affected keys and grouped by key with COUNT(*).
@@ -602,19 +584,18 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 	if (!old_count_expr) {
 		throw InternalException("DeltaJoin: failed to bind '-' for transition check: %s", sub_err.RawMessage());
 	}
-	// Only the DOWNWARD transition (old>0, new=0) is a phantom-NULL-pad risk here: the "other" side
-	// row is LEFT JOINed against base_get's CURRENT (already-merged) state, so a key that just LOST
-	// its last match reads as unmatched in "current" even though it was genuinely matched pre-batch --
-	// that phantom dangling row must be excluded (the higher-order term supplies the real removal row
-	// instead). A key that just GAINED its first match (old=0, new>0) is the opposite: "current"
-	// already reflects that real, new match, so this term's row IS the correct contribution and must
-	// NOT be excluded -- excluding it would drop the row entirely, since no other term re-adds it.
-	auto old_gt_zero = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, std::move(old_count_expr),
-	                                                     make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
-	auto new_eq_zero = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, build_new_count(),
-	                                                     make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
-	auto transition_expr = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
-	                                                             std::move(old_gt_zero), std::move(new_eq_zero));
+	// A kept outer join can invent a NULL pad only at its empty endpoint.
+	// Native terms read current state, so suppress downward transitions. A
+	// DuckLake term pinned to old state instead suppresses upward transitions.
+
+	auto old_support_check = BoundComparisonExpression::Create(
+	    old_state ? ExpressionType::COMPARE_EQUAL : ExpressionType::COMPARE_GREATERTHAN, std::move(old_count_expr),
+	    make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
+	auto new_support_check = BoundComparisonExpression::Create(
+	    old_state ? ExpressionType::COMPARE_GREATERTHAN : ExpressionType::COMPARE_EQUAL, build_new_count(),
+	    make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
+	auto transition_expr = make_uniq<BoundConjunctionExpression>(
+	    ExpressionType::CONJUNCTION_AND, std::move(old_support_check), std::move(new_support_check));
 	auto filter = make_uniq<LogicalFilter>(std::move(transition_expr));
 	filter->children.push_back(std::move(joined));
 	filter->ResolveOperatorTypes();
@@ -636,14 +617,15 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 
 static unique_ptr<TransitioningKeySet>
 GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binder, LogicalGet *base_get, idx_t key_pos,
-                          size_t leaf_index, const string &view_name,
-                          map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                          size_t leaf_index, const string &view_name, bool old_state,
+                          TransitionKeyCTEIndexes &transition_cte_indexes,
                           vector<TransitioningKeyCTEDefinition> &transition_ctes) {
-	auto cache_key = make_pair(leaf_index, key_pos);
+	auto cache_key = std::make_tuple(leaf_index, key_pos, old_state);
 	auto existing = transition_cte_indexes.find(cache_key);
 	idx_t definition_index;
 	if (existing == transition_cte_indexes.end()) {
-		auto transitioning_keys = BuildTransitioningKeySetImpl(context, con, binder, base_get, key_pos, view_name);
+		auto transitioning_keys =
+		    BuildTransitioningKeySetImpl(context, con, binder, base_get, key_pos, view_name, old_state);
 		D_ASSERT(transitioning_keys->node->types.size() == 1);
 		TransitioningKeyCTEDefinition definition;
 		definition.cte_index = binder.GenerateTableIndex();
@@ -671,25 +653,29 @@ GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binde
 
 // After DemoteOuterJoinsForMask, a LEFT/RIGHT join may remain un-demoted (kept as an outer join)
 // because its null-supplying side has no delta leaf in THIS mask — so it reads that side as
-// "current" state. If that null-supplying leaf independently has ANY pending delta (from this
-// same refresh, just not part of this term's mask), "current" silently mixes old and new state
-// for the dangling-tuple decision: a preserved-side row whose matching child rows are ALSO being
-// deleted in this same batch gets a spurious extra dangling row here, on top of the correct
-// removal already produced by the higher-order term that covers {this leaf, that leaf} together
-// (double-count). This is the outer-join analogue of the classic T_old-vs-T_new join delta
-// problem — LEFT JOIN's NULL-padding is a non-linear threshold function (unlike inner join's
-// bilinear product), so it cannot be decomposed by inclusion-exclusion the way ordinary joins
-// can; instead (matching Larson & Zhou / DBSP's semijoin-count treatment), we must exclude keys
-// that are themselves transitioning, since those are exclusively owned by the term(s) that
-// include this leaf's delta bit. Guard: anti-join the null-supplying leaf's current scan against
-// its own delta table on the join key, excluding any key present there. Only applies when the
-// null-supplying side is a single, unwrapped base-table leaf directly under the join (bails
-// silently otherwise, matching this file's existing unsupported-shape convention).
-static void
-GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &binder, LogicalOperator *node,
-                              const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask, const string &view_name,
-                              bool portable_anti_guard, map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
-                              vector<TransitioningKeyCTEDefinition> &transition_ctes, vector<size_t> &path) {
+// "current" state. If that null-supplying leaf independently has pending deltas in this refresh,
+// "current" mixes old and new state for the dangling-tuple decision and double-counts with the
+// higher-order term that covers both leaves. LEFT JOIN's NULL-padding is a non-linear threshold
+// function, so (matching Larson & Zhou / DBSP's semijoin-count treatment) this term excludes the
+// preserved-side rows whose key match-count transitions across zero; the terms including this
+// leaf's delta bit own them. Applies only when the null-supplying side resolves to a base-table
+// scan (bails silently otherwise).
+static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &binder,
+                                          LogicalOperator *node, const vector<JoinLeafInfo> &leaves,
+                                          uint64_t leaf_has_delta_mask, uint64_t old_state_mask,
+                                          const string &view_name, bool portable_anti_guard,
+                                          TransitionKeyCTEIndexes &transition_cte_indexes,
+                                          vector<TransitioningKeyCTEDefinition> &transition_ctes,
+                                          vector<size_t> &path) {
+	// Guard children before wrapping the preserved subtree in an anti-join.
+	// The leaf paths describe the original tree and would be shifted by that wrapper.
+	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
+		path.push_back(ci);
+		GuardKeptOuterJoinsForMaskRec(context, con, binder, node->children[ci].get(), leaves, leaf_has_delta_mask,
+		                              old_state_mask, view_name, portable_anti_guard, transition_cte_indexes,
+		                              transition_ctes, path);
+		path.pop_back();
+	}
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
 		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT) && !j->conditions.empty()) {
@@ -699,18 +685,24 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 			// resolution below must use j->children[null_side_child] directly -- that subtree lives
 			// in `term`'s OWN freshly-renumbered copy, whereas leaves[i].node/.get are stale pointers
 			// into the ORIGINAL (pre-copy) plan and carry different table indices entirely.
-			path.push_back(null_side_child);
+			idx_t other_child = 1 - null_side_child;
+			vector<LogicalOperator *> null_side_chain;
+			LogicalGet *current_null_side_get = FindGetInSubtree(j->children[null_side_child].get(), &null_side_chain);
+			auto null_path = path;
+			null_path.push_back(null_side_child);
 			size_t null_leaf_idx = SIZE_MAX;
 			for (size_t i = 0; i < leaves.size(); i++) {
-				if (leaves[i].path == path) {
+				// Legacy leaves stop at the wrapper; flattened leaves end at its GET.
+				if (leaves[i].path == null_path ||
+				    (leaves[i].path.size() == null_path.size() + null_side_chain.size() &&
+				     std::equal(null_path.begin(), null_path.end(), leaves[i].path.begin()) &&
+				     std::all_of(std::next(leaves[i].path.begin(), static_cast<int64_t>(null_path.size())),
+				                 leaves[i].path.end(), [](size_t child) { return child == 0; }))) {
 					null_leaf_idx = i;
 					break;
 				}
 			}
-			path.pop_back();
-			idx_t other_child = 1 - null_side_child;
-			vector<LogicalOperator *> null_side_chain;
-			LogicalGet *current_null_side_get = FindGetInSubtree(j->children[null_side_child].get(), &null_side_chain);
+
 			if (current_null_side_get && null_leaf_idx != SIZE_MAX && (leaf_has_delta_mask & (1ULL << null_leaf_idx))) {
 				auto &cond = j->conditions[0];
 				// null_key_expr references the null-supplying side (used to size/position the Δ-scan probe
@@ -735,17 +727,14 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 				}
 				if (key_expr && key_pos != DConstants::INVALID_INDEX &&
 				    other_key_expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-					// Build the set of keys whose match-count on the null-supplying side ACTUALLY
-					// transitions across zero (old>0,new=0 or old=0,new>0). A key merely appearing in
-					// the delta is NOT enough to exclude it: for a 1:many relationship (e.g. one
-					// customer, many orders) a single changed order must not suppress the customer's
-					// row when the customer still has OTHER, unchanged matches. Only a true 0<->>0
-					// transition means "this key's presence here is fully owned by the higher-order
-					// term" -- matching the same match-count-transition principle as the secondary-delta
-					// fix, just applied here to avoid a double-count instead of to add a missing row.
-					auto transitioning_keys =
-					    GetTransitioningKeySetRef(context, con, binder, current_null_side_get, key_pos, null_leaf_idx,
-					                              view_name, transition_cte_indexes, transition_ctes);
+					// Only a true 0<->>0 match-count transition (see BuildTransitioningKeySetImpl) means
+					// the key is fully owned by the higher-order term.
+					auto transitioning_keys = GetTransitioningKeySetRef(
+					    context, con, binder,
+					    old_state_mask & (1ULL << null_leaf_idx) ? GetLeafScan(leaves[null_leaf_idx])
+					                                             : current_null_side_get,
+					    key_pos, null_leaf_idx, view_name, (old_state_mask & (1ULL << null_leaf_idx)) != 0,
+					    transition_cte_indexes, transition_ctes);
 					auto &other_bcr = other_key_expr->Cast<BoundColumnRefExpression>();
 					auto left_expr =
 					    make_uniq<BoundColumnRefExpression>(other_bcr.GetReturnType(), other_bcr.Binding());
@@ -791,23 +780,45 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 			}
 		}
 	}
-	// Recursing over every child is required by the validated join tree; the >= mutant only skips descendants.
-	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
-		path.push_back(ci);
-		GuardKeptOuterJoinsForMaskRec(context, con, binder, node->children[ci].get(), leaves, leaf_has_delta_mask,
-		                              view_name, portable_anti_guard, transition_cte_indexes, transition_ctes, path);
-		path.pop_back();
-	}
 }
 
 static void GuardKeptOuterJoinsForMask(ClientContext &context, Connection &con, Binder &binder, LogicalOperator *node,
                                        const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
-                                       const string &view_name, bool portable_anti_guard,
-                                       map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                                       uint64_t old_state_mask, const string &view_name, bool portable_anti_guard,
+                                       TransitionKeyCTEIndexes &transition_cte_indexes,
                                        vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	vector<size_t> path;
-	GuardKeptOuterJoinsForMaskRec(context, con, binder, node, leaves, leaf_has_delta_mask, view_name,
+	GuardKeptOuterJoinsForMaskRec(context, con, binder, node, leaves, leaf_has_delta_mask, old_state_mask, view_name,
 	                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
+}
+
+vector<LogicalOperator *> LeafPathAncestors(LogicalOperator &root, const vector<size_t> &leaf_path,
+                                            const char *context_label) {
+	vector<LogicalOperator *> ancestors;
+	ancestors.reserve(leaf_path.size());
+	LogicalOperator *node = &root;
+	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
+		// Equality is the first invalid child index and is handled by this exception.
+		// mull-ignore-next: cxx_ge_to_gt
+		if (leaf_path[depth] >= node->children.size()) {
+			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
+			                        (idx_t)leaf_path[depth], (idx_t)depth);
+		}
+		ancestors.push_back(node);
+		node = node->children[leaf_path[depth]].get();
+	}
+	return ancestors;
+}
+
+idx_t JoinChildOutputOffset(LogicalOperator &join, size_t child_side) {
+	if (child_side == 0) {
+		return 0;
+	}
+	auto *logical_join = dynamic_cast<LogicalJoin *>(&join);
+	if (logical_join && !logical_join->left_projection_map.empty()) {
+		return logical_join->left_projection_map.size();
+	}
+	return join.children[0]->GetColumnBindings().size();
 }
 
 void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, const vector<size_t> &leaf_path,
@@ -835,24 +846,12 @@ void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, cons
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,
-                                                bool preserve_constant_sibling_child_outputs, idx_t fallback_mul_idx,
+                                                bool preserve_constant_sibling_child_outputs,
                                                 idx_t original_leaf_width) {
 	if (leaf_path.empty()) {
 		return;
 	}
-	vector<LogicalOperator *> ancestors;
-	ancestors.reserve(leaf_path.size());
-	LogicalOperator *node = term.get();
-	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
-		// Equality is the first invalid child index and is handled by this exception.
-		// mull-ignore-next: cxx_ge_to_gt
-		if (leaf_path[depth] >= node->children.size()) {
-			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
-			                        (idx_t)leaf_path[depth], (idx_t)depth);
-		}
-		ancestors.push_back(node);
-		node = node->children[leaf_path[depth]].get();
-	}
+	auto ancestors = LeafPathAncestors(*term, leaf_path, context_label);
 	for (size_t depth = leaf_path.size(); depth-- > 0;) {
 		size_t child_side = leaf_path[depth];
 		auto *join = dynamic_cast<LogicalJoin *>(ancestors[depth]);
@@ -869,12 +868,10 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 			auto shift_parent_projection = [&](idx_t insertion_idx, idx_t added) {
 				ShiftAncestorProjectionMap(ancestors, leaf_path, depth, insertion_idx, added);
 			};
+			auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
+			idx_t mul_idx = mul_binding_it == child_bindings.end() ? DConstants::INVALID_INDEX
+			                                                       : idx_t(mul_binding_it - child_bindings.begin());
 			if (!proj_map.empty()) {
-				idx_t mul_idx = DConstants::INVALID_INDEX;
-				auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
-				if (mul_binding_it != child_bindings.end()) {
-					mul_idx = idx_t(mul_binding_it - child_bindings.begin());
-				}
 				// Aggregate delta compilation inserts multiplicity among group bindings. This map still indexes
 				// the pre-rewrite child, so shift every selected data column at or after that insertion.
 				if (immediate_parent && original_leaf_width != DConstants::INVALID_INDEX &&
@@ -894,28 +891,10 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 						    context_label, (idx_t)projected_idx, (idx_t)child_side, (idx_t)child_bindings.size());
 					}
 				}
-				// CompileChild normally exposes the binding directly. This fallback exists only for an immediate copied
-				// wrapper whose validated output position is supplied by the caller.
-				switch (mul_idx) {
-				case DConstants::INVALID_INDEX:
-					if (immediate_parent &&
-					    fallback_mul_idx < child_bindings.size()) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-						mul_idx = fallback_mul_idx;
-					}
-					break;
-				default:
-					break;
-				}
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
 				}
-				idx_t old_width = proj_map.size();
-				idx_t insertion_idx = old_width;
-				if (child_side == 1) {
-					auto left_bindings = join->children[0]->GetColumnBindings();
-					insertion_idx +=
-					    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
-				}
+				idx_t insertion_idx = proj_map.size() + JoinChildOutputOffset(*join, child_side);
 				// Appending to this join's own left_projection_map grows its LEFT
 				// contribution width, which shifts the absolute position where its RIGHT
 				// contribution starts within its own combined GetColumnBindings(). A
@@ -958,19 +937,12 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				continue;
 			}
 
-			auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
-			if (mul_binding_it == child_bindings.end()) {
+			if (mul_idx == DConstants::INVALID_INDEX) {
 				continue;
-			}
-			idx_t insertion_idx = idx_t(mul_binding_it - child_bindings.begin());
-			if (child_side == 1) {
-				auto left_bindings = join->children[0]->GetColumnBindings();
-				insertion_idx +=
-				    join->left_projection_map.empty() ? left_bindings.size() : join->left_projection_map.size();
 			}
 			// An empty map passes the child's bindings through unchanged, so the
 			// multiplicity is inserted in-place and shifts every later binding.
-			shift_parent_projection(insertion_idx, 1);
+			shift_parent_projection(mul_idx + JoinChildOutputOffset(*join, child_side), 1);
 			join->ResolveOperatorTypes();
 		}
 	}
@@ -978,8 +950,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding, idx_t original_leaf_width) {
-	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin", false,
-	                                           DConstants::INVALID_INDEX, original_leaf_width);
+	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin", false, original_leaf_width);
 }
 
 // ============================================================================
@@ -994,12 +965,30 @@ struct DeltaStatus {
 	uint64_t tiny_mask;        // bit i=1: leaf has a tiny non-empty delta
 };
 
-/// For each leaf, detect delta status in a single query per table.
+static bool SourceFactMatches(const string &fact, TableCatalogEntry &table);
+
+// The refresh's activity for a leaf's source table; keys are always fully qualified.
+static optional_ptr<const openivm::SourceDeltaActivity> FactDeltaActivity(const openivm::CompileFacts &facts,
+                                                                          TableCatalogEntry &table) {
+	for (auto &activity : facts.delta_activity) {
+		auto parts = SqlUtils::ParseQualifiedIdentifier(activity.first);
+		if (parts.size() == 3 && SourceFactMatches(activity.first, table)) {
+			return &activity.second;
+		}
+	}
+	return nullptr;
+}
+
+/// For each leaf, detect delta status in a single query per table, or from the
+/// refresh's delta activity (CompileFacts::delta_activity) when it already counted that source.
 /// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
 /// Also records each catalog leaf's watermark and physical delta in probe_sources for key-domain probes.
 static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, const vector<JoinLeafInfo> &leaves,
-                                     DeltaSourceCache &cache, vector<JoinProbeSource> &probe_sources) {
+                                     DeltaSourceCache &cache, vector<JoinProbeSource> &probe_sources,
+                                     const openivm::CompileFacts &facts) {
 	DeltaStatus status = {0, 0, 0, 0};
+	// Compile-only plans run later against deltas this compiler cannot see.
+	const bool compile_only = facts.compile_only;
 
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
@@ -1020,39 +1009,61 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 			continue;
 		}
 		auto table_ref = get->GetTable();
-		// Get last_update timestamp for this view+table pair
-		auto &watermark = LoadDeltaWatermark(con, view_name, *table_ref, cache);
-		if (!watermark.watermark_error.empty() || watermark.last_update.IsNull()) {
-			continue;
-		}
-		string last_update = watermark.last_update.ToString();
-		auto delta_table_sql = RefreshMetadata(con).ResolveDeltaQualifiedName(
-		    view_name, watermark.delta_key, table_ref->ParentCatalog().GetName().GetIdentifierName(),
-		    table_ref->schema.name.GetIdentifierName());
-		probe_sources[i] = {get, delta_table_sql, last_update};
+		int64_t total_count, delete_count, base_count;
+		auto activity = compile_only ? nullptr : FactDeltaActivity(facts, *table_ref);
+		auto storage_rows = SqlUtils::StorageRowCount(*table_ref);
+		if (activity && storage_rows.IsValid()) {
+			// The refresh already counted this delta at the same watermark; a native base table
+			// reports its size without a statement.
+			auto &watermark = cache[table_ref.get()];
+			if (!watermark.watermark_loaded) {
+				watermark.watermark_loaded = true;
+				watermark.last_update = activity->last_update;
+				watermark.delta_key = activity->delta_key;
+			}
+			probe_sources[i] = {get, activity->delta_table_sql, activity->last_update.ToString()};
+			total_count = activity->pending_rows;
+			delete_count = activity->delete_rows;
+			base_count = NumericCast<int64_t>(storage_rows.GetIndex());
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (%s) reuses refresh delta activity: %lld rows, %lld deletes\n", i,
+			                    table_ref->name.c_str(), static_cast<long long>(total_count),
+			                    static_cast<long long>(delete_count));
+		} else {
+			// Get last_update timestamp for this view+table pair
+			auto &watermark = LoadDeltaWatermark(con, view_name, *table_ref, cache);
+			if (!watermark.watermark_error.empty() || watermark.last_update.IsNull()) {
+				continue;
+			}
+			string last_update = watermark.last_update.ToString();
+			auto delta_table_sql = RefreshMetadata(con).ResolveDeltaQualifiedName(
+			    view_name, watermark.delta_key, table_ref->ParentCatalog().GetName().GetIdentifierName(),
+			    table_ref->schema.name.GetIdentifierName());
+			probe_sources[i] = {get, delta_table_sql, last_update};
 
-		// Single query: get pending delta count, delete count, and current base
-		// cardinality. The base count lets us define "tiny" as <= max(8 rows,
-		// 5% of the source table), avoiding both a hard-coded absolute-only
-		// threshold and silly behavior on very small tables.
-		auto result = con.Query(
-		    "SELECT "
-		    "(SELECT COUNT(*) FROM " +
-		    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-		    SqlUtils::EscapeValue(last_update) +
-		    "'::TIMESTAMP), "
-		    "(SELECT COUNT(*) FROM " +
-		    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-		    SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(openivm::MULTIPLICITY_COL) +
-		    " < 0), "
-		    "(SELECT COUNT(*) FROM " +
-		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, table_ref->name) + ")");
-		if (result->HasError()) {
-			continue;
+			// Single query: get pending delta count, delete count, and current base
+			// cardinality. The base count lets us define "tiny" as <= max(8 rows,
+			// 5% of the source table), avoiding both a hard-coded absolute-only
+			// threshold and silly behavior on very small tables.
+			auto result = con.Query(
+			    "SELECT "
+			    "(SELECT COUNT(*) FROM " +
+			    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+			    SqlUtils::EscapeValue(last_update) +
+			    "'::TIMESTAMP), "
+			    "(SELECT COUNT(*) FROM " +
+			    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+			    SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(openivm::MULTIPLICITY_COL) +
+			    " < 0), "
+			    "(SELECT COUNT(*) FROM " +
+			    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, table_ref->name) +
+			    ")");
+			if (result->HasError()) {
+				continue;
+			}
+			total_count = result->Collection().GetValue(0, 0).GetValue<int64_t>();
+			delete_count = result->Collection().GetValue(1, 0).GetValue<int64_t>();
+			base_count = result->Collection().GetValue(2, 0).GetValue<int64_t>();
 		}
-		int64_t total_count = result->Collection().GetValue(0, 0).GetValue<int64_t>();
-		int64_t delete_count = result->Collection().GetValue(1, 0).GetValue<int64_t>();
-		int64_t base_count = result->Collection().GetValue(2, 0).GetValue<int64_t>();
 
 		if (total_count == 0) {
 			status.empty_mask |= (1ULL << i);
@@ -1114,23 +1125,17 @@ static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafIn
 }
 
 static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, const string &table_name, size_t &leaf) {
-	auto assign_leaf = [&](unordered_map<string, size_t>::const_iterator it) {
-		if (it == table_to_leaf.end()) {
-			return false;
-		}
-		switch (it->second) {
-		case size_t(-1):
-			return false;
-		default:
-			leaf = it->second;
-			return true;
-		}
-	};
 	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
 	for (auto &part : parts) {
 		part = SqlUtils::QuoteIdentifier(part);
 	}
-	return assign_leaf(table_to_leaf.find(StringUtil::Lower(StringUtil::Join(parts, "."))));
+	auto it = table_to_leaf.find(StringUtil::Lower(StringUtil::Join(parts, ".")));
+	// size_t(-1) marks an ambiguous alias.
+	if (it == table_to_leaf.end() || it->second == size_t(-1)) {
+		return false;
+	}
+	leaf = it->second;
+	return true;
 }
 
 static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes, size_t child_leaf,
@@ -1161,7 +1166,7 @@ static bool AllFKColumnsJoined(const vector<vector<DeltaJoinKeyProbe>> &key_prob
 	return true;
 }
 
-static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
+static vector<FKRelation> DetectFKRelations(const vector<JoinLeafInfo> &leaves,
                                             const vector<vector<DeltaJoinKeyProbe>> &key_probes,
                                             const vector<openivm::CachedConstraint> &declarations) {
 	vector<FKRelation> relations;
@@ -1296,6 +1301,23 @@ static bool SourceFactMatches(const string &fact, TableCatalogEntry &table) {
 	       (parts.size() < 3 || StringUtil::CIEquals(parts[0], table.ParentCatalog().GetName().GetIdentifierName()));
 }
 
+string FactDeltaShape(const openivm::CompileFacts &facts, TableCatalogEntry &table) {
+	// Several keys can name one table (bare, schema- or fully-qualified). Independent of map order, the least
+	// optimistic shape wins: UNCHANGED < INSERT_ONLY < anything else (a change of unknown or mixed kind); equally
+	// ranked shapes tie-break by name so the result never depends on hash order.
+	auto rank = [](const string &shape) {
+		return StringUtil::CIEquals(shape, "UNCHANGED") ? 1 : StringUtil::CIEquals(shape, "INSERT_ONLY") ? 2 : 3;
+	};
+	string result;
+	for (auto &entry : facts.delta_shape) {
+		if (SourceFactMatches(entry.first, table) && (result.empty() || rank(entry.second) > rank(result) ||
+		                                              (rank(entry.second) == rank(result) && entry.second > result))) {
+			result = entry.second;
+		}
+	}
+	return result;
+}
+
 static bool DeltaShapeIsInsertOnlyForPruning(const string &shape) {
 	return StringUtil::CIEquals(shape, "INSERT_ONLY") || StringUtil::CIEquals(shape, "UNCHANGED");
 }
@@ -1311,11 +1333,8 @@ static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, c
 			mask |= (1ULL << i);
 			continue;
 		}
-		for (auto &entry : facts.delta_shape) {
-			if (SourceFactMatches(entry.first, *get->GetTable()) && DeltaShapeIsInsertOnlyForPruning(entry.second)) {
-				mask |= (1ULL << i);
-				break;
-			}
+		if (DeltaShapeIsInsertOnlyForPruning(FactDeltaShape(facts, *get->GetTable()))) {
+			mask |= (1ULL << i);
 		}
 	}
 	return mask;
@@ -1334,17 +1353,7 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 				if (get.GetTable().get() == nullptr) {
 					continue;
 				}
-				bool table_unchanged = false;
-				for (auto &entry : facts.delta_shape) {
-					if (SourceFactMatches(entry.first, *get.GetTable()) &&
-					    StringUtil::CIEquals(entry.second, "UNCHANGED")) {
-						table_unchanged = true;
-						break;
-					}
-				}
-				if (!table_unchanged) {
-					all_unchanged = false;
-				}
+				all_unchanged = StringUtil::CIEquals(FactDeltaShape(facts, *get.GetTable()), "UNCHANGED");
 			}
 			for (auto &child : node->children) {
 				pending.push_back(child.get());
@@ -1402,8 +1411,9 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	// Detect delta status for all leaves (single query per table: total + delete count).
 	// Used by both FK pruning and empty-delta skipping.
 	vector<JoinProbeSource> leaf_refs(N);
-	DeltaStatus delta_status =
-	    DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves, source_cache, leaf_refs);
+	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
+	DeltaStatus delta_status = DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves, source_cache,
+	                                             leaf_refs, compile_facts);
 	uint64_t total_terms = (1ULL << N) - 1;
 	uint64_t non_empty_mask = total_terms & ~delta_status.empty_mask & ~delta_status.constant_mask;
 	idx_t non_empty_leaf_count = std::bitset<64>(non_empty_mask).count();
@@ -1411,7 +1421,6 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	bool fk_pruning_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
 	uint64_t skip_bits = 0;
-	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 	bool compile_only = compile_facts.compile_only;
 	// FK pruning pays for catalog constraint inspection. When every leaf changed
 	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and
@@ -1425,7 +1434,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	    has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1; // mull-ignore: cxx_eq_to_ne
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = has_compile_fk_facts ? DetectCompileFactsFKRelations(compile_facts, leaves, key_probes)
-		                                         : DetectFKRelations(context, leaves, key_probes, declarations);
+		                                         : DetectFKRelations(leaves, key_probes, declarations);
 		if (!fk_relations.empty()) {
 			uint64_t insert_only_mask = has_compile_fk_facts ? ComputeFactsInsertOnlyMask(compile_facts, leaves)
 			                                                 : delta_status.insert_only_mask;
@@ -1460,7 +1469,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	}
 
 	uint64_t pruned_count = 0;
-	map<pair<size_t, idx_t>, idx_t> transition_cte_indexes;
+	TransitionKeyCTEIndexes transition_cte_indexes;
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu, "
 	                    "known_empty_mask=%lu)\n",
 	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask,
@@ -1557,7 +1566,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 			if (leaf_has_delta_mask) {
 				bool portable_anti_guard = compile_facts.target_dialect != SqlDialect::DUCKDB;
 				GuardKeptOuterJoinsForMask(context, input.context.metadata_con, binder, term.get(), leaves,
-				                           leaf_has_delta_mask, input.context.view, portable_anti_guard,
+				                           leaf_has_delta_mask, 0, input.context.view, portable_anti_guard,
 				                           transition_cte_indexes, transition_ctes);
 			}
 		}
@@ -1612,9 +1621,8 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	}
 	vector<unique_ptr<Expression>> current_exprs;
 	D_ASSERT(current_types.size() == current_bindings.size());
-	idx_t current_type_idx = 0;
-	for (auto &binding : current_bindings) {
-		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[current_type_idx++], binding));
+	for (idx_t i = 0; i < current_bindings.size(); i++) {
+		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[i], current_bindings[i]));
 	}
 	current_exprs.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
 	auto current_projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(current_exprs));
@@ -1625,13 +1633,9 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	auto delta_bindings = delta.op->GetColumnBindings();
 	auto delta_types = delta.op->types;
 	D_ASSERT(delta_bindings.size() == current_bindings.size() + 1);
-	delta_bindings.pop_back();
-	delta_types.pop_back();
 	vector<unique_ptr<Expression>> delta_exprs;
-	idx_t delta_idx = 0;
-	for (auto &delta_binding : delta_bindings) {
-		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[delta_idx], delta_binding));
-		delta_idx++;
+	for (idx_t i = 0; i + 1 < delta_bindings.size(); i++) { // the last binding is the multiplicity
+		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[i], delta_bindings[i]));
 	}
 	delta_exprs.push_back(MultiplyIntegers(binder, make_uniq<BoundConstantExpression>(Value::INTEGER(-1)),
 	                                       make_uniq<BoundColumnRefExpression>(mul_type, delta.mul_binding)));
@@ -1649,22 +1653,6 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	        ColumnBinding(TableIndex(output_table_index), ProjectionIndex(current_bindings.size()))};
 }
 
-static void RebindRegularLeafParent(LogicalOperator &root, LogicalOperator &leaf,
-                                    const vector<ColumnBinding> &original_bindings,
-                                    const vector<ColumnBinding> &replacement_bindings) {
-	if (replacement_bindings.size() != original_bindings.size() + 1) {
-		throw InternalException("DeltaJoin: replacement leaf produced %zu bindings for %zu source columns",
-		                        replacement_bindings.size(), original_bindings.size());
-	}
-	OPENIVM_DEBUG_PRINT("[DeltaJoin] Rebinding %zu regular-leaf parent columns\n", original_bindings.size());
-	ColumnBindingReplacer replacer;
-	for (idx_t i = 0; i < original_bindings.size(); i++) {
-		replacer.replacement_bindings.emplace_back(original_bindings[i], replacement_bindings[i]);
-	}
-	replacer.stop_operator = &leaf;
-	replacer.VisitOperator(root);
-}
-
 DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context, Binder &binder,
                                           unique_ptr<LogicalOperator> &leaf_node, LogicalOperator *&term_root,
                                           DeltaSourceCache &source_cache) {
@@ -1675,14 +1663,14 @@ DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, Clien
 		auto original_bindings = leaf_node->GetColumnBindings();
 		auto delta = CreateDeltaGetNode(context, input.context.metadata_con, binder, &get, input.context.view,
 		                                &source_cache, true);
-		auto delta_bindings = delta.node->GetColumnBindings();
+		auto delta_bindings = delta.op->GetColumnBindings();
 		// DuckDB 2.0 can expose projected GET bindings using their sparse physical
 		// positions (for example 1,2,3 when position 0 is filter-only). Delta
 		// compaction emits contiguous bindings. Rebind conditions and expressions
 		// above the leaf before replacing it; join projection maps are positional and
 		// remain the responsibility of UpdateParentProjectionMap.
-		RebindRegularLeafParent(*term_root, *leaf_node, original_bindings, delta_bindings);
-		return {std::move(delta.node), delta.mul_binding};
+		ReplaceJoinOutputBindings(*term_root, *leaf_node, original_bindings, delta_bindings);
+		return delta;
 	}
 	return input.CompileCopiedSubtree(leaf_node, term_root);
 }
@@ -1760,7 +1748,7 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 			leaf_node = std::move(old.op);
 			// The old-state UNION compacts sparse scan bindings, including scans with
 			// filter-only columns. Rebind parent conditions to the new positions.
-			RebindRegularLeafParent(*term_root, *leaf_node, original_leaf_bindings, leaf_node->GetColumnBindings());
+			ReplaceJoinOutputBindings(*term_root, *leaf_node, original_leaf_bindings, leaf_node->GetColumnBindings());
 			UpdateParentProjectionMap(term, leaves[leaf], old.mul_binding, original_leaf_width);
 		}
 
@@ -1781,7 +1769,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	bool collect_ducklake_leaves = ducklake_nterm_enabled && input.context.model.type == RefreshType::SIMPLE_PROJECTION;
 	JoinPlanFacts join_facts;
 	vector<size_t> join_path;
-	CollectJoinPlanFacts(input.plan.get(), join_path, false, true, collect_ducklake_leaves, join_facts);
+	CollectJoinPlanFacts(input.plan.get(), join_path, true, collect_ducklake_leaves, join_facts);
 	vector<ColumnBinding> original_bindings;
 	vector<LogicalType> output_types;
 	FilterInternalMultiplicityColumns(all_original_bindings, input.plan->types,
@@ -1800,7 +1788,6 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (N > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
 		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
 	}
-
 	// 2. Output types
 	auto types = output_types;
 	D_ASSERT(types.size() == original_bindings.size());
@@ -1905,8 +1892,25 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	// Source watermarks and delta tables are read once per compile, not once per term and leaf.
 	DeltaSourceCache source_cache;
 	if (all_ducklake) {
+		TransitionKeyCTEIndexes transition_cte_indexes;
+		DuckLakeNullPaddingGuard guard;
+		if (!input.context.model.group_columns.empty() && !input.context.model.aggregate_types.empty()) {
+			RefreshMetadata metadata(input.context.metadata_con);
+			RefreshMetadata::LeftJoinSecondaryMeta secondary;
+			// Old stored correction programs use the previous primary-delta convention.
+			if (metadata.GetLeftJoinSecondaryMeta(input.context.view, secondary) &&
+			    (secondary.sql.find(openivm::LJSEC_OLD_SOURCE_PREFIX) != string::npos ||
+			     secondary.sql.find(openivm::LJSEC_OLD_NATIVE_DELTA_PREFIX) != string::npos)) {
+				guard = [&](unique_ptr<LogicalOperator> &term, uint64_t active_mask, uint64_t old_mask) {
+					GuardKeptOuterJoinsForMask(context, input.context.metadata_con, binder, term.get(), leaves,
+					                           active_mask, old_mask, input.context.view,
+					                           compile_facts.target_dialect != SqlDialect::DUCKDB,
+					                           transition_cte_indexes, transition_ctes);
+				};
+			}
+		}
 		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake, key_probes,
-		                               source_cache);
+		                               source_cache, guard);
 	} else if (regular_nterm) {
 		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask, has_left_join,
 		                              join_facts.existing_multiplicity_bindings, source_cache);
@@ -1930,7 +1934,8 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	}
 
 	// 5. Rebind parent references
-	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);
+	ColumnBinding new_mul_binding =
+	    ReplaceJoinOutputBindings(*input.root, *result, original_bindings, result->GetColumnBindings());
 
 	input.plan = std::move(result);
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),

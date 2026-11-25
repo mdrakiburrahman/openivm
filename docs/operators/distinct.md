@@ -96,6 +96,26 @@ CREATE MATERIALIZED VIEW distinct_pairs AS
 --             FROM sales GROUP BY region, product
 ```
 
+## DISTINCT ON
+
+`DISTINCT ON (key)` keeps one candidate per key using its `ORDER BY`, including
+explicit NULL ordering and tie-breakers:
+
+```sql
+CREATE MATERIALIZED VIEW latest_sale AS
+    SELECT DISTINCT ON (product) product, sold_at, amount
+    FROM sales
+    ORDER BY product, sold_at DESC, sale_id DESC;
+```
+
+OpenIVM preserves this winner selection and uses affected-group maintenance
+(`GROUP_RECOMPUTE`). A refresh finds keys touched by source changes, then replaces
+the winners for those keys. Deleting a winner exposes the next candidate. Keys
+omitted from the visible output are retained as hidden maintenance columns;
+computed and multi-column keys use the same path. Source-delta discovery runs
+before winner selection and any predicate on the winner, so a newly rejected
+winner still removes the old visible row. Unchanged keys remain in storage.
+
 ## Limitations
 
 - `DISTINCT` adds a hidden column to the MV table. This is invisible to `SELECT *` but present in the physical storage.
@@ -105,6 +125,11 @@ CREATE MATERIALIZED VIEW distinct_pairs AS
 
 A `DISTINCT` below another operator is not maintained with the MERGE above:
 
-- **Inner DISTINCT under an aggregate** (e.g., `SELECT g, COUNT(*) FROM (SELECT DISTINCT g, x FROM t) GROUP BY g`) uses affected-group recompute (`GROUP_RECOMPUTE`). With `SET openivm_distinct_aux_state = true` (default `false`), single-source views instead keep a per-tuple count aux table and propagate ±1 only when a tuple's count crosses zero (`DISTINCT_INCREMENTAL`); multi-source views still use group recompute.
+- **Inner DISTINCT under an aggregate** (e.g., `SELECT g, COUNT(*) FROM (SELECT DISTINCT g, x FROM t) GROUP BY g`) uses affected-group recompute (`GROUP_RECOMPUTE`). With `SET openivm_distinct_aux_state = true` (default `false`), supported single-source views with one `SUM(x)` keep a per-tuple count aux table and propagate ±1 only when a tuple's count crosses zero (`DISTINCT_INCREMENTAL`). The SUM state also tracks non-NULL inputs: a surviving group containing only NULL inputs returns NULL, while a nonempty collection of values that sums to zero returns zero. Other aggregate shapes and multi-source views still use group recompute.
 - **Inner DISTINCT below an outer projection** (no aggregate) uses affected-group recompute over the visible output columns.
 - For `UNION` without `ALL`, see [union](union-all.md#union-distinct).
+
+The auxiliary SUM path preserves renamed and computed group keys, repeated SUM
+outputs, and constant output columns. It feeds signed DISTINCT membership changes
+to the shared aggregate compiler. Casts are evaluated after the raw SUM state is
+updated, so fractional contributions are retained until the final cast.

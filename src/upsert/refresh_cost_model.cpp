@@ -93,17 +93,13 @@ struct TableStats {
 /// Aggregated plan statistics collected in a single tree walk.
 struct PlanStats {
 	vector<TableStats> table_stats;
-	idx_t join_leaf_count = 0;
 	idx_t aggregate_expr_count = 0; // total aggregate functions across all GROUP BY nodes (per-column MERGE cost)
 	bool has_join = false;
 	bool has_aggregate = false;
 	bool has_full_outer = false;
 	bool all_ducklake = true;        // true until a non-DuckLake leaf is found
 	double filter_selectivity = 1.0; // cumulative selectivity from non-pushed-down LOGICAL_FILTER nodes
-	idx_t linear_nodes = 0;
-	idx_t product_nodes = 0;
-	idx_t stateful_nodes = 0;
-	idx_t full_recompute_nodes = 0;
+	idx_t product_nodes = 0;         // join-like operators; each multiplies the full recompute cost
 };
 
 static const char *StrategyLabelForRefreshType(RefreshType view_type) {
@@ -163,26 +159,11 @@ static constexpr double PROJECTION_APPLY_MS_PER_UNIT =
     0.00002; // bulk insert/delete (projections): vectorized, far cheaper than a per-group MERGE
 static constexpr double AGG_EXPR_MS = 4.0; // per-aggregate-column MERGE penalty (incremental)
 
-static bool IsLinearCostNode(DeltaModelNodeKind kind) {
-	return kind == DeltaModelNodeKind::SCAN || kind == DeltaModelNodeKind::FILTER ||
-	       kind == DeltaModelNodeKind::PROJECT || kind == DeltaModelNodeKind::UNION ||
-	       kind == DeltaModelNodeKind::CONSTANT;
-}
-
 static void AddOperatorCostClass(LogicalOperator &op, PlanStats &stats) {
 	auto kind = NodeKindForOperator(op);
-	if (IsLinearCostNode(kind)) {
-		stats.linear_nodes++;
-	} else if (kind == DeltaModelNodeKind::JOIN || kind == DeltaModelNodeKind::ASOF_JOIN ||
-	           kind == DeltaModelNodeKind::POSITIONAL_JOIN) {
+	if (kind == DeltaModelNodeKind::JOIN || kind == DeltaModelNodeKind::ASOF_JOIN ||
+	    kind == DeltaModelNodeKind::POSITIONAL_JOIN) {
 		stats.product_nodes++;
-	} else if (kind == DeltaModelNodeKind::AGGREGATE || kind == DeltaModelNodeKind::DISTINCT ||
-	           kind == DeltaModelNodeKind::WINDOW || kind == DeltaModelNodeKind::SEMI_ANTI) {
-		stats.stateful_nodes++;
-	} else if (kind == DeltaModelNodeKind::TOP_K || kind == DeltaModelNodeKind::UNNEST ||
-	           kind == DeltaModelNodeKind::SAMPLE || kind == DeltaModelNodeKind::CTE ||
-	           kind == DeltaModelNodeKind::OTHER) {
-		stats.full_recompute_nodes++;
 	}
 }
 
@@ -293,7 +274,6 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 
 			stats.table_stats.push_back(ts);
 		}
-		stats.join_leaf_count++;
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
@@ -409,10 +389,9 @@ static bool Solve3x3(const double A[3][3], const double b[3], double x[3]) {
 /// Returns calibrated weights or uncalibrated fallback.
 static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHistoryEntry> &history, double decay,
                                        double ridge_lambda, idx_t min_samples) {
-	RegressionWeights result = {1.0, 1.0, 0.0, false};
 	idx_t n = history.size();
 	if (n < min_samples) {
-		return result; // cold start — use static model
+		return {1.0, 1.0, 0.0, false}; // cold start — use static model
 	}
 
 	// Build weighted normal equations: (X'WX + λI) w = X'Wy
@@ -442,23 +421,11 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 		XtWX[i][i] += ridge_lambda;
 	}
 
+	// The weighted mean is the fallback for a singular system or negative slopes.
+	RegressionWeights result = {0.0, 0.0, (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0, true};
 	double w_vec[3];
-	if (!Solve3x3(XtWX, XtWy, w_vec)) {
-		// Singular — fall back to weighted mean
-		result.w_compute = 0.0;
-		result.w_upsert = 0.0;
-		result.w_intercept = (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0;
-		result.calibrated = true;
-		return result;
-	}
-
-	// NNLS: clamp negative slope coefficients, re-fit with reduced features
-	if (w_vec[0] < 0 && w_vec[1] < 0) {
-		// Both slopes negative — use weighted mean
-		result.w_compute = 0.0;
-		result.w_upsert = 0.0;
-		result.w_intercept = (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0;
-		result.calibrated = true;
+	// NNLS: with both slopes negative, use the weighted mean.
+	if (!Solve3x3(XtWX, XtWy, w_vec) || (w_vec[0] < 0 && w_vec[1] < 0)) {
 		return result;
 	}
 
@@ -466,7 +433,6 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 		// Dropping one feature selects a principal submatrix of the already regularized normal equations.
 		int retained = w_vec[0] < 0 ? 1 : 0;
 		double slope, intercept;
-		result = {0.0, 0.0, (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0, true};
 		if (Solve2x2(XtWX[retained][retained], XtWX[retained][2], XtWX[2][retained], XtWX[2][2], XtWy[retained],
 		             XtWy[2], slope, intercept) &&
 		    slope >= 0) {
@@ -477,8 +443,7 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 		return result;
 	}
 
-	result = {w_vec[0], w_vec[1], w_vec[2], true};
-	return result;
+	return {w_vec[0], w_vec[1], w_vec[2], true};
 }
 
 // ============================================================================
@@ -498,10 +463,12 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 	// actually run at refresh time. Defaults to AGGREGATE_GROUP if the view isn't
 	// in metadata yet (e.g. test harnesses that call EstimateRefreshCost on a raw plan).
 	RefreshType view_type = RefreshType::AGGREGATE_GROUP;
+	// A refresh already read the view's metadata; the PRAGMA refresh_cost path reads it here.
+	RefreshMetadata view_meta(con);
+	view_meta.UseView(RefreshMetadata::PlanningView(context, view_name));
 	{
-		RefreshMetadata vt_meta(con);
 		try {
-			view_type = vt_meta.GetViewType(view_name);
+			view_type = view_meta.GetViewType(view_name);
 		} catch (...) {
 			// view_name not in openivm_views — keep default
 		}
@@ -520,15 +487,13 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 
 	// 2. Compute basic metrics
 	double total_base_scan = 0;
-	double delta_fraction_sum = 0;
 	bool has_active_delta = false;
 	for (auto &ts : table_stats) {
 		total_base_scan += ts.base_card;
-		delta_fraction_sum += ts.delta_card / ts.base_card;
 		has_active_delta = has_active_delta || ts.delta_card > 0;
 	}
 
-	auto internal_location = RefreshMetadata(con).GetInternalLocation(view_name);
+	auto internal_location = view_meta.GetInternalLocation(view_name);
 	double mv_card =
 	    GetTableRowCount(con, SqlUtils::FullName(internal_location.catalog_name, internal_location.schema_name,
 	                                             IncrementalTableNames::DataTableName(view_name)));
@@ -742,39 +707,27 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 		}
 
 		RefreshMetadata metadata(con);
-		constexpr double RIDGE_LAMBDA = 1e-4;
-		constexpr idx_t MIN_SAMPLES = 3;
-
-		auto strategy_history = metadata.GetRefreshHistory(view_name, strategy_label);
-		auto strategy_reg = FitRegression(strategy_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (strategy_reg.calibrated) {
-			strategy_predicted_ms =
-			    std::max(0.0, strategy_reg.w_compute * strategy_compute + strategy_reg.w_upsert * strategy_upsert +
-			                      strategy_reg.w_intercept);
+		// Replace the prior with the regression learned from this method's history, once calibrated.
+		auto apply_regression = [&](const string &method, double compute, double upsert, double &predicted_ms) {
+			constexpr double RIDGE_LAMBDA = 1e-4;
+			constexpr idx_t MIN_SAMPLES = 3;
+			auto reg = FitRegression(metadata.GetRefreshHistory(view_name, method), decay, RIDGE_LAMBDA, MIN_SAMPLES);
+			if (!reg.calibrated) {
+				return;
+			}
+			predicted_ms = std::max(0.0, reg.w_compute * compute + reg.w_upsert * upsert + reg.w_intercept);
 			calibrated = true;
 			OPENIVM_DEBUG_PRINT("[COST MODEL] %s regression: w_compute=%.4f, w_upsert=%.4f, intercept=%.1f\n",
-			                    strategy_label.c_str(), strategy_reg.w_compute, strategy_reg.w_upsert,
-			                    strategy_reg.w_intercept);
-		}
-
-		auto rc_history = metadata.GetRefreshHistory(view_name, "full");
-		auto rc_reg = FitRegression(rc_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (rc_reg.calibrated) {
-			recompute_predicted_ms = std::max(0.0, rc_reg.w_compute * recompute_compute +
-			                                           rc_reg.w_upsert * recompute_replace + rc_reg.w_intercept);
-			calibrated = true;
-			OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute regression: w_compute=%.4f, w_replace=%.4f, intercept=%.1f\n",
-			                    rc_reg.w_compute, rc_reg.w_upsert, rc_reg.w_intercept);
-		}
+			                    method.c_str(), reg.w_compute, reg.w_upsert, reg.w_intercept);
+		};
+		apply_regression(strategy_label, strategy_compute, strategy_upsert, strategy_predicted_ms);
+		apply_regression("full", recompute_compute, recompute_replace, recompute_predicted_ms);
 	}
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, FullOuter: %s, DuckLake: %s, FK: %s\n", N,
 	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.has_full_outer ? "yes" : "no",
 	                    plan_stats.all_ducklake ? "yes" : "no", fk_enabled ? "on" : "off");
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Operator classes: linear=%lu, product=%lu, stateful=%lu, full=%lu\n",
-	                    (unsigned long)plan_stats.linear_nodes, (unsigned long)plan_stats.product_nodes,
-	                    (unsigned long)plan_stats.stateful_nodes, (unsigned long)plan_stats.full_recompute_nodes);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Base scan total: %.0f, Delta fraction sum: %.4f, Filter selectivity: %.4f\n",
-	                    total_base_scan, delta_fraction_sum, plan_stats.filter_selectivity);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Join operators: %lu, Base scan total: %.0f, Filter selectivity: %.4f\n",
+	                    (unsigned long)plan_stats.product_nodes, total_base_scan, plan_stats.filter_selectivity);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Active sources: %lu, Join terms: %lu, MV cardinality: %.0f, Est. delta result: "
 	                    "%.0f\n",
 	                    (unsigned long)join_terms.active_sources, (unsigned long)join_terms.term_count, mv_card,

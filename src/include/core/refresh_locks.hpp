@@ -30,9 +30,35 @@ public:
 		return optional_idx(); // The database's mutation gate must never be evicted.
 	}
 
-	void Lock(const void *owner);
+	// A capture lock admits tracked DML only; every other lock may change source
+	// delta ownership.
+	void Lock(const void *owner, bool capture = false);
 	bool TryLock(const void *owner);
 	void Unlock(const void *owner);
+
+	// Cached ownership lookups. Ownership rows change only in transactions that
+	// write an ownership registry; each is marked from its first registry write
+	// until it has ended, bumping the epoch at both ends. Delta table entries are
+	// pinned by the catalog version in the cache key and re-resolved (with their
+	// oid) in the caller's snapshot. So a lookup made while no registry write is
+	// active, before the epoch moves again, reads the committed ownership that
+	// every transaction with that catalog version reads. Non-capture gate holds
+	// also bump the epoch, but only as a conservative extra: some scoped holds
+	// end before their caller's transaction commits.
+	struct CachedSourceDelta {
+		bool tracked = false;
+		string schema;
+		string name;
+		idx_t oid = 0;
+	};
+	// Invalid while an ownership change is in progress.
+	optional_idx ObserveOwnershipEpoch();
+	bool OwnershipEpochIs(idx_t epoch);
+	void MarkOwnershipChange(const void *owner);
+	void BeginOwnershipWrite();
+	void EndOwnershipWrite();
+	bool FindCachedSourceDelta(const string &key, idx_t epoch, CachedSourceDelta &result);
+	void CacheSourceDelta(const string &key, idx_t epoch, CachedSourceDelta entry);
 
 private:
 	friend class MutationGateTestAccess;
@@ -58,6 +84,11 @@ private:
 	idx_t depth = 0;
 	// Integration tests synchronize on an actual wait without timing the caller.
 	idx_t waiting_owners = 0;
+	bool capture_only_hold = false;
+	idx_t ownership_epoch = 0;
+	idx_t ownership_writers = 0;
+	idx_t cached_epoch = 0;
+	unordered_map<string, CachedSourceDelta> source_deltas;
 	unordered_map<idx_t, unordered_map<string, unique_ptr<SourceAdmission>>> sources;
 	unordered_map<const void *, idx_t> admitted_writers;
 };
@@ -75,9 +106,9 @@ class MutationLockGuard {
 public:
 	explicit MutationLockGuard(ClientContext &owner_p);
 
-	MutationLockGuard(DatabaseInstance &db_p, const void *owner_p)
+	MutationLockGuard(DatabaseInstance &db_p, const void *owner_p, bool capture = false)
 	    : gate(RefreshLocks::AcquireGate(db_p)), owner(owner_p) {
-		gate->Lock(owner);
+		gate->Lock(owner, capture);
 	}
 	~MutationLockGuard() {
 		gate->Unlock(owner);
@@ -118,9 +149,16 @@ private:
 class TransactionalMVLockState : public ClientContextState {
 public:
 	explicit TransactionalMVLockState(ClientContext &context);
+	~TransactionalMVLockState() override;
 	static TransactionalMVLockState &Get(ClientContext &context);
 
-	void AcquireMutationLock();
+	// Lifecycle and refresh callers may change ownership; capture callers only
+	// admit tracked DML (see MutationGate::Lock).
+	void AcquireMutationLock(bool capture = false);
+	// Writes to an ownership registry outside the gate (e.g. direct metadata DML)
+	// keep cached ownership lookups disabled until this transaction ends.
+	void MarkOwnershipMetadataWrite();
+	static bool IsOwnershipRegistry(const string &table_name);
 	// Untracked writers retain source admission through commit. Tracked writers
 	// release temporary admission before entering the mutation gate, then recheck
 	// ownership and retain admission again under that gate.
@@ -150,7 +188,12 @@ public:
 	// Reused replay helpers may reassert the same owner while their guard is held.
 	void SetMutationOwner(const void *owner_token);
 	const void *GetMutationOwner();
+	// Let a helper connection act under the caller's mutation ownership.
+	static void ShareMutationOwner(ClientContext &from, ClientContext &to) {
+		Get(to).SetMutationOwner(Get(from).GetMutationOwner());
+	}
 
+	void TransactionBegin(MetaTransaction &transaction, ClientContext &context) override;
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
 	// A prepared statement re-executes its cached plan without the optimizer rule that takes
@@ -162,8 +205,16 @@ private:
 	void CleanupUnusedSourceDeltas(ClientContext &context, const vector<RefreshMetadata::DeltaSource> &sources,
 	                               vector<string> cleanup);
 	void Release();
+	string SourceDeltaCacheKey(const string &catalog, const string &schema, const string &table);
+	bool FindCachedSourceDelta(const string &catalog, const string &key, optional_idx epoch,
+	                           optional_ptr<TableCatalogEntry> &delta);
+	void CacheSourceDelta(const string &key, optional_idx epoch, optional_ptr<TableCatalogEntry> delta);
 
 	mutex state_lock;
+	shared_ptr<MutationGate> gate;
+	// Ownership epoch observed when this transaction began; invalid if unknown.
+	optional_idx begin_ownership_epoch;
+	bool ownership_writer = false;
 	unique_ptr<MutationLockGuard> mutation_guard;
 	unordered_map<string, unique_ptr<SourceAdmissionGuard>> source_write_admissions;
 	unordered_map<string, unique_ptr<SourceAdmissionGuard>> source_publication_locks;

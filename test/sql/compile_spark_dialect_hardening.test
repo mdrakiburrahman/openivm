@@ -520,3 +520,206 @@ FROM openivm_compile_with_facts('sph_scope_mv','{"target_dialect":"spark","compi
 WHERE stmt_kind='data';
 ----
 1
+
+# Computed complex outputs use bare NULL deltas and target-dialect finalizers.
+statement ok
+CREATE TABLE sph_derived_source(k INT,v INT);
+
+statement ok
+INSERT INTO sph_derived_source VALUES (1,5),(1,6),(2,7);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_derived_group AS
+SELECT k,COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source GROUP BY k;
+
+statement ok
+CREATE VIEW sph_derived_group_expected AS
+SELECT k,COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW sph_derived_scalar AS
+SELECT COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source;
+
+statement ok
+CREATE VIEW sph_derived_scalar_expected AS
+SELECT COUNT(*) n,struct_pack(n := COUNT(*),"field""quote" := SUM(v),nested := struct_pack(n := COUNT(*)+1)) a
+FROM sph_derived_source;
+
+statement ok
+INSERT INTO sph_derived_source VALUES (1,10),(3,20);
+
+statement ok
+UPDATE sph_derived_source SET v=11 WHERE k=3;
+
+statement ok
+DELETE FROM sph_derived_source WHERE k=2;
+
+foreach variant group scalar
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%named_struct(''%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%''field"quote''%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%struct_pack%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%:=%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AS STRUCT%'
+             AND min(refresh_type)=CASE WHEN '{variant}'='group' THEN 0 ELSE 1 END
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('sph_derived_{variant}',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind='data';
+----
+1
+
+statement ok
+PRAGMA refresh('sph_derived_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM sph_derived_{variant} EXCEPT ALL SELECT * FROM sph_derived_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM sph_derived_{variant}_expected EXCEPT ALL SELECT * FROM sph_derived_{variant})
+);
+----
+0
+
+endloop
+
+# Floating candidate keys and selected differences use portable zero-sign witnesses.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type FLOAT DOUBLE
+
+statement ok
+CREATE TABLE spark_identity_source_{type}(id INT,v {type});
+
+statement ok
+INSERT INTO spark_identity_source_{type} VALUES(1,'-0.0'::{type}),(2,1);
+
+statement ok
+CREATE MATERIALIZED VIEW spark_identity_mv_{type} AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM spark_identity_source_{type} ORDER BY v LIMIT 2)d;
+
+query I
+SELECT CASE WHEN count(*) > 0 AND min(refresh_type)=8 AND count(*) FILTER(WHERE sql LIKE '%openivm_internal_value_key%')=0 THEN 1 ELSE 0 END FROM openivm_compile_with_facts('spark_identity_mv_{type}','{"target_dialect":"spark","compile_only":true}');
+----
+1
+
+statement ok
+CREATE VIEW spark_identity_expected_{type} AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM spark_identity_source_{type} ORDER BY v LIMIT 2)d;
+
+statement ok
+INSERT INTO spark_identity_source_{type} VALUES(99,'-0.0'::{type}),(3,1);
+
+statement ok
+UPDATE spark_identity_source_{type} SET v=2 WHERE id=99;
+
+statement ok
+UPDATE spark_identity_source_{type} SET v=3 WHERE id=2;
+
+statement ok
+DELETE FROM spark_identity_source_{type} WHERE id IN(1,99);
+
+statement ok
+PRAGMA refresh('spark_identity_mv_{type}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM spark_identity_mv_{type} EXCEPT ALL SELECT * FROM spark_identity_expected_{type}) UNION ALL(SELECT * FROM spark_identity_expected_{type} EXCEPT ALL SELECT * FROM spark_identity_mv_{type}));
+----
+0
+
+endloop
+
+statement ok
+CREATE TABLE spark_opaque_source(v INTERVAL);
+
+statement ok
+CREATE MATERIALIZED VIEW spark_opaque_mv AS WITH d AS(SELECT DISTINCT v FROM spark_opaque_source),p AS(SELECT extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement error
+SELECT * FROM openivm_compile_with_facts('spark_opaque_mv','{"target_dialect":"spark","compile_only":true}');
+----
+requires native DuckDB execution
+
+# Limited opaque candidates must also reject export before emitting the private helper.
+statement ok
+CREATE MATERIALIZED VIEW spark_opaque_limited AS WITH d AS(SELECT DISTINCT v FROM spark_opaque_source ORDER BY v LIMIT 2),p AS(SELECT extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement error
+SELECT * FROM openivm_compile_with_facts('spark_opaque_limited','{"target_dialect":"spark","compile_only":true}');
+----
+requires native DuckDB execution
+
+# Floating zero group keys: the keyed recompute upsert and the zero-sign fix-up use Spark null-safe
+# equality and the portable sign test, never INSERT OR REPLACE or DuckDB's signbit.
+statement ok
+CREATE TABLE sph_zero_src(id INT, k DOUBLE, v INT);
+
+statement ok
+INSERT INTO sph_zero_src VALUES (1, '-0.0', 1), (2, '-0.0', 2), (3, 1.5, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_zero_having AS
+    SELECT k, COUNT(*) c, SUM(v) s FROM sph_zero_src GROUP BY k HAVING SUM(v) > 1;
+
+statement ok
+DELETE FROM sph_zero_src WHERE id = 1;
+
+statement ok
+INSERT INTO sph_zero_src VALUES (4, 0.0, 4);
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%MERGE INTO%<=>%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AS openivm_target SET%<=>%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT OR REPLACE%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%signbit(%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%IS NOT DISTINCT FROM%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_zero_having',
+    '{"target_dialect":"spark","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# A MIN/MAX view with deletions refreshes by group recompute. Its native data table carries the
+# group-key UNIQUE index, but only DuckDB output may use the row-id upsert: Spark and Postgres
+# have no `rowid`, so they keep the null-safe key MERGE.
+statement ok
+CREATE TABLE sph_minmax_src(g INT, h VARCHAR, v INT);
+INSERT INTO sph_minmax_src VALUES (1, 'a', 10), (1, 'a', 20), (2, 'b', 5), (NULL, 'c', 7);
+CREATE MATERIALIZED VIEW sph_minmax_mv AS
+    SELECT g, h, MIN(v) AS mn, MAX(v) AS mx FROM sph_minmax_src GROUP BY g, h;
+DELETE FROM sph_minmax_src WHERE v = 10;
+INSERT INTO sph_minmax_src VALUES (2, 'b', 1), (3, NULL, 4);
+
+query I
+SELECT count(*) FROM duckdb_indexes() i JOIN openivm_views v ON i.table_name = 'openivm_data_' || v.view_name
+WHERE v.view_sql_name = 'sph_minmax_mv';
+----
+1
+
+query III
+SELECT (SELECT (bool_or(contains(sql, 'MERGE INTO') AND contains(sql, '<=>'))
+                AND NOT bool_or(contains(lower(sql), 'rowid')))::INT
+        FROM openivm_compile_with_facts('sph_minmax_mv', '{"target_dialect":"spark","compile_only":true}')),
+       (SELECT (bool_or(contains(sql, 'MERGE INTO')) AND NOT bool_or(contains(lower(sql), 'rowid')))::INT
+        FROM openivm_compile_with_facts('sph_minmax_mv', '{"target_dialect":"postgres","compile_only":true}')),
+       (SELECT bool_or(contains(sql, 'openivm_target_rowid'))::INT
+        FROM openivm_compile_with_facts('sph_minmax_mv', '{"target_dialect":"duckdb","compile_only":true}'));
+----
+1	1	1
+
+statement ok
+PRAGMA refresh('sph_minmax_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM sph_minmax_mv
+        EXCEPT ALL SELECT g, h, MIN(v), MAX(v) FROM sph_minmax_src GROUP BY g, h)
+    UNION ALL (SELECT g, h, MIN(v), MAX(v) FROM sph_minmax_src GROUP BY g, h
+        EXCEPT ALL SELECT * FROM sph_minmax_mv));
+----
+0

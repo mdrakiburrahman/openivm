@@ -7,6 +7,8 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 
 #include <atomic>
@@ -55,40 +57,31 @@ SimulatedCrashException::SimulatedCrashException(const string &point)
 
 namespace {
 
-struct AttachedCatalog {
-	bool found = false;
-	string name;
-	string type;
-	bool read_only = false;
-};
-
-AttachedCatalog DescribeCatalog(Connection &con, const string &catalog) {
+AttachedCatalog Describe(AttachedDatabase &database) {
 	AttachedCatalog info;
-	if (catalog.empty()) {
-		return info;
-	}
-	auto result = con.Query("SELECT database_name, type, readonly FROM duckdb_databases() WHERE NOT internal AND " +
-	                        SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog).ToSQLString()));
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM could not resolve metadata catalog: %s", result->GetError());
-	}
-	if (result->RowCount() == 0) {
-		return info;
-	}
 	info.found = true;
-	info.name = result->Collection().GetValue(0, 0).ToString();
-	info.type = result->Collection().GetValue(1, 0).IsNull() ? "" : result->Collection().GetValue(1, 0).ToString();
-	info.read_only =
-	    !result->Collection().GetValue(2, 0).IsNull() && result->Collection().GetValue(2, 0).GetValue<bool>();
+	info.name = database.GetName().GetIdentifierName();
+	info.type = database.GetCatalog().GetCatalogType();
+	info.read_only = database.IsReadOnly();
 	return info;
 }
 
-string SettingText(ClientContext &context, const char *name) {
-	Value value;
-	if (!context.TryGetCurrentSetting(Identifier(name), value) || value.IsNull()) {
-		return "";
+// What duckdb_databases() reports for user-visible databases, without planning a query:
+// catalog resolution runs on every helper connection of a refresh and CREATE.
+bool IsUserVisible(AttachedDatabase &database) {
+	return !database.IsSystem() && !database.IsTemporary() && database.GetVisibility() != AttachVisibility::HIDDEN;
+}
+
+AttachedCatalog DescribeCatalog(Connection &con, const string &catalog) {
+	if (catalog.empty()) {
+		return AttachedCatalog();
 	}
-	return value.ToString();
+	// Attached-database names compare case-insensitively (ASCII), like catalog lookup.
+	auto database = DatabaseManager::Get(*con.context->db).GetDatabase(Identifier(catalog));
+	if (!database || !IsUserVisible(*database)) {
+		return AttachedCatalog();
+	}
+	return Describe(*database);
 }
 
 void RequireSupportedType(const AttachedCatalog &info) {
@@ -124,10 +117,8 @@ bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 		return false;
 	}
 	auto marker = SqlUtils::FullName(info.name, DEFAULT_SCHEMA, openivm::METADATA_MARKER_TABLE);
-	auto rows = con.Query("SELECT metadata_catalog, metadata_schema FROM " + marker);
-	if (rows->HasError()) {
-		throw CatalogException("OpenIVM could not read metadata location marker %s: %s", marker, rows->GetError());
-	}
+	auto rows = SqlUtils::QueryOrThrow(con, "SELECT metadata_catalog, metadata_schema FROM " + marker,
+	                                   "OpenIVM could not read metadata location marker %s: %s", marker);
 	if (rows->RowCount() != 1 || rows->Collection().GetValue(0, 0).IsNull() ||
 	    rows->Collection().GetValue(1, 0).IsNull()) {
 		throw CatalogException("OpenIVM metadata location marker %s must contain exactly one non-NULL row", marker);
@@ -190,8 +181,8 @@ MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &co
 	}
 	MetadataLocation marked;
 	bool has_marker = info.found && ReadMarker(con, info.name, marked);
-	auto configured_catalog = SettingText(context, openivm::METADATA_CATALOG_SETTING);
-	auto configured_schema = SettingText(context, openivm::METADATA_SCHEMA_SETTING);
+	auto configured_catalog = SqlUtils::GetStringSetting(context, openivm::METADATA_CATALOG_SETTING);
+	auto configured_schema = SqlUtils::GetStringSetting(context, openivm::METADATA_SCHEMA_SETTING);
 	if (!configured_catalog.empty()) {
 		if (has_marker && !StringUtil::CIEquals(marked.catalog, configured_catalog)) {
 			throw CatalogException("OpenIVM metadata for catalog '%s' is recorded in %s, but openivm_metadata_catalog "
@@ -222,31 +213,6 @@ MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &co
 	                   !configured_catalog.empty());
 }
 
-void MetadataLocator::Use(Connection &con, const MetadataLocation &location) {
-	string target = SqlUtils::QuoteIdentifier(location.schema.empty() ? string(DEFAULT_SCHEMA) : location.schema);
-	if (!location.catalog.empty()) {
-		target = SqlUtils::QuoteIdentifier(location.catalog) + "." + target;
-	}
-	auto result = con.Query("USE " + target);
-	if (result->HasError() && location.explicit_placement) {
-		// The selected schema is part of the placement; create it on first use.
-		if (location.read_only) {
-			throw CatalogException("OpenIVM metadata schema %s does not exist and its catalog is attached read-only",
-			                       location.DisplayName());
-		}
-		auto created = con.Query("CREATE SCHEMA IF NOT EXISTS " + target);
-		if (created->HasError()) {
-			throw CatalogException("OpenIVM could not create metadata schema %s: %s", location.DisplayName(),
-			                       created->GetError());
-		}
-		result = con.Query("USE " + target);
-	}
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
-	}
-	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s\n", target.c_str());
-}
-
 vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &table) {
 	vector<MetadataLocation> result;
 	auto add = [&](const MetadataLocation &location) {
@@ -263,18 +229,7 @@ vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &tab
 	add(Resolve(*con.context, con, ""));
 	// Source metadata lives in native catalogs. Enumerating external tables also
 	// opens their metadata transactions and can block on unrelated DuckLake writes.
-	auto rows = con.Query("SELECT database_name, readonly FROM duckdb_databases() WHERE type='duckdb' "
-	                      "AND NOT internal ORDER BY database_name");
-	if (rows->HasError()) {
-		throw CatalogException("OpenIVM could not locate source metadata: %s", rows->GetError());
-	}
-	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		AttachedCatalog info;
-		info.found = true;
-		info.name = rows->Collection().GetValue(0, row).ToString();
-		info.type = NATIVE_CATALOG_TYPE;
-		info.read_only =
-		    !rows->Collection().GetValue(1, row).IsNull() && rows->Collection().GetValue(1, row).GetValue<bool>();
+	for (auto &info : MetadataLocator::AttachedCatalogs(*con.context->db, NATIVE_CATALOG_TYPE)) {
 		MetadataLocation marked;
 		if (ReadMarker(con, info.name, marked)) {
 			add(marked);
@@ -295,11 +250,8 @@ void MetadataLocator::ValidateExclusive(Connection &con, const MetadataLocation 
 		    !con.TableInfo(Identifier(other.catalog), Identifier(other.schema), Identifier(openivm::VIEWS_TABLE))) {
 			continue;
 		}
-		auto count = con.Query("SELECT count(*) FROM " + other.Table(openivm::VIEWS_TABLE));
-		if (count->HasError()) {
-			throw CatalogException("OpenIVM could not inspect metadata in %s: %s", other.DisplayName(),
-			                       count->GetError());
-		}
+		auto count = SqlUtils::QueryOrThrow(con, "SELECT count(*) FROM " + other.Table(openivm::VIEWS_TABLE),
+		                                    "OpenIVM could not inspect metadata in %s: %s", other.DisplayName());
 		auto registered = count->Collection().GetValue(0, 0).GetValue<int64_t>();
 		if (registered > 0) {
 			throw CatalogException(
@@ -364,8 +316,24 @@ vector<string> MetadataLocator::ReplaceRowsSQL(const MetadataLocation &location,
 }
 
 bool MetadataLocator::IsNativeCatalog(Connection &con, const string &catalog) {
+	return IsCatalogType(con, catalog, NATIVE_CATALOG_TYPE);
+}
+
+bool MetadataLocator::IsCatalogType(Connection &con, const string &catalog, const string &type) {
 	auto info = DescribeCatalog(con, catalog);
-	return info.found && StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE);
+	return info.found && StringUtil::CIEquals(info.type, type);
+}
+
+vector<AttachedCatalog> MetadataLocator::AttachedCatalogs(DatabaseInstance &db, const string &type) {
+	vector<AttachedCatalog> result;
+	for (auto &database : DatabaseManager::Get(db).GetDatabases()) {
+		if (IsUserVisible(*database) && StringUtil::CIEquals(database->GetCatalog().GetCatalogType(), type)) {
+			result.push_back(Describe(*database));
+		}
+	}
+	std::sort(result.begin(), result.end(),
+	          [](const AttachedCatalog &left, const AttachedCatalog &right) { return left.name < right.name; });
+	return result;
 }
 
 string MetadataLocator::PhysicalDefaultCatalog(DatabaseInstance &db) {
@@ -383,7 +351,7 @@ int64_t MetadataLocator::LeaseSeconds(ClientContext &context) {
 }
 
 bool MetadataLocator::TestPoint(ClientContext &context, const string &point) {
-	return StringUtil::CIEquals(SettingText(context, openivm::TEST_FAIL_POINT_SETTING), point);
+	return StringUtil::CIEquals(SqlUtils::GetStringSetting(context, openivm::TEST_FAIL_POINT_SETTING), point);
 }
 
 void MetadataLocator::FailPoint(ClientContext &context, const string &point) {
@@ -742,13 +710,13 @@ void RefreshLease::SimulateTakeover(bool notice_locally) {
 	}
 	// The new owner's lease has already expired, so the next client can recover at once.
 	Connection con(db);
-	auto result = con.Query("UPDATE " + location.Table(openivm::REFRESH_LEASE_TABLE) +
-	                        " SET owner = 'openivm-simulated-takeover', lease_until = TIMESTAMP '2000-01-01' "
-	                        "WHERE view_name = " +
-	                        Value(view_name).ToSQLString() + " AND owner = " + Value(token).ToSQLString());
-	if (result->HasError()) {
-		throw IOException("OpenIVM test takeover failed: %s", result->GetError());
-	}
+	SqlUtils::QueryOrThrow<IOException>(
+	    con,
+	    "UPDATE " + location.Table(openivm::REFRESH_LEASE_TABLE) +
+	        " SET owner = 'openivm-simulated-takeover', lease_until = TIMESTAMP '2000-01-01' "
+	        "WHERE view_name = " +
+	        Value(view_name).ToSQLString() + " AND owner = " + Value(token).ToSQLString(),
+	    "OpenIVM test takeover failed: %s");
 }
 
 void RefreshLease::Abandon() {

@@ -1115,3 +1115,706 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# #60: substituting the short source name must leave the other scan and string literals intact.
+statement ok
+CREATE TABLE gr_prefix (id INT, grp INT, x INT, label VARCHAR);
+
+statement ok
+CREATE TABLE gr_prefix2 (rid INT, y INT);
+
+statement ok
+INSERT INTO gr_prefix VALUES (1, 1, 10, 'memory.main.gr_prefix'), (2, 1, 20, 'memory.main.gr_prefix'),
+                             (3, 2, 30, 'memory.main.gr_prefix'), (4, 3, 50, 'other');
+
+statement ok
+INSERT INTO gr_prefix2 VALUES (1, 10), (3, 70);
+
+statement ok
+CREATE VIEW gr_prefix_expected AS
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM gr_prefix l ANTI JOIN gr_prefix2 r ON abs(l.x - r.y) <= 1
+    WHERE l.label = 'memory.main.gr_prefix' GROUP BY l.grp;
+
+statement ok
+CREATE MATERIALIZED VIEW gr_prefix_mv AS
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM gr_prefix l ANTI JOIN gr_prefix2 r ON abs(l.x - r.y) <= 1
+    WHERE l.label = 'memory.main.gr_prefix' GROUP BY l.grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'gr_prefix_mv';
+----
+6
+
+statement ok
+INSERT INTO gr_prefix VALUES (5, 2, 40, 'memory.main.gr_prefix'), (6, 1, 45, 'memory.main.gr_prefix');
+
+statement ok
+UPDATE gr_prefix SET x = 47 WHERE id = 6;
+
+statement ok
+DELETE FROM gr_prefix WHERE id = 6;
+
+statement ok
+INSERT INTO gr_prefix2 VALUES (2, 30), (4, 17);
+
+statement ok
+UPDATE gr_prefix2 SET y = 20 WHERE rid = 4;
+
+statement ok
+DELETE FROM gr_prefix2 WHERE rid = 3;
+
+statement ok
+PRAGMA refresh('gr_prefix_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM gr_prefix_mv EXCEPT ALL SELECT * FROM gr_prefix_expected)
+    UNION ALL
+    (SELECT * FROM gr_prefix_expected EXCEPT ALL SELECT * FROM gr_prefix_mv)
+);
+----
+0
+
+# #152: old join keys can disappear from both sources before one refresh.
+statement ok
+CREATE TABLE gr_join_item(k INT, s VARCHAR);
+
+statement ok
+CREATE TABLE gr_join_tag(k INT, s VARCHAR);
+
+statement ok
+INSERT INTO gr_join_item VALUES (1,'p'),(2,'q'),(3,'r'),(4,'s');
+
+statement ok
+INSERT INTO gr_join_tag VALUES (1,'Vanishes'),(2,'kept'),(3,NULL),(4,'old');
+
+statement ok
+CREATE VIEW gr_join_expected AS
+    SELECT t.s AS tag, COUNT(DISTINCT i.s) AS n
+    FROM gr_join_item i JOIN gr_join_tag t ON i.k = t.k GROUP BY t.s;
+
+statement ok
+CREATE MATERIALIZED VIEW gr_join_mv AS
+    SELECT t.s AS tag, COUNT(DISTINCT i.s) AS n
+    FROM gr_join_item i JOIN gr_join_tag t ON i.k = t.k GROUP BY t.s;
+
+statement ok
+CREATE VIEW gr_join_expression_expected AS
+    SELECT lower(t.s) AS tag, COUNT(DISTINCT i.s) AS n
+    FROM gr_join_item i JOIN gr_join_tag t ON i.k = t.k GROUP BY lower(t.s);
+
+statement ok
+CREATE MATERIALIZED VIEW gr_join_expression_mv AS
+    SELECT lower(t.s) AS tag, COUNT(DISTINCT i.s) AS n
+    FROM gr_join_item i JOIN gr_join_tag t ON i.k = t.k GROUP BY lower(t.s);
+
+statement ok
+CREATE MATERIALIZED VIEW gr_join_projected_mv AS
+    SELECT t.tag, COUNT(DISTINCT i.s) AS n
+    FROM gr_join_item i JOIN (SELECT k, lower(s) AS tag FROM gr_join_tag) t ON i.k = t.k GROUP BY t.tag;
+
+query TIT
+SELECT view_sql_name, type, group_recompute_affected_mode FROM openivm_views
+WHERE view_sql_name IN ('gr_join_mv', 'gr_join_expression_mv', 'gr_join_projected_mv') ORDER BY view_sql_name;
+----
+gr_join_expression_mv	6	source_delta
+gr_join_mv	6	source_delta
+gr_join_projected_mv	6	source_delta
+
+statement ok
+DELETE FROM gr_join_tag WHERE k IN (1,3);
+
+statement ok
+DELETE FROM gr_join_item WHERE k IN (1,3);
+
+statement ok
+UPDATE gr_join_item SET k = 5, s = 'updated' WHERE k = 4;
+
+statement ok
+UPDATE gr_join_tag SET k = 5, s = 'new' WHERE k = 4;
+
+statement ok
+INSERT INTO gr_join_item VALUES (5,'updated'),(6,'added');
+
+statement ok
+INSERT INTO gr_join_tag VALUES (6,'added');
+
+statement ok
+PRAGMA refresh('gr_join_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM gr_join_mv EXCEPT ALL SELECT * FROM gr_join_expected)
+    UNION ALL
+    (SELECT * FROM gr_join_expected EXCEPT ALL SELECT * FROM gr_join_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('gr_join_expression_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM gr_join_expression_mv EXCEPT ALL SELECT * FROM gr_join_expression_expected)
+    UNION ALL
+    (SELECT * FROM gr_join_expression_expected EXCEPT ALL SELECT * FROM gr_join_expression_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('gr_join_projected_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM gr_join_projected_mv EXCEPT ALL SELECT * FROM gr_join_expression_expected)
+    UNION ALL
+    (SELECT * FROM gr_join_expression_expected EXCEPT ALL SELECT * FROM gr_join_projected_mv)
+);
+----
+0
+
+# #213: an outer-join tree is parenthesized as `FROM (t AS c LEFT JOIN ...)`. Affected
+# groups must come from the delta of every scan, including the first one after `FROM (`,
+# so groups of moved and deleted preserved-side rows are removed. The BIGINT/INTEGER key
+# keeps these views on GROUP_RECOMPUTE; derived tables cover `FROM ((SELECT` and `FROM ((WITH`.
+statement ok
+CREATE TABLE lj_cust (cust BIGINT, region VARCHAR);
+
+statement ok
+CREATE TABLE lj_sale (id INTEGER, cust INTEGER, amount DOUBLE);
+
+statement ok
+CREATE TABLE lj_region (region VARCHAR, zone INTEGER);
+
+statement ok
+INSERT INTO lj_cust VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, NULL), (6, 'b');
+
+statement ok
+INSERT INTO lj_sale VALUES (1, 1, 10), (2, 1, 5), (3, 2, 20), (4, 3, 7), (5, 5, 1), (6, 6, 3), (7, 9, 100);
+
+statement ok
+INSERT INTO lj_region VALUES ('a', 1), ('b', 1), ('c', 2);
+
+statement ok
+CREATE VIEW lj_key_expected AS SELECT c.cust, c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot FROM lj_cust c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.cust, c.region;
+
+statement ok
+CREATE MATERIALIZED VIEW lj_key_mv AS SELECT c.cust, c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot FROM lj_cust c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.cust, c.region;
+
+statement ok
+CREATE VIEW lj_region_expected AS SELECT c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot FROM lj_cust c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.region;
+
+statement ok
+CREATE MATERIALIZED VIEW lj_region_mv AS SELECT c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot FROM lj_cust c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.region;
+
+statement ok
+CREATE VIEW lj_nested_expected AS SELECT c.cust, c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot, COUNT(r.zone) AS zones, SUM(r.zone) AS zone_sum FROM ((lj_cust c LEFT JOIN lj_sale s ON c.cust = s.cust) LEFT JOIN lj_region r ON c.region = r.region) GROUP BY c.cust, c.region;
+
+statement ok
+CREATE MATERIALIZED VIEW lj_nested_mv AS SELECT c.cust, c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot, COUNT(r.zone) AS zones, SUM(r.zone) AS zone_sum FROM ((lj_cust c LEFT JOIN lj_sale s ON c.cust = s.cust) LEFT JOIN lj_region r ON c.region = r.region) GROUP BY c.cust, c.region;
+
+statement ok
+CREATE VIEW lj_subq_expected AS SELECT c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot FROM (SELECT cust, region FROM lj_cust) c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.region;
+
+statement ok
+CREATE MATERIALIZED VIEW lj_subq_mv AS SELECT c.region, COUNT(s.id) AS n, SUM(s.amount) AS tot FROM (SELECT cust, region FROM lj_cust) c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.region;
+
+statement ok
+CREATE VIEW lj_with_expected AS SELECT c.cust, c.region, COUNT(s.id) AS n FROM (WITH cc AS (SELECT cust, region FROM lj_cust) SELECT * FROM cc) c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.cust, c.region;
+
+statement ok
+CREATE MATERIALIZED VIEW lj_with_mv AS SELECT c.cust, c.region, COUNT(s.id) AS n FROM (WITH cc AS (SELECT cust, region FROM lj_cust) SELECT * FROM cc) c LEFT JOIN lj_sale s ON c.cust = s.cust GROUP BY c.cust, c.region;
+
+query II
+SELECT view_sql_name, type FROM openivm_views WHERE view_sql_name LIKE 'lj\_%\_mv' ESCAPE '\' ORDER BY ALL;
+----
+lj_key_mv	6
+lj_nested_mv	6
+lj_region_mv	6
+lj_subq_mv	6
+lj_with_mv	6
+
+statement ok
+UPDATE lj_cust SET region = 'z' WHERE cust = 1;
+
+statement ok
+UPDATE lj_cust SET region = 'a' WHERE cust = 1;
+
+statement ok
+UPDATE lj_cust SET region = 'c' WHERE cust IN (2, 5);
+
+statement ok
+DELETE FROM lj_cust WHERE cust = 3;
+
+statement ok
+INSERT INTO lj_cust VALUES (7, 'b'), (3, 'c'), (9, 'a');
+
+statement ok
+DELETE FROM lj_cust WHERE cust = 7;
+
+statement ok
+UPDATE lj_sale SET cust = 4 WHERE id IN (1, 6);
+
+statement ok
+DELETE FROM lj_sale WHERE id = 3;
+
+statement ok
+INSERT INTO lj_sale VALUES (8, 3, 2), (9, 7, 50), (10, 4, 4);
+
+statement ok
+UPDATE lj_sale SET amount = amount + 1, cust = 2 WHERE id = 10;
+
+statement ok
+DELETE FROM lj_sale WHERE id = 9;
+
+statement ok
+PRAGMA refresh('lj_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_key_mv EXCEPT ALL SELECT * FROM lj_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_key_expected EXCEPT ALL SELECT * FROM lj_key_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_region_mv EXCEPT ALL SELECT * FROM lj_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_region_expected EXCEPT ALL SELECT * FROM lj_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_nested_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_nested_mv EXCEPT ALL SELECT * FROM lj_nested_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_nested_expected EXCEPT ALL SELECT * FROM lj_nested_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_subq_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_subq_mv EXCEPT ALL SELECT * FROM lj_subq_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_subq_expected EXCEPT ALL SELECT * FROM lj_subq_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_with_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_with_mv EXCEPT ALL SELECT * FROM lj_with_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_with_expected EXCEPT ALL SELECT * FROM lj_with_mv));
+----
+0	0
+
+statement ok
+UPDATE lj_region SET zone = 3 WHERE region = 'a';
+
+statement ok
+INSERT INTO lj_region VALUES ('z', 4);
+
+statement ok
+DELETE FROM lj_region WHERE region = 'c';
+
+statement ok
+UPDATE lj_cust SET region = 'z' WHERE cust IN (4, 6);
+
+statement ok
+DELETE FROM lj_cust WHERE cust = 1;
+
+statement ok
+INSERT INTO lj_cust VALUES (1, 'b'), (10, NULL);
+
+statement ok
+DELETE FROM lj_sale WHERE cust = 4;
+
+statement ok
+UPDATE lj_sale SET cust = 1 WHERE id = 8;
+
+statement ok
+INSERT INTO lj_sale VALUES (11, 10, 6), (12, 1, 8);
+
+statement ok
+PRAGMA refresh('lj_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_key_mv EXCEPT ALL SELECT * FROM lj_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_key_expected EXCEPT ALL SELECT * FROM lj_key_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_region_mv EXCEPT ALL SELECT * FROM lj_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_region_expected EXCEPT ALL SELECT * FROM lj_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_nested_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_nested_mv EXCEPT ALL SELECT * FROM lj_nested_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_nested_expected EXCEPT ALL SELECT * FROM lj_nested_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_subq_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_subq_mv EXCEPT ALL SELECT * FROM lj_subq_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_subq_expected EXCEPT ALL SELECT * FROM lj_subq_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_with_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_with_mv EXCEPT ALL SELECT * FROM lj_with_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_with_expected EXCEPT ALL SELECT * FROM lj_with_mv));
+----
+0	0
+
+statement ok
+UPDATE lj_cust SET region = NULL WHERE cust = 2;
+
+statement ok
+UPDATE lj_cust SET region = 'b' WHERE cust = 9;
+
+statement ok
+DELETE FROM lj_cust WHERE region = 'z';
+
+statement ok
+INSERT INTO lj_cust VALUES (4, 'a'), (11, 'c');
+
+statement ok
+UPDATE lj_sale SET cust = 11 WHERE cust IN (1, 10);
+
+statement ok
+DELETE FROM lj_sale WHERE id = 5;
+
+statement ok
+INSERT INTO lj_sale VALUES (13, 4, 9), (14, 6, 1);
+
+statement ok
+UPDATE lj_sale SET amount = amount * 2 WHERE cust = 4;
+
+statement ok
+UPDATE lj_region SET region = 'c' WHERE region = 'z';
+
+statement ok
+INSERT INTO lj_region VALUES ('b', 5);
+
+statement ok
+PRAGMA refresh('lj_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_key_mv EXCEPT ALL SELECT * FROM lj_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_key_expected EXCEPT ALL SELECT * FROM lj_key_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_region_mv EXCEPT ALL SELECT * FROM lj_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_region_expected EXCEPT ALL SELECT * FROM lj_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_nested_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_nested_mv EXCEPT ALL SELECT * FROM lj_nested_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_nested_expected EXCEPT ALL SELECT * FROM lj_nested_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_subq_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_subq_mv EXCEPT ALL SELECT * FROM lj_subq_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_subq_expected EXCEPT ALL SELECT * FROM lj_subq_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('lj_with_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM lj_with_mv EXCEPT ALL SELECT * FROM lj_with_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM lj_with_expected EXCEPT ALL SELECT * FROM lj_with_mv));
+----
+0	0
+
+# #215: unaliased outer-join tables. Replacing `memory.main.ua_cust` with its delta
+# subquery must keep the implicit alias, or `ua_cust.cust` no longer binds.
+statement ok
+CREATE TABLE ua_cust (cust BIGINT, region VARCHAR);
+
+statement ok
+CREATE TABLE ua_sale (id INTEGER, cust INTEGER, amount DOUBLE);
+
+statement ok
+INSERT INTO ua_cust VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, NULL), (6, 'b');
+
+statement ok
+INSERT INTO ua_sale VALUES (1, 1, 10), (2, 1, 5), (3, 2, 20), (4, 3, 7), (5, 5, 1), (6, 6, 3), (7, 9, 100);
+
+statement ok
+CREATE VIEW ua_left_key_expected AS SELECT ua_cust.cust, ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust LEFT JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.cust, ua_cust.region;
+
+statement ok
+CREATE MATERIALIZED VIEW ua_left_key_mv AS SELECT ua_cust.cust, ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust LEFT JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.cust, ua_cust.region;
+
+statement ok
+CREATE VIEW ua_left_region_expected AS SELECT ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust LEFT JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.region;
+
+statement ok
+CREATE MATERIALIZED VIEW ua_left_region_mv AS SELECT ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust LEFT JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.region;
+
+statement ok
+CREATE VIEW ua_full_region_expected AS SELECT ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust FULL OUTER JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.region;
+
+statement ok
+CREATE MATERIALIZED VIEW ua_full_region_mv AS SELECT ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust FULL OUTER JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.region;
+
+statement ok
+CREATE VIEW ua_full_key_expected AS SELECT ua_cust.cust, ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust FULL OUTER JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.cust, ua_cust.region;
+
+statement ok
+CREATE MATERIALIZED VIEW ua_full_key_mv AS SELECT ua_cust.cust, ua_cust.region, COUNT(ua_sale.id) AS n, SUM(ua_sale.amount) AS tot FROM ua_cust FULL OUTER JOIN ua_sale ON ua_cust.cust = ua_sale.cust GROUP BY ua_cust.cust, ua_cust.region;
+
+query II
+SELECT view_sql_name, type FROM openivm_views WHERE view_sql_name LIKE 'ua\_%\_mv' ESCAPE '\' ORDER BY ALL;
+----
+ua_full_key_mv	6
+ua_full_region_mv	6
+ua_left_key_mv	6
+ua_left_region_mv	6
+
+statement ok
+UPDATE ua_cust SET region = 'c' WHERE cust IN (2, 5);
+
+statement ok
+DELETE FROM ua_cust WHERE cust = 3;
+
+statement ok
+INSERT INTO ua_cust VALUES (9, 'a'), (10, 'b');
+
+statement ok
+UPDATE ua_cust SET region = 'z' WHERE cust = 10;
+
+statement ok
+DELETE FROM ua_cust WHERE cust = 10;
+
+statement ok
+PRAGMA refresh('ua_left_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_mv EXCEPT ALL SELECT * FROM ua_left_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_expected EXCEPT ALL SELECT * FROM ua_left_key_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_left_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_mv EXCEPT ALL SELECT * FROM ua_left_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_expected EXCEPT ALL SELECT * FROM ua_left_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_mv EXCEPT ALL SELECT * FROM ua_full_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_expected EXCEPT ALL SELECT * FROM ua_full_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_mv EXCEPT ALL SELECT * FROM ua_full_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_expected EXCEPT ALL SELECT * FROM ua_full_key_mv));
+----
+0	0
+
+statement ok
+INSERT INTO ua_sale VALUES (8, 4, 2), (9, 12, 4), (10, 3, 6);
+
+statement ok
+DELETE FROM ua_sale WHERE id IN (1, 10);
+
+statement ok
+UPDATE ua_sale SET cust = 2 WHERE id = 7;
+
+statement ok
+UPDATE ua_sale SET amount = amount + 1, cust = 9 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('ua_left_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_mv EXCEPT ALL SELECT * FROM ua_left_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_expected EXCEPT ALL SELECT * FROM ua_left_key_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_left_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_mv EXCEPT ALL SELECT * FROM ua_left_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_expected EXCEPT ALL SELECT * FROM ua_left_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_mv EXCEPT ALL SELECT * FROM ua_full_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_expected EXCEPT ALL SELECT * FROM ua_full_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_mv EXCEPT ALL SELECT * FROM ua_full_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_expected EXCEPT ALL SELECT * FROM ua_full_key_mv));
+----
+0	0
+
+statement ok
+UPDATE ua_cust SET region = 'z' WHERE cust = 4;
+
+statement ok
+DELETE FROM ua_sale WHERE cust = 4;
+
+statement ok
+INSERT INTO ua_cust VALUES (12, 'q'), (3, NULL);
+
+statement ok
+DELETE FROM ua_cust WHERE cust = 9;
+
+statement ok
+UPDATE ua_sale SET cust = 3 WHERE id IN (5, 9);
+
+statement ok
+INSERT INTO ua_sale VALUES (11, 12, 8), (12, 20, 1);
+
+statement ok
+DELETE FROM ua_sale WHERE id = 12;
+
+statement ok
+PRAGMA refresh('ua_left_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_mv EXCEPT ALL SELECT * FROM ua_left_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_expected EXCEPT ALL SELECT * FROM ua_left_key_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_left_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_mv EXCEPT ALL SELECT * FROM ua_left_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_expected EXCEPT ALL SELECT * FROM ua_left_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_mv EXCEPT ALL SELECT * FROM ua_full_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_expected EXCEPT ALL SELECT * FROM ua_full_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_mv EXCEPT ALL SELECT * FROM ua_full_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_expected EXCEPT ALL SELECT * FROM ua_full_key_mv));
+----
+0	0
+
+statement ok
+DELETE FROM ua_cust WHERE cust IN (1, 12);
+
+statement ok
+INSERT INTO ua_cust VALUES (1, 'b'), (4, 'a');
+
+statement ok
+UPDATE ua_cust SET region = NULL WHERE cust = 2;
+
+statement ok
+UPDATE ua_sale SET cust = 1 WHERE cust = 12;
+
+statement ok
+DELETE FROM ua_sale WHERE id = 6;
+
+statement ok
+INSERT INTO ua_sale VALUES (13, 4, 3), (14, 1, 9);
+
+statement ok
+PRAGMA refresh('ua_left_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_mv EXCEPT ALL SELECT * FROM ua_left_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_key_expected EXCEPT ALL SELECT * FROM ua_left_key_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_left_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_mv EXCEPT ALL SELECT * FROM ua_left_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_left_region_expected EXCEPT ALL SELECT * FROM ua_left_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_region_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_mv EXCEPT ALL SELECT * FROM ua_full_region_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_region_expected EXCEPT ALL SELECT * FROM ua_full_region_mv));
+----
+0	0
+
+statement ok
+PRAGMA refresh('ua_full_key_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_mv EXCEPT ALL SELECT * FROM ua_full_key_expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM ua_full_key_expected EXCEPT ALL SELECT * FROM ua_full_key_mv));
+----
+0	0

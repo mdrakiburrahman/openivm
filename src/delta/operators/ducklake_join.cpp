@@ -21,8 +21,7 @@ namespace duckdb {
 
 static string DuckLakeQualifiedTable(const string &catalog, const string &schema, const string &table_name,
                                      int64_t snapshot_id) {
-	string result = SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(schema) + "." +
-	                SqlUtils::QuoteIdentifier(table_name);
+	auto result = SqlUtils::FullName(catalog, schema, table_name);
 	// -1 is the only sentinel; snapshot zero, if supplied by DuckLake, is valid.
 	if (snapshot_id >= 0) { // mull-ignore: cxx_ge_to_gt,cxx_ge_to_lt
 		result += " AT (VERSION => " + to_string(snapshot_id) + ")";
@@ -30,43 +29,9 @@ static string DuckLakeQualifiedTable(const string &catalog, const string &schema
 	return result;
 }
 
-// Rows inserted into or deleted from a DuckLake table between two snapshots, projected to select_list.
-static string DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
-                                 const string &table_name, int64_t old_snapshot, int64_t current_snapshot) {
-	auto rows = [&](const char *function_name) {
-		return "SELECT " + select_list + " FROM " +
-		       SqlUtils::DuckLakeTableFunction(function_name, catalog, schema, table_name, old_snapshot,
-		                                       current_snapshot);
-	};
-	return rows("ducklake_table_insertions") + " UNION ALL " + rows("ducklake_table_deletions");
-}
-
-static idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
-	auto bindings = op.GetColumnBindings();
-	// The <= mutant indexes one past bindings.
-	for (idx_t binding_idx = 0; binding_idx < bindings.size(); binding_idx++) { // mull-ignore: cxx_lt_to_le
-		if (bindings[binding_idx] == binding) {
-			return binding_idx;
-		}
-	}
-	throw InternalException("%s: multiplicity binding %s is not exposed by %s", context_label,
-	                        binding.ToString().c_str(), op.GetName().c_str());
-}
-
 static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator> &term,
                                                       const vector<size_t> &leaf_path, ColumnBinding mul_binding) {
-	vector<LogicalOperator *> ancestors;
-	ancestors.reserve(leaf_path.size());
-	LogicalOperator *node = term.get();
-	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
-		if (leaf_path[depth] >= node->children.size()) { // mull-ignore: cxx_ge_to_gt
-			throw InternalException("DuckLakeJoin: leaf path child %llu out of bounds at depth %llu",
-			                        static_cast<idx_t>(leaf_path[depth]), static_cast<idx_t>(depth));
-		}
-		ancestors.push_back(node);
-		node = node->children[leaf_path[depth]].get();
-	}
-
+	auto ancestors = LeafPathAncestors(*term, leaf_path, "DuckLakeJoin");
 	for (size_t depth = leaf_path.size(); depth-- > 0;) {
 		auto *parent = ancestors[depth];
 		size_t child_side = leaf_path[depth];
@@ -101,11 +66,7 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 		}
 		if (parent->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 			// A new left column shifts the right side in any ancestor's positional map.
-			idx_t insertion_idx = mul_idx;
-			if (child_side == 1) {
-				insertion_idx += parent->children[0]->GetColumnBindings().size();
-			}
-			shift_parent_projection(insertion_idx);
+			shift_parent_projection(mul_idx + JoinChildOutputOffset(*parent, child_side));
 			parent->ResolveOperatorTypes();
 			continue;
 		}
@@ -117,21 +78,12 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 			}
 			OPENIVM_DEBUG_PRINT("\n");
 			if (projection_map.empty()) {
-				idx_t insertion_idx = mul_idx;
-				if (child_side == 1) {
-					insertion_idx += join->children[0]->GetColumnBindings().size();
-				}
-				shift_parent_projection(insertion_idx);
+				shift_parent_projection(mul_idx + JoinChildOutputOffset(*join, child_side));
 			} else {
 				// Numeric map positions can alias a different column after a deeper join grows.
 				auto exposed = join->GetColumnBindings();
 				if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
-					idx_t insertion_idx = projection_map.size();
-					if (child_side == 1) {
-						insertion_idx += join->left_projection_map.empty()
-						                     ? join->children[0]->GetColumnBindings().size()
-						                     : join->left_projection_map.size();
-					}
+					auto insertion_idx = projection_map.size() + JoinChildOutputOffset(*join, child_side);
 					projection_map.push_back(ProjectionIndex(mul_idx));
 					shift_parent_projection(insertion_idx);
 				}
@@ -152,7 +104,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
                                                            bool has_left_join, bool flattened_leaves,
                                                            const vector<vector<DeltaJoinKeyProbe>> &key_probes,
-                                                           DeltaSourceCache &source_cache) {
+                                                           DeltaSourceCache &source_cache,
+                                                           const DuckLakeNullPaddingGuard &guard) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -221,23 +174,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		size_t reused_activity_count = 0;
 		// Compile facts are an optimization cache; skipping this scan falls back to authoritative metadata probes.
 		for (size_t i = 0; i < N; i++) { // mull-ignore: cxx_lt_to_ge
-			for (auto &entry : compile_facts.delta_shape) {
-				if (!StringUtil::CIEquals(entry.first,
-				                          SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_names[i]))) {
-					continue;
-				}
-				if (StringUtil::CIEquals(entry.second, "UNCHANGED")) {
-					empty_table_delta[i] = true;
-					activity_known[i] = true;
-				} else if (StringUtil::CIEquals(entry.second, "INSERT_ONLY") ||
-				           StringUtil::CIEquals(entry.second, "MIXED")) {
-					activity_known[i] = true;
-				}
-				// This counter is used only by the debug summary below.
-				// mull-ignore-next: cxx_arithmetic
-				reused_activity_count += activity_known[i] ? 1 : 0;
-				break;
-			}
+			auto shape = FactDeltaShape(compile_facts, *GetLeafScan(leaves[i])->GetTable());
+			empty_table_delta[i] = StringUtil::CIEquals(shape, "UNCHANGED");
+			activity_known[i] = empty_table_delta[i] || StringUtil::CIEquals(shape, "INSERT_ONLY") ||
+			                    StringUtil::CIEquals(shape, "MIXED");
+			// This counter is used only by the debug summary below.
+			// mull-ignore-next: cxx_arithmetic
+			reused_activity_count += activity_known[i] ? 1 : 0;
 		}
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Reused source activity for %zu/%zu leaves\n", reused_activity_count, N);
 		RefreshMetadata metadata(con);
@@ -264,8 +207,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				}
 				continue;
 			}
-			auto changes = DuckLakeChangesSQL("1", table_catalogs[i], table_schemas[i], table_names[i],
-			                                  old_snapshots[i], current_snapshots[i]);
+			auto changes = SqlUtils::DuckLakeChangesSQL("1", table_catalogs[i], table_schemas[i], table_names[i],
+			                                            old_snapshots[i], current_snapshots[i]);
 			// Failed probes fail open; the metadata path normally handles this before the SQL fallback.
 			if (!DeltaJoinProbeExists(con, "(" + changes + ") openivm_delta_probe", "DuckLakeJoin")) {
 				empty_table_delta[i] = true;
@@ -276,6 +219,12 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves, flattened=%s)\n", N,
 	                    flattened_leaves ? "true" : "false");
 
+	uint64_t active_mask = 0;
+	for (size_t leaf = 0; leaf < N; leaf++) {
+		if (!empty_table_delta[leaf]) {
+			active_mask |= 1ULL << leaf;
+		}
+	}
 	for (size_t i = 0; i < N; i++) {
 		// Skip term if this table has no changes since last refresh.
 		if (skip_empty_enabled && empty_table_delta[i]) {
@@ -292,9 +241,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				size_t other = probe.other_leaf;
 				// A probe always targets another leaf, so > and >= differ only for an impossible self-probe.
 				int64_t other_snapshot = other > i ? old_snapshots[other] : -1; // mull-ignore: cxx_gt_to_ge
-				auto changes = DuckLakeChangesSQL(SqlUtils::QuoteIdentifier(probe.delta_column) + " AS openivm_key",
-				                                  table_catalogs[i], table_schemas[i], table_names[i], old_snapshots[i],
-				                                  current_snapshots[i]);
+				auto changes = SqlUtils::DuckLakeChangesSQL(
+				    SqlUtils::QuoteIdentifier(probe.delta_column) + " AS openivm_key", table_catalogs[i],
+				    table_schemas[i], table_names[i], old_snapshots[i], current_snapshots[i]);
 				auto other_relation = DuckLakeQualifiedTable(table_catalogs[other], table_schemas[other],
 				                                             table_names[other], other_snapshot);
 				if (!DeltaJoinProbeExists(con,
@@ -324,11 +273,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// term's delta. Preserved joins elsewhere in a left-deep star must remain
 		// outer joins so unmatched rows continue to flow to later dimensions.
 		if (has_left_join) {
-			if (flattened_leaves || input.context.model.type == RefreshType::SIMPLE_PROJECTION) {
-				DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << i), input.context.model.type);
-			} else if (leaves[i].is_right_of_left_join) {
-				DemoteLeftJoins(term.get());
-			}
+			DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << i), input.context.model.type);
 		}
 
 		// Replace leaf[i] with its delta: a bare GET directly, a GET wrapped in projections/filters by rewriting the
@@ -354,9 +299,14 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			    old_get->function.function_info) {
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);
+				func_info.include_local_changes = false;
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned leaf %zu (table_index=%lu) to old snapshot %ld\n", j,
 				                    (unsigned long)old_get->table_index.index, (long)old_snapshots[j]);
 			}
+		}
+
+		if (guard) {
+			guard(term, active_mask, ((1ULL << N) - 1) & ~((1ULL << (i + 1)) - 1));
 		}
 
 		terms.push_back(FinalizeJoinTerm(binder, std::move(term), {}, {mul_binding}, input.mul_type, false));

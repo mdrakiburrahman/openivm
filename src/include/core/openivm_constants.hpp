@@ -61,6 +61,15 @@ constexpr const char *COUNT_COL_PREFIX = "openivm_count_";
 // the visible projection index, which associates the state with the exact
 // bound output without inspecting SQL text or aliases.
 constexpr const char *SUM_COUNT_COL_PREFIX = "openivm_nonnull_sum_count_";
+constexpr const char *FINITE_SUM_COL_PREFIX = "openivm_finite_sum_";
+constexpr const char *LARGE_SUM_COL_PREFIX = "openivm_large_sum_";
+// Two finite lanes leave 64 exponent bits for accumulating up to BIGINT_MAX input rows.
+constexpr double FINITE_SUM_THRESHOLD = 0x1p960;
+constexpr double FINITE_SUM_SCALE = 0x1p64;
+constexpr const char *NAN_COUNT_COL_PREFIX = "openivm_nan_count_";
+constexpr const char *GROUP_SIGN_COUNT_COL_PREFIX = "openivm_group_sign_count_";
+constexpr const char *POS_INF_COUNT_COL_PREFIX = "openivm_pos_inf_count_";
+constexpr const char *NEG_INF_COUNT_COL_PREFIX = "openivm_neg_inf_count_";
 
 // Hidden COUNT(*) injected into AGGREGATE_GROUP MVs that don't already have a
 // count aggregate. Tracks per-group cardinality so the cleanup can delete rows
@@ -84,8 +93,10 @@ constexpr const char *INDEX_SUFFIX = "openivm_index";
 // is itself a join needs its own secondary delta. Handling only the outermost level left deeper
 // preserved-side counts undercounted for 4+ table chains.
 constexpr const char *LJSEC_INNER_DELTA_PREFIX = "__OPENIVM_LJSEC_INNER_DELTA_";
-constexpr const char *LJSEC_PRES_DELTA_PREFIX = "__OPENIVM_LJSEC_PRES_DELTA_";
 constexpr const char *LJSEC_PLACEHOLDER_SUFFIX = "__";
+// Quoted relation placeholder followed by the qualified source identity.
+constexpr const char *LJSEC_OLD_SOURCE_PREFIX = "__OPENIVM_LJSEC_OLD_SOURCE_";
+constexpr const char *LJSEC_OLD_NATIVE_DELTA_PREFIX = "__OPENIVM_LJSEC_OLD_NATIVE_DELTA_";
 
 // Temporary table prefix for companion row snapshots
 constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
@@ -95,8 +106,9 @@ static constexpr idx_t MAX_JOIN_TABLES = 16;
 
 // Data-dependent optimizers disabled when planning a view query into a delta-maintenance template.
 // column_lifetime is structural/data-independent and stays enabled.
-constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation";
-constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
+// Partial aggregate pushdown introduces opaque EXPORT_STATE aggregates below joins.
+// Rewrite the original aggregates first; native final-plan optimization can still push them down.
+constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation,partial_aggregate_pushdown";
 
 // Disabled wherever the deeply-nested generated refresh SQL is planned/executed. deliminator
 // recurses through OpenIVM's chained CTE/subquery expansions (N-term telescoping over many tables)

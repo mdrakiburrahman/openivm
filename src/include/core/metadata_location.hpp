@@ -59,6 +59,14 @@ struct MetadataLocation {
 	bool Matches(const MetadataLocation &other) const;
 };
 
+// A user-visible attached database, as duckdb_databases() reports it.
+struct AttachedCatalog {
+	bool found = false;
+	string name;
+	string type;
+	bool read_only = false;
+};
+
 class MetadataLocator {
 public:
 	// The metadata location for a view stored in `view_catalog` (empty: the caller's
@@ -66,9 +74,6 @@ public:
 	// or when a durable marker contradicts the configured placement.
 	static MetadataLocation At(Connection &con, const string &catalog, const string &schema);
 	static MetadataLocation Resolve(ClientContext &context, Connection &con, const string &view_catalog);
-	// Point `con` at `location` so unqualified metadata table names resolve there.
-	// Creates the selected schema of an explicit placement when it does not exist yet.
-	static void Use(Connection &con, const MetadataLocation &location);
 	// Every location that holds OpenIVM delta-table metadata: the configured location,
 	// marker targets and legacy native catalogs. Delta cleanup must consult all of them.
 	static vector<MetadataLocation> All(Connection &con, const string &table = openivm::DELTA_TABLES_TABLE);
@@ -87,6 +92,11 @@ public:
 	static vector<string> ReplaceRowsSQL(const MetadataLocation &location, const string &insert_or_replace_sql,
 	                                     const string &delete_predicate_sql);
 	static bool IsNativeCatalog(Connection &con, const string &catalog);
+	// Whether `catalog` is attached with catalog type `type` ("duckdb", "ducklake", ...).
+	static bool IsCatalogType(Connection &con, const string &catalog, const string &type);
+	// User-visible attached databases of catalog type `type`, in name order. Read from the
+	// database manager instead of duckdb_databases(), which costs a planned statement.
+	static vector<AttachedCatalog> AttachedCatalogs(DatabaseInstance &db, const string &type);
 	// The database a fresh connection starts in; external view catalogs keep their
 	// internal tables there regardless of the metadata placement.
 	static string PhysicalDefaultCatalog(DatabaseInstance &db);

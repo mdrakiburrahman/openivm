@@ -1,5 +1,6 @@
 #include "rules/incremental_rewrite_rule.hpp"
 
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_ddl.hpp"
@@ -15,8 +16,10 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
 
 namespace duckdb {
@@ -53,6 +56,29 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 	plan = std::move(insert_node);
 }
 
+unique_ptr<SQLStatement> IncrementalRewriteRule::LoadStoredViewStatement(ClientContext &context, Connection &con,
+                                                                         const string &view_catalog, const string &view,
+                                                                         const string &missing_error) {
+	RefreshMetadata::UseCatalog(context, con, view_catalog);
+	if (RefreshMetadata::TransactionMayHoldMetadata(context)) {
+		RefreshMetadata(con).SnapshotTransaction(context);
+	}
+	RefreshMetadata metadata(con);
+	metadata.UseView(RefreshMetadata::PlanningView(context, view));
+	auto view_query = metadata.GetViewQuery(view);
+	if (view_query.empty()) {
+		throw Exception(ExceptionType::CATALOG, missing_error);
+	}
+	OPENIVM_DEBUG_PRINT("[IVM] View: %s, Query: %s\n", view.c_str(), view_query.c_str());
+	auto parser = Parser::GetBuiltinParser();
+	parser.ParseQuery(view_query);
+	if (parser.statements.empty()) {
+		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
+	}
+	openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
+	return std::move(parser.statements[0]);
+}
+
 void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionInput &input,
                                                             duckdb::unique_ptr<LogicalOperator> &plan) {
 	WarnSnapshotHistoryDeletion(input.context, *plan);
@@ -69,9 +95,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		return;
 	}
 
-#if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Activating the rewrite rule\n");
-#endif
 
 	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
 	auto view_catalog = StringValue::Get(marker->parameters[0]);
@@ -79,31 +103,45 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto view = StringValue::Get(marker->parameters[2]);
 
 	Connection con(*input.context.db);
-	RefreshMetadata::UseCatalog(input.context, con, view_catalog);
-	if (!input.context.transaction.IsAutoCommit()) {
-		RefreshMetadata(con).SnapshotTransaction(input.context);
-	}
-
-	auto view_query = RefreshMetadata(con).GetViewQuery(view);
-	if (view_query.empty()) {
-		throw Exception(ExceptionType::CATALOG, "IVM: missing view definition for '" + view + "'");
-	}
-
-	auto parser = Parser::GetBuiltinParser();
 	Planner planner(input.context);
-
-	parser.ParseQuery(view_query);
-	if (parser.statements.empty()) {
-		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
-	}
-	openivm::TimeTravelPins::Peel(input.context, *parser.statements[0]);
-
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
-	PlanWithSourceColumns(planner, std::move(parser.statements[0]));
+	PlanWithSourceColumns(planner, LoadStoredViewStatement(input.context, con, view_catalog, view,
+	                                                       "IVM: missing view definition for '" + view + "'"));
+	RefreshMetadata metadata(con);
+	metadata.UseView(RefreshMetadata::PlanningView(input.context, view));
+	auto derived_outputs = metadata.GetDerivedAggregateOutputs(view);
+	if (derived_outputs.complete && !derived_outputs.outputs.empty()) {
+		auto group_columns = metadata.GetGroupColumns(view);
+		// The upsert evaluates f(state + delta). Evaluating f(delta) here can
+		// be invalid (e.g. an unsigned cast of COUNT(*) - 2 on a one-row delta).
+		// Keep raw aggregate inputs and let the optimizer prune consumed outputs.
+		planner.plan->ResolveOperatorTypes();
+		// Foreign INSERT SQL can use bare NULL, including for complex outputs
+		// whose target dialect has no verified cast type mapping.
+		bool native = openivm::CompileFactsContextSlot::Get(input.context).target_dialect == SqlDialect::DUCKDB;
+		auto bindings = planner.plan->GetColumnBindings();
+		vector<unique_ptr<Expression>> expressions;
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			bool derived = std::any_of(derived_outputs.outputs.begin(), derived_outputs.outputs.end(),
+			                           [&](const DerivedAggregateOutput &output) {
+				                           return output.output_column == planner.names[i].GetIdentifierName() &&
+				                                  std::find(group_columns.begin(), group_columns.end(),
+				                                            output.output_column) == group_columns.end();
+			                           });
+			unique_ptr<Expression> expression =
+			    derived ? unique_ptr<Expression>(
+			                  make_uniq<BoundConstantExpression>(native ? Value(planner.plan->types[i]) : Value()))
+			            : make_uniq<BoundColumnRefExpression>(planner.plan->types[i], bindings[i]);
+			expression->SetAlias(planner.names[i]);
+			expressions.push_back(std::move(expression));
+		}
+		auto projection = make_uniq<LogicalProjection>(planner.binder->GenerateTableIndex(), std::move(expressions));
+		projection->children.push_back(std::move(planner.plan));
+		planner.plan = std::move(projection);
+		OPENIVM_DEBUG_PRINT("[IVM Rewrite] Retained raw state inputs for derived aggregate deltas\n");
+	}
 	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
-#if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
-#endif
 	// This is still the stored base-view plan. Its scans have not been replaced with delta scans yet,
 	// so current base-table facts must never be folded into it. The user setting only controls the
 	// subsequent optimization of the finished incremental plan in GenerateRefreshSQL().
@@ -116,9 +154,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	// to generate all inclusion-exclusion terms (including delta/delta terms).
 	InlineMaterializedCteRefs(input.context, *planner.binder, optimized_plan);
 
-#if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Optimized plan: \n%s\n", optimized_plan->ToString().c_str());
-#endif
 
 	if (optimized_plan->children.empty()) {
 		throw NotImplementedException("Plan contains single node, this is not supported");

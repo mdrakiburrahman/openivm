@@ -10,9 +10,15 @@ struct DerivedAggregateOutput {
 	string expression_sql;
 };
 
+struct AggregateInput {
+	string output_column;
+	string aggregate_type;
+};
+
 struct DerivedAggregateOutputInfo {
 	bool complete = false;
 	vector<DerivedAggregateOutput> outputs;
+	vector<AggregateInput> inputs;
 };
 
 } // namespace duckdb

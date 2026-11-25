@@ -81,11 +81,8 @@ void RefreshDaemon::Run() {
 			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Woke up\n");
 
 			// Read cascade setting from the DB config
-			string cascade_mode = "downstream";
-			Value cascade_val;
-			if (con.context->TryGetCurrentSetting("openivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
-				cascade_mode = StringUtil::Lower(cascade_val.ToString());
-			}
+			auto cascade_mode =
+			    StringUtil::Lower(SqlUtils::GetStringSetting(*con.context, "openivm_cascade_refresh", "downstream"));
 
 			// Read adaptive backoff setting
 			adaptive_backoff_ = SqlUtils::GetBoolSetting(*con.context, "openivm_adaptive_backoff", adaptive_backoff_);
@@ -106,7 +103,7 @@ void RefreshDaemon::Run() {
 				MetadataLocation location;
 				location.catalog = sv.metadata_catalog;
 				location.schema = sv.metadata_schema;
-				MetadataLocator::Use(con, location);
+				RefreshMetadata::UseLocation(con, location);
 				auto view_key = SqlUtils::FullName(sv.catalog_name, sv.schema_name, sv.view_name);
 
 				// Skip if already refreshed via cascade from an earlier view in this cycle
@@ -115,14 +112,8 @@ void RefreshDaemon::Run() {
 				}
 
 				// Determine effective interval (may be backed off)
-				int64_t interval = sv.interval_seconds;
-				{
-					std::lock_guard<std::mutex> guard(backoff_mutex_);
-					auto it = effective_intervals_.find(view_key);
-					if (it != effective_intervals_.end()) {
-						interval = it->second;
-					}
-				}
+				auto backed_off = GetEffectiveInterval(view_key);
+				int64_t interval = backed_off < 0 ? sv.interval_seconds : backed_off;
 
 				// Check if the view is due for refresh
 				if (!sv.last_update.empty()) {
@@ -169,16 +160,8 @@ void RefreshDaemon::Run() {
 				}
 
 				// Mark this view and any cascaded views as done for this cycle
-				refreshed_this_cycle.insert(view_key);
-				if (cascade_mode == "downstream" || cascade_mode == "both") {
-					for (auto &dep : metadata.GetDownstreamViews(sv.view_name)) {
-						refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, dep));
-					}
-				}
-				if (cascade_mode == "upstream" || cascade_mode == "both") {
-					for (auto &dep : metadata.GetUpstreamViews(sv.view_name)) {
-						refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, dep));
-					}
+				for (auto &node : metadata.CascadeOrder(sv.view_name, cascade_mode)) {
+					refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, node));
 				}
 
 				auto after = std::chrono::steady_clock::now();
@@ -186,14 +169,11 @@ void RefreshDaemon::Run() {
 
 				// Adaptive backoff
 				if (adaptive_backoff_.load() && duration_seconds > sv.interval_seconds) {
-					std::lock_guard<std::mutex> guard(backoff_mutex_);
-					int64_t current = sv.interval_seconds;
-					auto it = effective_intervals_.find(view_key);
-					if (it != effective_intervals_.end()) {
-						current = it->second;
+					int64_t new_interval = std::min(interval * 2, MAX_BACKOFF_SECONDS);
+					{
+						std::lock_guard<std::mutex> guard(backoff_mutex_);
+						effective_intervals_[view_key] = new_interval;
 					}
-					int64_t new_interval = std::min(current * 2, MAX_BACKOFF_SECONDS);
-					effective_intervals_[view_key] = new_interval;
 					Printer::Print("Warning: refresh of '" + sv.view_name + "' took " + to_string(duration_seconds) +
 					               "s (interval: " + to_string(sv.interval_seconds) +
 					               "s). Increasing effective interval to " + to_string(new_interval) +

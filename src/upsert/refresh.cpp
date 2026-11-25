@@ -17,13 +17,12 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
-#include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/parser.hpp"
 #include <chrono>
@@ -86,15 +85,8 @@ static DuckLakeSourcePins PinDuckLakeSources(Connection &con, RefreshMetadata &m
 		return pins;
 	}
 	// Watermark placeholders may name any attached DuckLake catalog, so pin all of them.
-	auto catalogs = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
-	if (catalogs->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "OpenIVM could not list DuckLake catalogs: " + catalogs->GetError());
-	}
-	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-		if (!catalogs->Collection().GetValue(0, row).IsNull()) {
-			auto catalog = catalogs->Collection().GetValue(0, row).ToString();
-			pins.snapshots[catalog] = metadata.GetCurrentDuckLakeSnapshot(catalog);
-		}
+	for (auto &catalog : MetadataLocator::AttachedCatalogs(*con.context->db, "ducklake")) {
+		pins.snapshots[catalog.name] = metadata.GetCurrentDuckLakeSnapshot(catalog.name);
 	}
 	// Resolved after the snapshots, so a drop or recreate after the pin shows up as a change.
 	for (auto &source : pins.sources) {
@@ -157,12 +149,8 @@ static void InjectConcurrentCommit(ClientContext &context, const string &point, 
 		throw InvalidInputException("openivm_test_fail_point '%s' requires openivm_test_concurrent_sql", point);
 	}
 	Connection writer(*context.db.get());
-	TransactionalMVLockState::Get(*writer.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-	auto result = writer.Query(sql.ToString());
-	if (result->HasError()) {
-		throw InvalidInputException("openivm_test_concurrent_sql failed: %s", result->GetError());
-	}
+	TransactionalMVLockState::ShareMutationOwner(context, *writer.context);
+	SqlUtils::QueryOrThrow<InvalidInputException>(writer, sql.ToString(), "openivm_test_concurrent_sql failed: %s");
 }
 
 // Test-only: whether a refresh statement inserts into the view's own delta table (delta_<mv>).
@@ -194,9 +182,6 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	RefreshMetadata probe_meta(probe_con);
 	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
 	MetadataLocator::RequireWritable(metadata_location, "refresh materialized view '" + display_name + "'");
-	// Before anything reads source deltas, including the empty-delta shortcut below.
-	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
-	                                      attached_db_catalog_name, attached_db_schema_name);
 	// Metadata stored outside the MV's database cannot commit with its data. The split
 	// protocol commits (1) the interruption marker, (2) the MV data, (3) the watermarks
 	// with the marker cleared. A failure at any point leaves the marker set, so the next
@@ -205,6 +190,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	bool split_native = split_protocol && probe_meta.IsNativeCatalog(view_catalog_name);
 	// Remote metadata can be shared by several clients; only the lease holder refreshes.
 	RefreshLease lease(context, metadata_location, vn);
+	// Every later metadata read of this attempt, including SQL generation, is served from one read.
+	// It follows the lease: until then another client sharing remote metadata may refresh or replace
+	// the view (cascaded nodes reach this point without a lease from RefreshNodeWithHooks).
+	auto view_record = probe_meta.LoadView(vn);
+	// Before anything reads source deltas, including the empty-delta shortcut below.
+	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
+	                                      attached_db_catalog_name, attached_db_schema_name);
 	bool was_interrupted = false;
 	int64_t refresh_epoch = 0;
 	if (split_protocol) {
@@ -266,17 +258,25 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
 	Connection exec_con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *exec_con.context, "TimeZone");
-	TransactionalMVLockState::Get(*exec_con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	TransactionalMVLockState::ShareMutationOwner(context, *exec_con.context);
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;
+	// Failing to roll back is benign (the Connection destructor still cleans up); never mask the original error.
+	auto rollback_open_transaction = [&]() {
+		if (tx_open) {
+			try {
+				exec_con.Rollback();
+			} catch (...) {
+			}
+			tx_open = false;
+		}
+	};
 	bool intent_recorded = false;
 	// Metadata statements of the split protocol run in one fenced metadata transaction.
 	// Returns the error, or an empty string once committed.
 	auto run_metadata = [&](const string &statements) -> string {
 		Connection meta_con(*context.db.get());
-		TransactionalMVLockState::Get(*meta_con.context)
-		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+		TransactionalMVLockState::ShareMutationOwner(context, *meta_con.context);
 		if (!split_protocol) {
 			auto result = meta_con.Query(statements);
 			return result->HasError() ? result->GetError() : string();
@@ -337,7 +337,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
-		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr);
+		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr, view_record);
 		// The ranked rowid program is compiled with the primary one, before refresh_in_progress is set.
 		// It only runs when DuckLake reports that the exhaustive tuple delete removed more rows than the
 		// negative delta requested, and defers the same cleanup, so it never writes outside the data
@@ -373,7 +373,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs. Keep the
 		// established guard while rejecting unexpectedly recursive generated plans.
-		exec_con.Query("SET max_expression_depth = 10000");
+		Settings::Set<MaxExpressionDepthSetting>(*exec_con.context, SetScope::SESSION, Value::UBIGINT(10000));
 		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
 		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
 		// overflow in the optimizer before the refresh query runs.
@@ -381,7 +381,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
-		exec_con.Query("SET preserve_insertion_order=false");
+		Settings::Set<PreserveInsertionOrderSetting>(*exec_con.context, SetScope::SESSION, Value::BOOLEAN(false));
 		// The archive lives in the metadata location exec_con selected (catalog and schema).
 		string archive_catalog;
 		string archive_schema;
@@ -573,10 +573,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                    SqlUtils::ReplaceAllOccurrences(error, vn, probe_meta.GetViewSQLName(vn)));
 		}
 		if (!after_hook.empty()) {
-			auto hook_result = exec_con.Query(after_hook);
-			if (hook_result->HasError()) {
-				throw InvalidInputException("after-hook for '%s' failed: %s", display_name, hook_result->GetError());
-			}
+			SqlUtils::QueryOrThrow<InvalidInputException>(exec_con, after_hook, "after-hook for '%s' failed: %s",
+			                                              display_name);
 		}
 
 		// Transactional DuckLake reads all happened before this point, so verify before
@@ -656,11 +654,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			    publication->Collection().GetValue(0, 0).ToString());
 			set_archived_program();
 			data_may_be_committed = true;
-			auto published = exec_con.Query(publish_sql);
-			if (published->HasError()) {
-				throw CatalogException("Could not advance snapshot publication for '%s': %s", vn,
-				                       published->GetError());
-			}
+			SqlUtils::QueryOrThrow(exec_con, publish_sql, "Could not advance snapshot publication for '%s': %s", vn);
 			profiler.AddStep("publish_snapshot", publication_start, "no physical publication copy");
 		}
 		if (cross_system && !meta_post_sql.empty()) {
@@ -740,8 +734,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// Housekeeping after the watermarks advanced: delete delta rows every consumer
 			// has committed. Failures only retain rows that later refreshes exclude.
 			Connection cleanup_con(*context.db.get());
-			TransactionalMVLockState::Get(*cleanup_con.context)
-			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+			TransactionalMVLockState::ShareMutationOwner(context, *cleanup_con.context);
 			for (auto &cleanup : post_watermark_cleanup) {
 				auto cleaned = cleanup_con.Query(cleanup);
 				if (cleaned->HasError()) {
@@ -754,20 +747,12 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		if (!cost_estimate.strategy_label.empty()) {
 			auto history_start = std::chrono::steady_clock::now();
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-			// Determine which method was used. Priority:
-			//   1) `openivm_refresh_mode = 'full'` overrides everything → "full".
-			//   2) If the adaptive cost model picked full recompute, record "full".
-			//   3) Otherwise record the selected refresh strategy label.
-			string method = cost_estimate.strategy_label.empty() ? "incremental" : cost_estimate.strategy_label;
-			if (cost_estimate.ShouldRecompute()) {
+			// Record "full" when openivm_refresh_mode = 'full' or the adaptive cost model picked
+			// full recompute; otherwise record the selected refresh strategy label.
+			string method = cost_estimate.strategy_label;
+			if (cost_estimate.ShouldRecompute() ||
+			    StringUtil::CIEquals(SqlUtils::GetStringSetting(context, "openivm_refresh_mode"), "full")) {
 				method = "full";
-			}
-			Value mode_val;
-			if (context.TryGetCurrentSetting(Identifier("openivm_refresh_mode"), mode_val) && !mode_val.IsNull()) {
-				auto mode = StringUtil::Lower(mode_val.ToString());
-				if (mode == "full") {
-					method = "full";
-				}
 			}
 
 			RefreshMetadata(exec_con).RecordRefreshHistory(
@@ -801,29 +786,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	} catch (SimulatedCrashException &) {
 		// A crashed process loses its open transaction and runs no compensation; the
 		// interruption marker and any lease remain for recovery to handle.
-		if (tx_open) {
-			try {
-				exec_con.Rollback();
-			} catch (...) {
-			}
-			tx_open = false;
-		}
+		rollback_open_transaction();
 		lease.Abandon();
 		throw;
 	} catch (...) {
-		// Ensure the transaction is rolled back before we propagate the exception.
-		// This covers the case where Query() itself threw (vs returning HasError) —
-		// without this, the tx would stay open until exec_con's destructor runs,
-		// possibly leaving dirty WAL entries.
-		if (tx_open) {
-			try {
-				exec_con.Rollback();
-			} catch (...) {
-				// Rollback-inside-rollback failure is benign: the Connection destructor
-				// will still clean up. Swallow so we don't mask the original error.
-			}
-			tx_open = false;
-		}
+		// Roll back before propagating, also when Query() itself threw (vs returning HasError);
+		// otherwise the tx would stay open until exec_con's destructor runs.
+		rollback_open_transaction();
 		if (split_protocol && intent_recorded && !data_may_be_committed && !was_interrupted) {
 			// The data transaction rolled back, so nothing changed: retract our marker
 			// rather than force a full recompute. Best effort; a set marker is still safe.
@@ -955,11 +924,56 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 
 	for (auto &advance : activity.ducklake_snapshot_advances) {
 		if (advance.snapshot_id >= 0) {
-			metadata.UpdateDuckLakeRefreshMetadata(view_name, advance.table_name, advance.snapshot_id);
+			metadata.UpdateDuckLakeRefreshMetadata(view_name, advance.table_name, advance.snapshot_id,
+			                                       advance.source_table_id);
 		}
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
 	return true;
+}
+
+// Custom SQL to run before/after/instead of IVM; both outputs stay empty without a hook.
+static void ReadRefreshHook(Connection &con, const string &view_name, string &hook_sql, string &hook_mode) {
+	auto rows = con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks WHERE view_name = '" +
+	                      SqlUtils::EscapeValue(view_name) + "'");
+	if (!rows->HasError() && rows->RowCount() > 0) {
+		hook_sql = rows->Collection().GetValue(0, 0).ToString();
+		hook_mode = StringUtil::Lower(rows->Collection().GetValue(1, 0).ToString());
+	}
+}
+
+struct RefreshTarget {
+	string view_catalog_name;
+	string view_schema_name;
+	string attached_db_catalog_name;
+	string attached_db_schema_name;
+	string view_name;
+	bool cross_system = false;
+};
+
+// PRAGMA refresh arguments: (view), (catalog, schema, view), or (catalog, schema, attached catalog,
+// attached schema, view). A pipeline resolves its first target.
+static RefreshTarget ParseRefreshTarget(ClientContext &context, Connection &con, const FunctionParameters &parameters,
+                                        bool pipeline) {
+	RefreshTarget target;
+	auto &values = parameters.values;
+	if (!pipeline && (values.size() == 3 || values.size() == 5)) {
+		target.view_catalog_name = StringValue::Get(values[0]);
+		target.view_schema_name = StringValue::Get(values[1]);
+		target.view_name = StringValue::Get(values.back());
+		if (values.size() == 5) {
+			target.attached_db_catalog_name = StringValue::Get(values[2]);
+			target.attached_db_schema_name = StringValue::Get(values[3]);
+			target.cross_system = true;
+		}
+		return target;
+	}
+	auto resolved = ResolveViewCatalogFromContext(context, con, StringValue::Get(values[0]));
+	target.view_catalog_name = resolved.view_catalog_name;
+	target.view_schema_name = resolved.view_schema_name;
+	target.view_name = resolved.view_name;
+	target.cross_system = resolved.cross_system;
+	return target;
 }
 
 static vector<string> PipelineTargets(const FunctionParameters &parameters) {
@@ -978,11 +992,7 @@ static vector<string> PipelineTargets(const FunctionParameters &parameters) {
 static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const string &view_catalog) {
 	auto catalog = view_catalog;
 	if (catalog.empty()) {
-		auto result = con.Query("SELECT current_database()");
-		if (result->HasError()) {
-			throw CatalogException("Cannot resolve after-hook catalog: %s", result->GetError());
-		}
-		catalog = result->Collection().GetValue(0, 0).ToString();
+		catalog = SqlUtils::RequireCurrentDatabase(con, "Cannot resolve after-hook catalog: %s");
 	}
 	for (auto &statement : con.ExtractStatements(hook_sql)) {
 		auto prepared = con.Prepare(std::move(statement));
@@ -1013,31 +1023,17 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 	// Check for refresh hooks (custom SQL to run before/after/instead of IVM)
 	string hook_sql;
 	string hook_mode;
-	{
-		auto hook_r = con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks WHERE view_name = '" +
-		                        SqlUtils::EscapeValue(view_name) + "'");
-		if (!hook_r->HasError() && hook_r->RowCount() > 0) {
-			hook_sql = hook_r->Collection().GetValue(0, 0).ToString();
-			hook_mode = StringUtil::Lower(hook_r->Collection().GetValue(1, 0).ToString());
-		}
-	}
+	ReadRefreshHook(con, view_name, hook_sql, hook_mode);
 	bool has_refresh_hook = !hook_sql.empty();
 
 	bool pending_after_hook = false;
 	bool staged_after_hook = hook_mode == "after" && has_refresh_hook &&
 	                         (cross_system || AfterHookNeedsStaging(con, hook_sql, view_catalog_name));
 	if (hook_mode == "after" && has_refresh_hook) {
-		// Attached controllers may predate this column and were not present at LOAD.
-		auto migrated =
-		    con.Query("ALTER TABLE openivm_views ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL");
-		if (migrated->HasError()) {
-			throw CatalogException("Cannot initialize after-hook state: %s", migrated->GetError());
-		}
-		auto pending = con.Query("SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
-		                         SqlUtils::EscapeValue(view_name) + "'");
-		if (pending->HasError()) {
-			throw CatalogException("Cannot read pending after-hook for '%s': %s", display_name, pending->GetError());
-		}
+		auto pending = SqlUtils::QueryOrThrow(con,
+		                                      "SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
+		                                          SqlUtils::EscapeValue(view_name) + "'",
+		                                      "Cannot read pending after-hook for '%s': %s", display_name);
 		pending_after_hook = pending->RowCount() && !pending->Collection().GetValue(0, 0).IsNull() &&
 		                     pending->Collection().GetValue(0, 0).GetValue<bool>();
 		// A repaired hook can change its target catalog while a committed
@@ -1047,11 +1043,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		                    pending_after_hook);
 	}
 	auto mark_after_hook = [&](bool pending) {
-		auto result = con.Query("UPDATE openivm_views SET pending_after_hook = " + string(pending ? "true" : "false") +
-		                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-		if (result->HasError()) {
-			throw CatalogException("Cannot record after-hook state for '%s': %s", display_name, result->GetError());
-		}
+		SqlUtils::QueryOrThrow(con,
+		                       "UPDATE openivm_views SET pending_after_hook = " + string(pending ? "true" : "false") +
+		                           " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
+		                       "Cannot record after-hook state for '%s': %s", display_name);
 	};
 
 	// Hook-bearing refreshes keep the old pre-hook empty skip semantics. Hook-free refreshes
@@ -1104,91 +1099,49 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 
 static void RefreshViewsLocked(ClientContext &context, const FunctionParameters &parameters, bool pipeline) {
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
-	// PRAGMA refresh refreshes relational state, not ordered output. Force the
-	// OpenIVM entry point onto DuckDB's unordered execution mode even if this
-	// connection previously had a local preserve_insertion_order=true setting.
-	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
-	                                                              Value::BOOLEAN(false));
-	string view_catalog_name;
-	string view_schema_name;
-	string attached_db_catalog_name;
-	string attached_db_schema_name;
-	string view_name;
-	bool cross_system = false;
-
 	Connection con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *con.context, "TimeZone");
 	// Hooks run through this helper connection while the caller owns the
 	// database-wide mutation gate. Give tracked DML in the hook the same logical
 	// owner so delta capture re-enters the gate instead of waiting on its caller.
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-
-	if (!pipeline && parameters.values.size() == 3) {
-		view_catalog_name = StringValue::Get(parameters.values[0]);
-		view_schema_name = StringValue::Get(parameters.values[1]);
-		view_name = StringValue::Get(parameters.values[2]);
-	} else if (!pipeline && parameters.values.size() == 5) {
-		view_catalog_name = StringValue::Get(parameters.values[0]);
-		view_schema_name = StringValue::Get(parameters.values[1]);
-		attached_db_catalog_name = StringValue::Get(parameters.values[2]);
-		attached_db_schema_name = StringValue::Get(parameters.values[3]);
-		view_name = StringValue::Get(parameters.values[4]);
-		cross_system = true;
-	} else {
-		auto resolved = ResolveViewCatalogFromContext(context, con, StringValue::Get(parameters.values[0]));
-		view_catalog_name = resolved.view_catalog_name;
-		view_schema_name = resolved.view_schema_name;
-		view_name = resolved.view_name;
-		cross_system = resolved.cross_system;
-		OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s', cross_system=%d\n", view_catalog_name.c_str(),
-		                    view_schema_name.c_str(), cross_system ? 1 : 0);
-	}
+	TransactionalMVLockState::ShareMutationOwner(context, *con.context);
+	auto target = ParseRefreshTarget(context, con, parameters, pipeline);
 
 	// A newly configured openivm_metadata_schema takes effect for this refresh.
-	RefreshMetadata::PrepareMetadataSchema(context, view_catalog_name, false);
-	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
+	RefreshMetadata::PrepareMetadataSchema(context, target.view_catalog_name, false);
+	RefreshMetadata::UseCatalog(context, con, target.view_catalog_name);
 	// Only external data catalogs need a separate native metadata transaction.
-	auto metadata_catalog = con.Query("SELECT current_database()");
-	if (metadata_catalog->HasError()) {
-		throw CatalogException("OpenIVM could not resolve metadata catalog: %s", metadata_catalog->GetError());
-	}
-	cross_system =
-	    !view_catalog_name.empty() && metadata_catalog->Collection().GetValue(0, 0).ToString() != view_catalog_name;
+	auto metadata_catalog = SqlUtils::RequireCurrentDatabase(con, "OpenIVM could not resolve metadata catalog: %s");
+	target.cross_system = !target.view_catalog_name.empty() && metadata_catalog != target.view_catalog_name;
 
 	// Check cascade mode
-	string cascade_mode = "downstream";
-	Value cascade_val;
-	if (context.TryGetCurrentSetting(Identifier("openivm_cascade_refresh"), cascade_val) && !cascade_val.IsNull()) {
-		cascade_mode = StringUtil::Lower(cascade_val.ToString());
-	}
+	auto cascade_mode = StringUtil::Lower(SqlUtils::GetStringSetting(context, "openivm_cascade_refresh", "downstream"));
 
 	RefreshMetadata metadata(con);
 	if (!pipeline && parameters.values.size() > 1) {
-		view_name = metadata.FindViewKey(view_catalog_name, view_schema_name, metadata.GetViewSQLName(view_name));
+		target.view_name = metadata.FindViewKey(target.view_catalog_name, target.view_schema_name,
+		                                        metadata.GetViewSQLName(target.view_name));
 	}
 	if (pipeline) {
 		auto targets = PipelineTargets(parameters);
-		for (auto &target : targets) {
-			target = ResolveViewCatalogFromContext(context, con, target).view_name;
+		for (auto &name : targets) {
+			name = ResolveViewCatalogFromContext(context, con, name).view_name;
 		}
 		auto order = metadata.GetPipelineRefreshOrder(targets, cascade_mode);
 		// Rebind every selected definition before any refresh. A dropped source or an
 		// incompatible schema must not be discovered after earlier nodes have committed.
 		for (auto &node : order) {
-			auto location = metadata.GetStoredViewLocation(node, view_catalog_name, view_schema_name);
+			auto location = metadata.GetStoredViewLocation(node, target.view_catalog_name, target.view_schema_name);
 			for (auto &query : {metadata.GetViewQuery(node),
 			                    "SELECT * FROM " + SqlUtils::FullName(location.catalog_name, location.schema_name,
 			                                                          metadata.GetViewSQLName(node))}) {
-				auto bound = con.Query("EXPLAIN " + query);
-				if (bound->HasError()) {
-					throw CatalogException("refresh_pipeline: cannot bind materialized view '%s': %s",
-					                       DisplayViewName(metadata, location.schema_name, node), bound->GetError());
-				}
+				SqlUtils::QueryOrThrow(con, "EXPLAIN " + query,
+				                       "refresh_pipeline: cannot bind materialized view '%s': %s",
+				                       DisplayViewName(metadata, location.schema_name, node));
 			}
 		}
 		for (auto &node : order) {
-			auto location = ResolveViewLocation(con, node, view_catalog_name, view_schema_name);
+			auto location = ResolveViewLocation(con, node, target.view_catalog_name, target.view_schema_name);
 			OPENIVM_DEBUG_PRINT("[PIPELINE] Refreshing '%s'\n", node.c_str());
 			RefreshNodeWithHooks(context, con, location.catalog_name, location.schema_name, node, location.cross_system,
 			                     "", "", true);
@@ -1196,29 +1149,18 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 		return;
 	}
 
-	// Upstream cascade: refresh ancestors first (this may populate our delta tables).
-	if (cascade_mode == "upstream" || cascade_mode == "both") {
-		auto upstream = metadata.GetUpstreamViews(view_name);
-		for (auto &dep : upstream) {
-			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
-			RefreshViewSerialized(context, dep_location.catalog_name, dep_location.schema_name, dep,
-			                      dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name,
-			                      /*skip_empty_refresh=*/true);
+	// Ancestors refresh first (this may populate our delta tables), dependents after.
+	for (auto &node : metadata.CascadeOrder(target.view_name, cascade_mode)) {
+		if (node == target.view_name) {
+			RefreshNodeWithHooks(context, con, target.view_catalog_name, target.view_schema_name, target.view_name,
+			                     target.cross_system, target.attached_db_catalog_name, target.attached_db_schema_name,
+			                     false);
+			continue;
 		}
-	}
-
-	RefreshNodeWithHooks(context, con, view_catalog_name, view_schema_name, view_name, cross_system,
-	                     attached_db_catalog_name, attached_db_schema_name, false);
-
-	// Downstream cascade: refresh dependents after
-	if (cascade_mode == "downstream" || cascade_mode == "both") {
-		auto downstream = metadata.GetDownstreamViews(view_name);
-		for (auto &dep : downstream) {
-			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
-			RefreshViewSerialized(context, dep_location.catalog_name, dep_location.schema_name, dep,
-			                      dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name,
-			                      /*skip_empty_refresh=*/true);
-		}
+		auto location = ResolveViewLocation(con, node, target.view_catalog_name, target.view_schema_name);
+		RefreshViewSerialized(context, location.catalog_name, location.schema_name, node, location.cross_system,
+		                      target.attached_db_catalog_name, target.attached_db_schema_name,
+		                      /*skip_empty_refresh=*/true);
 	}
 }
 
@@ -1230,14 +1172,36 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
                                                const string &view_catalog_name, const string &view_schema_name,
                                                const string &view_name, const string &attached_db_catalog_name,
                                                const string &attached_db_schema_name) {
-	RefreshMetadata metadata(metadata_con);
-	auto delta_tables = metadata.GetDeltaTables(view_name);
+	RefreshMetadata metadata(metadata_con, &context);
+	auto sources = metadata.GetDeltaSources(view_name);
 	DeltaActivityResult conservative_activity;
-	conservative_activity.has_join = metadata.HasJoin(view_name) || delta_tables.size() > 1;
-	conservative_activity.tables_with_changes = delta_tables.size();
+	conservative_activity.has_join = metadata.HasJoin(view_name) || sources.size() > 1;
+	conservative_activity.tables_with_changes = sources.size();
 	conservative_activity.any_has_deletes = true;
 	conservative_activity.all_ducklake = false;
-	conservative_activity.active_delta_table_names = delta_tables;
+	for (auto &source : sources) {
+		conservative_activity.active_delta_table_names.push_back(source.table_name);
+		if (!StringUtil::CIEquals(source.catalog_type, "ducklake")) {
+			continue;
+		}
+		auto loc = ResolveDuckLakeSourceLocation(metadata_con, view_name, source.table_name, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		auto last_snapshot = metadata.GetLastSnapshotId(view_name, source.table_name);
+		auto snapshot = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
+		if (snapshot < last_snapshot) {
+			throw TransactionException("DuckLake snapshot for '%s' predates the refresh watermark of '%s'",
+			                           source.table_name, DisplayViewName(metadata, view_schema_name, view_name));
+		}
+		auto activity = ProbeDuckLakeSnapshotActivity(metadata, metadata_con, view_name, source.table_name,
+		                                              loc.catalog_name, loc.schema_name, last_snapshot, snapshot);
+		conservative_activity.requires_full_refresh |= activity.requires_full_refresh;
+		DeltaActivityResult::Source source_activity;
+		source_activity.delta_table_name = source.table_name;
+		source_activity.backfill_source_table_id = activity.source_table_id_to_backfill >= 0;
+		conservative_activity.sources.push_back(std::move(source_activity));
+	}
+	OPENIVM_DEBUG_PRINT("[REFRESH] Checked %zu DuckLake sources in the caller transaction for %s\n",
+	                    conservative_activity.sources.size(), view_name.c_str());
 
 	// The planning connection cannot see transaction-local delta rows. Compile all
 	// registered native sources conservatively; the returned SQL executes through
@@ -1343,74 +1307,42 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		RefreshViewsLocked(context, parameters, pipeline);
 		return "SELECT true AS Success";
 	}
-	string view_catalog_name;
-	string view_schema_name;
-	string attached_db_catalog_name;
-	string attached_db_schema_name;
-	string view_name;
-	bool cross_system = false;
 	if (!pipeline && parameters.values.size() != 1 && parameters.values.size() != 3 && parameters.values.size() != 5) {
 		throw InvalidInputException("OpenIVM refresh received an unsupported argument list");
 	}
-	view_name = StringValue::Get(pipeline ? parameters.values.front() : parameters.values.back());
-	if (!pipeline && parameters.values.size() >= 3) {
-		view_catalog_name = StringValue::Get(parameters.values[0]);
-		view_schema_name = StringValue::Get(parameters.values[1]);
-	} else {
-		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		view_catalog_name = default_entry.GetCatalog().GetIdentifierName();
-		view_schema_name =
-		    default_entry.GetSchema().empty() ? DEFAULT_SCHEMA : default_entry.GetSchema().GetIdentifierName();
-	}
 	Connection metadata_con(*context.db);
-	RefreshMetadata::UseCatalog(context, metadata_con, view_catalog_name);
+	RefreshMetadata::UseCatalog(
+	    context, metadata_con,
+	    !pipeline && parameters.values.size() >= 3
+	        ? StringValue::Get(parameters.values[0])
+	        : ClientData::Get(context).catalog_search_path->GetDefault().GetCatalog().GetIdentifierName());
 	RefreshMetadata(metadata_con).SnapshotTransaction(context);
 
-	if (!pipeline && parameters.values.size() == 3) {
-		view_catalog_name = StringValue::Get(parameters.values[0]);
-		view_schema_name = StringValue::Get(parameters.values[1]);
-		view_name = StringValue::Get(parameters.values[2]);
-	} else if (!pipeline && parameters.values.size() == 5) {
-		view_catalog_name = StringValue::Get(parameters.values[0]);
-		view_schema_name = StringValue::Get(parameters.values[1]);
-		attached_db_catalog_name = StringValue::Get(parameters.values[2]);
-		attached_db_schema_name = StringValue::Get(parameters.values[3]);
-		view_name = StringValue::Get(parameters.values[4]);
-		cross_system = true;
-	} else if (pipeline || parameters.values.size() == 1) {
-		view_name = StringValue::Get(parameters.values[0]);
-		auto resolved = ResolveViewCatalogFromContext(context, metadata_con, view_name);
-		view_catalog_name = resolved.view_catalog_name;
-		view_schema_name = resolved.view_schema_name;
-		view_name = resolved.view_name;
-		cross_system = resolved.cross_system;
-	}
-	const string requested_view_name = view_name;
+	auto target = ParseRefreshTarget(context, metadata_con, parameters, pipeline);
+	const string requested_view_name = target.view_name;
 	if (!pipeline && parameters.values.size() > 1) {
 		RefreshMetadata names(metadata_con);
-		view_name = names.FindViewKey(view_catalog_name, view_schema_name, names.GetViewSQLName(view_name));
+		target.view_name = names.FindViewKey(target.view_catalog_name, target.view_schema_name,
+		                                     names.GetViewSQLName(target.view_name));
 	}
 	RefreshMetadata names_for_error(metadata_con);
-	if (view_name.empty() || names_for_error.GetViewQuery(view_name).empty()) {
-		const string &missing_name = view_name.empty() ? requested_view_name : view_name;
+	if (target.view_name.empty() || names_for_error.GetViewQuery(target.view_name).empty()) {
+		const string &missing_name = target.view_name.empty() ? requested_view_name : target.view_name;
 		throw CatalogException("Materialized view '%s' does not exist",
-		                       DisplayViewName(names_for_error, view_schema_name, missing_name));
+		                       DisplayViewName(names_for_error, target.view_schema_name, missing_name));
 	}
 
-	if (!view_catalog_name.empty()) {
-		auto default_result = metadata_con.Query("SELECT current_database()");
-		if (!default_result->HasError() && default_result->RowCount() > 0 &&
-		    !default_result->Collection().GetValue(0, 0).IsNull() &&
-		    default_result->Collection().GetValue(0, 0).ToString() != view_catalog_name) {
-			cross_system = true;
-		}
+	if (!target.view_catalog_name.empty()) {
+		auto current_database = SqlUtils::CurrentDatabase(metadata_con);
+		target.cross_system =
+		    target.cross_system || (!current_database.empty() && current_database != target.view_catalog_name);
 	}
 	{
 		// The staged cross-catalog path below commits outside the caller's transaction.
 		// With an explicitly placed metadata catalog that would silently break atomicity.
 		Connection location_con(*context.db);
-		auto location = MetadataLocator::Resolve(context, location_con, view_catalog_name);
-		MetadataLocator::RejectExplicitTransaction(context, location, view_catalog_name,
+		auto location = MetadataLocator::Resolve(context, location_con, target.view_catalog_name);
+		MetadataLocator::RejectExplicitTransaction(context, location, target.view_catalog_name,
 		                                           pipeline ? "PRAGMA refresh_pipeline" : "PRAGMA refresh");
 		MetadataLocator::RequireWritable(location, "refresh materialized view '" + requested_view_name + "'");
 	}
@@ -1418,7 +1350,7 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 	// path. Cross-system refresh delegates to a helper that acquires its own view
 	// lock; retaining that non-recursive view lock here would self-deadlock.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
-	if (cross_system) {
+	if (target.cross_system) {
 		// DuckDB cannot commit writes to the native metadata catalog and an
 		// attached external catalog in one transaction. Keep the staged path for
 		// that boundary; native catalogs use the caller-transaction program below.
@@ -1426,66 +1358,49 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		return "SELECT true AS Success";
 	}
 	RefreshMetadata metadata(metadata_con);
-	string cascade_mode = "downstream";
-	Value cascade_value;
-	if (context.TryGetCurrentSetting(Identifier("openivm_cascade_refresh"), cascade_value) && !cascade_value.IsNull()) {
-		cascade_mode = StringUtil::Lower(cascade_value.ToString());
-	}
+	auto cascade_mode = StringUtil::Lower(SqlUtils::GetStringSetting(context, "openivm_cascade_refresh", "downstream"));
 
 	vector<string> refresh_order;
 	if (pipeline) {
 		auto targets = PipelineTargets(parameters);
-		for (auto &target : targets) {
-			target = ResolveViewCatalogFromContext(context, metadata_con, target).view_name;
+		for (auto &name : targets) {
+			name = ResolveViewCatalogFromContext(context, metadata_con, name).view_name;
 		}
 		refresh_order = metadata.GetPipelineRefreshOrder(targets, cascade_mode);
 	} else {
-		if (cascade_mode == "upstream" || cascade_mode == "both") {
-			auto upstream = metadata.GetUpstreamViews(view_name);
-			refresh_order.insert(refresh_order.end(), upstream.begin(), upstream.end());
-		}
-		refresh_order.push_back(view_name);
-		if (cascade_mode == "downstream" || cascade_mode == "both") {
-			auto downstream = metadata.GetDownstreamViews(view_name);
-			refresh_order.insert(refresh_order.end(), downstream.begin(), downstream.end());
-		}
+		refresh_order = metadata.CascadeOrder(target.view_name, cascade_mode);
 	}
 
 	string program;
 	unordered_set<string> seen;
-	vector<string> ordered_nodes;
+	vector<pair<string, ViewLocation>> ordered_nodes;
 	for (auto &node : refresh_order) {
 		if (!seen.insert(node).second) {
 			continue;
 		}
-		auto location = ResolveViewLocation(metadata_con, node, view_catalog_name, view_schema_name);
+		auto location = ResolveViewLocation(metadata_con, node, target.view_catalog_name, target.view_schema_name);
 		if (location.cross_system) {
 			throw NotImplementedException(
 			    "Transactional native refresh cannot include cross-catalog dependent view '%s'",
 			    DisplayViewName(metadata, location.schema_name, node));
 		}
-		ordered_nodes.push_back(node);
+		ordered_nodes.emplace_back(node, location);
 	}
 
-	for (auto &node : ordered_nodes) {
-		auto location = ResolveViewLocation(metadata_con, node, view_catalog_name, view_schema_name);
+	for (auto &entry : ordered_nodes) {
+		auto &node = entry.first;
+		auto &location = entry.second;
 		string hook_sql;
 		string hook_mode;
-		auto hooks = metadata_con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks"
-		                                " WHERE view_name = '" +
-		                                SqlUtils::EscapeValue(node) + "'");
-		if (!hooks->HasError() && hooks->RowCount() > 0) {
-			hook_sql = hooks->Collection().GetValue(0, 0).ToString();
-			hook_mode = StringUtil::Lower(hooks->Collection().GetValue(1, 0).ToString());
-		}
+		ReadRefreshHook(metadata_con, node, hook_sql, hook_mode);
 		if (!hook_sql.empty() && hook_mode == "before") {
 			program += hook_sql + ";\n";
 		}
 		if (hook_mode != "replace") {
 			program +=
 			    BuildTransactionalRefreshViewSQL(context, metadata_con, location.catalog_name, location.schema_name,
-			                                     node, attached_db_catalog_name, attached_db_schema_name);
-			program += "\n";
+			                                     node, target.attached_db_catalog_name, target.attached_db_schema_name);
+			program += '\n';
 		}
 		if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
 			program += hook_sql + ";\n";

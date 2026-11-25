@@ -12,6 +12,7 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/operator/persistent/physical_batch_insert.hpp"
 #include "duckdb/execution/operator/persistent/physical_delete.hpp"
 #include "duckdb/execution/operator/persistent/physical_insert.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
@@ -114,7 +115,7 @@ private:
 static void EnterDeltaWritePhase(ClientContext &context) {
 	// Normally a no-op: the statement already took the gate before execution (see
 	// RefreshInsertRule and TransactionalMVLockState::OnExecutePrepared).
-	TransactionalMVLockState::Get(context).AcquireMutationLock();
+	TransactionalMVLockState::Get(context).AcquireMutationLock(true);
 }
 
 class TransactionalDeltaAppendState {
@@ -426,17 +427,24 @@ public:
 class PhysicalTransactionalDeltaCapture : public PhysicalOperator {
 public:
 	PhysicalTransactionalDeltaCapture(PhysicalPlan &physical_plan, PhysicalOperator &child,
-	                                  TableCatalogEntry &base_table_p, TableCatalogEntry &delta_table_p,
-	                                  DeltaCaptureMode mode_p, vector<unique_ptr<Expression>> update_expressions_p,
+	                                  vector<LogicalType> output_types, TableCatalogEntry &base_table_p,
+	                                  TableCatalogEntry &delta_table_p, DeltaCaptureMode mode_p,
+	                                  vector<unique_ptr<Expression>> update_expressions_p,
 	                                  vector<unique_ptr<Expression>> generated_expressions_p,
 	                                  vector<PhysicalIndex> update_columns_p, optional_idx row_id_index_p,
-	                                  idx_t estimated_cardinality)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, child.GetTypes(), estimated_cardinality),
+	                                  vector<idx_t> old_row_columns_p, idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(output_types),
+	                       estimated_cardinality),
 	      mode(mode_p), update_expressions(std::move(update_expressions_p)),
 	      update_columns(std::move(update_columns_p)), row_id_index(row_id_index_p),
+	      old_row_columns(std::move(old_row_columns_p)),
 	      appender(make_shared_ptr<TransactionalDeltaAppender>(base_table_p, delta_table_p,
 	                                                           std::move(generated_expressions_p))),
 	      row_fetcher(base_table_p) {
+		D_ASSERT(old_row_columns.empty() || old_row_columns.size() == row_fetcher.Types().size());
+		for (idx_t column = 0; column < types.size(); column++) {
+			output_columns.push_back(column);
+		}
 		children.push_back(child);
 	}
 
@@ -461,7 +469,12 @@ public:
 		} else {
 			CaptureDeleteOrUpdate(context, input, gstate, state);
 		}
-		chunk.Reference(input);
+		if (chunk.ColumnCount() == input.ColumnCount()) {
+			chunk.Reference(input);
+		} else {
+			// Drop the preimage columns appended for capture; the DML expects its original input.
+			chunk.ReferenceColumns(input, output_columns);
+		}
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
@@ -490,18 +503,26 @@ private:
 	                           TransactionalDeltaCaptureLocalState &state) const {
 		D_ASSERT(row_id_index.IsValid());
 		state.selected_input.Reset();
-		idx_t selected_count;
-		// Only row-id deduplication is shared. Sharding keeps disjoint chunks from
-		// serializing behind one global mutex; preimage fetch and expression work
-		// remain parallel.
-		selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.shards, state.dedup_candidates,
-		                                  state.selection, state.selected_input);
-		if (selected_count == 0) {
-			return;
+		if (old_row_columns.empty()) {
+			// Only row-id deduplication is shared. Sharding keeps disjoint chunks from
+			// serializing behind one global mutex; preimage fetch and expression work
+			// remain parallel.
+			auto selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.shards,
+			                                       state.dedup_candidates, state.selection, state.selected_input);
+			if (selected_count == 0) {
+				return;
+			}
+			row_fetcher.Fetch(context.client, state.selected_input.data[row_id_index.GetIndex()], selected_count,
+			                  state.old_rows, state.fetch_state);
+		} else {
+			// The child is a single scan of the target table: each row arrives once,
+			// carrying its preimage, so neither deduplication nor a row-id fetch is needed.
+			if (input.size() == 0) {
+				return;
+			}
+			state.selected_input.Reference(input);
+			state.old_rows.ReferenceColumns(input, old_row_columns);
 		}
-
-		row_fetcher.Fetch(context.client, state.selected_input.data[row_id_index.GetIndex()], selected_count,
-		                  state.old_rows, state.fetch_state);
 		appender->Append(context.client, state.old_rows, -1, state.append_state);
 
 		if (mode != DeltaCaptureMode::UPDATE) {
@@ -524,11 +545,13 @@ private:
 	vector<unique_ptr<Expression>> update_expressions;
 	vector<PhysicalIndex> update_columns;
 	optional_idx row_id_index;
+	vector<column_t> old_row_columns;
+	vector<column_t> output_columns;
 	shared_ptr<TransactionalDeltaAppender> appender;
 	TransactionalBaseRowFetcher row_fetcher;
 };
 
-class MergeDeltaCaptureExecutionState {
+class ActionDeltaCaptureExecutionState {
 public:
 	mutex lock;
 	std::condition_variable preimage_ready;
@@ -537,15 +560,15 @@ public:
 	idx_t finalized_actions = 0;
 };
 
-class MergeDeltaCaptureCoordinator {
+class ActionDeltaCaptureCoordinator {
 public:
-	MergeDeltaCaptureCoordinator(TableCatalogEntry &base_table, shared_ptr<TransactionalDeltaAppender> appender_p,
-	                             const vector<LogicalType> &action_input_types_p, idx_t action_count_p)
+	ActionDeltaCaptureCoordinator(TableCatalogEntry &base_table, shared_ptr<TransactionalDeltaAppender> appender_p,
+	                              const vector<LogicalType> &action_input_types_p, idx_t action_count_p)
 	    : row_fetcher(base_table), appender(std::move(appender_p)), action_input_types(action_input_types_p),
 	      action_count(action_count_p) {
 	}
 
-	shared_ptr<MergeDeltaCaptureExecutionState> GetExecutionState(ClientContext &context) {
+	shared_ptr<ActionDeltaCaptureExecutionState> GetExecutionState(ClientContext &context) {
 		// Action sinks are separate physical operators, but their preimages form one statement-level delta.
 		const auto query_id = context.transaction.GetActiveQuery();
 		lock_guard<mutex> guard(lock);
@@ -562,12 +585,12 @@ public:
 				return state;
 			}
 		}
-		auto state = make_shared_ptr<MergeDeltaCaptureExecutionState>();
+		auto state = make_shared_ptr<ActionDeltaCaptureExecutionState>();
 		states[query_id] = state;
 		return state;
 	}
 
-	void CapturePreimages(ClientContext &context, MergeDeltaCaptureExecutionState &state, Vector &input_row_ids,
+	void CapturePreimages(ClientContext &context, ActionDeltaCaptureExecutionState &state, Vector &input_row_ids,
 	                      idx_t count, vector<row_t> &reserved_row_ids, Vector &fetch_row_ids, DataChunk &rows,
 	                      ColumnFetchState &fetch_state, TransactionalDeltaAppendState &append_state) const {
 		UnifiedVectorFormat row_id_data;
@@ -627,7 +650,7 @@ public:
 		});
 	}
 
-	void FinalizeAction(ClientContext &context, MergeDeltaCaptureExecutionState &state) const {
+	void FinalizeAction(ClientContext &context, ActionDeltaCaptureExecutionState &state) const {
 		{
 			lock_guard<mutex> guard(state.lock);
 			state.finalized_actions++;
@@ -636,7 +659,7 @@ public:
 			}
 			D_ASSERT(state.capturing_row_ids.empty());
 		}
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] finalizing MERGE deltas for %zu target rows\n",
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] finalizing action deltas for %zu target rows\n",
 		                    state.captured_row_ids.size());
 		TransactionalDeltaAppendState append_state(context, appender->GeneratedExpressions(), appender->DeltaTypes());
 		appender->EnterWritePhase(context, append_state);
@@ -665,7 +688,7 @@ public:
 			appender->Append(context, rows, 1, append_state);
 		}
 		appender->Finalize(context, append_state);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] skipped %zu invisible MERGE target postimages\n", invisible_count);
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] skipped %zu invisible action target postimages\n", invisible_count);
 	}
 
 	const TransactionalBaseRowFetcher &RowFetcher() const {
@@ -686,28 +709,28 @@ private:
 	vector<LogicalType> action_input_types;
 	idx_t action_count;
 	mutex lock;
-	unordered_map<idx_t, weak_ptr<MergeDeltaCaptureExecutionState>> states;
+	unordered_map<idx_t, weak_ptr<ActionDeltaCaptureExecutionState>> states;
 };
 
-class MergeActionDeltaCaptureGlobalState : public GlobalSinkState {
+class ActionDeltaCaptureGlobalState : public GlobalSinkState {
 public:
-	MergeActionDeltaCaptureGlobalState(unique_ptr<GlobalSinkState> child_state_p,
-	                                   shared_ptr<MergeDeltaCaptureExecutionState> execution_state_p)
+	ActionDeltaCaptureGlobalState(unique_ptr<GlobalSinkState> child_state_p,
+	                              shared_ptr<ActionDeltaCaptureExecutionState> execution_state_p)
 	    : child_state(std::move(child_state_p)), execution_state(std::move(execution_state_p)) {
 	}
 
 	unique_ptr<GlobalSinkState> child_state;
-	shared_ptr<MergeDeltaCaptureExecutionState> execution_state;
+	shared_ptr<ActionDeltaCaptureExecutionState> execution_state;
 	array<RowIdDedupShard, ROW_ID_DEDUP_SHARDS> delete_insert_shards;
 };
 
-class MergeActionDeltaCaptureLocalState : public LocalSinkState {
+class ActionDeltaCaptureLocalState : public LocalSinkState {
 public:
-	MergeActionDeltaCaptureLocalState(ExecutionContext &context, PhysicalOperator &action_op,
-	                                  const TransactionalDeltaAppender &appender, const vector<LogicalType> &base_types,
-	                                  const vector<LogicalType> &action_input_types,
-	                                  const vector<LogicalType> &delegated_types, bool capture_delete_insert_update,
-	                                  bool has_update_defaults)
+	ActionDeltaCaptureLocalState(ExecutionContext &context, PhysicalOperator &action_op,
+	                             const TransactionalDeltaAppender &appender, const vector<LogicalType> &base_types,
+	                             const vector<LogicalType> &action_input_types,
+	                             const vector<LogicalType> &delegated_types, bool capture_delete_insert_update,
+	                             bool has_update_defaults)
 	    : child_state(action_op.GetLocalSinkState(context)),
 	      append_state(context.client, appender.GeneratedExpressions(), appender.DeltaTypes()),
 	      selection(STANDARD_VECTOR_SIZE), fetch_row_ids(LogicalType::ROW_TYPE, STANDARD_VECTOR_SIZE) {
@@ -749,10 +772,10 @@ public:
 	bool prepared_for_input = false;
 };
 
-class PhysicalMergeActionDeltaCapture : public PhysicalOperator {
+class PhysicalActionDeltaCapture : public PhysicalOperator {
 public:
-	PhysicalMergeActionDeltaCapture(PhysicalPlan &physical_plan, PhysicalOperator &action_op_p,
-	                                shared_ptr<MergeDeltaCaptureCoordinator> coordinator_p, idx_t estimated_cardinality)
+	PhysicalActionDeltaCapture(PhysicalPlan &physical_plan, PhysicalOperator &action_op_p,
+	                           shared_ptr<ActionDeltaCaptureCoordinator> coordinator_p, idx_t estimated_cardinality)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, action_op_p.GetTypes(),
 	                       estimated_cardinality),
 	      action_op(action_op_p), coordinator(std::move(coordinator_p)),
@@ -792,20 +815,20 @@ public:
 	}
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
-		return make_uniq<MergeActionDeltaCaptureGlobalState>(action_op.GetGlobalSinkState(context),
-		                                                     coordinator->GetExecutionState(context));
+		return make_uniq<ActionDeltaCaptureGlobalState>(action_op.GetGlobalSinkState(context),
+		                                                coordinator->GetExecutionState(context));
 	}
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
 		auto &capture_input_types = delegated_types.empty() ? children[0].get().types : delegated_types;
-		return make_uniq<MergeActionDeltaCaptureLocalState>(
+		return make_uniq<ActionDeltaCaptureLocalState>(
 		    context, action_op, *coordinator->Appender(), coordinator->RowFetcher().Types(), capture_input_types,
 		    delegated_types, capture_delete_insert_update, !default_update_indexes.empty());
 	}
 
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
-		auto &gstate = input.global_state.Cast<MergeActionDeltaCaptureGlobalState>();
-		auto &lstate = input.local_state.Cast<MergeActionDeltaCaptureLocalState>();
+		auto &gstate = input.global_state.Cast<ActionDeltaCaptureGlobalState>();
+		auto &lstate = input.local_state.Cast<ActionDeltaCaptureLocalState>();
 		auto &action_input = PrepareActionInput(chunk, lstate);
 		if (action_op.type != PhysicalOperatorType::INSERT) {
 			const auto row_id_index = action_op.type == PhysicalOperatorType::DELETE_OPERATOR
@@ -836,8 +859,8 @@ public:
 	}
 
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
-		auto &gstate = input.global_state.Cast<MergeActionDeltaCaptureGlobalState>();
-		auto &lstate = input.local_state.Cast<MergeActionDeltaCaptureLocalState>();
+		auto &gstate = input.global_state.Cast<ActionDeltaCaptureGlobalState>();
+		auto &lstate = input.local_state.Cast<ActionDeltaCaptureLocalState>();
 		OperatorSinkCombineInput child_input {*gstate.child_state, *lstate.child_state, input.interrupt_state};
 		auto result = action_op.Combine(context, child_input);
 		if (result == SinkCombineResultType::FINISHED) {
@@ -848,7 +871,7 @@ public:
 
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override {
-		auto &gstate = input.global_state.Cast<MergeActionDeltaCaptureGlobalState>();
+		auto &gstate = input.global_state.Cast<ActionDeltaCaptureGlobalState>();
 		OperatorSinkFinalizeInput child_input {*gstate.child_state, input.interrupt_state};
 		auto result = action_op.Finalize(pipeline, event, context, child_input);
 		if (result != SinkFinalizeType::BLOCKED) {
@@ -858,7 +881,7 @@ public:
 	}
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
-		auto &gstate = sink_state->Cast<MergeActionDeltaCaptureGlobalState>();
+		auto &gstate = sink_state->Cast<ActionDeltaCaptureGlobalState>();
 		action_op.sink_state = std::move(gstate.child_state);
 		return action_op.GetGlobalSourceState(context);
 	}
@@ -874,7 +897,7 @@ public:
 	}
 
 	string GetName() const override {
-		return "OPENIVM_MERGE_ACTION_DELTA_CAPTURE";
+		return "OPENIVM_ACTION_DELTA_CAPTURE";
 	}
 
 private:
@@ -904,7 +927,7 @@ private:
 		delegated_types.push_back(input_types.back());
 	}
 
-	DataChunk &PrepareActionInput(DataChunk &input, MergeActionDeltaCaptureLocalState &state) const {
+	DataChunk &PrepareActionInput(DataChunk &input, ActionDeltaCaptureLocalState &state) const {
 		if (default_update_indexes.empty()) {
 			return input;
 		}
@@ -929,8 +952,7 @@ private:
 	}
 
 	void PrepareDeleteInsertRows(ExecutionContext &context, DataChunk &input, idx_t row_id_index,
-	                             MergeActionDeltaCaptureGlobalState &gstate,
-	                             MergeActionDeltaCaptureLocalState &lstate) const {
+	                             ActionDeltaCaptureGlobalState &gstate, ActionDeltaCaptureLocalState &lstate) const {
 		lstate.selected_input.Reset();
 		auto selected_count = SelectUnseenRows(input, row_id_index, gstate.delete_insert_shards,
 		                                       lstate.dedup_candidates, lstate.selection, lstate.selected_input);
@@ -960,7 +982,7 @@ private:
 	}
 
 	PhysicalOperator &action_op;
-	shared_ptr<MergeDeltaCaptureCoordinator> coordinator;
+	shared_ptr<ActionDeltaCaptureCoordinator> coordinator;
 	bool capture_delete_insert_update;
 	vector<idx_t> default_update_indexes;
 	vector<LogicalType> delegated_types;
@@ -1154,10 +1176,23 @@ void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op) {
 		source->Admit(context);
 		return;
 	}
-	if (dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op) ||
-	    dynamic_cast<PhysicalMergeActionDeltaCapture *>(&op)) {
-		TransactionalMVLockState::Get(context).AcquireMutationLock();
+	if (dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op) || dynamic_cast<PhysicalActionDeltaCapture *>(&op)) {
+		TransactionalMVLockState::Get(context).AcquireMutationLock(true);
 		return;
+	}
+	optional_ptr<TableCatalogEntry> target;
+	if (op.type == PhysicalOperatorType::INSERT) {
+		target = op.Cast<PhysicalInsert>().insert_table.get();
+	} else if (op.type == PhysicalOperatorType::BATCH_INSERT) {
+		target = op.Cast<PhysicalBatchInsert>().insert_table.get();
+	} else if (op.type == PhysicalOperatorType::UPDATE) {
+		target = op.Cast<PhysicalUpdate>().tableref;
+	} else if (op.type == PhysicalOperatorType::DELETE_OPERATOR) {
+		target = op.Cast<PhysicalDelete>().tableref;
+	}
+	if (target && TransactionalMVLockState::IsOwnershipRegistry(target->name.GetIdentifierName())) {
+		// A cached plan writing an ownership registry runs without the optimizer rule.
+		TransactionalMVLockState::Get(context).MarkOwnershipMetadataWrite();
 	}
 	if (op.type == PhysicalOperatorType::MERGE_INTO) {
 		for (auto &action : op.Cast<PhysicalMergeInto>().actions) {
@@ -1284,14 +1319,18 @@ PhysicalOperator &LogicalTransactionalDeltaCapture::CreatePlan(ClientContext &co
 	planner.dependencies.AddDependency(delta_table);
 
 	auto generated_expressions = BindGeneratedExpressions(context, base_table, delta_table);
-	return planner.Make<PhysicalTransactionalDeltaCapture>(child, base_table, delta_table, mode, std::move(expressions),
-	                                                       std::move(generated_expressions), std::move(update_columns),
-	                                                       row_id_index, estimated_cardinality);
+	return planner.Make<PhysicalTransactionalDeltaCapture>(
+	    child, types, base_table, delta_table, mode, std::move(expressions), std::move(generated_expressions),
+	    std::move(update_columns), row_id_index, std::move(old_row_columns), estimated_cardinality);
 }
 
 vector<ColumnBinding> LogicalTransactionalDeltaCapture::GetColumnBindings() {
 	D_ASSERT(children.size() == 1);
-	return children[0]->GetColumnBindings();
+	auto bindings = children[0]->GetColumnBindings();
+	if (output_column_count.IsValid()) {
+		bindings.resize(output_column_count.GetIndex());
+	}
+	return bindings;
 }
 
 string LogicalTransactionalDeltaCapture::GetName() const {
@@ -1305,25 +1344,31 @@ string LogicalTransactionalDeltaCapture::GetExtensionName() const {
 void LogicalTransactionalDeltaCapture::ResolveTypes() {
 	D_ASSERT(children.size() == 1);
 	types = children[0]->types;
+	if (output_column_count.IsValid()) {
+		types.resize(output_column_count.GetIndex());
+	}
 }
 
-LogicalTransactionalMergeDeltaCapture::LogicalTransactionalMergeDeltaCapture(TableCatalogEntry &base_table_p,
-                                                                             TableCatalogEntry &delta_table_p)
+LogicalTransactionalActionDeltaCapture::LogicalTransactionalActionDeltaCapture(TableCatalogEntry &base_table_p,
+                                                                               TableCatalogEntry &delta_table_p)
     : base_table(base_table_p), delta_table(delta_table_p) {
 }
 
-PhysicalOperator &LogicalTransactionalMergeDeltaCapture::CreatePlan(ClientContext &context,
-                                                                    PhysicalPlanGenerator &planner) {
+PhysicalOperator &LogicalTransactionalActionDeltaCapture::CreatePlan(ClientContext &context,
+                                                                     PhysicalPlanGenerator &planner) {
 	D_ASSERT(children.size() == 1);
 	auto &child = planner.CreatePlan(*children[0]);
-	if (child.type != PhysicalOperatorType::MERGE_INTO) {
-		throw InternalException("OpenIVM MERGE delta capture expected a physical MERGE operator");
-	}
 	planner.dependencies.AddDependency(base_table);
 	planner.dependencies.AddDependency(delta_table);
 	auto generated_expressions = BindGeneratedExpressions(context, base_table, delta_table);
 	auto appender =
 	    make_shared_ptr<TransactionalDeltaAppender>(base_table, delta_table, std::move(generated_expressions));
+	if (child.type == PhysicalOperatorType::UPDATE) {
+		auto coordinator =
+		    make_shared_ptr<ActionDeltaCaptureCoordinator>(base_table, appender, child.children[0].get().types, 1);
+		return planner.Make<PhysicalActionDeltaCapture>(child, coordinator, estimated_cardinality);
+	}
+	D_ASSERT(child.type == PhysicalOperatorType::MERGE_INTO);
 	auto &merge = child.Cast<PhysicalMergeInto>();
 	idx_t action_count = 0;
 	bool requires_serial_execution = false;
@@ -1337,13 +1382,13 @@ PhysicalOperator &LogicalTransactionalMergeDeltaCapture::CreatePlan(ClientContex
 			requires_serial_execution = true;
 		}
 	}
-	auto coordinator = make_shared_ptr<MergeDeltaCaptureCoordinator>(base_table, appender,
-	                                                                 merge.children[0].get().types, action_count);
+	auto coordinator = make_shared_ptr<ActionDeltaCaptureCoordinator>(base_table, appender,
+	                                                                  merge.children[0].get().types, action_count);
 	for (auto &action : merge.actions) {
 		if (!action->op) {
 			continue;
 		}
-		action->op = planner.Make<PhysicalMergeActionDeltaCapture>(*action->op, coordinator, estimated_cardinality);
+		action->op = planner.Make<PhysicalActionDeltaCapture>(*action->op, coordinator, estimated_cardinality);
 	}
 	if (requires_serial_execution) {
 		// DuckDB and capture must choose the same first match for delete-and-insert updates.
@@ -1352,20 +1397,20 @@ PhysicalOperator &LogicalTransactionalMergeDeltaCapture::CreatePlan(ClientContex
 	return child;
 }
 
-vector<ColumnBinding> LogicalTransactionalMergeDeltaCapture::GetColumnBindings() {
+vector<ColumnBinding> LogicalTransactionalActionDeltaCapture::GetColumnBindings() {
 	D_ASSERT(children.size() == 1);
 	return children[0]->GetColumnBindings();
 }
 
-string LogicalTransactionalMergeDeltaCapture::GetName() const {
-	return "OPENIVM_TRANSACTIONAL_MERGE_DELTA_CAPTURE";
+string LogicalTransactionalActionDeltaCapture::GetName() const {
+	return "OPENIVM_TRANSACTIONAL_ACTION_DELTA_CAPTURE";
 }
 
-string LogicalTransactionalMergeDeltaCapture::GetExtensionName() const {
-	return "openivm_transactional_merge_delta_capture";
+string LogicalTransactionalActionDeltaCapture::GetExtensionName() const {
+	return "openivm_transactional_action_delta_capture";
 }
 
-void LogicalTransactionalMergeDeltaCapture::ResolveTypes() {
+void LogicalTransactionalActionDeltaCapture::ResolveTypes() {
 	D_ASSERT(children.size() == 1);
 	types = children[0]->types;
 }

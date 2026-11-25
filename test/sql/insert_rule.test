@@ -305,18 +305,6 @@ SELECT count(*) FROM openivm_delta_ab;
 ----
 0
 
-statement ok
-INSERT INTO openivm_delta_tables (view_name, table_name, last_update, source_catalog, source_schema)
-VALUES ('short_table_capture', 'openivm_delta_ab', now(), 'memory', 'main');
-
-statement ok
-INSERT INTO ab VALUES (1, 42);
-
-query I
-SELECT count(*) FROM openivm_delta_ab;
-----
-1
-
 # ==========================================
 # Test 13: Mixed INSERT + DELETE + UPDATE without PRAGMA between
 # ==========================================
@@ -1950,6 +1938,288 @@ SELECT count(*) FROM (
     SELECT * FROM merge_mixed_visibility_src
     EXCEPT ALL
     SELECT * FROM merge_mixed_visibility_mv
+);
+----
+0
+
+# ==========================================
+# UPDATE/DELETE preimages read from the target scan
+# ==========================================
+# Plain UPDATE/DELETE capture reads each row's preimage from the scan feeding
+# the DML; UPDATE ... FROM and other shapes fetch it by row id. Cover both,
+# generated and nested columns, indexed-key updates (DuckDB's delete+insert),
+# transaction-local rows, prepared statements, RETURNING and rollback.
+statement ok
+CREATE TABLE scan_pre_src (
+    id INTEGER PRIMARY KEY,
+    k INTEGER,
+    v INTEGER DEFAULT 7,
+    g INTEGER GENERATED ALWAYS AS (v * 2 + k),
+    s STRUCT(a INTEGER, b VARCHAR),
+    name VARCHAR
+);
+
+statement ok
+INSERT INTO scan_pre_src (id, k, v, s, name)
+SELECT i, i % 10, i, {'a': i % 13, 'b': 'b' || (i % 5)}, 'n' || i FROM range(50000) r(i);
+
+statement ok
+CREATE TABLE scan_pre_lookup (id INTEGER, w INTEGER);
+
+# Duplicate lookup keys: UPDATE ... FROM keeps the first match for a target row.
+statement ok
+INSERT INTO scan_pre_lookup SELECT i % 40, i FROM range(80) r(i);
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_rows AS
+SELECT id, k, v, g, s, name FROM scan_pre_src WHERE v % 3 <> 1;
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_agg AS
+SELECT k, SUM(v) AS sv, SUM(g) AS sg, COUNT(*) AS c, MAX(name) AS mn, SUM(s.a) AS sa
+FROM scan_pre_src GROUP BY k;
+
+# Exact delta rows for a plain UPDATE: full preimage (-1) and postimage (+1).
+statement ok
+UPDATE scan_pre_src SET v = v + 100, name = name || '!' WHERE id = 3;
+
+query IIIIII
+SELECT id, k, v, s, name, openivm_multiplicity
+FROM openivm_delta_scan_pre_src ORDER BY openivm_multiplicity, id;
+----
+3	3	3	{'a': 3, 'b': b3}	n3	-1
+3	3	103	{'a': 3, 'b': b3}	n3!	1
+
+statement ok
+PRAGMA refresh('scan_pre_rows');
+
+statement ok
+PRAGMA refresh('scan_pre_agg');
+
+statement ok
+SET threads = 4;
+
+statement ok
+PREPARE scan_pre_bump AS UPDATE scan_pre_src SET v = v + $1 WHERE k = $2;
+
+# A rolled-back batch must leave no captured rows behind.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE scan_pre_src SET v = 0 WHERE k = 1;
+
+statement ok
+DELETE FROM scan_pre_src WHERE s.a = 4;
+
+statement ok
+EXECUTE scan_pre_bump(5, 2);
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_delta_scan_pre_src;
+----
+0
+
+# One batch of conflicting DML on overlapping rows before a single refresh.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO scan_pre_src (id, k, v, s, name)
+SELECT 100000 + i, i % 10, i * 3, {'a': i % 13, 'b': 'new'}, 'm' || i FROM range(3000) r(i);
+
+statement ok
+UPDATE scan_pre_src SET v = v + 1 WHERE k < 4;
+
+statement ok
+UPDATE scan_pre_src SET v = v * 2 WHERE id >= 100000 AND id % 7 = 0;
+
+statement ok
+DELETE FROM scan_pre_src WHERE id >= 100000 AND id % 11 = 0;
+
+statement ok
+DELETE FROM scan_pre_src WHERE s.a = 5 AND k = 3;
+
+statement ok
+UPDATE scan_pre_src SET v = scan_pre_lookup.w, name = 'from'
+FROM scan_pre_lookup WHERE scan_pre_src.id = scan_pre_lookup.id;
+
+statement ok
+UPDATE scan_pre_src SET id = id + 1000000 WHERE id % 97 = 0;
+
+statement ok
+UPDATE scan_pre_src SET v = DEFAULT, s = {'a': 99, 'b': 'dflt'} WHERE k = 6 AND id % 5 = 0;
+
+statement ok
+UPDATE scan_pre_src SET k = (k + 1) % 10 WHERE id % 13 = 0 RETURNING id, k, g;
+
+statement ok
+DELETE FROM scan_pre_src WHERE k = 8 AND id % 3 = 0 RETURNING id, g;
+
+statement ok
+EXECUTE scan_pre_bump(5, 2);
+
+statement ok
+EXECUTE scan_pre_bump(-2, 2);
+
+statement ok
+UPDATE scan_pre_src SET v = v + 2;
+
+statement ok
+UPDATE scan_pre_src SET name = upper(name) WHERE id IN (SELECT id FROM scan_pre_lookup);
+
+statement ok
+DELETE FROM scan_pre_src WHERE k = 9 AND v > 40000;
+
+statement ok
+COMMIT;
+
+statement ok
+SET threads = 1;
+
+statement ok
+PRAGMA refresh('scan_pre_rows');
+
+statement ok
+PRAGMA refresh('scan_pre_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_rows
+    EXCEPT ALL
+    SELECT id, k, v, g, s, name FROM scan_pre_src WHERE v % 3 <> 1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, k, v, g, s, name FROM scan_pre_src WHERE v % 3 <> 1
+    EXCEPT ALL
+    SELECT * FROM scan_pre_rows
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_agg
+    EXCEPT ALL
+    SELECT k, SUM(v), SUM(g), COUNT(*), MAX(name), SUM(s.a) FROM scan_pre_src GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, SUM(v), SUM(g), COUNT(*), MAX(name), SUM(s.a) FROM scan_pre_src GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM scan_pre_agg
+);
+----
+0
+
+# Filtered DML fetches preimages by row id unless its scan already reads every
+# column (e.g. a primary-key update, which DuckDB runs as delete+insert); DML
+# under a MATERIALIZED CTE is captured like any other statement.
+statement ok
+CREATE TABLE scan_pre_narrow (id INTEGER PRIMARY KEY, k INTEGER, v BIGINT, d DATE);
+
+statement ok
+INSERT INTO scan_pre_narrow SELECT i, i % 10, i * 7, DATE '2020-01-01' + (i % 400)::INTEGER FROM range(30000) r(i);
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_narrow_agg AS
+SELECT k, SUM(v) AS sv, COUNT(*) AS c, MAX(d) AS md FROM scan_pre_narrow GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW scan_pre_narrow_rows AS
+SELECT id, k, v, d FROM scan_pre_narrow WHERE v % 2 = 0;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE scan_pre_narrow SET v = v + 1 WHERE k < 3;
+
+statement ok
+UPDATE scan_pre_narrow SET d = d + 1 WHERE hash(id) % 50 = 7;
+
+statement ok
+DELETE FROM scan_pre_narrow WHERE k = 4;
+
+statement ok
+DELETE FROM scan_pre_narrow WHERE id % 1000 = 1 RETURNING v;
+
+statement ok
+UPDATE scan_pre_narrow SET id = id + 100000 WHERE id % 777 = 0;
+
+statement ok
+INSERT INTO scan_pre_narrow SELECT 200000 + i, i % 10, i, DATE '2021-01-01' FROM range(500) r(i);
+
+statement ok
+UPDATE scan_pre_narrow SET v = v * 3 WHERE id >= 200000 AND k = 5;
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT 300000 + i AS id FROM range(50) r(i))
+INSERT INTO scan_pre_narrow SELECT id, id % 10, id, DATE '2022-02-02' FROM picked;
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT i * 3 AS id FROM range(200) r(i))
+UPDATE scan_pre_narrow SET v = -v WHERE id IN (SELECT id FROM picked);
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT 300000 + i AS id FROM range(0, 50, 2) r(i))
+DELETE FROM scan_pre_narrow WHERE id IN (SELECT id FROM picked);
+
+statement ok
+COMMIT;
+
+statement ok
+WITH picked AS MATERIALIZED (SELECT 6 AS k)
+UPDATE scan_pre_narrow SET v = v + 11 WHERE k IN (SELECT k FROM picked);
+
+statement ok
+PRAGMA refresh('scan_pre_narrow_agg');
+
+statement ok
+PRAGMA refresh('scan_pre_narrow_rows');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_narrow_agg
+    EXCEPT ALL
+    SELECT k, SUM(v), COUNT(*), MAX(d) FROM scan_pre_narrow GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, SUM(v), COUNT(*), MAX(d) FROM scan_pre_narrow GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM scan_pre_narrow_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scan_pre_narrow_rows
+    EXCEPT ALL
+    SELECT id, k, v, d FROM scan_pre_narrow WHERE v % 2 = 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, k, v, d FROM scan_pre_narrow WHERE v % 2 = 0
+    EXCEPT ALL
+    SELECT * FROM scan_pre_narrow_rows
 );
 ----
 0

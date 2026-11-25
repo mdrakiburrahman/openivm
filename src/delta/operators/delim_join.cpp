@@ -19,48 +19,8 @@ namespace duckdb {
 
 namespace {
 
-struct BaseLeafInfo {
-	vector<size_t> path;
-	LogicalGet *get;
-	LogicalOperator *node;
-};
-
-static bool IsJoinNode(LogicalOperatorType type) {
-	switch (type) {
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static void CollectBaseLeavesAndVerify(LogicalOperator *node, vector<size_t> path, vector<BaseLeafInfo> &leaves) {
-	if (IsJoinNode(node->type)) {
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join) {
-			switch (join->join_type) {
-			case JoinType::INNER:
-			case JoinType::LEFT:
-			case JoinType::RIGHT:
-			case JoinType::OUTER:
-			case JoinType::MARK:
-			case JoinType::SEMI:
-			case JoinType::ANTI:
-			case JoinType::RIGHT_SEMI:
-			case JoinType::RIGHT_ANTI:
-			case JoinType::SINGLE:
-				break;
-			default:
-				throw Exception(ExceptionType::OPTIMIZER,
-				                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM DELIM_JOIN");
-			}
-		}
-	}
+// Every mutable base-table scan below node; DELIM_GETs are rebuilt per term instead.
+static void CollectBaseLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves) {
 	if (node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
 		return;
 	}
@@ -73,7 +33,7 @@ static void CollectBaseLeavesAndVerify(LogicalOperator *node, vector<size_t> pat
 	}
 	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
 		path.push_back(child_idx);
-		CollectBaseLeavesAndVerify(node->children[child_idx].get(), path, leaves);
+		CollectBaseLeaves(node->children[child_idx].get(), path, leaves);
 		path.pop_back();
 	}
 }
@@ -104,48 +64,6 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 		}
 	}
 	return !join.duplicate_eliminated_columns.empty();
-}
-
-static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op, const column_binding_set_t &mul_set) {
-	if (IsJoinNode(op.type)) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
-		if (join) {
-			const idx_t projected_child_count = std::min<idx_t>(op.children.size(), 2);
-			// A comparison join owns exactly these two projection maps; disabling the loop only corrupts its internal
-			// plan.
-			for (idx_t child_idx = 0; child_idx < projected_child_count; child_idx++) { // mull-ignore: cxx_lt_to_ge
-				auto &proj_map = child_idx == 0 ? join->left_projection_map : join->right_projection_map;
-				if (proj_map.empty()) {
-					continue;
-				}
-				auto child_bindings = op.children[child_idx]->GetColumnBindings();
-				for (auto projected_idx : proj_map) {
-					// Equality is valid: the largest valid index is size - 1.
-					if (projected_idx >= child_bindings.size()) { // mull-ignore: cxx_ge_to_gt
-						throw InternalException(
-						    "DeltaDelimJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
-						    (idx_t)projected_idx, (idx_t)child_idx, (idx_t)child_bindings.size());
-					}
-				}
-				// Disabling this bounded scan only creates an invalid internal projection map, not another SQL
-				// behavior.
-				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); // mull-ignore: cxx_lt_to_ge
-				     binding_idx++) {                                  // mull-ignore: cxx_post_inc_to_post_dec
-					if (!mul_set.count(child_bindings[binding_idx])) { // mull-ignore: cxx_remove_negation
-						continue;
-					}
-					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
-						proj_map.push_back(ProjectionIndex(binding_idx));
-					}
-				}
-			}
-		}
-	}
-	for (auto &child : op.children) {
-		if (child) {
-			AppendMultiplicityBindingsToJoinProjectionMaps(*child, mul_set);
-		}
-	}
 }
 
 static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, LogicalComparisonJoin &delim_join,
@@ -206,17 +124,18 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 	return std::move(distinct);
 }
 
-static void AddColumnBindingReplacements(const vector<ColumnBinding> &old_bindings,
-                                         const vector<ColumnBinding> &new_bindings,
-                                         vector<ReplacementBinding> &replacement_bindings,
-                                         const ColumnBinding *stop_binding = nullptr) {
-	const idx_t count = std::min(old_bindings.size(), new_bindings.size());
-	for (idx_t i = 0; i < count; i++) {
-		if (stop_binding && new_bindings[i] == *stop_binding) {
-			break;
-		}
-		replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
+// Replace a DELIM_GET with its distinct key source, recording the one-to-one binding replacements.
+static void ReplaceDelimGet(unique_ptr<LogicalOperator> &node, unique_ptr<LogicalOperator> source,
+                            vector<ReplacementBinding> &replacements) {
+	auto old_bindings = node->GetColumnBindings();
+	auto new_bindings = source->GetColumnBindings();
+	if (old_bindings.size() != new_bindings.size()) {
+		throw InternalException("DELIM_GET replacement changed binding count");
 	}
+	for (idx_t i = 0; i < old_bindings.size(); i++) {
+		replacements.emplace_back(old_bindings[i], new_bindings[i]);
+	}
+	node = std::move(source);
 }
 
 static void AddLeafBindingReplacements(const vector<ColumnBinding> &old_bindings,
@@ -292,17 +211,8 @@ static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator>
 		if (!active_delim_join) {
 			throw NotImplementedException("LOGICAL_DELIM_GET without enclosing DELIM_JOIN is not supported");
 		}
-		auto &delim_get = node->Cast<LogicalDelimGet>();
-		auto old_bindings = delim_get.GetColumnBindings();
-		node = BuildDelimKeySource(context, *active_delim_join, delim_get, true);
-		auto new_bindings = node->GetColumnBindings();
-		if (old_bindings.size() != new_bindings.size()) {
-			throw InternalException("DELIM_GET replacement changed binding count");
-		}
-		// The replacement must remain one-to-one; disabling the bounded loop only leaves dangling internal bindings.
-		for (idx_t i = 0; i < old_bindings.size(); i++) { // mull-ignore: cxx_lt_to_ge
-			replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
-		}
+		ReplaceDelimGet(node, BuildDelimKeySource(context, *active_delim_join, node->Cast<LogicalDelimGet>(), true),
+		                replacement_bindings);
 		return true;
 	}
 
@@ -344,20 +254,14 @@ static bool ReplaceSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<Logi
 		if (!active_delim_join || !active_replacements) {
 			return false;
 		}
-		auto &delim_get = node->Cast<LogicalDelimGet>();
-		auto old_bindings = delim_get.GetColumnBindings();
+		// Shapes the strict key source cannot express keep the original DELIM_JOIN.
+		unique_ptr<LogicalOperator> source;
 		try {
-			node = BuildDelimKeySource(context, *active_delim_join, delim_get, false);
+			source = BuildDelimKeySource(context, *active_delim_join, node->Cast<LogicalDelimGet>(), false);
 		} catch (Exception &) {
 			return false;
 		}
-		auto new_bindings = node->GetColumnBindings();
-		if (old_bindings.size() != new_bindings.size()) {
-			throw InternalException("DELIM_GET replacement changed binding count");
-		}
-		for (idx_t i = 0; i < old_bindings.size(); i++) {
-			active_replacements->emplace_back(old_bindings[i], new_bindings[i]);
-		}
+		ReplaceDelimGet(node, std::move(source), *active_replacements);
 		return true;
 	}
 
@@ -370,7 +274,7 @@ static bool ReplaceSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<Logi
 		}
 		if (replaced && !local_replacements.empty()) {
 			ColumnBindingReplacer replacer;
-			replacer.replacement_bindings = local_replacements;
+			replacer.replacement_bindings = std::move(local_replacements);
 			replacer.VisitOperator(*node);
 			join.duplicate_eliminated_columns.clear();
 			node->type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
@@ -398,8 +302,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 	const vector<ColumnBinding> original_bindings = input.plan->GetColumnBindings();
 
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::DELIM_JOIN_INCLUSION_EXCLUSION);
-	vector<BaseLeafInfo> leaves;
-	CollectBaseLeavesAndVerify(input.plan.get(), {}, leaves);
+	vector<JoinLeafInfo> leaves;
+	CollectBaseLeaves(input.plan.get(), {}, leaves);
 	if (leaves.empty()) {
 		throw InternalException("DeltaDelimJoin: no mutable base leaves found");
 	}
@@ -432,15 +336,14 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			}
 			auto &leaf_ref = GetNodeAtPath(term, leaves[i].path);
 			auto leaf_bindings = leaf_ref->GetColumnBindings();
-			DeltaGetResult delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder, leaves[i].get,
-			                                            input.context.view, &source_cache, true);
-			auto delta_bindings = delta_i.node->GetColumnBindings();
+			auto delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder, leaves[i].get,
+			                                  input.context.view, &source_cache, true);
+			auto delta_bindings = delta_i.op->GetColumnBindings();
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
-			leaf_ref = std::move(delta_i.node);
-			auto fallback_mul_idx = leaves[i].node->GetColumnBindings().size();
+			leaf_ref = std::move(delta_i.op);
 			AppendMultiplicityToAncestorProjectionMaps(term, leaves[i].path, delta_i.mul_binding, "DeltaDelimJoin",
-			                                           true, fallback_mul_idx);
+			                                           true);
 		}
 
 		vector<ReplacementBinding> delim_replacements;
@@ -448,7 +351,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		output_replacements.insert(output_replacements.end(), delim_replacements.begin(), delim_replacements.end());
 
 		column_binding_set_t mul_set(mul_bindings.begin(), mul_bindings.end());
-		AppendMultiplicityBindingsToJoinProjectionMaps(*term, mul_set);
+		AppendBindingsToJoinProjectionMaps(*term, mul_set);
 
 		auto term_bindings = term->GetColumnBindings();
 		vector<unique_ptr<Expression>> exprs;
@@ -470,7 +373,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 	}
 
 	auto result = AssembleJoinUnionAll(terms, types, binder);
-	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);
+	ColumnBinding new_mul_binding =
+	    ReplaceJoinOutputBindings(*input.root, *result, original_bindings, result->GetColumnBindings());
 	input.plan = std::move(result);
 	return {std::move(input.plan), new_mul_binding};
 }

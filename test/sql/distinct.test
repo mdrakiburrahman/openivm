@@ -1002,11 +1002,8 @@ SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61
 6
 
 # Flag `openivm_distinct_aux_state` routes single-source inner-DISTINCT-under-AGG
-# views to RefreshType::DISTINCT_INCREMENTAL (8) at CREATE time. The actual
-# aux-state SQL pipeline isn't wired yet — it falls through to the
-# GROUP_RECOMPUTE compile path as a stub — but the classification surface
-# is stable so the eventual implementation can replace just the upsert SQL
-# without touching parser/dispatch.
+# views with one SUM to RefreshType::DISTINCT_INCREMENTAL (8). Per-tuple aux
+# counts emit a signed change only when a tuple enters or leaves the DISTINCT set.
 statement ok
 SET openivm_distinct_aux_state = true;
 
@@ -1081,7 +1078,7 @@ SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61
 ----
 8
 
-# Refresh still produces correct results (via the GROUP_RECOMPUTE fallback for now).
+# Refresh propagates the DISTINCT membership changes through the outer SUM.
 statement ok
 INSERT INTO idist_u2 VALUES (2, 'm3', 4), (1, 'm5', 32);
 
@@ -1332,6 +1329,4617 @@ query I
 SELECT COUNT(*) FROM ((SELECT * FROM distinct_switch_child EXCEPT ALL SELECT grp,SUM(cores) AS total_cores FROM (SELECT DISTINCT grp,machine,cores FROM distinct_switch_src WHERE machine IS NOT NULL)d GROUP BY grp) UNION ALL (SELECT grp,SUM(cores) AS total_cores FROM (SELECT DISTINCT grp,machine,cores FROM distinct_switch_src WHERE machine IS NOT NULL)d GROUP BY grp EXCEPT ALL SELECT * FROM distinct_switch_child));
 ----
 0
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+# Issue #151: SUM needs a non-NULL input count separate from tuple existence.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE null_aux_source(k INT, region VARCHAR, tag VARCHAR, v INT, active BOOLEAN);
+
+statement ok
+INSERT INTO null_aux_source VALUES
+    (1,'a','old',10,true),(1,'a','null',NULL,true),
+    (2,'b','old',5,true),(2,'b','old',5,true),
+    (3,'c','x',3,true),(3,'c','y',-3,true),(3,'c','null',NULL,true),
+    (NULL,NULL,'null',NULL,true),(4,'excluded','x',100,false);
+
+statement ok
+CREATE MATERIALIZED VIEW null_aux_mv AS
+SELECT k,region,SUM(v) total FROM
+    (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d
+GROUP BY k,region;
+
+statement ok
+CREATE VIEW null_aux_expected AS
+SELECT k,region,SUM(v) total FROM
+    (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d
+GROUP BY k,region;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='null_aux_mv';
+----
+8
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Remove the last non-NULL input; NULL-only deltas must not poison a non-NULL sum.
+statement ok
+DELETE FROM null_aux_source WHERE k=1 AND v=10;
+
+statement ok
+INSERT INTO null_aux_source VALUES (2,'b','null',NULL,true),(5,'e','null',NULL,true);
+
+statement ok
+UPDATE null_aux_source SET v=4 WHERE k IS NULL;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Batched duplicate, predicate, NULL, zero-sum, and group-existence transitions.
+statement ok
+INSERT INTO null_aux_source VALUES (1,'a','fresh',7,true),(1,'a','fresh',7,true),(1,'a','transient',99,true),(6,'f','zero',0,true);
+
+statement ok
+UPDATE null_aux_source SET v=8 WHERE k=1 AND tag='fresh';
+
+statement ok
+DELETE FROM null_aux_source WHERE k=1 AND tag='transient';
+
+statement ok
+DELETE FROM null_aux_source WHERE k=2 AND tag='old';
+
+statement ok
+UPDATE null_aux_source SET v=NULL WHERE k IS NULL;
+
+statement ok
+UPDATE null_aux_source SET active=true WHERE k=4;
+
+statement ok
+DELETE FROM null_aux_source WHERE k=5;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Leave only qualifying NULL inputs, without removing their groups.
+statement ok
+DELETE FROM null_aux_source WHERE active AND v IS NOT NULL;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Repopulate NULL-only groups and create another group with a genuine zero sum.
+statement ok
+INSERT INTO null_aux_source VALUES (1,'a','back',11,true),(1,'a','back',11,true),(2,'b','back',0,true),(7,'g','pos',4,true),(7,'g','neg',-4,true);
+
+statement ok
+UPDATE null_aux_source SET v=12 WHERE k=1 AND tag='back';
+
+statement ok
+DELETE FROM null_aux_source WHERE rowid IN (SELECT rowid FROM null_aux_source WHERE k=1 AND tag='back' LIMIT 1);
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Delete every group.
+statement ok
+DELETE FROM null_aux_source;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+# DISTINCT aux inputs retain group aliases, shared SUM outputs, and constants.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE aux_projection_source(k INT,v INT,active BOOLEAN);
+
+statement ok
+INSERT INTO aux_projection_source VALUES
+    (1,10,true),(1,NULL,true),(2,5,true),(2,5,true),
+    (NULL,NULL,true),(4,99,false);
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_alias AS SELECT k AS g,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_alias AS SELECT k AS g,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_duplicate AS SELECT k,SUM(v) a,SUM(v) b FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_duplicate AS SELECT k,SUM(v) a,SUM(v) b FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_constant AS SELECT k,42 flag,SUM(v) total,'steady' marker,NULL empty_marker FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_constant AS SELECT k,42 flag,SUM(v) total,'steady' marker,NULL empty_marker FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_combined AS SELECT k%2 AS g,SUM(v) a,SUM(v) b,42 flag FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k%2;
+
+statement ok
+CREATE VIEW expected_projected_distinct_combined AS SELECT k%2 AS g,SUM(v) a,SUM(v) b,42 flag FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k%2;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_cte AS WITH d AS (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) SELECT k AS g,SUM(v) total FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_cte AS WITH d AS (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) SELECT k AS g,SUM(v) total FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_collision AS SELECT k AS v,SUM(v) AS k FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_collision AS SELECT k AS v,SUM(v) AS k FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_duplicate_keys AS
+SELECT k AS g,k AS h,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_duplicate_keys AS
+SELECT k AS g,k AS h,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_cast_constant AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_cast_constant AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='projected_distinct_{kind}';
+----
+8
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+# Conflicting writes change membership, predicates, and nullable group keys before refresh.
+statement ok
+INSERT INTO aux_projection_source VALUES(1,8,true),(1,8,true),(2,NULL,true),(3,9,true),(3,9,true),(5,999,true);
+
+statement ok
+UPDATE aux_projection_source SET v=-2 WHERE k=3;
+
+statement ok
+UPDATE aux_projection_source SET active=false WHERE k=1 AND v=8;
+
+statement ok
+UPDATE aux_projection_source SET v=7 WHERE k IS NULL;
+
+statement ok
+DELETE FROM aux_projection_source WHERE k=5 OR (k=1 AND v=10);
+
+statement ok
+DELETE FROM aux_projection_source WHERE rowid IN(SELECT rowid FROM aux_projection_source WHERE k=2 AND v=5 LIMIT 1);
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+# Keep NULL-only groups, then exercise forced refresh and aux-state rebuilding.
+statement ok
+DELETE FROM aux_projection_source WHERE active AND v IS NOT NULL;
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+# Repopulate groups with shared sums and preserve constant output values.
+statement ok
+INSERT INTO aux_projection_source VALUES(1,11,true),(1,11,true),(2,0,true),(3,4,true),(3,-4,true);
+
+statement ok
+UPDATE aux_projection_source SET v=12 WHERE k=1 AND v=11;
+
+statement ok
+DELETE FROM aux_projection_source WHERE rowid IN(SELECT rowid FROM aux_projection_source WHERE k=1 AND v=12 LIMIT 1);
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+# Remove every group.
+statement ok
+DELETE FROM aux_projection_source;
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+# Cast only the updated raw SUM; adding individually rounded deltas loses fractions.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE distinct_cast_decimal_source(k INT,v DECIMAL(12,2));
+
+statement ok
+INSERT INTO distinct_cast_decimal_source VALUES(1,0.40),(1,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cast_decimal_mv AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM distinct_cast_decimal_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cast_decimal_expected AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM distinct_cast_decimal_source) d GROUP BY k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_cast_decimal_mv';
+----
+8
+
+statement ok
+INSERT INTO distinct_cast_decimal_source VALUES(1,0.45),(1,0.45),(2,1.20),(3,99.0);
+
+statement ok
+UPDATE distinct_cast_decimal_source SET v=1.40 WHERE k=2;
+
+statement ok
+DELETE FROM distinct_cast_decimal_source WHERE k=3;
+
+statement ok
+PRAGMA refresh('distinct_cast_decimal_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM distinct_cast_decimal_mv EXCEPT ALL SELECT * FROM distinct_cast_decimal_expected)
+    UNION ALL
+    (SELECT * FROM distinct_cast_decimal_expected EXCEPT ALL SELECT * FROM distinct_cast_decimal_mv)
+);
+----
+0
+
+statement ok
+DELETE FROM distinct_cast_decimal_source WHERE v IS NOT NULL;
+
+statement ok
+PRAGMA refresh('distinct_cast_decimal_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM distinct_cast_decimal_mv EXCEPT ALL SELECT * FROM distinct_cast_decimal_expected)
+    UNION ALL
+    (SELECT * FROM distinct_cast_decimal_expected EXCEPT ALL SELECT * FROM distinct_cast_decimal_mv)
+);
+----
+0
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+# Computed outer SUM outputs must finalize after DISTINCT tuple transitions.
+# The aux path also preserves scalar empty-state and SUM's non-NULL counts.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE derived_distinct_source(id INT,k INT,v INT);
+
+statement ok
+INSERT INTO derived_distinct_source VALUES (1,1,10),(2,1,10),(3,2,NULL),(4,NULL,30),(5,2,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_add AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_add_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_mul AS SELECT k,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_mul_expected AS SELECT k,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_coalesce AS SELECT k,COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_coalesce_expected AS SELECT k,COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_mixed AS SELECT k,SUM(v) raw,SUM(v) duplicate,SUM(v)*2 a,COUNT(*)+1 n,
+struct_pack(total := SUM(v)) packed,'fixed' label
+FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_mixed_expected AS SELECT k,SUM(v) raw,SUM(v) duplicate,SUM(v)*2 a,COUNT(*)+1 n,
+struct_pack(total := SUM(v)) packed,'fixed' label
+FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_add AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_add_expected AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_mul AS SELECT SUM(v)*2 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_mul_expected AS SELECT SUM(v)*2 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_coalesce AS SELECT COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_coalesce_expected AS SELECT COALESCE(SUM(v),0)+1 a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_mixed AS SELECT SUM(v) raw,SUM(v)*2 a,COUNT(*)+1 n,struct_pack(total := SUM(v)) packed
+FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_mixed_expected AS SELECT SUM(v) raw,SUM(v)*2 a,COUNT(*)+1 n,struct_pack(total := SUM(v)) packed
+FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_plain_group AS SELECT k,SUM(v) a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_plain_group_expected AS SELECT k,SUM(v) a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_plain_scalar AS SELECT SUM(v) a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+statement ok
+CREATE VIEW derived_distinct_plain_scalar_expected AS SELECT SUM(v) a FROM (SELECT DISTINCT v FROM derived_distinct_source) d;
+
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_renamed AS SELECT k AS renamed,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_renamed_expected AS SELECT k AS renamed,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_computed AS SELECT k+1 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k+1;
+
+statement ok
+CREATE VIEW derived_distinct_group_computed_expected AS SELECT k+1 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k+1;
+
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_projected AS SELECT k%2 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_projected_expected AS SELECT k%2 AS g,SUM(v)*2 a FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_permuted AS SELECT SUM(v)*2 a,k AS renamed FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_permuted_expected AS SELECT SUM(v)*2 a,k AS renamed FROM (SELECT DISTINCT k,v FROM derived_distinct_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_cte AS WITH x AS(SELECT k,v FROM derived_distinct_source) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_cte_expected AS WITH x AS(SELECT k,v FROM derived_distinct_source) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_cte_expr AS WITH x AS(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v>5) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_cte_expr_expected AS WITH x AS(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v>5) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_cte_chain AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE k>=1 OR k IS NULL),y AS MATERIALIZED(SELECT k,v+1 AS v FROM x WHERE v>10),d AS MATERIALIZED(SELECT DISTINCT k,v FROM y) SELECT SUM(v)*2 a,k AS renamed FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_cte_chain_expected AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE k>=1 OR k IS NULL),y AS MATERIALIZED(SELECT k,v+1 AS v FROM x WHERE v>10),d AS MATERIALIZED(SELECT DISTINCT k,v FROM y) SELECT SUM(v)*2 a,k AS renamed FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_cte AS WITH x AS(SELECT v*2 AS v FROM derived_distinct_source WHERE v>=0) SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM x)d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_cte_expected AS WITH x AS(SELECT v*2 AS v FROM derived_distinct_source WHERE v>=0) SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM x)d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_variant_group AS SELECT variant_typeof(k::VARIANT) g,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source)d GROUP BY variant_typeof(k::VARIANT);
+
+statement ok
+CREATE VIEW derived_distinct_variant_group_expected AS SELECT variant_typeof(k::VARIANT) g,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source)d GROUP BY variant_typeof(k::VARIANT);
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_post_projected AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,v*2 AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_post_projected_expected AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,v*2 AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_post_nullified AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,NULLIF(v,20) AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_post_nullified_expected AS WITH d AS(SELECT DISTINCT k,v FROM derived_distinct_source),p AS(SELECT k,NULLIF(v,20) AS v FROM d) SELECT k,SUM(v)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_post_projected AS WITH d AS(SELECT DISTINCT v FROM derived_distinct_source),p AS(SELECT v*2 AS v FROM d) SELECT SUM(v)+1 a FROM p;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_post_projected_expected AS WITH d AS(SELECT DISTINCT v FROM derived_distinct_source),p AS(SELECT v*2 AS v FROM d) SELECT SUM(v)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_group_limit AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_group_limit_expected AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM derived_distinct_source ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_scalar_limit AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM derived_distinct_source ORDER BY v NULLS LAST LIMIT 2)d;
+
+statement ok
+CREATE VIEW derived_distinct_scalar_limit_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM derived_distinct_source ORDER BY v NULLS LAST LIMIT 2)d;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_cte_input_limit AS WITH x AS(SELECT k,v FROM derived_distinct_source ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_cte_input_limit_expected AS WITH x AS(SELECT k,v FROM derived_distinct_source ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_cte_limit_offset AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v IS NOT NULL ORDER BY v DESC,k NULLS FIRST LIMIT 3 OFFSET 1),d AS(SELECT DISTINCT k,v FROM x) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW derived_distinct_cte_limit_offset_expected AS WITH x AS MATERIALIZED(SELECT k,v*2 AS v FROM derived_distinct_source WHERE v IS NOT NULL ORDER BY v DESC,k NULLS FIRST LIMIT 3 OFFSET 1),d AS(SELECT DISTINCT k,v FROM x) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
+
+statement ok
+CREATE MATERIALIZED VIEW derived_distinct_child_{variant} AS SELECT * FROM derived_distinct_{variant};
+
+endloop
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='derived_distinct_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+query I
+SELECT CASE WHEN min(refresh_type)=8
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%WITH ddist AS (%'
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%struct_pack%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('derived_distinct_{variant}',
+    '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind='data';
+----
+1
+
+endloop
+
+# New groups and duplicate inserts exercise both MERGE branches.
+statement ok
+INSERT INTO derived_distinct_source VALUES (6,1,20),(7,3,40),(8,3,40),(9,4,NULL),(10,4,NULL);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# Consolidate conflicting operations and last-support deletions before one refresh.
+statement ok
+INSERT INTO derived_distinct_source VALUES (11,5,50),(12,1,10),(13,4,NULL);
+
+statement ok
+UPDATE derived_distinct_source SET v=20 WHERE id=1;
+
+statement ok
+UPDATE derived_distinct_source SET k=2,v=NULL WHERE id=4;
+
+statement ok
+DELETE FROM derived_distinct_source WHERE id IN (2,7,9,11,12);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# Full refresh rebuilds tuple support counts and raw aggregate state.
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+UPDATE derived_distinct_source SET v=50 WHERE id=8;
+
+statement ok
+INSERT INTO derived_distinct_source VALUES (14,6,60),(15,6,60);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM derived_distinct_source WHERE id IN (6,14);
+
+statement ok
+INSERT INTO derived_distinct_source VALUES (16,6,60),(17,1,NULL);
+
+statement ok
+UPDATE derived_distinct_source SET v=NULL WHERE id=15;
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM derived_distinct_source;
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# Scalar SUM remains one NULL row when empty, and can accept new tuples again.
+statement ok
+INSERT INTO derived_distinct_source VALUES (18,NULL,NULL),(19,1,7),(20,1,7);
+
+foreach variant group_add group_mul group_coalesce group_mixed scalar_add scalar_mul scalar_coalesce scalar_mixed plain_group plain_scalar group_renamed group_computed group_projected group_permuted group_cte group_cte_expr group_cte_chain scalar_cte variant_group group_post_projected group_post_nullified scalar_post_projected group_limit scalar_limit cte_input_limit cte_limit_offset
+
+statement ok
+PRAGMA refresh('derived_distinct_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_{variant})
+);
+----
+0
+
+endloop
+
+foreach variant group_mul scalar_coalesce group_limit cte_input_limit
+
+statement ok
+PRAGMA refresh('derived_distinct_child_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM derived_distinct_child_{variant} EXCEPT ALL SELECT * FROM derived_distinct_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM derived_distinct_{variant}_expected EXCEPT ALL SELECT * FROM derived_distinct_child_{variant})
+);
+----
+0
+
+endloop
+
+# SUM inputs must be signed and widened before multiplying by tuple weights.
+statement ok
+CREATE TABLE distinct_typed_source(id INT,k INT,v INT,b BOOLEAN);
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (1,1,-2147483648,true),(2,1,1,true),(3,2,NULL,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_int_group AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_typed_int_group_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_int_scalar AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM distinct_typed_source) d;
+
+statement ok
+CREATE VIEW distinct_typed_int_scalar_expected AS SELECT SUM(v)+1 a FROM (SELECT DISTINCT v FROM distinct_typed_source) d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_bool_group AS SELECT k,SUM(b)+1 a FROM (SELECT DISTINCT k,b FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_typed_bool_group_expected AS SELECT k,SUM(b)+1 a FROM (SELECT DISTINCT k,b FROM distinct_typed_source) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_typed_bool_scalar AS SELECT SUM(b)+1 a FROM (SELECT DISTINCT b FROM distinct_typed_source) d;
+
+statement ok
+CREATE VIEW distinct_typed_bool_scalar_expected AS SELECT SUM(b)+1 a FROM (SELECT DISTINCT b FROM distinct_typed_source) d;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_typed_{variant}';
+----
+8
+
+query I
+SELECT CASE WHEN min(refresh_type)=8
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%HUGEINT%'
+                 AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST(%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('distinct_typed_{variant}',
+    '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind='data';
+----
+1
+
+endloop
+
+# Retracting INT_MIN must negate the widened SUM input, not an INT32 value.
+statement ok
+INSERT INTO distinct_typed_source VALUES (4,2,20,false),(5,3,30,false);
+
+statement ok
+UPDATE distinct_typed_source SET k=3,v=21 WHERE id=4;
+
+statement ok
+DELETE FROM distinct_typed_source WHERE id IN (1,5);
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (6,1,-2147483648,true),(7,1,-2147483648,true),(8,4,NULL,NULL);
+
+statement ok
+UPDATE distinct_typed_source SET v=22,b=false WHERE id=2;
+
+statement ok
+DELETE FROM distinct_typed_source WHERE id=6;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (9,1,-2147483648,true);
+
+statement ok
+UPDATE distinct_typed_source SET b=NULL WHERE id=4;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (10,5,2147483647,false);
+
+statement ok
+UPDATE distinct_typed_source SET k=1 WHERE id=10;
+
+statement ok
+DELETE FROM distinct_typed_source WHERE id IN (7,9);
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_typed_source;
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_typed_source VALUES (11,NULL,-2147483648,true),(12,NULL,NULL,NULL);
+
+foreach variant int_group int_scalar bool_group bool_scalar
+
+statement ok
+PRAGMA refresh('distinct_typed_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_typed_{variant} EXCEPT ALL SELECT * FROM distinct_typed_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_typed_{variant}_expected EXCEPT ALL SELECT * FROM distinct_typed_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+# Candidate counts and stable selection aliases survive reopen and source-column rename.
+load __TEST_DIR__/distinct_limited_reopen.db
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE s(id INT,k INT,v INT);
+
+statement ok
+INSERT INTO s VALUES(1,1,10),(2,1,10),(3,2,NULL),(4,2,30),(5,3,40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_limited AS WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_offset AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k;
+
+statement ok
+INSERT INTO s VALUES(6,4,5);
+
+statement ok
+DELETE FROM s WHERE id=2;
+
+statement ok
+PRAGMA refresh('mv_limited');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_limited EXCEPT ALL SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected) UNION ALL(SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_limited)) THEN error('bag mismatch limited') ELSE true END;
+
+statement ok
+PRAGMA refresh('mv_offset');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_offset EXCEPT ALL SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected) UNION ALL(SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_offset)) THEN error('bag mismatch offset') ELSE true END;
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+UPDATE s SET v=12 WHERE id=4;
+
+statement ok
+DELETE FROM s WHERE id=1;
+
+statement ok
+INSERT INTO s VALUES(7,1,0);
+
+statement ok
+PRAGMA refresh('mv_limited');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_limited EXCEPT ALL SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected) UNION ALL(SELECT * FROM (WITH x AS(SELECT k,v FROM s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_limited)) THEN error('bag mismatch limited') ELSE true END;
+
+statement ok
+PRAGMA refresh('mv_offset');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_offset EXCEPT ALL SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected) UNION ALL(SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_offset)) THEN error('bag mismatch offset') ELSE true END;
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+ALTER TABLE s RENAME COLUMN v TO amount;
+
+statement ok
+INSERT INTO s VALUES(8,5,3);
+
+statement ok
+UPDATE s SET amount=50 WHERE id=6;
+
+statement ok
+DELETE FROM s WHERE id=3;
+
+statement ok
+PRAGMA refresh('mv_limited');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_limited EXCEPT ALL SELECT * FROM (WITH x AS(SELECT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected) UNION ALL(SELECT * FROM (WITH x AS(SELECT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY id LIMIT 4) SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM x)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_limited)) THEN error('bag mismatch limited') ELSE true END;
+
+statement ok
+PRAGMA refresh('mv_offset');
+
+statement ok
+SELECT CASE WHEN EXISTS((SELECT * FROM mv_offset EXCEPT ALL SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected) UNION ALL(SELECT * FROM (SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM(SELECT id,k,amount AS v FROM s)s ORDER BY v NULLS LAST,k NULLS LAST LIMIT 3 OFFSET 1)d GROUP BY k) expected EXCEPT ALL SELECT * FROM mv_offset)) THEN error('bag mismatch offset') ELSE true END;
+
+# Limited candidate identity preserves raw strings and VARIANT payload types.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE exact_candidates(k VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO exact_candidates VALUES('A'),('a');
+
+statement ok
+CREATE TABLE typed_candidates(v VARIANT);
+
+statement ok
+INSERT INTO typed_candidates VALUES(1::TINYINT::VARIANT),(1::BIGINT::VARIANT);
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_collated AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 2)d;
+
+statement ok
+CREATE VIEW exact_candidate_collated_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 2)d;
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_percent AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 50 PERCENT)d;
+
+statement ok
+CREATE VIEW exact_candidate_percent_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM exact_candidates ORDER BY v LIMIT 50 PERCENT)d;
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_variant AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM typed_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW exact_candidate_variant_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM typed_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE TABLE nested_candidates(v VARIANT);
+
+statement ok
+INSERT INTO nested_candidates VALUES({'x':1::TINYINT}::VARIANT),({'x':1::BIGINT}::VARIANT);
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_nested AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v.x) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM nested_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW exact_candidate_nested_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE variant_typeof(v.x) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END AS n FROM nested_candidates ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE TABLE finite_distinct_source(k INT,v DOUBLE);
+
+statement ok
+INSERT INTO finite_distinct_source VALUES(1,'NaN'),(1,10),(2,'Infinity'),(2,20),(3,'-Infinity'),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW exact_candidate_nan AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM finite_distinct_source ORDER BY v,k LIMIT 6)d GROUP BY k;
+
+statement ok
+CREATE VIEW exact_candidate_nan_expected AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM finite_distinct_source ORDER BY v,k LIMIT 6)d GROUP BY k;
+
+statement ok
+INSERT INTO exact_candidates VALUES('b');
+
+statement ok
+INSERT INTO typed_candidates VALUES('x'::VARIANT);
+
+statement ok
+INSERT INTO nested_candidates VALUES({'x':'s'}::VARIANT);
+
+statement ok
+DELETE FROM finite_distinct_source WHERE NOT isfinite(v);
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO exact_candidates VALUES('A'),('c');
+
+statement ok
+DELETE FROM exact_candidates WHERE k COLLATE C='a';
+
+statement ok
+INSERT INTO typed_candidates VALUES(2::SMALLINT::VARIANT);
+
+statement ok
+DELETE FROM typed_candidates WHERE variant_typeof(v)='INT8';
+
+statement ok
+DELETE FROM nested_candidates WHERE variant_typeof(v.x)='INT8';
+
+statement ok
+INSERT INTO finite_distinct_source VALUES(1,'Infinity'),(1,'NaN');
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO exact_candidates VALUES('d');
+
+statement ok
+INSERT INTO typed_candidates VALUES(3::TINYINT::VARIANT);
+
+statement ok
+INSERT INTO nested_candidates VALUES({'x':3::TINYINT}::VARIANT);
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM exact_candidates WHERE k COLLATE C='A';
+
+statement ok
+DELETE FROM typed_candidates WHERE variant_typeof(v)='INT64';
+
+statement ok
+DELETE FROM nested_candidates WHERE variant_typeof(v.x)='INT64';
+
+statement ok
+DELETE FROM finite_distinct_source WHERE NOT isfinite(v);
+
+foreach variant collated percent variant nan nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='exact_candidate_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('exact_candidate_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM exact_candidate_{variant} EXCEPT ALL SELECT * FROM exact_candidate_{variant}_expected) UNION ALL(SELECT * FROM exact_candidate_{variant}_expected EXCEPT ALL SELECT * FROM exact_candidate_{variant}));
+----
+0
+
+endloop
+
+query I
+SELECT (count(*)>0)::INTEGER FROM openivm_compile_with_facts('exact_candidate_collated','{"target_dialect":"spark","compile_only":true}') WHERE stmt_kind='data';
+----
+1
+
+# Default collations require the same byte identity as declared column collations.
+statement ok
+SET default_collation='nocase';
+
+statement ok
+CREATE TABLE default_collation_candidates(k VARCHAR);
+
+statement ok
+INSERT INTO default_collation_candidates VALUES('A'),('a');
+
+statement ok
+CREATE MATERIALIZED VIEW default_collation_candidate_mv AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT ascii(k) AS v FROM default_collation_candidates ORDER BY v LIMIT 2)d;
+
+statement ok
+INSERT INTO default_collation_candidates VALUES('b');
+
+statement ok
+PRAGMA refresh('default_collation_candidate_mv');
+
+query I
+SELECT count(*) FROM((SELECT * FROM default_collation_candidate_mv EXCEPT ALL SELECT SUM(v)+1 FROM(SELECT DISTINCT ascii(k) AS v FROM default_collation_candidates ORDER BY v LIMIT 2)d) UNION ALL(SELECT SUM(v)+1 FROM(SELECT DISTINCT ascii(k) AS v FROM default_collation_candidates ORDER BY v LIMIT 2)d EXCEPT ALL SELECT * FROM default_collation_candidate_mv));
+----
+0
+
+statement ok
+SET default_collation='';
+
+# Candidate identity preserves interval components and signed zero, including nested values.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE identity_source_interval(id INT,v INTERVAL);
+
+statement ok
+INSERT INTO identity_source_interval VALUES(1,INTERVAL '1 month'),(2,INTERVAL '30 days');
+
+statement ok
+CREATE MATERIALIZED VIEW identity_interval AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v) AS n FROM identity_source_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_interval_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v) AS n FROM identity_source_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_interval VALUES(3,INTERVAL '2 months');
+
+statement ok
+CREATE TABLE identity_source_zero(id INT,v DOUBLE);
+
+statement ok
+INSERT INTO identity_source_zero VALUES(1,'-0.0'::DOUBLE),(2,0::DOUBLE);
+
+statement ok
+CREATE MATERIALIZED VIEW identity_zero AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_zero_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_zero VALUES(3,1::DOUBLE);
+
+statement ok
+CREATE TABLE identity_source_float_zero(id INT,v FLOAT);
+
+statement ok
+INSERT INTO identity_source_float_zero VALUES(1,'-0.0'::FLOAT),(2,0::FLOAT);
+
+statement ok
+CREATE MATERIALIZED VIEW identity_float_zero AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_float_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_float_zero_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v) THEN 10 ELSE 20 END AS n FROM identity_source_float_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_float_zero VALUES(3,1::FLOAT);
+
+statement ok
+CREATE TABLE identity_source_nested_interval(id INT,v STRUCT(x INTERVAL));
+
+statement ok
+INSERT INTO identity_source_nested_interval VALUES(1,{'x':INTERVAL '1 month'}),(2,{'x':INTERVAL '30 days'});
+
+statement ok
+CREATE MATERIALIZED VIEW identity_nested_interval AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v.x) AS n FROM identity_source_nested_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_nested_interval_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT extract(month FROM v.x) AS n FROM identity_source_nested_interval ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_nested_interval VALUES(3,{'x':INTERVAL '2 months'});
+
+statement ok
+CREATE TABLE identity_source_nested_zero(id INT,v DOUBLE[]);
+
+statement ok
+INSERT INTO identity_source_nested_zero VALUES(1,['-0.0'::DOUBLE]),(2,[0::DOUBLE]);
+
+statement ok
+CREATE MATERIALIZED VIEW identity_nested_zero AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END AS n FROM identity_source_nested_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+CREATE VIEW identity_nested_zero_expected AS SELECT SUM(n)+1 a FROM(SELECT DISTINCT CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END AS n FROM identity_source_nested_zero ORDER BY n LIMIT 2)d;
+
+statement ok
+INSERT INTO identity_source_nested_zero VALUES(3,[1::DOUBLE]);
+
+foreach variant interval zero float_zero nested_interval nested_zero
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='identity_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('identity_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM identity_{variant} EXCEPT ALL SELECT * FROM identity_{variant}_expected) UNION ALL(SELECT * FROM identity_{variant}_expected EXCEPT ALL SELECT * FROM identity_{variant}));
+----
+0
+
+endloop
+
+# Native storage may retain the old representation when an UPDATE is SQL-equal.
+foreach variant interval zero float_zero nested_interval nested_zero
+
+statement ok
+INSERT INTO identity_source_{variant} SELECT 6,v FROM identity_source_{variant} WHERE id=1;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=2) WHERE id=6;
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=6;
+
+statement ok
+PRAGMA refresh('identity_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM identity_{variant} EXCEPT ALL SELECT * FROM identity_{variant}_expected) UNION ALL(SELECT * FROM identity_{variant}_expected EXCEPT ALL SELECT * FROM identity_{variant}));
+----
+0
+
+endloop
+
+foreach variant interval zero float_zero nested_interval nested_zero
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=1;
+
+statement ok
+INSERT INTO identity_source_{variant} SELECT 4,v FROM identity_source_{variant} WHERE id=2;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=3) WHERE id=4;
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=4;
+
+statement ok
+INSERT INTO identity_source_{variant} SELECT 5,v FROM identity_source_{variant} WHERE id=2;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=3) WHERE id=5;
+
+statement ok
+UPDATE identity_source_{variant} SET v=(SELECT v FROM identity_source_{variant} WHERE id=2) WHERE id=5;
+
+statement ok
+DELETE FROM identity_source_{variant} WHERE id=5;
+
+statement ok
+PRAGMA refresh('identity_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM identity_{variant} EXCEPT ALL SELECT * FROM identity_{variant}_expected) UNION ALL(SELECT * FROM identity_{variant}_expected EXCEPT ALL SELECT * FROM identity_{variant}));
+----
+0
+
+endloop
+
+statement ok
+CREATE TABLE overflow_distinct_source(k INT,v DOUBLE);
+
+statement ok
+INSERT INTO overflow_distinct_source VALUES(1,1e308),(1,1.5e308),(2,-1e308),(2,-1.5e308);
+
+statement ok
+CREATE MATERIALIZED VIEW overflow_distinct AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM overflow_distinct_source ORDER BY k,v LIMIT 4)d GROUP BY k;
+
+statement ok
+CREATE VIEW overflow_distinct_expected AS SELECT k,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM overflow_distinct_source ORDER BY k,v LIMIT 4)d GROUP BY k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='overflow_distinct';
+----
+8
+
+statement ok
+DELETE FROM overflow_distinct_source WHERE abs(v)=1.5e308;
+
+statement ok
+INSERT INTO overflow_distinct_source VALUES(1,1.5e308),(2,-1.5e308);
+
+statement ok
+UPDATE overflow_distinct_source SET v=-v WHERE abs(v)=1.5e308;
+
+statement ok
+DELETE FROM overflow_distinct_source WHERE abs(v)=1.5e308;
+
+statement ok
+PRAGMA refresh('overflow_distinct');
+
+query I
+SELECT count(*) FROM((SELECT * FROM overflow_distinct EXCEPT ALL SELECT * FROM overflow_distinct_expected) UNION ALL(SELECT * FROM overflow_distinct_expected EXCEPT ALL SELECT * FROM overflow_distinct));
+----
+0
+
+# Sign support counters receive the same signed DISTINCT tuple transitions.
+statement ok
+CREATE TABLE distinct_sign_source(id INT,k DOUBLE,v INT);
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(1,'-0.0'::DOUBLE,10),(2,'-0.0'::DOUBLE,20);
+
+statement ok
+CREATE TABLE distinct_nan_sign_source(id INT,v DOUBLE);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(1,-('NaN'::DOUBLE)),(2,10);
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_group AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source ORDER BY v LIMIT 4)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_sign_group_expected AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source ORDER BY v LIMIT 4)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_group_plain AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_sign_group_plain_expected AS SELECT k,signbit(k) negative,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_sign_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_nan AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source ORDER BY v LIMIT 4)d;
+
+statement ok
+CREATE VIEW distinct_sign_nan_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source ORDER BY v LIMIT 4)d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_sign_nan_plain AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source)d;
+
+statement ok
+CREATE VIEW distinct_sign_nan_plain_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT v FROM distinct_nan_sign_source)d;
+
+foreach variant group group_plain nan nan_plain
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_sign_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=1;
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=2;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(2,0::DOUBLE,20);
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(3,'-0.0'::DOUBLE,30);
+
+statement ok
+UPDATE distinct_sign_source SET v=40 WHERE id=3;
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=3;
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(3,'NaN');
+
+statement ok
+UPDATE distinct_nan_sign_source SET v=-('NaN'::DOUBLE) WHERE id=3;
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE id=3;
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_sign_source WHERE id=2;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(4,'-0.0'::DOUBLE,20);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE id=1;
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(4,-('NaN'::DOUBLE));
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+DELETE FROM distinct_nan_sign_source;
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(5,0::DOUBLE,15);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(5,-('NaN'::DOUBLE)),(6,15);
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+# Full refresh rebuilds sign counters before incremental sign-only replacements resume.
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(6,'-0.0'::DOUBLE,15);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE isnan(v);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(7,'NaN');
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(7,0::DOUBLE,15);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE isnan(v);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(8,-('NaN'::DOUBLE));
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+statement ok
+ALTER TABLE distinct_sign_source RENAME COLUMN k TO key_value;
+
+statement ok
+ALTER TABLE distinct_nan_sign_source RENAME COLUMN v TO amount;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_group_expected AS SELECT key_value AS k,signbit(key_value) negative,SUM(v)+1 a FROM(SELECT DISTINCT key_value,v FROM distinct_sign_source ORDER BY v LIMIT 4)d GROUP BY key_value;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_group_plain_expected AS SELECT key_value AS k,signbit(key_value) negative,SUM(v)+1 a FROM(SELECT DISTINCT key_value,v FROM distinct_sign_source)d GROUP BY key_value;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_nan_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT amount AS v FROM distinct_nan_sign_source ORDER BY amount LIMIT 4)d;
+
+statement ok
+CREATE OR REPLACE VIEW distinct_sign_nan_plain_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT amount AS v FROM distinct_nan_sign_source)d;
+
+statement ok
+DELETE FROM distinct_sign_source;
+
+statement ok
+INSERT INTO distinct_sign_source VALUES(8,'-0.0'::DOUBLE,15);
+
+statement ok
+DELETE FROM distinct_nan_sign_source WHERE isnan(amount);
+
+statement ok
+INSERT INTO distinct_nan_sign_source VALUES(9,'NaN');
+
+foreach variant group group_plain nan nan_plain
+
+statement ok
+PRAGMA refresh('distinct_sign_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_sign_{variant} EXCEPT ALL SELECT * FROM distinct_sign_{variant}_expected) UNION ALL(SELECT * FROM distinct_sign_{variant}_expected EXCEPT ALL SELECT * FROM distinct_sign_{variant}));
+----
+0
+
+endloop
+
+# DISTINCT representatives survive while supported and switch when their last exact value disappears.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE representative_collated_source(id INT,k INT,v VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO representative_collated_source VALUES(1,1,'A'),(2,1,'a');
+
+statement ok
+CREATE MATERIALIZED VIEW representative_collated_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_collated_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_collated_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_collated_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_collated_source),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE TABLE representative_interval_source(id INT,k INT,v INTERVAL);
+
+statement ok
+INSERT INTO representative_interval_source VALUES(1,1,INTERVAL '1 month'),(2,1,INTERVAL '30 days');
+
+statement ok
+CREATE MATERIALIZED VIEW representative_interval_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_interval_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_interval_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_interval_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_interval_source),p AS(SELECT k,extract(month FROM v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE TABLE representative_variant_source(id INT,k INT,v VARIANT);
+
+statement ok
+INSERT INTO representative_variant_source VALUES(1,1,1::TINYINT::VARIANT),(2,1,1::BIGINT::VARIANT);
+
+statement ok
+CREATE MATERIALIZED VIEW representative_variant_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_variant_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_variant_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_variant_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_variant_source),p AS(SELECT k,CASE variant_typeof(v) WHEN 'INT8' THEN 10 WHEN 'INT64' THEN 20 ELSE 30 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE TABLE representative_nested_source(id INT,k INT,v DOUBLE[]);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(1,1,['-0.0'::DOUBLE]),(2,1,[0::DOUBLE]);
+
+statement ok
+CREATE MATERIALIZED VIEW representative_nested_scalar AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW representative_nested_scalar_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW representative_nested_group AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW representative_nested_group_expected AS WITH d AS(SELECT DISTINCT k,v FROM representative_nested_source),p AS(SELECT k,CASE WHEN signbit(v[1]) THEN 10 ELSE 20 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='representative_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 1.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source WHERE id IN(1,99);
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source WHERE id IN(1,99);
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source WHERE id IN(1,99);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source WHERE id IN(1,99);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 2.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_collated_source VALUES(3,1,'A'),(4,1,'A');
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(3,1,INTERVAL '1 month'),(4,1,INTERVAL '1 month');
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(3,1,1::TINYINT::VARIANT),(4,1,1::TINYINT::VARIANT);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(3,1,['-0.0'::DOUBLE]),(4,1,['-0.0'::DOUBLE]);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 3.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Representative lifecycle batch 4.
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_collated_source VALUES(5,1,'a'),(6,1,'a');
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(5,1,INTERVAL '30 days'),(6,1,INTERVAL '30 days');
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(5,1,1::BIGINT::VARIANT),(6,1,1::BIGINT::VARIANT);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(5,1,[0::DOUBLE]),(6,1,[0::DOUBLE]);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Full refresh rebuilds representatives before loading aggregate state.
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO representative_collated_source VALUES(99,1,'A');
+
+statement ok
+UPDATE representative_collated_source SET v='z' WHERE id=99;
+
+statement ok
+DELETE FROM representative_collated_source;
+
+statement ok
+INSERT INTO representative_collated_source VALUES(7,1,'A'),(8,1,'A');
+
+statement ok
+INSERT INTO representative_interval_source VALUES(99,1,INTERVAL '1 month');
+
+statement ok
+UPDATE representative_interval_source SET v=INTERVAL '2 months' WHERE id=99;
+
+statement ok
+DELETE FROM representative_interval_source;
+
+statement ok
+INSERT INTO representative_interval_source VALUES(7,1,INTERVAL '1 month'),(8,1,INTERVAL '1 month');
+
+statement ok
+INSERT INTO representative_variant_source VALUES(99,1,1::TINYINT::VARIANT);
+
+statement ok
+UPDATE representative_variant_source SET v=2::SMALLINT::VARIANT WHERE id=99;
+
+statement ok
+DELETE FROM representative_variant_source;
+
+statement ok
+INSERT INTO representative_variant_source VALUES(7,1,1::TINYINT::VARIANT),(8,1,1::TINYINT::VARIANT);
+
+statement ok
+INSERT INTO representative_nested_source VALUES(99,1,['-0.0'::DOUBLE]);
+
+statement ok
+UPDATE representative_nested_source SET v=[1::DOUBLE] WHERE id=99;
+
+statement ok
+DELETE FROM representative_nested_source;
+
+statement ok
+INSERT INTO representative_nested_source VALUES(7,1,['-0.0'::DOUBLE]),(8,1,['-0.0'::DOUBLE]);
+
+foreach variant collated_scalar collated_group interval_scalar interval_group variant_scalar variant_group nested_scalar nested_group
+
+statement ok
+PRAGMA refresh('representative_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM representative_{variant} EXCEPT ALL SELECT * FROM representative_{variant}_expected) UNION ALL(SELECT * FROM representative_{variant}_expected EXCEPT ALL SELECT * FROM representative_{variant}));
+----
+0
+
+endloop
+
+# Multiple floating sign witnesses must choose a supported tuple jointly.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type FLOAT DOUBLE
+
+statement ok
+CREATE TABLE correlated_{type}_source(id INT,g INT,x {type},y {type});
+
+statement ok
+INSERT INTO correlated_{type}_source VALUES(1,1,'-0.0'::{type},'-0.0'::{type}),(2,1,'-0.0'::{type},0),(3,1,0,'-0.0'::{type});
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_scalar AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW correlated_{type}_scalar_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_group AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+CREATE VIEW correlated_{type}_group_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_limited_scalar AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW correlated_{type}_limited_scalar_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW correlated_{type}_limited_group AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+CREATE VIEW correlated_{type}_limited_group_expected AS WITH d AS(SELECT DISTINCT g,x,y FROM correlated_{type}_source ORDER BY g,x,y LIMIT 100),p AS(SELECT g,CASE WHEN signbit(x) AND signbit(y) THEN 1 ELSE 0 END n FROM d) SELECT g,SUM(n)+1 a FROM p GROUP BY g;
+
+statement ok
+INSERT INTO correlated_{type}_source VALUES(99,1,'-0.0'::{type},'-0.0'::{type});
+
+statement ok
+UPDATE correlated_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM correlated_{type}_source WHERE id IN(1,99);
+
+foreach variant scalar group limited_scalar limited_group
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='correlated_{type}_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('correlated_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM correlated_{type}_{variant} EXCEPT ALL SELECT * FROM correlated_{type}_{variant}_expected) UNION ALL(SELECT * FROM correlated_{type}_{variant}_expected EXCEPT ALL SELECT * FROM correlated_{type}_{variant}));
+----
+0
+
+endloop
+
+# Empty and refill before one refresh, restoring the all-negative representative.
+statement ok
+INSERT INTO correlated_{type}_source VALUES(99,1,0,0);
+
+statement ok
+UPDATE correlated_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM correlated_{type}_source;
+
+statement ok
+INSERT INTO correlated_{type}_source VALUES(4,1,'-0.0'::{type},'-0.0'::{type}),(5,1,'-0.0'::{type},'-0.0'::{type});
+
+foreach variant scalar group limited_scalar limited_group
+
+statement ok
+PRAGMA refresh('correlated_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM correlated_{type}_{variant} EXCEPT ALL SELECT * FROM correlated_{type}_{variant}_expected) UNION ALL(SELECT * FROM correlated_{type}_{variant}_expected EXCEPT ALL SELECT * FROM correlated_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# A parallel source DISTINCT and its candidate-bag DISTINCT can pick different
+# collated representatives. The aggregate must use its persisted input selection.
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TABLE selected_parallel_source(id INT,k INT,v VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO selected_parallel_source SELECT r,r%128,CASE WHEN r%256<128 THEN 'A' ELSE 'a' END FROM range(300000)t(r);
+
+statement ok
+CREATE MATERIALIZED VIEW selected_parallel_limit AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW selected_parallel_limit_expected AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW selected_parallel_percent AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW selected_parallel_percent_expected AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW selected_parallel_nested AS WITH d AS(SELECT DISTINCT k,v FROM(SELECT k,v FROM selected_parallel_source ORDER BY id LIMIT 300000)d ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW selected_parallel_nested_expected AS WITH d AS(SELECT DISTINCT k,v FROM(SELECT k,v FROM selected_parallel_source ORDER BY id LIMIT 300000)d ORDER BY k,v LIMIT 1000000),p AS(SELECT k,ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+INSERT INTO selected_parallel_source VALUES(999999,0,'A');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source WHERE ascii(v)=65 OR id=999999;
+
+foreach variant limit percent nested
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='selected_parallel_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('selected_parallel_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selected_parallel_{variant} EXCEPT ALL SELECT * FROM selected_parallel_{variant}_expected) UNION ALL(SELECT * FROM selected_parallel_{variant}_expected EXCEPT ALL SELECT * FROM selected_parallel_{variant}));
+----
+0
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET threads=4;
+
+# Rebuild both the persisted input and the aggregate, then resume incrementally.
+statement ok
+INSERT INTO selected_parallel_source VALUES(999999,0,'a');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source;
+
+statement ok
+INSERT INTO selected_parallel_source SELECT r,r,'A' FROM range(128)t(r);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant limit percent nested
+
+statement ok
+PRAGMA refresh('selected_parallel_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selected_parallel_{variant} EXCEPT ALL SELECT * FROM selected_parallel_{variant}_expected) UNION ALL(SELECT * FROM selected_parallel_{variant}_expected EXCEPT ALL SELECT * FROM selected_parallel_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO selected_parallel_source VALUES(999999,0,'A');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source;
+
+statement ok
+INSERT INTO selected_parallel_source SELECT r,r,'a' FROM range(128)t(r);
+
+foreach variant limit percent nested
+
+statement ok
+PRAGMA refresh('selected_parallel_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selected_parallel_{variant} EXCEPT ALL SELECT * FROM selected_parallel_{variant}_expected) UNION ALL(SELECT * FROM selected_parallel_{variant}_expected EXCEPT ALL SELECT * FROM selected_parallel_{variant}));
+----
+0
+
+endloop
+
+# DROP includes the persisted selection, alongside the candidate count state.
+statement ok
+CREATE TABLE dropped_selection_tables AS SELECT 'openivm_distinct_count_' || view_name || '_selected' table_name FROM openivm_views WHERE view_sql_name LIKE 'selected_parallel_%';
+
+foreach variant limit percent nested
+
+statement ok
+DROP MATERIALIZED VIEW selected_parallel_{variant};
+
+endloop
+
+query I
+SELECT count(*) FROM duckdb_tables()t JOIN dropped_selection_tables d USING(table_name);
+----
+0
+
+# Replacement can change both the candidate schema and aggregate-input width.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE MATERIALIZED VIEW selection_replacement AS WITH d AS(SELECT DISTINCT v FROM selected_parallel_source ORDER BY v LIMIT 1),p AS(SELECT ascii(v) n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW selection_replacement AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW selection_replacement_expected AS WITH d AS(SELECT DISTINCT k,v FROM selected_parallel_source ORDER BY k,v LIMIT 100 PERCENT),p AS(SELECT k,ascii(v) n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+INSERT INTO selected_parallel_source VALUES(1000,0,'A'),(999999,0,'a');
+
+statement ok
+UPDATE selected_parallel_source SET v='z' WHERE id=999999;
+
+statement ok
+DELETE FROM selected_parallel_source WHERE id IN(0,999999);
+
+statement ok
+PRAGMA refresh('selection_replacement');
+
+query I
+SELECT count(*) FROM((SELECT * FROM selection_replacement EXCEPT ALL SELECT * FROM selection_replacement_expected) UNION ALL(SELECT * FROM selection_replacement_expected EXCEPT ALL SELECT * FROM selection_replacement));
+----
+0
+
+# Unary input resolution also ignores order-only wrappers without a limit.
+statement ok
+CREATE TABLE ordered_unary_source(id INT,v INT);
+
+statement ok
+INSERT INTO ordered_unary_source VALUES(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW ordered_unary_distinct AS WITH d AS(SELECT DISTINCT n FROM(SELECT v+1 n FROM ordered_unary_source ORDER BY v)s) SELECT SUM(n)+1 a FROM d;
+
+statement ok
+CREATE VIEW ordered_unary_expected AS WITH d AS(SELECT DISTINCT n FROM(SELECT v+1 n FROM ordered_unary_source ORDER BY v)s) SELECT SUM(n)+1 a FROM d;
+
+statement ok
+INSERT INTO ordered_unary_source VALUES(99,10),(3,30);
+
+statement ok
+UPDATE ordered_unary_source SET v=40 WHERE id=99;
+
+statement ok
+DELETE FROM ordered_unary_source WHERE id IN(1,99);
+
+statement ok
+PRAGMA refresh('ordered_unary_distinct');
+
+query I
+SELECT count(*) FROM((SELECT * FROM ordered_unary_distinct EXCEPT ALL SELECT * FROM ordered_unary_expected) UNION ALL(SELECT * FROM ordered_unary_expected EXCEPT ALL SELECT * FROM ordered_unary_distinct));
+----
+0
+
+# Group lineage follows bound output positions after sanitizing/deduplicating names.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE group_alias_source(id INT,k INT,v INT);
+
+statement ok
+INSERT INTO group_alias_source VALUES(1,1,10),(2,1,10),(3,2,20),(4,NULL,NULL),(5,3,5);
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_space AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_space_expected AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_dash AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_dash_expected AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_duplicate AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_duplicate_expected AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_case AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_case_expected AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_suffix AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_suffix_expected AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_sanitized AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_sanitized_expected AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_quote AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_quote_expected AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_plain_repeated AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_plain_repeated_expected AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_space AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_space_expected AS SELECT k AS "key space",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_dash AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_dash_expected AS SELECT k AS "key-dash",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_duplicate AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_duplicate_expected AS SELECT SUM(v)+1 a,k AS a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_case AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_case_expected AS SELECT SUM(v)+1 a,k AS "A" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_suffix AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_suffix_expected AS SELECT SUM(v)+1 a,k AS "A",k AS a_1 FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_sanitized AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_sanitized_expected AS SELECT SUM(v)+1 AS "key-space",k AS "key space" FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_quote AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_quote_expected AS SELECT k AS "key""quote",SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW group_alias_limited_repeated AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+statement ok
+CREATE VIEW group_alias_limited_repeated_expected AS SELECT k AS a,k AS a,SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM group_alias_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d GROUP BY k;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='group_alias_{mode}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,1,10),(6,1,30),(7,NULL,40);
+
+statement ok
+UPDATE group_alias_source SET k=2,v=100 WHERE id=99;
+
+statement ok
+UPDATE group_alias_source SET k=NULL,v=50 WHERE id=3;
+
+statement ok
+DELETE FROM group_alias_source WHERE id IN(1,99);
+
+statement ok
+UPDATE group_alias_source SET v=NULL WHERE id=5;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,NULL,0);
+
+statement ok
+UPDATE group_alias_source SET k=4,v=99 WHERE id=99;
+
+statement ok
+DELETE FROM group_alias_source;
+
+statement ok
+INSERT INTO group_alias_source VALUES(8,2,5),(9,NULL,NULL),(10,2,5);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,1,0);
+
+statement ok
+UPDATE group_alias_source SET k=4,v=99 WHERE id=99;
+
+statement ok
+DELETE FROM group_alias_source;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+INSERT INTO group_alias_source VALUES(99,NULL,0),(11,NULL,1);
+
+statement ok
+UPDATE group_alias_source SET k=4,v=99 WHERE id=99;
+
+statement ok
+DELETE FROM group_alias_source WHERE id=99;
+
+foreach mode plain limited
+
+foreach variant space dash duplicate case suffix sanitized quote repeated
+
+statement ok
+PRAGMA refresh('group_alias_{mode}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM group_alias_{mode}_{variant} EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}_expected) UNION ALL(SELECT * FROM group_alias_{mode}_{variant}_expected EXCEPT ALL SELECT * FROM group_alias_{mode}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# A single floating DISTINCT column uses sign counters. CREATE and full refresh
+# must seed the aggregate from that same aux representative, even when parallel
+# GROUP BY executions could independently pick different zero signs.
+statement ok
+SET threads=4;
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type float double
+
+statement ok
+CREATE TABLE seed_{type}_source(id INT,k INT,x {type});
+
+statement ok
+INSERT INTO seed_{type}_source SELECT r,r%128,CASE WHEN (r//128)%7=0 THEN '-0.0'::{type} ELSE 0 END FROM range(300000)t(r);
+
+statement ok
+CREATE MATERIALIZED VIEW seed_{type}_scalar AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW seed_{type}_scalar_expected AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW seed_{type}_group AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+statement ok
+CREATE VIEW seed_{type}_group_expected AS WITH d AS(SELECT DISTINCT k,x FROM seed_{type}_source),p AS(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d) SELECT k,SUM(n)+1 a FROM p GROUP BY k;
+
+# Direct SUM retains a hidden count_star output in the lowered DISTINCT block.
+statement ok
+CREATE MATERIALIZED VIEW seed_{type}_direct AS SELECT k,SUM(x)+1 a FROM(SELECT DISTINCT k,x FROM seed_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW seed_{type}_direct_expected AS SELECT k,SUM(x)+1 a FROM(SELECT DISTINCT k,x FROM seed_{type}_source)d GROUP BY k;
+
+statement ok
+SET VARIABLE seed_scalar_aux=(SELECT 'openivm_distinct_count_'||view_name FROM openivm_views WHERE view_sql_name='seed_{type}_scalar');
+
+statement ok
+CREATE VIEW seed_{type}_scalar_chosen AS WITH p AS MATERIALIZED(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM seed_{type}_source),d AS(SELECT DISTINCT p.k,p.n FROM p JOIN query_table(getvariable('seed_scalar_aux')) a ON p.k IS NOT DISTINCT FROM a.k AND p.n=CASE WHEN signbit(a.x) THEN 1 ELSE 0 END WHERE a._count>0) SELECT SUM(n)+1 a FROM d;
+
+statement ok
+SET VARIABLE seed_group_aux=(SELECT 'openivm_distinct_count_'||view_name FROM openivm_views WHERE view_sql_name='seed_{type}_group');
+
+statement ok
+CREATE VIEW seed_{type}_group_chosen AS WITH p AS MATERIALIZED(SELECT k,CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM seed_{type}_source),d AS(SELECT DISTINCT p.k,p.n FROM p JOIN query_table(getvariable('seed_group_aux')) a ON p.k IS NOT DISTINCT FROM a.k AND p.n=CASE WHEN signbit(a.x) THEN 1 ELSE 0 END WHERE a._count>0) SELECT k,SUM(n)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW seed_{type}_direct_chosen AS SELECT * FROM seed_{type}_direct_expected;
+
+# Mixed signs permit different native DISTINCT choices. Check the actual seed
+# invariant using the base query restricted to the supported aux choice.
+# After deletion below, also compare the original unrestricted base query.
+foreach variant scalar group
+
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_chosen) UNION ALL(SELECT * FROM seed_{type}_{variant}_chosen EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO seed_{type}_source VALUES(999999,0,'-0.0'::{type});
+
+statement ok
+UPDATE seed_{type}_source SET x=1 WHERE id=999999;
+
+statement ok
+DELETE FROM seed_{type}_source WHERE signbit(x) OR id=999999;
+
+foreach variant scalar group direct
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='seed_{type}_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('seed_{type}_{variant}');
+
+# All surviving zeros are positive: native query equality is now unambiguous.
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_expected) UNION ALL(SELECT * FROM seed_{type}_{variant}_expected EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO seed_{type}_source SELECT r+1000000,r%128,CASE WHEN (r//128)%7=0 THEN '-0.0'::{type} ELSE 0 END FROM range(300000)t(r);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach variant scalar group direct
+
+statement ok
+PRAGMA refresh('seed_{type}_{variant}');
+
+# EXCEPT ALL compares the base DISTINCT query with its supported aux choice
+# while both zero signs coexist; the direct sum is independent of that choice.
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_chosen) UNION ALL(SELECT * FROM seed_{type}_{variant}_chosen EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+INSERT INTO seed_{type}_source VALUES(999999,0,'-0.0'::{type});
+
+statement ok
+UPDATE seed_{type}_source SET x=1 WHERE id=999999;
+
+statement ok
+DELETE FROM seed_{type}_source WHERE signbit(x) OR id=999999;
+
+foreach variant scalar group direct
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='seed_{type}_{variant}';
+----
+8
+
+statement ok
+PRAGMA refresh('seed_{type}_{variant}');
+
+# All surviving zeros are positive: native query equality is now unambiguous.
+query I
+SELECT count(*) FROM((SELECT * FROM seed_{type}_{variant} EXCEPT ALL SELECT * FROM seed_{type}_{variant}_expected) UNION ALL(SELECT * FROM seed_{type}_{variant}_expected EXCEPT ALL SELECT * FROM seed_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET threads=1;
+
+# Filters between DISTINCT and a scalar aggregate must apply to emitted tuple
+# transitions. Repeated DISTINCT expressions also retain separate output slots
+# when the SQL parser deduplicates their GROUP BY expressions.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+CREATE TABLE distinct_input_{type}_source(id INT,k INT,v {type});
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(1,1,10),(2,1,20),(3,1,20),(4,2,5),(5,NULL,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_inline AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source)d WHERE v>10;
+
+statement ok
+CREATE VIEW distinct_input_{type}_inline_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source)d WHERE v>10;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_projected AS WITH d AS(SELECT DISTINCT k,v FROM distinct_input_{type}_source),p AS(SELECT k,v*2 n FROM d),q AS(SELECT n FROM p WHERE n>20 AND k IS NOT NULL) SELECT SUM(n)+1 a FROM q;
+
+statement ok
+CREATE VIEW distinct_input_{type}_projected_expected AS WITH d AS(SELECT DISTINCT k,v FROM distinct_input_{type}_source),p AS(SELECT k,v*2 n FROM d),q AS(SELECT n FROM p WHERE n>20 AND k IS NOT NULL) SELECT SUM(n)+1 a FROM q;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_limited AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d WHERE v>10;
+
+statement ok
+CREATE VIEW distinct_input_{type}_limited_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k,v FROM distinct_input_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3)d WHERE v>10;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_duplicate_key AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x FROM distinct_input_{type}_source)d GROUP BY a;
+
+statement ok
+CREATE VIEW distinct_input_{type}_duplicate_key_expected AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x FROM distinct_input_{type}_source)d GROUP BY a;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_duplicate_value AS SELECT k,SUM(x)+1 z FROM(SELECT DISTINCT k,v AS x,v AS y FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_input_{type}_duplicate_value_expected AS SELECT k,SUM(x)+1 z FROM(SELECT DISTINCT k,v AS x,v AS y FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_duplicate_scalar AS SELECT SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x,v AS y FROM distinct_input_{type}_source)d;
+
+statement ok
+CREATE VIEW distinct_input_{type}_duplicate_scalar_expected AS SELECT SUM(x)+1 z FROM(SELECT DISTINCT k AS a,k AS b,v AS x,v AS y FROM distinct_input_{type}_source)d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_unnamed_key AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,k,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_input_{type}_unnamed_key_expected AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,k,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_unnamed_value AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,v,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_input_{type}_unnamed_value_expected AS SELECT k,SUM(v)+1 z FROM(SELECT DISTINCT k,v,v FROM distinct_input_{type}_source)d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_{type}_expression_key AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k+1 a,k+1 b,v x,1 c FROM distinct_input_{type}_source)d GROUP BY a;
+
+statement ok
+CREATE VIEW distinct_input_{type}_expression_key_expected AS SELECT a,SUM(x)+1 z FROM(SELECT DISTINCT k+1 a,k+1 b,v x,1 c FROM distinct_input_{type}_source)d GROUP BY a;
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_input_{type}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,1,2),(6,1,5),(7,1,30);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=9 WHERE id=99;
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=8 WHERE id=2;
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# All ordinary post-filter inputs disappear while DISTINCT support remains.
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,1,30);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=5 WHERE id IN(3,7,99);
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# Empty and refill before one refresh, then exercise persisted filter metadata.
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,1,5);
+
+statement ok
+UPDATE distinct_input_{type}_source SET k=NULL,v=100 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_input_{type}_source;
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(8,2,40),(9,2,40),(10,NULL,50),(11,NULL,NULL);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,2,40),(12,3,5);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=60 WHERE id IN(8,99);
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id IN(9,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_input_{type}_source VALUES(99,2,0),(13,3,30);
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=70 WHERE id=99;
+
+statement ok
+UPDATE distinct_input_{type}_source SET v=5 WHERE id=8;
+
+statement ok
+DELETE FROM distinct_input_{type}_source WHERE id IN(10,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant inline projected limited duplicate_key duplicate_value duplicate_scalar unnamed_key unnamed_value expression_key
+
+statement ok
+PRAGMA refresh('distinct_input_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_input_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_input_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_input_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# Post-DISTINCT predicates must observe the old and new representatives, not
+# merely filter the source support. Cover sign-counter and joint-candidate paths.
+foreach type FLOAT DOUBLE
+
+statement ok
+CREATE TABLE filtered_sign_{type}_source(id INT,x {type},y {type});
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(1,'-0.0'::{type},'-0.0'::{type}),(2,'-0.0'::{type},'-0.0'::{type});
+
+statement ok
+CREATE MATERIALIZED VIEW filtered_sign_{type}_counter AS WITH d AS(SELECT DISTINCT x FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(x)) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW filtered_sign_{type}_counter_expected AS WITH d AS(SELECT DISTINCT x FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(x)) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE MATERIALIZED VIEW filtered_sign_{type}_joint AS WITH d AS(SELECT DISTINCT x,y FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(y)) SELECT SUM(n)+1 a FROM p;
+
+statement ok
+CREATE VIEW filtered_sign_{type}_joint_expected AS WITH d AS(SELECT DISTINCT x,y FROM filtered_sign_{type}_source),p AS(SELECT CASE WHEN signbit(x) THEN 1 ELSE 0 END n FROM d WHERE signbit(y)) SELECT SUM(n)+1 a FROM p;
+
+foreach variant counter joint
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='filtered_sign_{type}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM filtered_sign_{type}_{variant} EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}_expected) UNION ALL(SELECT * FROM filtered_sign_{type}_{variant}_expected EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(99,0,0);
+
+statement ok
+UPDATE filtered_sign_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM filtered_sign_{type}_source WHERE signbit(x) OR id=99;
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(3,0,0),(4,0,0);
+
+foreach variant counter joint
+
+statement ok
+PRAGMA refresh('filtered_sign_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM filtered_sign_{type}_{variant} EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}_expected) UNION ALL(SELECT * FROM filtered_sign_{type}_{variant}_expected EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}));
+----
+0
+
+endloop
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(99,0,0);
+
+statement ok
+UPDATE filtered_sign_{type}_source SET x=1,y=1 WHERE id=99;
+
+statement ok
+DELETE FROM filtered_sign_{type}_source;
+
+statement ok
+INSERT INTO filtered_sign_{type}_source VALUES(5,'-0.0'::{type},'-0.0'::{type});
+
+foreach variant counter joint
+
+statement ok
+PRAGMA refresh('filtered_sign_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM filtered_sign_{type}_{variant} EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}_expected) UNION ALL(SELECT * FROM filtered_sign_{type}_{variant}_expected EXCEPT ALL SELECT * FROM filtered_sign_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+
+# User DISTINCT columns may use the compiler's preferred count and weight names.
+# Allocate internal names consistently across CREATE, refresh, and state checks.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+CREATE TABLE distinct_names_{type}_source(id INT,k INT,v {type});
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(1,1,10),(2,2,20),(3,2,20),(4,NULL,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dd_scalar AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dd_scalar_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dd_group AS SELECT dd g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d GROUP BY dd;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dd_group_expected AS SELECT dd g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source)d GROUP BY dd;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dmult_scalar AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d WHERE dmult>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dmult_scalar_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d WHERE dmult>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_dmult_group AS SELECT dmult g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d GROUP BY dmult;
+
+statement ok
+CREATE VIEW distinct_names_{type}_dmult_group_expected AS SELECT dmult g,SUM(v)+1 a FROM(SELECT DISTINCT k AS dmult,v FROM distinct_names_{type}_source)d GROUP BY dmult;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}__count_scalar AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d WHERE _count>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}__count_scalar_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d WHERE _count>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}__count_group AS SELECT _count g,SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d GROUP BY _count;
+
+statement ok
+CREATE VIEW distinct_names_{type}__count_group_expected AS SELECT _count g,SUM(v)+1 a FROM(SELECT DISTINCT k AS _count,v FROM distinct_names_{type}_source)d GROUP BY _count;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_suffixes AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k+10 AS "DD_",k AS dmult,k+20 AS "DMULT_",k AS _count,k+30 AS "_COUNT_",k AS openivm_aux_sign_count_8,k+40 AS "OPENIVM_AUX_SIGN_COUNT_8_",v AS x FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_suffixes_expected AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k+10 AS "DD_",k AS dmult,k+20 AS "DMULT_",k AS _count,k+30 AS "_COUNT_",k AS openivm_aux_sign_count_8,k+40 AS "OPENIVM_AUX_SIGN_COUNT_8_",v AS x FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_sum_names AS SELECT SUM(dd)+1 a FROM(SELECT DISTINCT k,v AS dd,v AS dmult,v AS _count FROM distinct_names_{type}_source)d;
+
+statement ok
+CREATE VIEW distinct_names_{type}_sum_names_expected AS SELECT SUM(dd)+1 a FROM(SELECT DISTINCT k,v AS dd,v AS dmult,v AS _count FROM distinct_names_{type}_source)d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_limited AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source ORDER BY dd NULLS LAST,v NULLS LAST LIMIT 3)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_limited_expected AS SELECT SUM(v)+1 a FROM(SELECT DISTINCT k AS dd,v FROM distinct_names_{type}_source ORDER BY dd NULLS LAST,v NULLS LAST LIMIT 3)d WHERE dd>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_names_{type}_joint AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k AS dmult,k AS _count,k AS openivm_selected,k+10 AS "OPENIVM_SELECTED_",k AS openivm_chosen,k+20 AS "OPENIVM_CHOSEN_",k AS openivm_selected_identity_0,k+30 AS "OPENIVM_SELECTED_IDENTITY_0_",k AS extra_key,k AS openivm_tuple_identity_12,k+40 AS "OPENIVM_TUPLE_IDENTITY_12_",v AS x,v AS y FROM distinct_names_{type}_source)d WHERE dd>1;
+
+statement ok
+CREATE VIEW distinct_names_{type}_joint_expected AS SELECT SUM(x)+1 a FROM(SELECT DISTINCT k AS dd,k AS dmult,k AS _count,k AS openivm_selected,k+10 AS "OPENIVM_SELECTED_",k AS openivm_chosen,k+20 AS "OPENIVM_CHOSEN_",k AS openivm_selected_identity_0,k+30 AS "OPENIVM_SELECTED_IDENTITY_0_",k AS extra_key,k AS openivm_tuple_identity_12,k+40 AS "OPENIVM_TUPLE_IDENTITY_12_",v AS x,v AS y FROM distinct_names_{type}_source)d WHERE dd>1;
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_names_{type}_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,20),(5,2,30),(6,3,40),(7,1,5);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=50 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id IN(1,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,20);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=50 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_names_{type}_source;
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(8,NULL,NULL);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,0),(9,2,50),(10,2,50),(11,NULL,60),(12,4,0);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=50 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,50),(13,3,30);
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=4,v=70 WHERE id IN(9,99);
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id IN(10,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+foreach type INTEGER FLOAT DOUBLE
+
+statement ok
+INSERT INTO distinct_names_{type}_source VALUES(99,2,70),(14,3,40);
+
+statement ok
+UPDATE distinct_names_{type}_source SET v=100 WHERE id=99;
+
+statement ok
+UPDATE distinct_names_{type}_source SET k=2,v=10 WHERE id=9;
+
+statement ok
+DELETE FROM distinct_names_{type}_source WHERE id IN(11,99);
+
+endloop
+
+foreach type INTEGER FLOAT DOUBLE
+
+foreach variant dd_scalar dd_group dmult_scalar dmult_group _count_scalar _count_group suffixes sum_names limited joint
+
+statement ok
+PRAGMA refresh('distinct_names_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_names_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_names_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_names_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# Non-unary CTE bodies share the maintained candidate/selection path. They must
+# bind physical sources, retain repeated scans, and maintain the parent aggregate.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER DOUBLE
+
+statement ok
+CREATE TABLE distinct_cte_{type}_source(id INT,k INT,v {type});
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(1,1,10),(2,2,20),(3,2,20),(4,NULL,NULL),(5,NULL,40);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_self_join_cte AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_cte_expected AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_self_join_scalar AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_scalar_expected AS WITH b AS(SELECT a.k,b.v FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_union_cte AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_cte_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_union_scalar AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_scalar_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_cross_values AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_cross_values_scalar AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_scalar_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_materialized_reuse AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_reuse_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_materialized_group AS WITH b AS MATERIALIZED(SELECT v,k FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a,k AS "key space" FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_group_expected AS WITH b AS MATERIALIZED(SELECT v,k FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a,k AS "key space" FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_union_expressions AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source WHERE id%2=0 UNION ALL SELECT k+1,v*2 FROM distinct_cte_{type}_source WHERE v>10),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_expressions_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source WHERE id%2=0 UNION ALL SELECT k+1,v*2 FROM distinct_cte_{type}_source WHERE v>10),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_cross_expressions AS WITH b AS(SELECT k,v*t.a v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_expressions_expected AS WITH b AS(SELECT k,v*t.a v FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT k,v FROM b) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_post_filter AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b),p AS(SELECT k,v*2 n FROM d WHERE v>10) SELECT SUM(n)+1 a FROM p WHERE k IS NOT NULL;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_post_filter_expected AS WITH b AS(SELECT k,v FROM distinct_cte_{type}_source UNION ALL SELECT k,v FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT k,v FROM b),p AS(SELECT k,v*2 n FROM d WHERE v>10) SELECT SUM(n)+1 a FROM p WHERE k IS NOT NULL;
+
+# Reused aggregate definitions precede the parent in plan traversal.
+# Bind the aggregate that consumes DISTINCT, including scalar and grouped parents.
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_aggregate_reuse_scalar AS WITH b AS MATERIALIZED(SELECT k,SUM(v) v FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_reuse_scalar_expected AS WITH b AS MATERIALIZED(SELECT k,SUM(v) v FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_aggregate_reuse_group AS WITH b AS MATERIALIZED(SELECT k,SUM(v) v FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a,k AS "key space" FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_reuse_group_expected AS WITH b AS MATERIALIZED(SELECT k,SUM(v) v FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a,k AS "key space" FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_aggregate_counts AS WITH b AS MATERIALIZED(SELECT k,COUNT(*) cnt,SUM(v) subtotal FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT a.k,b.subtotal v FROM b a JOIN b b ON a.k=b.k WHERE a.cnt>1),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_counts_expected AS WITH b AS MATERIALIZED(SELECT k,COUNT(*) cnt,SUM(v) subtotal FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT a.k,b.subtotal v FROM b a JOIN b b ON a.k=b.k WHERE a.cnt>1),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_aggregate_union AS WITH b AS MATERIALIZED(SELECT k,SUM(v) subtotal FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT k,subtotal v FROM b UNION ALL SELECT k+1,subtotal*2 FROM b),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_union_expected AS WITH b AS MATERIALIZED(SELECT k,SUM(v) subtotal FROM distinct_cte_{type}_source GROUP BY k),j AS(SELECT k,subtotal v FROM b UNION ALL SELECT k+1,subtotal*2 FROM b),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k;
+
+# Producer and consumer DISTINCTs may have different widths. Bind the direct
+# consumer through its input path; joins/unions retain the complete input bag.
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_producer_union_scalar AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_scalar_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT v FROM j) SELECT SUM(v)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_producer_union_projected AS WITH b AS MATERIALIZED(SELECT v FROM distinct_cte_{type}_source UNION SELECT v FROM distinct_cte_{type}_source),j AS(SELECT a.v x,b.v y FROM b a CROSS JOIN b b),d AS(SELECT DISTINCT x,y FROM j) SELECT SUM(x)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_projected_expected AS WITH b AS MATERIALIZED(SELECT v FROM distinct_cte_{type}_source UNION SELECT v FROM distinct_cte_{type}_source),j AS(SELECT a.v x,b.v y FROM b a CROSS JOIN b b),d AS(SELECT DISTINCT x,y FROM j) SELECT SUM(x)+1 a FROM d;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_joined_distinct AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v+b.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_distinct_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v+b.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_consumer_union AS WITH d AS MATERIALIZED(SELECT DISTINCT v FROM distinct_cte_{type}_source),j AS(SELECT 1 k,v FROM d UNION SELECT 2 k,v FROM d) SELECT SUM(v)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_consumer_union_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT v FROM distinct_cte_{type}_source),j AS(SELECT 1 k,v FROM d UNION SELECT 2 k,v FROM d) SELECT SUM(v)+1 a FROM j;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_joined_column AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_column_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.v n FROM d a JOIN d b ON a.k=b.k) SELECT SUM(n)+1 a FROM j;
+
+# HAVING reuses canonical raw state aliases; hidden grouping keys must survive
+# materialized CTE wrappers, including computed keys and publication limits.
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_direct AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_direct_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_limited AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_limited_expected AS SELECT k,SUM(v)+1 a FROM (SELECT DISTINCT k,v FROM distinct_cte_{type}_source ORDER BY k NULLS LAST,v NULLS LAST LIMIT 3) d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_cte AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_cte_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING SUM(v)>15;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_having_count AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING COUNT(*)>1;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_count_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT k,SUM(v)+1 a FROM d GROUP BY k HAVING COUNT(*)>1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_union_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_union_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source UNION SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_expr_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k%2 ORDER BY k%2 NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_expr_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k%2 ORDER BY k%2 NULLS LAST;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cte_{type}_hidden_topk_group AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST LIMIT 1;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_topk_group_expected AS WITH b AS MATERIALIZED(SELECT k,v FROM distinct_cte_{type}_source),j AS(SELECT a.k,b.v FROM b a JOIN b b ON a.k=b.k),d AS(SELECT DISTINCT k,v FROM j) SELECT SUM(v)+1 a FROM d GROUP BY k ORDER BY k NULLS LAST LIMIT 1;
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+# Joins above the only explicit DISTINCT retain their existing group-recompute path.
+query I
+SELECT CASE WHEN type=CASE WHEN '{variant}' IN('joined_distinct','joined_column') THEN 6 ELSE 8 END THEN 1 ELSE 0 END FROM openivm_views WHERE view_sql_name='distinct_cte_{type}_{variant}';
+----
+1
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20),(6,2,30),(7,3,40);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=3,v=50 WHERE id=99;
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=3,v=25 WHERE id=2;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id IN(1,99);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET v=100 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source;
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20),(8,2,50),(9,2,50),(10,NULL,60),(11,4,0);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=4,v=70 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id=99;
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+restart
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+SET openivm_distinct_aux_state=true;
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,50),(12,3,30);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET k=4,v=80 WHERE id IN(8,99);
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id IN(9,99);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+DROP VIEW distinct_cte_{type}_{variant}_expected;
+
+endloop
+
+statement ok
+ALTER TABLE distinct_cte_{type}_source RENAME COLUMN k TO key_new;
+
+statement ok
+ALTER TABLE distinct_cte_{type}_source RENAME COLUMN v TO value_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_cte_expected AS WITH b AS(SELECT a.key_new,b.value_new FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_self_join_scalar_expected AS WITH b AS(SELECT a.key_new,b.value_new FROM distinct_cte_{type}_source a JOIN distinct_cte_{type}_source b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_cte_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION ALL SELECT key_new,value_new FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_scalar_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION ALL SELECT key_new,value_new FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_values_scalar_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_reuse_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_materialized_group_expected AS WITH b AS MATERIALIZED(SELECT value_new,key_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a,key_new AS "key space" FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_union_expressions_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source WHERE id%2=0 UNION ALL SELECT key_new+1,value_new*2 FROM distinct_cte_{type}_source WHERE value_new>10),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_cross_expressions_expected AS WITH b AS(SELECT key_new,value_new*t.a value_new FROM distinct_cte_{type}_source CROSS JOIN(VALUES(1),(2))t(a)),d AS(SELECT DISTINCT key_new,value_new FROM b) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_post_filter_expected AS WITH b AS(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION ALL SELECT key_new,value_new FROM distinct_cte_{type}_source),d AS(SELECT DISTINCT key_new,value_new FROM b),p AS(SELECT key_new,value_new*2 n FROM d WHERE value_new>10) SELECT SUM(n)+1 a FROM p WHERE key_new IS NOT NULL;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_reuse_scalar_expected AS WITH b AS MATERIALIZED(SELECT key_new,SUM(value_new) value_new FROM distinct_cte_{type}_source GROUP BY key_new),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_reuse_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,SUM(value_new) value_new FROM distinct_cte_{type}_source GROUP BY key_new),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a,key_new AS "key space" FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_counts_expected AS WITH b AS MATERIALIZED(SELECT key_new,COUNT(*) cnt,SUM(value_new) subtotal FROM distinct_cte_{type}_source GROUP BY key_new),j AS(SELECT a.key_new,b.subtotal value_new FROM b a JOIN b b ON a.key_new=b.key_new WHERE a.cnt>1),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_aggregate_union_expected AS WITH b AS MATERIALIZED(SELECT key_new,SUM(value_new) subtotal FROM distinct_cte_{type}_source GROUP BY key_new),j AS(SELECT key_new,subtotal value_new FROM b UNION ALL SELECT key_new+1,subtotal*2 FROM b),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_scalar_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT value_new FROM j) SELECT SUM(value_new)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_producer_union_projected_expected AS WITH b AS MATERIALIZED(SELECT value_new FROM distinct_cte_{type}_source UNION SELECT value_new FROM distinct_cte_{type}_source),j AS(SELECT a.value_new x,b.value_new y FROM b a CROSS JOIN b b),d AS(SELECT DISTINCT x,y FROM j) SELECT SUM(x)+1 a FROM d;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_distinct_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.value_new+b.value_new n FROM d a JOIN d b ON a.key_new=b.key_new) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_consumer_union_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT value_new FROM distinct_cte_{type}_source),j AS(SELECT 1 key_new,value_new FROM d UNION SELECT 2 key_new,value_new FROM d) SELECT SUM(value_new)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_joined_column_expected AS WITH d AS MATERIALIZED(SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.value_new n FROM d a JOIN d b ON a.key_new=b.key_new) SELECT SUM(n)+1 a FROM j;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_direct_expected AS SELECT key_new,SUM(value_new)+1 a FROM (SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source) d GROUP BY key_new HAVING SUM(value_new)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_limited_expected AS SELECT key_new,SUM(value_new)+1 a FROM (SELECT DISTINCT key_new,value_new FROM distinct_cte_{type}_source ORDER BY key_new NULLS LAST,value_new NULLS LAST LIMIT 3) d GROUP BY key_new HAVING SUM(value_new)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_cte_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new HAVING SUM(value_new)>15;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_having_count_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT key_new,SUM(value_new)+1 a FROM d GROUP BY key_new HAVING COUNT(*)>1;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new ORDER BY key_new NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_union_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source UNION SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new ORDER BY key_new NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_expr_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new%2 ORDER BY key_new%2 NULLS LAST;
+
+statement ok
+CREATE VIEW distinct_cte_{type}_hidden_topk_group_expected AS WITH b AS MATERIALIZED(SELECT key_new,value_new FROM distinct_cte_{type}_source),j AS(SELECT a.key_new,b.value_new FROM b a JOIN b b ON a.key_new=b.key_new),d AS(SELECT DISTINCT key_new,value_new FROM j) SELECT SUM(value_new)+1 a FROM d GROUP BY key_new ORDER BY key_new NULLS LAST LIMIT 1;
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,4,80),(13,3,40);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET value_new=1 WHERE id=99;
+
+statement ok
+UPDATE distinct_cte_{type}_source SET key_new=2,value_new=20 WHERE id=8;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source WHERE id IN(10,99);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+foreach type INTEGER DOUBLE
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(99,2,20);
+
+statement ok
+UPDATE distinct_cte_{type}_source SET value_new=5 WHERE id=99;
+
+statement ok
+DELETE FROM distinct_cte_{type}_source;
+
+statement ok
+INSERT INTO distinct_cte_{type}_source VALUES(14,NULL,NULL),(15,2,30),(16,2,30);
+
+endloop
+
+foreach type INTEGER DOUBLE
+
+foreach variant self_join_cte self_join_scalar union_cte union_scalar cross_values cross_values_scalar materialized_reuse materialized_group union_expressions cross_expressions post_filter aggregate_reuse_scalar aggregate_reuse_group aggregate_counts aggregate_union producer_union_scalar producer_union_projected joined_distinct consumer_union joined_column having_direct having_limited having_cte having_count hidden_group hidden_union_group hidden_expr_group hidden_topk_group
+
+statement ok
+PRAGMA refresh('distinct_cte_{type}_{variant}');
+
+query I
+SELECT count(*) FROM((SELECT * FROM distinct_cte_{type}_{variant} EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}_expected) UNION ALL(SELECT * FROM distinct_cte_{type}_{variant}_expected EXCEPT ALL SELECT * FROM distinct_cte_{type}_{variant}));
+----
+0
+
+endloop
+
+endloop
+
+# Issue #155: preserve DISTINCT ON winner selection and repair only affected keys.
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE TABLE distinct_on_source(k INT,region VARCHAR,id INT,v INT);
+
+statement ok
+INSERT INTO distinct_on_source VALUES(1,'a',1,10),(1,'a',2,20),(1,'b',3,NULL),(1,'b',4,15),(2,'a',5,-3),(2,'a',6,7),(NULL,'a',7,4),(NULL,'a',8,9),(3,NULL,9,5),(3,NULL,10,NULL),(4,'d',11,6),(4,'d',11,6),(5,'x',12,8);
+
+statement ok
+CREATE TABLE distinct_on_tags(region VARCHAR,label VARCHAR);
+
+statement ok
+INSERT INTO distinct_on_tags VALUES('a','one'),('b','two'),('d','four'),('x','gone');
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_original AS
+SELECT DISTINCT ON(k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE VIEW distinct_on_original_expected AS
+SELECT DISTINCT ON(k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_ordered AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC NULLS LAST,id;
+
+statement ok
+CREATE VIEW distinct_on_ordered_expected AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC NULLS LAST,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_multi AS
+SELECT DISTINCT ON(k,region) k,region,id,v FROM distinct_on_source ORDER BY k NULLS FIRST,region NULLS LAST,v ASC NULLS FIRST,id DESC;
+
+statement ok
+CREATE VIEW distinct_on_multi_expected AS
+SELECT DISTINCT ON(k,region) k,region,id,v FROM distinct_on_source ORDER BY k NULLS FIRST,region NULLS LAST,v ASC NULLS FIRST,id DESC;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_hidden_key AS
+SELECT DISTINCT ON(k) v,id FROM distinct_on_source ORDER BY k,v DESC,id;
+
+statement ok
+CREATE VIEW distinct_on_hidden_key_expected AS
+SELECT DISTINCT ON(k) v,id FROM distinct_on_source ORDER BY k,v DESC,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_computed AS
+SELECT DISTINCT ON(k%2) k%2 bucket,v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE VIEW distinct_on_computed_expected AS
+SELECT DISTINCT ON(k%2) k%2 bucket,v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_limited AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY v DESC,k NULLS LAST,id LIMIT 2 OFFSET 1;
+
+statement ok
+CREATE VIEW distinct_on_limited_expected AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY v DESC,k NULLS LAST,id LIMIT 2 OFFSET 1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_cte AS
+WITH d AS (SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC,id) SELECT id,v,k FROM d WHERE v IS NOT NULL;
+
+statement ok
+CREATE VIEW distinct_on_cte_expected AS
+WITH d AS (SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC,id) SELECT id,v,k FROM d WHERE v IS NOT NULL;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_hidden_computed AS
+SELECT DISTINCT ON(k%2) v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE VIEW distinct_on_hidden_computed_expected AS
+SELECT DISTINCT ON(k%2) v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_postfilter AS
+SELECT k,id,v FROM (SELECT DISTINCT ON(k) k,id,v FROM distinct_on_source ORDER BY k,v DESC,id) d WHERE id%2=0;
+
+statement ok
+CREATE VIEW distinct_on_postfilter_expected AS
+SELECT k,id,v FROM (SELECT DISTINCT ON(k) k,id,v FROM distinct_on_source ORDER BY k,v DESC,id) d WHERE id%2=0;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_repeated_keys AS
+SELECT DISTINCT ON(k,k,k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE VIEW distinct_on_repeated_keys_expected AS
+SELECT DISTINCT ON(k,k,k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_join AS
+SELECT DISTINCT ON(a.k) a.k,a.id,a.v,b.label FROM distinct_on_source a JOIN distinct_on_tags b ON a.region=b.region ORDER BY a.k,a.v DESC,a.id,b.label;
+
+statement ok
+CREATE VIEW distinct_on_join_expected AS
+SELECT DISTINCT ON(a.k) a.k,a.id,a.v,b.label FROM distinct_on_source a JOIN distinct_on_tags b ON a.region=b.region ORDER BY a.k,a.v DESC,a.id,b.label;
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_sql_name LIKE 'distinct_on_%'
+  AND (type <> 6 OR group_recompute_affected_mode <> 'source_delta'
+       OR group_recompute_affected_query IS NULL);
+----
+0
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+# Confirm hidden/computed keys keep scoped incremental programs.
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+query I
+SELECT count(*) > 0 FROM openivm_compile_with_facts(
+  'distinct_on_{variant}', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data' AND refresh_type = 6 AND contains(sql, 'openivm_affected_');
+----
+true
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts(
+  'distinct_on_{variant}', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data' AND sql LIKE 'DELETE FROM%openivm_data_%' AND NOT contains(sql, 'WHERE');
+----
+0
+
+endloop
+
+# Winner deletion, key moves, transient candidates, and both join inputs changing
+# happen together before one refresh. The post-winner filter rejects the new key-2 winner.
+
+statement ok
+INSERT INTO distinct_on_source VALUES(1,'a',13,99),(2,'a',14,8),(6,'a',15,3),(7,'x',16,88),(2,'a',17,99);
+
+statement ok
+UPDATE distinct_on_source SET v=-9 WHERE id=13;
+
+statement ok
+UPDATE distinct_on_source SET k=8 WHERE id=5;
+
+statement ok
+UPDATE distinct_on_source SET v=5 WHERE id=10;
+
+statement ok
+DELETE FROM distinct_on_source WHERE id IN(2,6) OR k IN(5,7);
+
+statement ok
+INSERT INTO distinct_on_tags VALUES('b','aaa');
+
+statement ok
+DELETE FROM distinct_on_tags WHERE region='x';
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+# Full refresh keeps the same winners; subsequent incremental maintenance resumes.
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO distinct_on_source VALUES (1,'a',18,200),(NULL,'a',19,100),(9,'b',20,50);
+
+statement ok
+UPDATE distinct_on_source SET v=201 WHERE id=18;
+
+statement ok
+DELETE FROM distinct_on_source WHERE id=19;
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM distinct_on_source WHERE id IN (17,18);
+
+statement ok
+UPDATE distinct_on_source SET k=10,v=300 WHERE id=20;
+
+statement ok
+INSERT INTO distinct_on_source VALUES (1,'a',21,400),(NULL,'a',22,500);
+
+statement ok
+UPDATE distinct_on_source SET v=-400 WHERE id=21;
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_on_source;
+
+statement ok
+DELETE FROM distinct_on_tags;
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+# Renaming a source key must rewrite candidate discovery as well as the winner query.
+
+statement ok
+CREATE TABLE distinct_on_rename_source(k INT,id INT,v INT);
+
+statement ok
+INSERT INTO distinct_on_rename_source VALUES (1,1,10),(1,2,20),(2,3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_rename AS SELECT DISTINCT ON(k%2) id,v FROM distinct_on_rename_source ORDER BY k%2,v DESC,id;
+
+statement ok
+ALTER TABLE distinct_on_rename_source RENAME COLUMN k TO renamed_k;
+
+statement ok
+INSERT INTO distinct_on_rename_source VALUES (1,4,100),(NULL,5,200);
+
+statement ok
+UPDATE distinct_on_rename_source SET renamed_k=4 WHERE id=1;
+
+statement ok
+DELETE FROM distinct_on_rename_source WHERE id=2;
+
+statement ok
+PRAGMA refresh('distinct_on_rename');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_rename EXCEPT ALL
+   (SELECT DISTINCT ON(renamed_k%2) id,v FROM distinct_on_rename_source ORDER BY renamed_k%2,v DESC,id))
+  UNION ALL
+  ((SELECT DISTINCT ON(renamed_k%2) id,v FROM distinct_on_rename_source ORDER BY renamed_k%2,v DESC,id)
+   EXCEPT ALL SELECT * FROM distinct_on_rename)
+);
+----
+0
+
+# Aux-state DISTINCT over DOUBLE inputs: one joined pass derives both the old and the new zero
+# representative. Batched conflicting DML flips zero signs, mixes them, adds new tuples, updates
+# into -0.0 and churns NaN/NULL tuples before each refresh. Only unambiguous zero groups (all
+# -0.0 or all +0.0 rows) have a determined stored sign.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE dz(id INT, g INT, v DOUBLE, x INT);
+
+statement ok
+INSERT INTO dz VALUES (1,1,'-0.0',1),(2,1,'-0.0',1),(3,2,0.0,2),(4,3,'-0.0',3),(5,3,0.0,3),(6,4,'NaN',4),
+    (7,4,-('NaN'::DOUBLE),4),(8,5,NULL,5),(9,6,2.5,6),(10,6,1.25,6);
+
+statement ok
+CREATE MATERIALIZED VIEW dz_group AS SELECT g, v, SUM(x)+1 a FROM (SELECT DISTINCT g, v, x FROM dz) d GROUP BY g, v;
+
+statement ok
+CREATE VIEW dz_group_expected AS SELECT g, v, SUM(x)+1 a FROM (SELECT DISTINCT g, v, x FROM dz) d GROUP BY g, v;
+
+statement ok
+CREATE MATERIALIZED VIEW dz_sum AS SELECT g, SUM(v) s FROM (SELECT DISTINCT g, v FROM dz) d GROUP BY g;
+
+statement ok
+CREATE VIEW dz_sum_expected AS SELECT g, SUM(v) s FROM (SELECT DISTINCT g, v FROM dz) d GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW dz_simple AS SELECT SUM(v) s FROM (SELECT DISTINCT v FROM dz) d;
+
+statement ok
+CREATE VIEW dz_simple_expected AS SELECT SUM(v) s FROM (SELECT DISTINCT v FROM dz) d;
+
+statement ok
+CREATE VIEW dz_signs AS SELECT g, v, bool_and(signbit(v)) neg, bool_and(NOT signbit(v)) pos FROM dz WHERE v = 0 GROUP BY g, v;
+
+foreach variant group sum simple
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='dz_{variant}';
+----
+8
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dz_{variant} EXCEPT ALL SELECT * FROM dz_{variant}_expected) UNION ALL (SELECT * FROM dz_{variant}_expected EXCEPT ALL SELECT * FROM dz_{variant}));
+----
+0
+
+endloop
+
+# Round 1: (g=1) -0 -> +0, (g=2) +0 -> -0, (g=3) mixed -> +0, (g=7) a new tuple whose delta
+# mixes signs but ends -0, (g=6) an update into -0.0, NaN/NULL churn and conflicting ops.
+statement ok
+INSERT INTO dz VALUES (11,1,0.0,1),(12,2,'-0.0',2),(70,7,0.0,7),(71,7,'-0.0',7),(13,4,'NaN',4),(14,5,NULL,5);
+
+statement ok
+UPDATE dz SET x = x + 10 WHERE id IN (11, 12, 70, 71, 13);
+
+statement ok
+DELETE FROM dz WHERE id IN (1, 2, 3, 4, 70, 7, 8);
+
+statement ok
+UPDATE dz SET v = '-0.0' WHERE id = 9;
+
+foreach variant group sum simple
+
+statement ok
+PRAGMA refresh('dz_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dz_{variant} EXCEPT ALL SELECT * FROM dz_{variant}_expected) UNION ALL (SELECT * FROM dz_{variant}_expected EXCEPT ALL SELECT * FROM dz_{variant}));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM dz_group m JOIN dz_signs e ON m.g = e.g AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+query II
+SELECT g, signbit(v) FROM dz_group WHERE v = 0 ORDER BY g;
+----
+1	false
+2	true
+3	false
+6	true
+7	true
+
+# Round 2: (g=1) back to -0, (g=3) mixed again, (g=7) disappears, (g=6) leaves -0.0
+# while a +0 joins, and (g=2) is replaced by +0.
+statement ok
+INSERT INTO dz VALUES (15,1,'-0.0',1),(16,3,'-0.0',3),(17,6,0.0,6),(18,2,0.0,12);
+
+statement ok
+DELETE FROM dz WHERE id IN (11, 71, 12);
+
+statement ok
+UPDATE dz SET v = 2.5 WHERE id = 9;
+
+statement ok
+UPDATE dz SET x = x + 1 WHERE id IN (15, 16, 17, 18, 5);
+
+foreach variant group sum simple
+
+statement ok
+PRAGMA refresh('dz_{variant}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dz_{variant} EXCEPT ALL SELECT * FROM dz_{variant}_expected) UNION ALL (SELECT * FROM dz_{variant}_expected EXCEPT ALL SELECT * FROM dz_{variant}));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM dz_group m JOIN dz_signs e ON m.g = e.g AND m.v = e.v WHERE (e.neg AND NOT signbit(m.v)) OR (e.pos AND signbit(m.v));
+----
+0
+
+query II
+SELECT g, signbit(v) FROM dz_group WHERE v = 0 AND g <> 3 ORDER BY g;
+----
+1	true
+2	false
+6	false
 
 statement ok
 SET openivm_distinct_aux_state=false;

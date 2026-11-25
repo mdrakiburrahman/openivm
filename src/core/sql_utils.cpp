@@ -2,12 +2,16 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
@@ -23,14 +27,49 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "lpts_sql_scanner.hpp"
 
 #include <cctype>
 #include <cstring>
 #include <regex>
-#include <sstream>
 
 namespace duckdb {
+
+string SqlUtils::NegativeZeroSQL(const string &value) {
+	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
+}
+
+string SqlUtils::NegativeZeroSQL(const string &value, SqlDialect dialect) {
+	if (dialect != SqlDialect::DUCKDB) {
+		return NegativeZeroSQL(value);
+	}
+	return "CASE WHEN (" + value + ") = 0 THEN signbit(" + value + ") ELSE FALSE END";
+}
+
+string SqlUtils::FloatingRepresentativeSQL(const string &value, const string &negative_count,
+                                           const string &total_count) {
+	return "CASE WHEN (" + value + ") = 0 THEN CASE WHEN " + negative_count + " = 0 THEN abs(" + value + ") WHEN " +
+	       negative_count + " = " + total_count + " THEN -abs(" + value + ") ELSE " + value + " END ELSE " + value +
+	       " END";
+}
+
+string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation) {
+	if (type.IsFloating()) {
+		return NegativeZeroSQL(value);
+	}
+	if (type.id() == LogicalTypeId::VARCHAR &&
+	    (!StringType::GetCollation(type).empty() || !default_collation.empty())) {
+		return "unhex(hex(" + value + "))";
+	}
+	return EqualityCanHideValueIdentity(type) ? "openivm_internal_value_key(" + value + ")" : "";
+}
+
+bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
+	return TypeVisitor::Contains(type, [](const LogicalType &child) {
+		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL || child.IsFloating();
+	});
+}
 
 void SqlUtils::CopySessionSetting(ClientContext &from, ClientContext &to, const string &name) {
 	auto &db_config = DBConfig::GetConfig(to);
@@ -266,6 +305,24 @@ string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
 	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
 	// fold only A-Z. Preserve every other code point, including quoted identifiers.
 	auto fold = [](const string &expression) {
+		// A string literal (Value::ToSQLString) folds here instead of in every evaluation; quotes
+		// inside it are doubled, so folding the SQL text folds exactly the literal's value.
+		bool literal = expression.size() >= 2 && expression.front() == '\'' && expression.back() == '\'';
+		for (idx_t i = 1; literal && i + 1 < expression.size(); i++) {
+			if (expression[i] == '\'') {
+				literal = i + 2 < expression.size() && expression[i + 1] == '\'';
+				i++;
+			}
+		}
+		if (literal) {
+			string folded = expression;
+			for (auto &c : folded) {
+				if (c >= 'A' && c <= 'Z') {
+					c = static_cast<char>(c - 'A' + 'a');
+				}
+			}
+			return folded;
+		}
 		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
 	};
 	// An application collation must not widen physical identifier equality either.
@@ -443,87 +500,17 @@ string SqlUtils::EscapeSingleQuotes(const string &input) {
 	return StringUtil::Replace(input, "'", "''");
 }
 
-string SqlUtils::SQLToLowercase(const string &sql) {
-	std::stringstream lowercase_stream;
-	bool in_string = false;
-	char quoted_identifier = '\0';
-	for (size_t i = 0; i < sql.size(); i++) {
-		auto c = sql[i];
-		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
-
-		if (in_string) {
-			lowercase_stream << c;
-			if (c == '\'' && next == '\'') {
-				lowercase_stream << next;
-				i++;
-			} else if (c == '\'') {
-				in_string = false;
-			}
-			continue;
-		}
-
-		if (quoted_identifier != '\0') {
-			lowercase_stream << c;
-			if (c == quoted_identifier && next == quoted_identifier) {
-				lowercase_stream << next;
-				i++;
-			} else if (c == quoted_identifier) {
-				quoted_identifier = '\0';
-			}
-			continue;
-		}
-
-		if (c == '\'') {
-			in_string = true;
-			lowercase_stream << c;
-			continue;
-		}
-		if (c == '"' || c == '`') {
-			quoted_identifier = c;
-			lowercase_stream << c;
-			continue;
-		}
-		if (c == '-' && next == '-') {
-			while (i < sql.size() && sql[i] != '\n') {
-				lowercase_stream << sql[i++];
-			}
-			if (i < sql.size()) {
-				lowercase_stream << sql[i];
-			}
-			continue;
-		}
-		if (c == '/' && next == '*') {
-			size_t comment_depth = 1;
-			lowercase_stream << "/*";
-			i += 2;
-			while (i < sql.size() && comment_depth > 0) {
-				c = sql[i];
-				next = i + 1 < sql.size() ? sql[i + 1] : '\0';
-				if (c == '/' && next == '*') {
-					lowercase_stream << "/*";
-					comment_depth++;
-					i += 2;
-				} else if (c == '*' && next == '/') {
-					lowercase_stream << "*/";
-					comment_depth--;
-					i += 2;
-				} else {
-					lowercase_stream << c;
-					i++;
-				}
-			}
-			if (i > 0) {
-				i--;
-			}
-			continue;
-		}
-		lowercase_stream << StringUtil::CharacterToLower(c);
+unique_ptr<SelectStatement> SqlUtils::TryParseSelect(const string &sql) {
+	auto parser = Parser::GetBuiltinParser();
+	try {
+		parser.ParseQuery(sql);
+	} catch (const ParserException &) {
+		return nullptr;
 	}
-	return lowercase_stream.str();
-}
-
-void SqlUtils::RemoveRedundantWhitespaces(string &query) {
-	query = std::regex_replace(query, std::regex("\\s+"), " ");
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return nullptr;
+	}
+	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 }
 
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
@@ -677,7 +664,7 @@ string SqlUtils::JsonQuote(const string &value) {
 			result += c;
 		}
 	}
-	result += "\"";
+	result += '"';
 	return result;
 }
 
@@ -697,11 +684,41 @@ string SqlUtils::DuckLakeTableFunction(const string &function_name, const string
 	       "', " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 }
 
+string SqlUtils::DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
+                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id) {
+	auto rows = [&](const char *function_name) {
+		return "SELECT " + select_list + " FROM " +
+		       DuckLakeTableFunction(function_name, catalog, schema, table, last_snapshot_id, current_snapshot_id);
+	};
+	return rows("ducklake_table_insertions") + " UNION ALL " + rows("ducklake_table_deletions");
+}
+
+string SqlUtils::CurrentDatabase(Connection &con) {
+	// current_database() without planning a statement; empty when no database is attached.
+	return DatabaseManager::TryGetDefaultDatabase(*con.context).GetIdentifierName();
+}
+
+string SqlUtils::RequireCurrentDatabase(Connection &con, const string &format) {
+	try {
+		return DatabaseManager::GetDefaultDatabase(*con.context).GetIdentifierName();
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		throw CatalogException(format, error.RawMessage());
+	}
+}
+
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
 	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
 	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
 	                                   : entry.GetCatalog().GetIdentifierName(),
 	        entry.GetSchema().empty() ? string(DEFAULT_SCHEMA) : entry.GetSchema().GetIdentifierName()};
+}
+
+optional_idx SqlUtils::StorageRowCount(TableCatalogEntry &table) {
+	if (!table.IsDuckTable()) {
+		return optional_idx();
+	}
+	return table.Cast<DuckTableEntry>().GetStorage().GetTotalRows();
 }
 
 string SqlUtils::DeleteViewRowsSQL(const string &table, const string &view_name, const string &column) {
@@ -757,6 +774,25 @@ string SqlUtils::BuildRowRepetitionSQL(const string &count, const string &alias,
 	return " CROSS JOIN range(" + bound + ") " + quoted_alias;
 }
 
+string SqlUtils::BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter,
+                                            const vector<string> &columns, const string &candidate_join) {
+	const string alias = "openivm_scope_source";
+	const string weight = alias + "." + openivm::MULTIPLICITY_COL;
+	const string projection = columns.empty() ? alias + ".*" : JoinQualifiedQuotedColumns(columns, alias);
+	auto delta_projection = projection;
+	if (columns.empty()) {
+		delta_projection += " EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " + openivm::TIMESTAMP_COL + ")";
+	}
+	auto weighted_delta = [&](const string &comparison) {
+		return "SELECT " + delta_projection + " FROM " + delta + " " + alias + candidate_join +
+		       BuildRowRepetitionSQL("abs(" + weight + ")", "openivm_scope_weights", SqlDialect::DUCKDB) + " WHERE " +
+		       (delta_ts_filter.empty() ? "" : "(" + delta_ts_filter + ") AND ") + weight + comparison;
+	};
+	// Add deletions before subtracting insertions, including rows inserted and deleted in the same batch.
+	return "((SELECT " + projection + " FROM " + current + " " + alias + candidate_join + " UNION ALL " +
+	       weighted_delta(" < 0") + ") EXCEPT ALL " + weighted_delta(" > 0") + ")";
+}
+
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
 	return BuildNullSafeKeyPredicate(columns, lhs_alias + ".", rhs_alias + ".");
 }
@@ -769,8 +805,49 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 	});
 }
 
+string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
+                                     const vector<string> &columns, SqlDialect dialect) {
+	if (keys.empty() || columns.empty()) {
+		throw InternalException("Keyed upsert into %s needs its key and column names", data_table);
+	}
+	// Only non-key columns are assigned: an indexed key assignment turns every update into
+	// delete+insert.
+	const string rowid_column = "openivm_target_rowid";
+	vector<string> updates;
+	// Only DuckDB tables expose `rowid`, and an output column named like it or the helper alias
+	// would shadow it in the row-id form.
+	bool key_match_only = dialect != SqlDialect::DUCKDB;
+	for (auto &column : columns) {
+		key_match_only |= StringUtil::CIEquals(column, "rowid") || StringUtil::CIEquals(column, rowid_column);
+		if (std::find(keys.begin(), keys.end(), column) == keys.end()) {
+			auto quoted = QuoteIdentifier(column);
+			updates.push_back(quoted + " = d." + quoted);
+		}
+	}
+	auto not_matched = "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
+	                   JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+	if (updates.empty() || key_match_only) {
+		// Nothing is updated, or the row-id form is unavailable: match on the key directly.
+		auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
+		return "MERGE INTO " + data_table + " v USING " + source + " d ON " +
+		       BuildNullSafeKeyPredicate(keys, "v.", "d.") + matched + not_matched;
+	}
+	// DuckDB applies matched updates in the order the join emits them. INSERT OR REPLACE and a key
+	// MERGE each pick the probe side by cardinality estimate, and when the source probes, an order
+	// uncorrelated with the target's storage makes every update chunk touch many row groups (~100x
+	// slower). Resolve each source row's target row id and sort by it first: matching on the row id
+	// then follows storage order whichever side probes. Unmatched rows get a NULL row id and insert.
+	auto ordered_source = "(SELECT openivm_src.*, openivm_old.rowid AS " + rowid_column + " FROM " + source +
+	                      " openivm_src LEFT JOIN " + data_table + " openivm_old ON " +
+	                      BuildNullSafeKeyPredicate(keys, "openivm_old.", "openivm_src.") + " ORDER BY " +
+	                      rowid_column + ")";
+	return "MERGE INTO " + data_table + " v USING " + ordered_source + " d ON v.rowid = d." + rowid_column +
+	       "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ") + not_matched;
+}
+
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
-                                       const vector<string> &unique_keys, const string &temp_table) {
+                                       const vector<string> &unique_keys, const string &temp_table,
+                                       const vector<string> &columns, const vector<LogicalType> &column_types) {
 	if (unique_keys.empty() || temp_table.empty()) {
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
@@ -779,14 +856,46 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	// those keys as present -- raising a spurious "Duplicate key ... violates unique constraint".
 	// Materialize the new contents once, delete only the keys that are gone, then upsert the rest, so
 	// no non-NULL key is deleted and re-inserted in the same transaction. NULL-containing keys do not
-	// conflict in a UNIQUE index, so remove them explicitly before INSERT OR REPLACE to avoid duplicates.
+	// conflict in a UNIQUE index, so remove them explicitly before the upsert to avoid duplicates.
 	string keep_match = BuildNullSafeKeyPredicate(unique_keys, "openivm_new.", "openivm_old.");
 	string nullable_key = BuildAnyNullPredicate(unique_keys, "openivm_old.");
 	string sql = "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n";
 	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE (" + nullable_key +
 	       ")\n   OR NOT EXISTS (\n  SELECT 1 FROM " + temp_table + " AS openivm_new WHERE " + keep_match + "\n);\n";
-	sql += "INSERT OR REPLACE INTO " + data_table + " SELECT * FROM " + temp_table + ";\n";
+	sql += BuildKeyedUpsertSQL(data_table, temp_table, unique_keys, columns);
+	// The upsert never rewrites a matched key, so a floating zero key would keep a sign that
+	// the recomputed group no longer has. Adopt the recomputed representative, as the plain
+	// DELETE+INSERT form does. The indexed key makes this update a delete+insert.
+	vector<string> zero_keys;
+	vector<string> sign_changes;
+	vector<string> assignments;
+	for (idx_t index = 0; index < columns.size() && index < column_types.size(); index++) {
+		auto id = column_types[index].id();
+		if ((id != LogicalTypeId::FLOAT && id != LogicalTypeId::DOUBLE) ||
+		    std::find(unique_keys.begin(), unique_keys.end(), columns[index]) == unique_keys.end()) {
+			continue;
+		}
+		auto key = QuoteIdentifier(columns[index]);
+		zero_keys.push_back("v." + key + " = 0");
+		sign_changes.push_back(NegativeZeroSQL("v." + key, SqlDialect::DUCKDB) + " <> " +
+		                       NegativeZeroSQL("openivm_new." + key, SqlDialect::DUCKDB));
+		assignments.push_back(key + " = openivm_new." + key);
+	}
+	if (!assignments.empty()) {
+		sql += "UPDATE " + data_table + " AS v SET " + StringUtil::Join(assignments, ", ") + " FROM " + temp_table +
+		       " AS openivm_new WHERE " + BuildNullSafeKeyPredicate(unique_keys, "v.", "openivm_new.") + " AND (" +
+		       StringUtil::Join(zero_keys, " OR ") + ") AND (" + StringUtil::Join(sign_changes, " OR ") + ");\n";
+	}
 	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
+	return sql;
+}
+
+string SqlUtils::StripTrailingSemicolon(string sql) {
+	StringUtil::Trim(sql);
+	if (!sql.empty() && sql.back() == ';') {
+		sql.pop_back();
+		StringUtil::Trim(sql);
+	}
 	return sql;
 }
 
@@ -857,6 +966,8 @@ bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, cons
 struct TableReferenceMatch {
 	idx_t start;
 	idx_t end;
+	//! Last name part: the implicit alias of an unaliased reference.
+	string name;
 };
 
 static bool IsIdentifierTokenStart(char c) {
@@ -929,8 +1040,13 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 			idx_t end = i;
 			vector<IdentifierSegmentSpan> parts;
 			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
-				if (expect_table && matches_table(parts)) {
-					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
+				// `FROM (SELECT ...` / `FROM (WITH ...`: an unquoted reserved word is never a table name.
+				bool reserved_word =
+				    parts.size() == 1 && sql[start] != '"' &&
+				    KeywordHelper::KeywordCategoryType(parts[0].value) == KeywordCategory::KEYWORD_RESERVED;
+				if (expect_table && !reserved_word && matches_table(parts)) {
+					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end,
+					                   parts.back().value});
 					i = matches.back().end;
 					expect_table = false;
 					continue;
@@ -940,7 +1056,8 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 				continue;
 			}
 		}
-		if (!std::isspace(static_cast<unsigned char>(c))) {
+		// A parenthesized join tree (`FROM (t AS a LEFT JOIN ...`) still starts with a table reference.
+		if (!std::isspace(static_cast<unsigned char>(c)) && c != '(') {
 			expect_table = false;
 		}
 		i++;
@@ -980,12 +1097,48 @@ string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &t
 	return sql.substr(match.start, match.end - match.start);
 }
 
+// `t AS a`, `t a` and `t "a"` carry an alias; `t ON`, `t LEFT JOIN` and `t WHERE` do not.
+static bool HasTableAlias(const string &sql, idx_t pos) {
+	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
+		pos++;
+	}
+	if (pos >= sql.size()) {
+		return false;
+	}
+	if (sql[pos] == '"') {
+		return true;
+	}
+	if (!std::isalpha(static_cast<unsigned char>(sql[pos])) && sql[pos] != '_') {
+		return false;
+	}
+	idx_t end = pos;
+	while (end < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[end])) || sql[end] == '_')) {
+		end++;
+	}
+	auto word = sql.substr(pos, end - pos);
+	if (StringUtil::CIEquals(word, "as")) {
+		return true;
+	}
+	auto category = KeywordHelper::KeywordCategoryType(word);
+	return category != KeywordCategory::KEYWORD_RESERVED && category != KeywordCategory::KEYWORD_TYPE_FUNC;
+}
+
+// A subquery in place of an unaliased table must keep the table's implicit alias,
+// or qualified references such as `t.col` no longer bind.
+static string ReplacementFor(const string &sql, const TableReferenceMatch &match, const string &replacement) {
+	if (replacement.empty() || replacement.front() != '(' || replacement.back() != ')' ||
+	    ExtendPastTimeTravelClause(sql, match.end) != match.end || HasTableAlias(sql, match.end)) {
+		return replacement;
+	}
+	return replacement + " AS " + SqlUtils::QuoteIdentifier(match.name);
+}
+
 static string ReplaceMatches(const string &sql, const vector<TableReferenceMatch> &matches, const string &replacement) {
 	string result;
 	idx_t last = 0;
 	for (auto &match : matches) {
 		result.append(sql, last, match.start - last);
-		result += replacement;
+		result += ReplacementFor(sql, match, replacement);
 		last = match.end;
 	}
 	return result.append(sql, last, string::npos);
@@ -1007,7 +1160,7 @@ vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const stri
 	vector<string> variants;
 	for (auto &match : CollectTableReferenceMatches(sql, table_name, false)) {
 		string variant = sql;
-		variant.replace(match.start, match.end - match.start, replacement);
+		variant.replace(match.start, match.end - match.start, ReplacementFor(sql, match, replacement));
 		variants.push_back(std::move(variant));
 	}
 	return variants;
@@ -1036,18 +1189,6 @@ int64_t SqlUtils::ParseRefreshInterval(const string &interval_str) {
 		throw ParserException("Unknown time unit: '" + unit + "'");
 	}
 	return seconds;
-}
-
-int64_t SqlUtils::ExtractRefreshInterval(string &query) {
-	std::regex refresh_re(R"(refresh\s+every\s+'([^']+)')", std::regex::icase);
-	std::smatch match;
-	if (!std::regex_search(query, match, refresh_re)) {
-		return -1;
-	}
-	string interval_str = match[1].str();
-	// Strip the REFRESH EVERY clause from the query
-	query = std::regex_replace(query, refresh_re, "");
-	return ParseRefreshInterval(interval_str);
 }
 
 } // namespace duckdb

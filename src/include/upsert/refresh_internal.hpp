@@ -15,6 +15,9 @@
 
 namespace duckdb {
 
+// Hidden indexed state companions use a published projection position as their suffix.
+const string &IndexedStateColumn(const vector<string> &columns, const string &state_column, const string &prefix);
+
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 // Precedes the synthetic timestamp of DuckLake signed delta rows, so every row in the range counts.
 constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";
@@ -74,12 +77,13 @@ struct DuckLakeSnapshotAdvance {
 	DuckLakeSnapshotAdvance() {
 	}
 
-	DuckLakeSnapshotAdvance(string table_name_p, int64_t snapshot_id_p)
-	    : table_name(std::move(table_name_p)), snapshot_id(snapshot_id_p) {
+	DuckLakeSnapshotAdvance(string table_name_p, int64_t snapshot_id_p, int64_t source_table_id_p)
+	    : table_name(std::move(table_name_p)), snapshot_id(snapshot_id_p), source_table_id(source_table_id_p) {
 	}
 
 	string table_name;
 	int64_t snapshot_id = -1;
+	int64_t source_table_id = -1;
 };
 
 struct DeltaActivityResult {
@@ -101,9 +105,13 @@ struct DeltaActivityResult {
 		bool has_deletes = false;
 		bool requires_full_refresh = false;
 		int64_t pending_rows = -1;
-		int64_t pending_deletes = -1;
+		int64_t delete_rows = -1;
+		// Native sources: the qualified physical delta and the view's watermark the counts used.
+		string delta_table_sql;
+		Value last_update;
 		int64_t last_snapshot_id = -1;
 		int64_t current_snapshot_id = -1;
+		bool backfill_source_table_id = false;
 	};
 	vector<Source> sources;
 };
@@ -113,6 +121,7 @@ struct DuckLakeTableActivity {
 	bool has_changes = false;
 	bool has_deletes = false;
 	bool requires_full_refresh = false;
+	int64_t source_table_id_to_backfill = -1;
 };
 
 struct RefreshCostEstimate;
@@ -152,19 +161,20 @@ string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &
                              const vector<LogicalType> &column_types, SqlDialect dialect = SqlDialect::DUCKDB);
 string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
                                 const vector<string> &column_names, const string &delta_ts_filter);
-// When `upsert_keys` and `recompute_temp_table` are supplied, emits an INSERT OR REPLACE form that
-// never deletes and re-inserts the same key inside one transaction. Required when the data table
-// carries a UNIQUE index: DuckDB's on-disk unique index keeps deleted keys for constraint checking
-// within the same transaction, so DELETE-then-INSERT of a surviving group raises a spurious
-// "Duplicate key ... violates unique constraint". Only valid when such an index exists (INSERT OR
-// REPLACE requires a UNIQUE/PK constraint); pass them empty to keep the plain DELETE+INSERT form.
+// When `upsert_keys`, `recompute_temp_table` and the data table's `upsert_columns` are supplied, emits
+// a keyed MERGE upsert that never deletes and re-inserts the same key inside one transaction. Required
+// when the data table carries a UNIQUE index: DuckDB's on-disk unique index keeps deleted keys for
+// constraint checking within the same transaction, so DELETE-then-INSERT of a surviving group raises a
+// spurious "Duplicate key ... violates unique constraint". Pass them empty to keep the plain
+// DELETE+INSERT form.
 string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
                                   const string &recompute_temp_table = "",
-                                  RefreshPublicationScope *publication_scope = nullptr);
+                                  RefreshPublicationScope *publication_scope = nullptr,
+                                  const vector<string> &upsert_columns = {}, SqlDialect dialect = SqlDialect::DUCKDB);
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
 // Insert column list plus the select lists that project a row as a retraction (-1) or an insertion (+1).
@@ -190,7 +200,6 @@ AffectedGroupSignedDelta BuildAffectedGroupSignedDelta(const string &data_table,
 string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
                                     const string &old_table, const string &new_table, const string &filter,
                                     bool use_data_modifying_ctes = false);
-bool IsSummableLogicalType(const LogicalType &type);
 // Resolve a logical source to its metadata key using catalog and schema as well as its name.
 string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
                                const vector<string> &delta_table_names);
@@ -198,13 +207,16 @@ string BaseTableNameFromDeltaKey(const string &delta_key);
 // A tracked delta's rows (both images) without the multiplicity and timestamp columns.
 string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
                                  const string &extra_predicate = "");
-string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
+string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec, bool deleted_only = false);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
                                      const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);
 
+// `upsert_columns` and `upsert_types` describe the data table when it carries a unique key index.
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
+                           const string &ducklake_checkpoints, const vector<string> &upsert_columns,
+                           const vector<LogicalType> &upsert_types, bool cross_system,
+                           const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
                            const vector<string> &delta_metadata_tables = {}, const string &data_catalog = "");
@@ -214,13 +226,15 @@ string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const strin
                                           const string &data_table, const string &view_query_sql,
                                           const string &delta_ts_filter, const string &catalog_prefix,
                                           const string &recompute_alias);
-string
-CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                         const vector<string> &delta_table_names, const string &data_table,
-                         const string &view_query_sql, const string &delta_ts_filter, const string &catalog_prefix,
-                         bool has_full_outer, bool has_left_join, bool skip_proj_delete, bool insert_only = false,
-                         const vector<string> &active_delta_table_names = {}, bool can_use_runtime_delta_shape = false,
-                         ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, string *appended_rows = nullptr);
+string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
+                                const vector<LogicalType> &column_types, const vector<string> &delta_table_names,
+                                const string &data_table, const string &view_query_sql, const string &delta_ts_filter,
+                                const string &catalog_prefix, bool has_full_outer, bool has_left_join,
+                                bool skip_proj_delete, bool insert_only = false,
+                                const vector<string> &active_delta_table_names = {},
+                                bool can_use_runtime_delta_shape = false,
+                                ProjectionDeleteRetryPlan *delete_retry_plan = nullptr,
+                                string *appended_rows = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
@@ -299,7 +313,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
                           const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
                           ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true,
-                          vector<string> *deferred_cleanup = nullptr);
+                          vector<string> *deferred_cleanup = nullptr,
+                          shared_ptr<const RefreshMetadata::ViewRecord> view_record = nullptr);
 
 } // namespace duckdb
 
