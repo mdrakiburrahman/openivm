@@ -13,17 +13,18 @@
 
 namespace duckdb {
 
-unique_ptr<Expression> MultiplyIntegers(Binder &binder, unique_ptr<Expression> lhs, unique_ptr<Expression> rhs) {
+unique_ptr<Expression> BindBinaryOperator(Binder &binder, const string &op, unique_ptr<Expression> lhs,
+                                          unique_ptr<Expression> rhs) {
 	vector<unique_ptr<Expression>> args;
 	args.push_back(std::move(lhs));
 	args.push_back(std::move(rhs));
 	ErrorData error;
 	FunctionBinder function_binder(binder);
-	auto product = function_binder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), error, true);
-	if (!product) {
-		throw InternalException("DeltaJoin: failed to bind multiplicity '*': %s", error.RawMessage());
+	auto result = function_binder.BindScalarFunction(DEFAULT_SCHEMA, Identifier(op), std::move(args), error, true);
+	if (!result) {
+		throw InternalException("DeltaJoin: failed to bind '%s': %s", op, error.RawMessage());
 	}
-	return product;
+	return result;
 }
 
 // Combined multiplicity: (-1)^(k-1) * ∏ w_i where k = |mask|.
@@ -46,12 +47,13 @@ unique_ptr<Expression> BuildJoinMultiplicityProduct(Binder &binder, const Logica
 	}
 	unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[0]);
 	for (size_t i = 1; i < mul_bindings.size(); i++) {
-		product = MultiplyIntegers(binder, std::move(product),
-		                           make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[i]));
+		product = BindBinaryOperator(binder, "*", std::move(product),
+		                             make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[i]));
 	}
 	// Apply Möbius sign: (-1)^(k-1). Only flip when k is even.
 	if (mobius_sign && mul_bindings.size() % 2 == 0) {
-		product = MultiplyIntegers(binder, make_uniq<BoundConstantExpression>(Value::INTEGER(-1)), std::move(product));
+		product =
+		    BindBinaryOperator(binder, "*", make_uniq<BoundConstantExpression>(Value::INTEGER(-1)), std::move(product));
 	}
 	return product;
 }

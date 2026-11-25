@@ -11,9 +11,6 @@
 namespace duckdb {
 
 struct DeltaCompileContext {
-	DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
-	                    const DeltaViewModel &model);
-
 	OptimizerExtensionInput &input;
 	Connection &metadata_con;
 	const string &view;
@@ -24,15 +21,11 @@ class DeltaCompiler {
 public:
 	DeltaCompiler(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
 	              const DeltaViewModel &model);
-	explicit DeltaCompiler(DeltaCompileContext context);
 
-	DeltaPlanFragment Compile(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root);
-	DeltaPlanFragment CompileCopiedSubtree(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root);
+	// A copied subtree has no model nodes: it is compiled by operator kind.
+	DeltaPlanFragment Compile(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root, bool copied_subtree = false);
 
 private:
-	const DeltaModelNode *FindNode(LogicalOperator *op) const;
-	DeltaPlanFragment CompileInternal(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root, bool copied_subtree);
-
 	DeltaCompileContext context;
 	unordered_map<const LogicalOperator *, idx_t> node_by_plan;
 };

@@ -41,12 +41,6 @@ struct DeltaOperatorInput {
 	      node(node_) {
 	}
 
-	DeltaOperatorInput WithNode(const DeltaModelNode &node_) const {
-		auto result = *this;
-		result.node = &node_;
-		return result;
-	}
-
 	DeltaPlanFragment CompileChild(unique_ptr<LogicalOperator> &child, LogicalOperator *&child_root) const;
 	DeltaPlanFragment CompileCopiedSubtree(unique_ptr<LogicalOperator> &subtree, LogicalOperator *&subtree_root) const;
 

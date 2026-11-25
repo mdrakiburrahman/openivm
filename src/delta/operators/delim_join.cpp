@@ -38,17 +38,15 @@ static void CollectBaseLeaves(LogicalOperator *node, vector<size_t> path, vector
 	}
 }
 
-static bool IsSemiAntiJoinType(JoinType join_type) {
-	return join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::RIGHT_SEMI ||
-	       join_type == JoinType::RIGHT_ANTI;
-}
-
 static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 	if (op.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 		return false;
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
-	if (!IsSemiAntiJoinType(join.join_type) || join.conditions.empty() || join.HasArbitraryConditions()) {
+	auto join_type = join.join_type;
+	if ((join_type != JoinType::SEMI && join_type != JoinType::ANTI && join_type != JoinType::RIGHT_SEMI &&
+	     join_type != JoinType::RIGHT_ANTI) ||
+	    join.conditions.empty() || join.HasArbitraryConditions()) {
 		return false;
 	}
 	for (auto &condition : join.conditions) {
@@ -88,14 +86,9 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 			throw NotImplementedException("DELIM_JOIN duplicate-eliminated expression must be a column reference");
 		}
 		auto &col_ref = expr->Cast<BoundColumnRefExpression>();
-		idx_t source_ordinal = DConstants::INVALID_INDEX;
-		for (idx_t i = 0; i < source_bindings.size(); i++) {
-			if (source_bindings[i] == col_ref.Binding()) {
-				source_ordinal = i;
-				break;
-			}
-		}
-		if (source_ordinal == DConstants::INVALID_INDEX) {
+		auto source_entry = std::find(source_bindings.begin(), source_bindings.end(), col_ref.Binding());
+		auto source_ordinal = NumericCast<idx_t>(source_entry - source_bindings.begin());
+		if (source_entry == source_bindings.end()) {
 			if (!allow_ordinal_fallback ||
 			    col_ref.Binding().column_index >= copy_bindings.size()) { // mull-ignore: cxx_ge_to_gt
 				throw InternalException("DELIM_JOIN duplicate-eliminated binding not found in source child");
@@ -166,27 +159,20 @@ static ColumnBinding MapTermBinding(ColumnBinding binding, const unordered_map<o
 	// At most N replacements can be followed. The inclusive final pass detects a cycle instead of returning midway.
 	for (idx_t pass = 0; pass <= replacement_bindings.size(); // mull-ignore: cxx_le_to_lt
 	     pass++) {                                            // mull-ignore: cxx_post_inc_to_post_dec
-		bool replaced = false;
-		for (auto &replacement : replacement_bindings) {
-			if (binding == replacement.old_binding) {
-				binding = replacement.new_binding;
-				replaced = true;
-				break;
-			}
-		}
-		if (!replaced) {
+		auto replacement = std::find_if(replacement_bindings.begin(), replacement_bindings.end(),
+		                                [&](const ReplacementBinding &entry) { return entry.old_binding == binding; });
+		if (replacement == replacement_bindings.end()) {
 			return binding;
 		}
+		binding = replacement->new_binding;
 	}
 	return binding;
 }
 
 static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_bindings, ColumnBinding target,
                                        idx_t output_idx) {
-	for (auto &binding : term_bindings) {
-		if (binding == target) {
-			return binding;
-		}
+	if (std::find(term_bindings.begin(), term_bindings.end(), target) != term_bindings.end()) {
+		return target;
 	}
 	// This ordinal fallback is planner bookkeeping after exact binding lookup, not a separately observable SQL path.
 	if (output_idx < term_bindings.size() &&                           // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
@@ -313,8 +299,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 	}
 
 	input.plan->ResolveOperatorTypes();
-	auto output_types = input.plan->types;
-	auto types = output_types;
+	auto types = input.plan->types;
 	types.emplace_back(input.mul_type);
 
 	vector<unique_ptr<LogicalOperator>> terms;
@@ -323,9 +308,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 	OPENIVM_DEBUG_PRINT("[DeltaDelimJoin] Rewriting DELIM_JOIN with %zu base leaves (%llu terms)\n", leaves.size(),
 	                    (unsigned long long)term_count);
 	for (uint64_t mask = 1; mask <= term_count; mask++) {
-		auto term = input.plan->Copy(context);
-		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
-		term = std::move(renumbered.op);
+		auto renumbered = renumber_and_rebind_subtree(input.plan->Copy(context), binder);
+		auto term = std::move(renumbered.op);
 		vector<ColumnBinding> mul_bindings;
 		vector<ReplacementBinding> output_replacements;
 
@@ -362,7 +346,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 				throw InternalException("DeltaDelimJoin: original output remapped to multiplicity binding");
 			}
 			auto output_binding = FindOutputBinding(term_bindings, mapped_binding, output_idx);
-			exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx], output_binding));
+			exprs.push_back(make_uniq<BoundColumnRefExpression>(types[output_idx], output_binding));
 		}
 		exprs.push_back(BuildJoinMultiplicityProduct(binder, input.mul_type, mul_bindings, true));
 

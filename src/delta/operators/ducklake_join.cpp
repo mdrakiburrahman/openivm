@@ -140,15 +140,14 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		auto *get = GetLeafScan(leaves[i]);
 		D_ASSERT(get);
 		auto table_ref = get->GetTable();
-		string table_name = table_ref.get()->name.GetIdentifierName();
 		table_catalogs[i] = table_ref->ParentCatalog().GetName().GetIdentifierName();
 		table_schemas[i] = table_ref->schema.name.GetIdentifierName();
-		table_names[i] = table_name;
+		table_names[i] = table_ref->name.GetIdentifierName();
 		auto stored_snapshot = stored_snapshots.find(
-		    StringUtil::Lower(SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_name)));
+		    StringUtil::Lower(SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_names[i])));
 		if (stored_snapshot == stored_snapshots.end()) {
-			throw Exception(ExceptionType::CATALOG, "IVM: no snapshot ID recorded for DuckLake table '" + table_name +
-			                                            "' in view '" + input.context.view + "'");
+			throw Exception(ExceptionType::CATALOG, "IVM: no snapshot ID recorded for DuckLake table '" +
+			                                            table_names[i] + "' in view '" + input.context.view + "'");
 		}
 		old_snapshots[i] = stored_snapshot->second;
 		// CreateDeltaGetNode reuses this snapshot instead of re-reading it for every term.
@@ -171,18 +170,15 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	vector<bool> activity_known(N, false);
 	if (skip_empty_enabled) {
 		auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
-		size_t reused_activity_count = 0;
 		// Compile facts are an optimization cache; skipping this scan falls back to authoritative metadata probes.
 		for (size_t i = 0; i < N; i++) { // mull-ignore: cxx_lt_to_ge
 			auto shape = FactDeltaShape(compile_facts, *GetLeafScan(leaves[i])->GetTable());
 			empty_table_delta[i] = StringUtil::CIEquals(shape, "UNCHANGED");
 			activity_known[i] = empty_table_delta[i] || StringUtil::CIEquals(shape, "INSERT_ONLY") ||
 			                    StringUtil::CIEquals(shape, "MIXED");
-			// This counter is used only by the debug summary below.
-			// mull-ignore-next: cxx_arithmetic
-			reused_activity_count += activity_known[i] ? 1 : 0;
 		}
-		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Reused source activity for %zu/%zu leaves\n", reused_activity_count, N);
+		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Reused source activity for %zu/%zu leaves\n",
+		                    (size_t)std::count(activity_known.begin(), activity_known.end(), true), N);
 		RefreshMetadata metadata(con);
 		// Skipping table-activity probes only retains extra terms; it cannot omit a required delta term.
 		for (size_t i = 0; i < N; i++) { // mull-ignore: cxx_lt_to_ge
@@ -263,9 +259,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			continue;
 		}
 
-		auto term = input.plan->Copy(context);
-		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
-		term = std::move(renumbered.op);
+		auto renumbered = renumber_and_rebind_subtree(input.plan->Copy(context), binder);
+		auto term = std::move(renumbered.op);
 
 		LogicalOperator *term_root = term.get();
 
