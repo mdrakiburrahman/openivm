@@ -180,8 +180,10 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	Connection probe_con(*context.db.get());
 	auto metadata_location = RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
-	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
-	MetadataLocator::RequireWritable(metadata_location, "refresh materialized view '" + display_name + "'");
+	if (metadata_location.read_only) {
+		MetadataLocator::RequireWritable(
+		    metadata_location, "refresh materialized view '" + DisplayViewName(probe_meta, view_schema_name, vn) + "'");
+	}
 	// Metadata stored outside the MV's database cannot commit with its data. The split
 	// protocol commits (1) the interruption marker, (2) the MV data, (3) the watermarks
 	// with the marker cleared. A failure at any point leaves the marker set, so the next
@@ -194,6 +196,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// It follows the lease: until then another client sharing remote metadata may refresh or replace
 	// the view (cascaded nodes reach this point without a lease from RefreshNodeWithHooks).
 	auto view_record = probe_meta.LoadView(vn);
+	// Served from the record rather than another metadata read.
+	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
 	// Before anything reads source deltas, including the empty-delta shortcut below.
 	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
 	                                      attached_db_catalog_name, attached_db_schema_name);
@@ -1016,7 +1020,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
                                  const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                  bool strict_hooks) {
 	RefreshMetadata metadata(con);
-	const string display_name = DisplayViewName(metadata, view_schema_name, view_name);
+	// Only hook paths and their errors name the view; plain refreshes skip the metadata read.
+	auto display_name = [&]() {
+		return DisplayViewName(metadata, view_schema_name, view_name);
+	};
 	// Hooks and the refresh they wrap share one lease on remote metadata.
 	Connection lease_con(*context.db);
 	RefreshLease lease(context, MetadataLocator::Resolve(context, lease_con, view_catalog_name), view_name);
@@ -1033,7 +1040,7 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		auto pending = SqlUtils::QueryOrThrow(con,
 		                                      "SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
 		                                          SqlUtils::EscapeValue(view_name) + "'",
-		                                      "Cannot read pending after-hook for '%s': %s", display_name);
+		                                      "Cannot read pending after-hook for '%s': %s", display_name());
 		pending_after_hook = pending->RowCount() && !pending->Collection().GetValue(0, 0).IsNull() &&
 		                     pending->Collection().GetValue(0, 0).GetValue<bool>();
 		// A repaired hook can change its target catalog while a committed
@@ -1046,13 +1053,13 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		SqlUtils::QueryOrThrow(con,
 		                       "UPDATE openivm_views SET pending_after_hook = " + string(pending ? "true" : "false") +
 		                           " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
-		                       "Cannot record after-hook state for '%s': %s", display_name);
+		                       "Cannot record after-hook state for '%s': %s", display_name());
 	};
 
 	// Hook-bearing refreshes keep the old pre-hook empty skip semantics. Hook-free refreshes
 	// compute the same delta activity under the view lock and reuse it during SQL generation.
 	if (has_refresh_hook && !pending_after_hook) {
-		lease.Require(display_name);
+		lease.Require(display_name());
 	}
 	bool skip_current_node = has_refresh_hook && !pending_after_hook &&
 	                         TrySkipEmptyRefresh(context, metadata, con, view_catalog_name, view_schema_name, view_name,
@@ -1062,10 +1069,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 			auto hr = con.Query(hook_sql);
 			if (hr->HasError()) {
 				if (strict_hooks) {
-					throw InvalidInputException("refresh_pipeline: before-hook for '%s' failed: %s", display_name,
+					throw InvalidInputException("refresh_pipeline: before-hook for '%s' failed: %s", display_name(),
 					                            hr->GetError());
 				}
-				Printer::Print("Warning: before-hook for '" + display_name + "' failed: " + hr->GetError());
+				Printer::Print("Warning: before-hook for '" + display_name() + "' failed: " + hr->GetError());
 			}
 		}
 
@@ -1084,9 +1091,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 			if (hr->HasError()) {
 				if (strict_hooks) {
 					throw InvalidInputException("refresh_pipeline: %s-hook for '%s' failed: %s", hook_mode,
-					                            display_name, hr->GetError());
+					                            display_name(), hr->GetError());
 				}
-				Printer::Print("Warning: " + hook_mode + "-hook for '" + display_name + "' failed: " + hr->GetError());
+				Printer::Print("Warning: " + hook_mode + "-hook for '" + display_name() +
+				               "' failed: " + hr->GetError());
 			}
 			if (!hr->HasError() && staged_after_hook) {
 				mark_after_hook(false);
