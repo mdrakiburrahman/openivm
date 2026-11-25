@@ -8,12 +8,9 @@ namespace duckdb {
 
 class RefreshInsertRule : public OptimizerExtension {
 public:
-	RefreshInsertRule();
-
-	struct RefreshInsertOptimizerInfo : OptimizerExtensionInfo {
-		explicit RefreshInsertOptimizerInfo() {
-		}
-	};
+	RefreshInsertRule() {
+		optimize_function = RefreshInsertRuleFunction;
+	}
 
 	static void RefreshInsertRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan);
 };
