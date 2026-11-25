@@ -665,10 +665,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                     DialectQuoteIdent(internal_schema_name, SqlDialect::SPARK) + ".";
 			}
 		}
-		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
-		                                      publication_columns, publication_types, target_is_ducklake,
-		                                      delta_metadata_table, {}, "", active_facts.target_dialect, "", "",
-		                                      delta_metadata_tables, publication_consumers_absent);
+		publication_sql = BuildPublishViewSQL(
+		    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
+		    target_is_ducklake, delta_metadata_table, {}, "", active_facts.target_dialect, "", "",
+		    delta_metadata_tables, publication_consumers_absent, direct_native_refresh);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -1942,11 +1942,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                                         signed_publication_filter);
 			OPENIVM_DEBUG_PRINT("[PUBLISH] Applying exact signed row changes for %s\n", view_name.c_str());
 		} else {
-			publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
-			                                      publication_columns, publication_types, target_is_ducklake,
-			                                      delta_metadata_table, scope_columns, "", active_facts.target_dialect,
-			                                      appended_projection_rows, retained_publication_scope.rows,
-			                                      delta_metadata_tables, publication_consumers_absent);
+			publication_sql = BuildPublishViewSQL(
+			    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
+			    target_is_ducklake, delta_metadata_table, scope_columns, "", active_facts.target_dialect,
+			    appended_projection_rows, retained_publication_scope.rows, delta_metadata_tables,
+			    publication_consumers_absent, direct_native_refresh);
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}

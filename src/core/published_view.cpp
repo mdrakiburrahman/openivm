@@ -128,8 +128,8 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
                            const vector<string> &columns, const vector<LogicalType> &column_types, bool ducklake,
                            const string &metadata_table, const vector<string> &scope_columns,
                            const string &timestamp_sql, SqlDialect dialect, const string &appended_rows,
-                           const string &scope_rows, const vector<string> &delta_metadata_tables,
-                           bool consumers_absent) {
+                           const string &scope_rows, const vector<string> &delta_metadata_tables, bool consumers_absent,
+                           bool private_connection) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -237,7 +237,10 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		sql += "INSERT INTO " + visible + " SELECT v.* FROM " + next + " v WHERE EXISTS (SELECT 1 FROM " + changes +
 		       " d WHERE " + equality + ");\n";
 	}
-	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
+	if (!private_connection) {
+		// A private refresh connection discards its temporary stages when it closes.
+		sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
+	}
 	if (write_delta) {
 		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, delta_metadata_tables,
 		                                             "", "", "", dialect == SqlDialect::DUCKDB);
