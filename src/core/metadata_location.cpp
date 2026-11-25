@@ -43,12 +43,8 @@ string MetadataLocation::DisplayName() const {
 	return catalog + "." + schema;
 }
 
-bool MetadataLocation::Matches(const string &catalog_name, const string &schema_name) const {
-	return StringUtil::CIEquals(catalog, catalog_name) && StringUtil::CIEquals(schema, schema_name);
-}
-
 bool MetadataLocation::Matches(const MetadataLocation &other) const {
-	return Matches(other.catalog, other.schema);
+	return StringUtil::CIEquals(catalog, other.catalog) && StringUtil::CIEquals(schema, other.schema);
 }
 
 SimulatedCrashException::SimulatedCrashException(const string &point)
@@ -139,11 +135,11 @@ bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 			if (!visited.insert(StringUtil::Lower(target_schema)).second) {
 				throw CatalogException("OpenIVM metadata schema redirect cycle in catalog '%s'", target.name);
 			}
-			auto redirect = con.Query("SELECT metadata_schema FROM " +
-			                          SqlUtils::FullName(target.name, target_schema, openivm::METADATA_REDIRECT_TABLE));
-			if (redirect->HasError()) {
-				throw CatalogException(redirect->GetError());
-			}
+			auto redirect = SqlUtils::QueryOrThrow(
+			    con,
+			    "SELECT metadata_schema FROM " +
+			        SqlUtils::FullName(target.name, target_schema, openivm::METADATA_REDIRECT_TABLE),
+			    "%s");
 			if (redirect->RowCount() != 1 || redirect->Collection().GetValue(0, 0).IsNull()) {
 				throw CatalogException("OpenIVM metadata redirect in '%s.%s' must contain one non-NULL schema",
 				                       target.name, target_schema);
@@ -216,15 +212,11 @@ MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &co
 vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &table) {
 	vector<MetadataLocation> result;
 	auto add = [&](const MetadataLocation &location) {
-		for (auto &existing : result) {
-			if (existing.Matches(location)) {
-				return;
-			}
+		if (!std::any_of(result.begin(), result.end(),
+		                 [&](const MetadataLocation &existing) { return existing.Matches(location); }) &&
+		    con.TableInfo(Identifier(location.catalog), Identifier(location.schema), Identifier(table))) {
+			result.push_back(location);
 		}
-		if (!con.TableInfo(Identifier(location.catalog), Identifier(location.schema), Identifier(table))) {
-			return;
-		}
-		result.push_back(location);
 	};
 	add(Resolve(*con.context, con, ""));
 	// Source metadata lives in native catalogs. Enumerating external tables also
@@ -576,13 +568,8 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 			}
 		}
 	});
-	HeldLease held;
-	held.token = token;
-	held.lease_seconds = lease_seconds;
-	held.depth = 1;
-	held.heartbeat = heartbeat;
 	std::lock_guard<std::mutex> guard(registry.lock);
-	registry.held[key] = std::move(held);
+	registry.held[key] = HeldLease {token, lease_seconds, 1, false, heartbeat};
 	OPENIVM_DEBUG_PRINT("[LEASE] Acquired refresh lease for %s in %s\n", view_name.c_str(),
 	                    location.DisplayName().c_str());
 }
@@ -623,10 +610,6 @@ RefreshLease::~RefreshLease() {
 		// The lease expires on its own; never mask the refresh outcome.
 		OPENIVM_DEBUG_PRINT("[LEASE] Release failed: %s\n", ex.what());
 	}
-}
-
-bool RefreshLease::Lost() const {
-	return heartbeat && heartbeat->lost.load();
 }
 
 bool RefreshLease::Expired() const {
@@ -760,11 +743,8 @@ void LifecycleLeaseState::Acquire(ClientContext &context, const MetadataLocation
 	std::sort(view_names.begin(), view_names.end());
 	for (auto &view_name : view_names) {
 		auto key = StringUtil::Lower(location.Prefix()) + view_name;
-		bool held = false;
-		for (auto &lease : leases) {
-			held |= lease.first == key;
-		}
-		if (!held) {
+		if (std::none_of(leases.begin(), leases.end(),
+		                 [&](const pair<string, unique_ptr<RefreshLease>> &lease) { return lease.first == key; })) {
 			leases.emplace_back(key, make_uniq<RefreshLease>(context, location, view_name));
 		}
 	}
@@ -778,12 +758,9 @@ void LifecycleLeaseState::Require() const {
 }
 
 bool LifecycleLeaseState::CanCleanup() const {
-	for (auto &lease : leases) {
-		if (!lease.second->ConfirmOwnership()) {
-			return false;
-		}
-	}
-	return true;
+	return std::all_of(leases.begin(), leases.end(), [](const pair<string, unique_ptr<RefreshLease>> &lease) {
+		return lease.second->ConfirmOwnership();
+	});
 }
 
 void LifecycleLeaseState::SimulateTakeover() {

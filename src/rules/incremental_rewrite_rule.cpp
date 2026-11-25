@@ -24,9 +24,8 @@
 
 namespace duckdb {
 
-void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                                           const string &view_name, const string &view_catalog_name,
-                                           const string &view_schema_name) {
+static void AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                          const string &view_name, const string &view_catalog_name, const string &view_schema_name) {
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("\nAdd the insert node to the plan...\n");
 	OPENIVM_DEBUG_PRINT("Plan:\n%s\nParameters:", plan->ToString().c_str());
@@ -43,13 +42,9 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 	                                         OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, binder.GenerateTableIndex());
 
-	Value value;
-	unique_ptr<BoundConstantExpression> exp;
-	for (size_t i = 0; i < plan->expressions.size(); i++) {
-		insert_node->expected_types.emplace_back(plan->expressions[i]->GetReturnType());
-		value = Value(plan->expressions[i]->GetReturnType());
-		exp = make_uniq<BoundConstantExpression>(std::move(value));
-		insert_node->bound_defaults.emplace_back(std::move(exp));
+	for (auto &expression : plan->expressions) {
+		insert_node->expected_types.push_back(expression->GetReturnType());
+		insert_node->bound_defaults.push_back(make_uniq<BoundConstantExpression>(Value(expression->GetReturnType())));
 	}
 
 	insert_node->children.emplace_back(std::move(plan));
@@ -177,7 +172,6 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	AddInsertNode(input.context, input.optimizer.binder, fragment.op, view, view_catalog, view_schema);
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === FINAL PLAN ===\n%s\n", fragment.op->ToString().c_str());
 	plan = std::move(fragment.op);
-	return;
 }
 
 } // namespace duckdb

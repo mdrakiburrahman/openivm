@@ -42,11 +42,7 @@ DeltaPlanFragment CompileStaticConstantLeaf(DeltaOperatorInput input) {
 	    make_uniq<LogicalProjection>(input.context.input.optimizer.binder.GenerateTableIndex(), std::move(exprs));
 	projection->children.push_back(std::move(input.plan));
 	projection->ResolveOperatorTypes();
-	auto projection_bindings = projection->GetColumnBindings();
-	if (projection_bindings.empty()) {
-		throw InternalException("DeltaConstant: static projection has no multiplicity binding");
-	}
-	auto mul_binding = projection_bindings.back();
+	auto mul_binding = projection->GetColumnBindings().back();
 
 	OPENIVM_DEBUG_PRINT("[Delta Operator] %s constant leaf -- appended static multiplicity for copied subtree\n",
 	                    LogicalOperatorToString(projection->children[0]->type).c_str());

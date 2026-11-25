@@ -184,19 +184,6 @@ static bool IsMetadataSchemaStatement(const string &statement) {
 	return StringUtil::StartsWith(lower, "create table") || StringUtil::StartsWith(lower, "alter table");
 }
 
-static bool MatchesNowCall(const string &statement, idx_t offset) {
-	static const string now_call = "now()";
-	if (offset + now_call.size() > statement.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < now_call.size(); i++) {
-		if (StringUtil::CharacterToLower(statement[offset + i]) != now_call[i]) {
-			return false;
-		}
-	}
-	return true;
-}
-
 static string StabilizeTransactionalMetadata(const string &statement, const string &timestamp_sql) {
 	string result;
 	result.reserve(statement.size() + timestamp_sql.size());
@@ -204,29 +191,21 @@ static string StabilizeTransactionalMetadata(const string &statement, const stri
 	bool in_double_quote = false;
 	for (idx_t offset = 0; offset < statement.size();) {
 		char current = statement[offset];
-		if (current == '\'' && !in_double_quote) {
+		if ((current == '\'' && !in_double_quote) || (current == '"' && !in_single_quote)) {
+			bool &in_quote = current == '\'' ? in_single_quote : in_double_quote;
 			result.push_back(current);
-			if (in_single_quote && offset + 1 < statement.size() && statement[offset + 1] == '\'') {
-				result.push_back(statement[offset + 1]);
+			// A doubled quote inside a quoted section is an escaped quote character.
+			if (in_quote && offset + 1 < statement.size() && statement[offset + 1] == current) {
+				result.push_back(current);
 				offset += 2;
 				continue;
 			}
-			in_single_quote = !in_single_quote;
+			in_quote = !in_quote;
 			offset++;
 			continue;
 		}
-		if (current == '"' && !in_single_quote) {
-			result.push_back(current);
-			if (in_double_quote && offset + 1 < statement.size() && statement[offset + 1] == '"') {
-				result.push_back(statement[offset + 1]);
-				offset += 2;
-				continue;
-			}
-			in_double_quote = !in_double_quote;
-			offset++;
-			continue;
-		}
-		if (!in_single_quote && !in_double_quote && MatchesNowCall(statement, offset)) {
+		if (!in_single_quote && !in_double_quote && offset + 5 <= statement.size() &&
+		    StringUtil::CIEquals(statement.data() + offset, 5, "now()", 5)) {
 			result += timestamp_sql;
 			offset += 5;
 			continue;
@@ -242,10 +221,7 @@ struct DDLExecutorBindData : public TableFunctionData {
 };
 
 struct DDLExecutorGlobalData : public GlobalTableFunctionState {
-	DDLExecutorGlobalData() : offset(0) {
-	}
-
-	idx_t offset;
+	idx_t offset = 0;
 };
 
 unique_ptr<GlobalTableFunctionState> DDLExecutorInitFunction(ClientContext &context, TableFunctionInitInput &input) {
@@ -493,14 +469,10 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		if (pending_ddl.empty()) {
 			return;
 		}
-		string query;
+		string query = StringUtil::Join(pending_ddl, ";\n");
 		size_t bytes = 0;
-		for (idx_t i = 0; i < pending_ddl.size(); i++) {
-			if (i > 0) {
-				query += ";\n";
-			}
-			query += pending_ddl[i];
-			bytes += pending_ddl[i].size();
+		for (auto &ddl : pending_ddl) {
+			bytes += ddl.size();
 		}
 		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL batch (%lu statements): %s\n",
 		                    (unsigned long)pending_ddl.size(), query.c_str());
@@ -887,10 +859,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		seed_table(table, "");
 	}
 	for (auto &statement : local_statements) {
-		if (IsMetadataSchemaStatement(statement)) {
-			continue;
-		}
-		if (ReadMetadataMutationTarget(statement).Matches(dependency_tables)) {
+		if (!IsMetadataSchemaStatement(statement) && ReadMetadataMutationTarget(statement).Matches(dependency_tables)) {
 			replay_statement(statement);
 		}
 	}
@@ -967,13 +936,10 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		seed_table(table, filter);
 	}
 	for (auto &statement : local_statements) {
-		if (IsMetadataSchemaStatement(statement)) {
-			continue;
+		if (!IsMetadataSchemaStatement(statement) &&
+		    !ReadMetadataMutationTarget(statement).Matches(dependency_tables)) {
+			replay_statement(statement);
 		}
-		if (ReadMetadataMutationTarget(statement).Matches(dependency_tables)) {
-			continue;
-		}
-		replay_statement(statement);
 	}
 }
 

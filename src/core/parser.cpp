@@ -620,7 +620,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (has_query_dependent_binding) {
 		facts.analysis.incremental_compatible = false;
-		facts.analysis.found_volatile_expression = true;
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Query-dependent binding requires full refresh\n");
 	}
 	unordered_set<string> table_names;

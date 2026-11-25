@@ -1,6 +1,5 @@
 #include "upsert/refresh_cost_model.hpp"
 #include <cmath>
-#include <unordered_set>
 #include "core/ivm_delta_model.hpp"
 #include "core/ivm_view_classifier.hpp"
 #include "core/openivm_constants.hpp"
@@ -14,8 +13,6 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/client_data.hpp"
-#include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/constraint.hpp"
@@ -83,10 +80,9 @@ struct TableStats {
 	optional_ptr<TableCatalogEntry> table;
 	string table_name;
 	string delta_table_name;
-	double base_card;    // |T| (may reflect pushed-down filter selectivity)
-	double actual_card;  // actual unfiltered table row count
-	double delta_card;   // |ΔT|
-	bool has_fk = false; // table has FK referencing another table in the join
+	double base_card;   // |T| (may reflect pushed-down filter selectivity)
+	double actual_card; // actual unfiltered table row count
+	double delta_card;  // |ΔT|
 	bool has_deletes = false;
 };
 
@@ -159,14 +155,6 @@ static constexpr double PROJECTION_APPLY_MS_PER_UNIT =
     0.00002; // bulk insert/delete (projections): vectorized, far cheaper than a per-group MERGE
 static constexpr double AGG_EXPR_MS = 4.0; // per-aggregate-column MERGE penalty (incremental)
 
-static void AddOperatorCostClass(LogicalOperator &op, PlanStats &stats) {
-	auto kind = NodeKindForOperator(op);
-	if (kind == DeltaModelNodeKind::JOIN || kind == DeltaModelNodeKind::ASOF_JOIN ||
-	    kind == DeltaModelNodeKind::POSITIONAL_JOIN) {
-		stats.product_nodes++;
-	}
-}
-
 struct JoinTermEstimate {
 	idx_t active_sources = 0; // tables with a non-empty delta
 	idx_t priced_sources = 0; // tables whose single-source terms execute a base scan (= active_sources
@@ -214,17 +202,16 @@ static JoinTermEstimate EstimateJoinTerms(const PlanStats &stats, bool nterm_ena
 	if (!stats.has_join || (result.active_sources == 0 && skip_empty_enabled)) {
 		return result;
 	}
-	idx_t priced_sources = skip_empty_enabled ? result.active_sources : stats.table_stats.size();
-	result.priced_sources = priced_sources;
+	result.priced_sources = skip_empty_enabled ? result.active_sources : stats.table_stats.size();
 	if (fk_enabled && skip_empty_enabled && !stats.all_ducklake && result.active_sources == 1 &&
 	    ActiveSourceIsInsertOnlyPK(stats, active_idx)) {
 		return result;
 	}
 	if (nterm_enabled && stats.all_ducklake) {
-		result.term_count = priced_sources;
+		result.term_count = result.priced_sources;
 		return result;
 	}
-	result.term_count = (static_cast<idx_t>(1) << priced_sources) - 1;
+	result.term_count = (static_cast<idx_t>(1) << result.priced_sources) - 1;
 	return result;
 }
 
@@ -232,7 +219,11 @@ static JoinTermEstimate EstimateJoinTerms(const PlanStats &stats, bool nterm_ena
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
                                       const string &view_name, const DeltaActivityResult &delta_activity,
                                       PlanStats &stats) {
-	AddOperatorCostClass(op, stats);
+	auto kind = NodeKindForOperator(op);
+	if (kind == DeltaModelNodeKind::JOIN || kind == DeltaModelNodeKind::ASOF_JOIN ||
+	    kind == DeltaModelNodeKind::POSITIONAL_JOIN) {
+		stats.product_nodes++;
+	}
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op.Cast<LogicalGet>();
@@ -240,20 +231,15 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 			TableStats ts;
 			ts.table = get.GetTable();
 			ts.table_name = get.GetTable()->name.GetIdentifierName();
-			ts.base_card = static_cast<double>(get.EstimateCardinality(context));
-			if (ts.base_card == 0) {
-				ts.base_card = 1;
-			}
+			ts.base_card = std::max(1.0, static_cast<double>(get.EstimateCardinality(context)));
 
 			// Actual (unfiltered) table row count — for filter selectivity estimation.
 			// base_card from EstimateCardinality may reflect pushed-down filters, so
 			// actual_card / base_card gives us the filter selectivity ratio.
 			auto catalog_name = get.GetTable()->ParentCatalog().GetName().GetIdentifierName();
 			auto schema_name = get.GetTable()->schema.name.GetIdentifierName();
-			ts.actual_card = GetTableRowCount(con, SqlUtils::FullName(catalog_name, schema_name, ts.table_name));
-			if (ts.actual_card == 0) {
-				ts.actual_card = 1;
-			}
+			ts.actual_card =
+			    std::max(1.0, GetTableRowCount(con, SqlUtils::FullName(catalog_name, schema_name, ts.table_name)));
 
 			bool ducklake_source =
 			    get.function.GetName().GetIdentifierName() == "ducklake_scan" && get.function.function_info;
@@ -281,11 +267,9 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
 	case LogicalOperatorType::LOGICAL_JOIN: {
 		stats.has_join = true;
-		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-			auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
-			if (join && join->join_type == JoinType::OUTER) {
-				stats.has_full_outer = true;
-			}
+		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+		    op.Cast<LogicalComparisonJoin>().join_type == JoinType::OUTER) {
+			stats.has_full_outer = true;
 		}
 		break;
 	}
@@ -466,12 +450,10 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 	// A refresh already read the view's metadata; the PRAGMA refresh_cost path reads it here.
 	RefreshMetadata view_meta(con);
 	view_meta.UseView(RefreshMetadata::PlanningView(context, view_name));
-	{
-		try {
-			view_type = view_meta.GetViewType(view_name);
-		} catch (...) {
-			// view_name not in openivm_views — keep default
-		}
+	try {
+		view_type = view_meta.GetViewType(view_name);
+	} catch (...) {
+		// view_name not in openivm_views — keep default
 	}
 
 	// 1. Collect all plan statistics in one tree walk
@@ -487,22 +469,18 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 
 	// 2. Compute basic metrics
 	double total_base_scan = 0;
+	double total_delta = 0;
 	bool has_active_delta = false;
 	for (auto &ts : table_stats) {
 		total_base_scan += ts.base_card;
+		total_delta += ts.delta_card;
 		has_active_delta = has_active_delta || ts.delta_card > 0;
 	}
 
 	auto internal_location = view_meta.GetInternalLocation(view_name);
-	double mv_card =
-	    GetTableRowCount(con, SqlUtils::FullName(internal_location.catalog_name, internal_location.schema_name,
-	                                             IncrementalTableNames::DataTableName(view_name)));
-	if (mv_card == 0) {
-		mv_card = 1;
-	}
-
-	bool has_join = plan_stats.has_join;
-	bool has_aggregate = plan_stats.has_aggregate;
+	double mv_card = std::max(
+	    1.0, GetTableRowCount(con, SqlUtils::FullName(internal_location.catalog_name, internal_location.schema_name,
+	                                                  IncrementalTableNames::DataTableName(view_name))));
 
 	// 3. Estimate IVM cost from the query's operator classes. Linear plans scan
 	// pending deltas; product plans pay for active join terms; stateful operators
@@ -511,7 +489,7 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 	double incremental_compute;
 	double estimated_delta_result;
 
-	if (has_join) {
+	if (plan_stats.has_join) {
 		// Estimate delta result: each delta row fans out by MV/actual_card.
 		// Use actual_card (unfiltered) instead of base_card to avoid inflated fanout
 		// when filters are pushed into the scan (base_card reflects post-filter estimate).
@@ -543,10 +521,8 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 		}
 	} else {
 		// Unary operators: scan cost is the full delta (filter doesn't reduce scan cost)
-		double total_delta = 0;
 		double filtered_delta = 0;
 		for (auto &ts : table_stats) {
-			total_delta += ts.delta_card;
 			// Selectivity from pushed-down filters: base_card / actual_card
 			double selectivity = std::min(1.0, ts.base_card / ts.actual_card);
 			filtered_delta += ts.delta_card * selectivity;
@@ -557,7 +533,7 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 	}
 
 	double incremental_upsert;
-	if (has_aggregate) {
+	if (plan_stats.has_aggregate) {
 		// Aggregate merge: affected groups ≈ min(delta_result, MV groups)
 		// Merge cost is proportional to affected groups, not full MV
 		double affected_groups = std::min(estimated_delta_result, mv_card);
@@ -602,17 +578,13 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 		// Each source contributes a per-table view-query variant (substitute T_i
 		// with delta_T_i in view_query_sql), so compute scales with N_active sources.
 		double affected_keys = 0;
-		idx_t active_sources = 0;
 		for (auto &ts : table_stats) {
-			if (ts.delta_card <= 0) {
-				continue;
+			if (ts.delta_card > 0) {
+				affected_keys += ts.delta_card * (mv_card / ts.actual_card);
 			}
-			affected_keys += ts.delta_card * (mv_card / ts.actual_card);
-			active_sources++;
 		}
-		if (active_sources == 0) {
-			active_sources = 1; // empty deltas → one trivial scan
-		}
+		// Empty deltas → one trivial scan.
+		auto active_sources = std::max<idx_t>(join_terms.active_sources, 1);
 		// Each variant runs the view body restricted to that source's delta. The
 		// restricted scan dominates; approximate as one average source scan per
 		// variant. Upper-bounded by full base scan
@@ -626,10 +598,6 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 		// Partition recompute: scan delta to identify affected partitions, then
 		// re-evaluate the view query for those partitions. Cost ≈ delta scan +
 		// affected-partitions fraction of full scan.
-		double total_delta = 0;
-		for (auto &ts : table_stats) {
-			total_delta += ts.delta_card;
-		}
 		double affected_fraction = std::min(1.0, total_delta / std::max(mv_card, 1.0));
 		strategy_compute = total_delta + total_base_scan * affected_fraction;
 		strategy_upsert = std::min(total_delta * (mv_card / std::max(total_base_scan, 1.0)), mv_card) * 2.0;
@@ -724,8 +692,9 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 		apply_regression("full", recompute_compute, recompute_replace, recompute_predicted_ms);
 	}
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, FullOuter: %s, DuckLake: %s, FK: %s\n", N,
-	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.has_full_outer ? "yes" : "no",
-	                    plan_stats.all_ducklake ? "yes" : "no", fk_enabled ? "on" : "off");
+	                    plan_stats.has_join ? "yes" : "no", plan_stats.has_aggregate ? "yes" : "no",
+	                    plan_stats.has_full_outer ? "yes" : "no", plan_stats.all_ducklake ? "yes" : "no",
+	                    fk_enabled ? "on" : "off");
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Join operators: %lu, Base scan total: %.0f, Filter selectivity: %.4f\n",
 	                    (unsigned long)plan_stats.product_nodes, total_base_scan, plan_stats.filter_selectivity);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Active sources: %lu, Join terms: %lu, MV cardinality: %.0f, Est. delta result: "
@@ -743,18 +712,9 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
 	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label.c_str());
 
-	RefreshCostEstimate estimate;
-	estimate.incremental_compute = strategy_compute;
-	estimate.incremental_upsert = strategy_upsert;
-	estimate.recompute_compute = recompute_compute;
-	estimate.recompute_replace = recompute_replace;
-	estimate.incremental_cost = strategy_total;
-	estimate.recompute_cost = recompute_total;
-	estimate.incremental_predicted_ms = strategy_predicted_ms;
-	estimate.recompute_predicted_ms = recompute_predicted_ms;
-	estimate.calibrated = calibrated;
-	estimate.strategy_label = std::move(strategy_label);
-	return estimate;
+	return {strategy_compute, strategy_upsert,          recompute_compute,     recompute_replace,
+	        strategy_total,   recompute_total,          strategy_predicted_ms, recompute_predicted_ms,
+	        calibrated,       std::move(strategy_label)};
 }
 
 RefreshCostEstimate EstimateViewRefreshCost(ClientContext &context, const string &view_query_sql,
@@ -799,10 +759,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	//     view's classification — the IVM-vs-full check never overrides it.
 	//   - For "incremental" views, the cost model may pick "full" when adaptive
 	//     refresh decides full recompute is cheaper.
-	string decision = estimate.strategy_label.empty() ? "incremental" : estimate.strategy_label;
-	if (estimate.ShouldRecompute()) {
-		decision = "full";
-	}
+	string decision = estimate.ShouldRecompute() ? "full" : estimate.strategy_label;
 	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.incremental_cost) + " AS incremental_cost, " +
 	       to_string(estimate.recompute_cost) + " AS recompute_cost, " + to_string(estimate.incremental_predicted_ms) +
 	       " AS incremental_predicted_ms, " + to_string(estimate.recompute_predicted_ms) +

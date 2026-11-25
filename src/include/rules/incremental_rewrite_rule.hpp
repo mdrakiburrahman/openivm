@@ -13,9 +13,6 @@ public:
 		optimize_function = IncrementalRewriteRuleFunction;
 	}
 
-	static void AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-	                          const string &view_name, const string &view_catalog_name, const string &view_schema_name);
-
 	static void IncrementalRewriteRuleFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
 
 	// Point con at the view's metadata (snapshotting an explicit transaction's metadata) and parse its stored
