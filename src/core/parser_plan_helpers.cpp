@@ -3464,9 +3464,9 @@ bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<s
 			continue;
 		}
 		auto &ref = top_expressions[i]->Cast<BoundColumnRefExpression>();
-		if (ResolvesToGroupBinding(ref.Binding().table_index, ref.Binding().column_index, aggregate.group_index, 1,
-		                           facts)) {
-			output_name = ProjectionOutputName(top_expressions[i], i, output_names, ref);
+		if (ResolvesToOutputBinding(ref.Binding().table_index, ref.Binding().column_index, aggregate.group_index, 1,
+		                            facts, false)) {
+			output_name = ProjectionOutputName(*facts.first_projection, i, facts, output_names, ref);
 			visible_matches++;
 		}
 	}

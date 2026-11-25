@@ -242,6 +242,7 @@ BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name, c
                            const string &attached_db_schema_name, string &affected_keys_sql) {
 	string scoped = view_query_sql;
 	vector<string> replaced_tables;
+	vector<std::pair<string, string>> implicit_aliases;
 	unordered_set<string> seen_sources;
 	unordered_set<string> covered_sources;
 	for (auto &op : key_ops) {
@@ -264,13 +265,20 @@ BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name, c
 		if (base_ref.empty()) {
 			return LineageAffectedKeysResult::UNSAFE;
 		}
-		scoped = SqlUtils::ReplaceTableReferences(scoped, base_ref,
-		                                          BuildStandardDeltaRowsSQL(delta_table, "", delta_ts_filter));
+		auto delta_rows = BuildStandardDeltaRowsSQL(delta_table, "", delta_ts_filter);
+		scoped = SqlUtils::ReplaceTableReferences(scoped, base_ref, delta_rows);
 		replaced_tables.push_back(UnquotedLastIdentifier(base_table));
+		// ReplaceTableReferences keeps an unaliased table's implicit alias on the replacement.
+		implicit_aliases.emplace_back(
+		    delta_rows + " AS " + SqlUtils::QuoteIdentifier(UnquotedLastIdentifier(base_ref)), delta_rows);
 		covered_sources.insert(ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names));
 	}
+	string residual = scoped;
+	for (auto &alias : implicit_aliases) {
+		residual = StringUtil::Replace(residual, alias.first, alias.second);
+	}
 	for (auto &table : replaced_tables) {
-		if (ContainsIdentifierToken(scoped, table)) {
+		if (ContainsIdentifierToken(residual, table)) {
 			return LineageAffectedKeysResult::UNSAFE;
 		}
 	}
