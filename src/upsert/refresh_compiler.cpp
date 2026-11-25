@@ -950,37 +950,51 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		}
 	}
 
+	// Delta evaluates the selected MERGE action. Reuse its lookup when the key
+	// needs no stored representative or outer-join state.
+	const bool finalize_in_actions = options.spark_merge_actions && insert_only && !has_match_count &&
+	                                 group_sign_counts.empty() && !quoted_derived_output_expressions.empty();
+	auto render_finalized = [&](const string &expression, const unordered_map<string, string> &values,
+	                            const string &count) {
+		auto rendered = options.render_derived_output ? options.render_derived_output(expression, values)
+		                                              : SubstituteDerivedOutputColumns(expression, values);
+		// Groups whose count reaches zero are removed after the merge.
+		return count.empty() ? rendered : "CASE WHEN " + count + " > 0 THEN " + rendered + " ELSE NULL END";
+	};
+
 	string merge_source = "refresh_cte";
 	if (!quoted_derived_output_expressions.empty()) {
 		// SUM(delta) can widen COUNT's BIGINT state to HUGEINT. Finalize with
 		// the stored input types so type-sensitive functions keep their semantics.
 		for (idx_t i = 0; i < column_names.size() && i < options.column_types.size(); i++) {
-			auto input = updated_column_expressions.find(column_names[i]);
-			if (input != updated_column_expressions.end() && !keys_set.count(column_names[i]) &&
+			auto &name = column_names[i];
+			auto input = updated_column_expressions.find(name);
+			if (input != updated_column_expressions.end() && !keys_set.count(name) &&
 			    options.column_types[i].id() == LogicalTypeId::BIGINT) {
 				input->second = "CAST(" + input->second + " AS BIGINT)";
+				if (finalize_in_actions) {
+					auto &insert = inserted_column_expressions.at(name);
+					insert = "CAST(" + insert + " AS BIGINT)";
+				}
 			}
 		}
-		vector<string> projections {"d.*"};
-		for (auto &column : aggregates) {
-			auto derived = quoted_derived_output_expressions.find(column);
-			if (derived == quoted_derived_output_expressions.end()) {
-				continue;
+		if (!finalize_in_actions) {
+			vector<string> projections {"d.*"};
+			for (auto &column : aggregates) {
+				auto derived = quoted_derived_output_expressions.find(column);
+				if (derived != quoted_derived_output_expressions.end()) {
+					auto expression = render_finalized(derived->second, updated_column_expressions, group_count);
+					projections.push_back(expression + " AS " + column);
+				}
 			}
-			string expression = options.render_derived_output
-			                        ? options.render_derived_output(derived->second, updated_column_expressions)
-			                        : SubstituteDerivedOutputColumns(derived->second, updated_column_expressions);
-			if (!group_count.empty()) {
-				// Disappearing groups are removed below; their output expressions need not be defined at count zero.
-				expression = "CASE WHEN " + group_count + " > 0 THEN " + expression + " ELSE NULL END";
-			}
-			projections.push_back(expression + " AS " + column);
+			// DuckDB may evaluate INSERT expressions for matched rows. Use the
+			// actual resulting state for the derived value in both actions.
+			merge_source = "(SELECT " + StringUtil::Join(projections, ", ") + " FROM refresh_cte d LEFT JOIN " +
+			               data_table + " v ON " + on_clause + ")";
 		}
-		// MERGE may evaluate INSERT expressions for matched rows too. Compute each
-		// derived value once over its actual updated state, shared by both branches.
-		merge_source = "(SELECT " + StringUtil::Join(projections, ", ") + " FROM refresh_cte d LEFT JOIN " +
-		               data_table + " v ON " + on_clause + ")";
 	}
+	const string inserted_count =
+	    finalize_in_actions && !group_count_column.empty() ? inserted_column_expressions.at(group_count_column) : "";
 	// Build update_set and insert_vals in the SAME column order as aggregates.
 	// Derived columns (AVG, STDDEV, VARIANCE) get their formula inline rather
 	// than being appended at the end — this ensures INSERT column/value alignment.
@@ -991,9 +1005,16 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			update_set += ", ";
 			insert_vals += ", ";
 		}
-		if (quoted_derived_output_expressions.count(column)) {
-			update_set += column + " = d." + column;
-			insert_vals += "d." + column;
+		auto derived = quoted_derived_output_expressions.find(column);
+		if (derived != quoted_derived_output_expressions.end()) {
+			update_set += column + " = ";
+			if (finalize_in_actions) {
+				update_set += render_finalized(derived->second, updated_column_expressions, group_count);
+				insert_vals += render_finalized(derived->second, inserted_column_expressions, inserted_count);
+			} else {
+				update_set += "d." + column;
+				insert_vals += "d." + column;
+			}
 		} else {
 			const string &raw_column = aggregate_raw_names.at(column);
 			update_set += column + " = " + updated_column_expressions.at(raw_column);
