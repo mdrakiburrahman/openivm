@@ -381,7 +381,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
 		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
 		// overflow in the optimizer before the refresh query runs.
-		exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
+		// disabled_optimizers is a global option: scope it to this refresh instead of a SET, which
+		// would leave it disabled for every later query of the database.
+		ScopedDisabledOptimizers disabled_optimizers(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
