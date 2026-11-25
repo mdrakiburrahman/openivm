@@ -629,10 +629,11 @@ class PlanningHelperState : public ClientContextState {};
 shared_ptr<const RefreshMetadata::ViewRecord> RefreshMetadata::LoadView(const string &view_name) {
 	view_record.reset();
 	// One statement for the row and its sources. canonical_plan_blob is matcher-only and can be large.
-	auto result = con.Query(
-	    "SELECT COLUMNS(lambda c: c <> 'canonical_plan_blob'), (SELECT list(d ORDER BY d.table_name) FROM " +
-	    string(openivm::DELTA_TABLES_TABLE) + " d WHERE d.view_name = v.view_name) AS " + RECORD_DELTAS_COLUMN +
-	    " FROM " + string(openivm::VIEWS_TABLE) + " v WHERE v.view_name = " + Value(view_name).ToSQLString());
+	auto result =
+	    con.Query("SELECT COLUMNS(lambda c: c <> 'canonical_plan_blob'), (SELECT list(d ORDER BY d.table_name) FROM " +
+	              string(openivm::DELTA_TABLES_TABLE) + " d WHERE d.view_name = " + Value(view_name).ToSQLString() +
+	              ") AS " + RECORD_DELTAS_COLUMN + " FROM " + string(openivm::VIEWS_TABLE) +
+	              " v WHERE v.view_name = " + Value(view_name).ToSQLString());
 	if (result->HasError() || result->RowCount() != 1) {
 		// Per-column reads report the specific error, or the missing view.
 		OPENIVM_DEBUG_PRINT("[METADATA] No view record for %s: %s\n", view_name.c_str(),
@@ -641,11 +642,13 @@ shared_ptr<const RefreshMetadata::ViewRecord> RefreshMetadata::LoadView(const st
 	}
 	auto record = make_shared_ptr<ViewRecord>();
 	record->view_name = view_name;
-	auto &rows = result->Collection();
+	// One materialization for the row: Collection().GetValue rescans the result per call.
+	auto rows = result->Collection().GetRows();
+	auto &row = rows[0];
 	for (idx_t column = 0; column + 1 < result->ColumnCount(); column++) {
-		record->view[result->ColumnName(column).GetIdentifierName()] = rows.GetValue(column, 0);
+		record->view[result->ColumnName(column).GetIdentifierName()] = row.GetValue(column);
 	}
-	auto deltas = rows.GetValue(result->ColumnCount() - 1, 0);
+	auto deltas = row.GetValue(result->ColumnCount() - 1);
 	if (!deltas.IsNull()) {
 		for (auto &delta : ListValue::GetChildren(deltas)) {
 			auto &fields = StructType::GetChildTypes(delta.type());
