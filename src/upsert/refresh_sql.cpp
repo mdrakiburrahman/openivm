@@ -599,7 +599,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
 	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
 	// A direct native refresh executes this program at once, under the mutation gate and in one
-	// transaction, so publication consumers can be read now. Reusable programs keep the runtime check.
+	// transaction. Publication consumers can then be read now, and the interruption marker is
+	// never visible to anyone. Reusable programs keep the runtime check and the marker.
 	bool direct_native_refresh = !facts_in && owned_connection && !active_facts.compile_only && !cross_system &&
 	                             !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB;
 	string publication_sql;
@@ -1947,13 +1948,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}
-	string meta_pre_sql = in_progress_sql(true);
+	string meta_pre_sql = direct_native_refresh ? "" : in_progress_sql(true);
 	// Source cleanup reads the minimum watermark of every consumer. Advance this
 	// consumer first, while its source rows still exist for MAX(timestamp), then
 	// remove only rows consumed by all views. Cross-catalog cleanup remains deferred
 	// until commit by BuildDeltaCleanupSQL.
-	string meta_post_sql =
-	    update_timestamp_query + snapshot_update_query + "\n" + delete_from_delta_table_query + in_progress_sql(false);
+	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + delete_from_delta_table_query +
+	                       (direct_native_refresh ? "" : in_progress_sql(false));
 	OPENIVM_DEBUG_PRINT("[UPSERT] Source delta cleanup follows consumer watermark updates for '%s'\n",
 	                    view_name.c_str());
 	if (active_facts.target_dialect == SqlDialect::SPARK) {
