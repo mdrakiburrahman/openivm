@@ -21,8 +21,9 @@ inline string FinalPlanDisabledOptimizers(ClientContext &context, bool cross_sys
 
 // Disables optimizers for the lifetime of the object. The option is database-wide, so concurrent
 // scopes share it: each optimizer is added when the first scope needing it starts and removed when
-// the last one ends, and only if a scope added it. Changes go through DBConfig's locked accessors,
-// which other connections read while planning.
+// the last one ends, and only if a scope added it. A value set by the user since OpenIVM last wrote
+// it is the user's: scopes then keep their hands off it. All changes happen under one lock and go
+// through DBConfig's locked accessors, which other connections read while planning.
 class ScopedDisabledOptimizers {
 public:
 	ScopedDisabledOptimizers(ClientContext &context, const string &optimizer_list)
@@ -36,38 +37,39 @@ public:
 		}
 		auto &registry = Registry();
 		lock_guard<mutex> guard(registry.lock);
-		auto disabled = config.GetDisabledOptimizers();
+		auto &database = registry.databases[&config];
+		auto disabled = Reconcile(database);
 		bool changed = false;
 		for (auto type : types) {
-			auto &scope = registry.scopes[&config][type];
+			auto &scope = database.scopes[type];
 			if (scope.count++ == 0) {
 				scope.added = disabled.insert(type).second;
 				changed |= scope.added;
 			}
 		}
 		if (changed) {
-			config.SetDisabledOptimizers(std::move(disabled));
+			Write(database, std::move(disabled));
 		}
 	}
 
 	~ScopedDisabledOptimizers() {
 		auto &registry = Registry();
 		lock_guard<mutex> guard(registry.lock);
-		auto &scopes = registry.scopes[&config];
-		auto disabled = config.GetDisabledOptimizers();
+		auto &database = registry.databases[&config];
+		auto disabled = Reconcile(database);
 		bool changed = false;
 		for (auto type : types) {
-			auto scope = scopes.find(type);
+			auto scope = database.scopes.find(type);
 			if (--scope->second.count == 0) {
 				changed |= scope->second.added && disabled.erase(type) > 0;
-				scopes.erase(scope);
+				database.scopes.erase(scope);
 			}
 		}
-		if (scopes.empty()) {
-			registry.scopes.erase(&config);
-		}
 		if (changed) {
-			config.SetDisabledOptimizers(std::move(disabled));
+			Write(database, std::move(disabled));
+		}
+		if (database.scopes.empty()) {
+			registry.databases.erase(&config);
 		}
 	}
 
@@ -79,13 +81,37 @@ private:
 		idx_t count = 0;
 		bool added = false;
 	};
+	struct DatabaseScopes {
+		map<OptimizerType, Scope> scopes;
+		//! The value OpenIVM last wrote, to recognize a SET by the user since then.
+		bool has_written = false;
+		set<OptimizerType> written;
+	};
 	struct ScopeRegistry {
 		mutex lock;
-		unordered_map<DBConfig *, map<OptimizerType, Scope>> scopes;
+		unordered_map<DBConfig *, DatabaseScopes> databases;
 	};
 	static ScopeRegistry &Registry() {
 		static ScopeRegistry registry;
 		return registry;
+	}
+
+	//! The current value. If the user changed it since OpenIVM's last write, no scope owns any of it.
+	set<OptimizerType> Reconcile(DatabaseScopes &database) {
+		auto disabled = config.GetDisabledOptimizers();
+		if (database.has_written && disabled != database.written) {
+			for (auto &scope : database.scopes) {
+				scope.second.added = false;
+			}
+			database.has_written = false;
+		}
+		return disabled;
+	}
+
+	void Write(DatabaseScopes &database, set<OptimizerType> disabled) {
+		database.written = disabled;
+		database.has_written = true;
+		config.SetDisabledOptimizers(std::move(disabled));
 	}
 
 	DBConfig &config;
