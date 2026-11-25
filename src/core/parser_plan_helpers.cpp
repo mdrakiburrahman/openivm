@@ -2817,7 +2817,7 @@ static bool IsNormalizedSeedLookup(const CreateMVPlanFacts &facts, const vector<
 	    facts.windows.front()->expressions.front()->GetExpressionType() != ExpressionType::WINDOW_ROW_NUMBER ||
 	    facts.source_occurrences.size() != 2 ||
 	    facts.source_occurrences[0].table == facts.source_occurrences[1].table ||
-	    facts.analysis.found_volatile_expression || direct_ops.size() != 1 ||
+	    !facts.analysis.incremental_compatible || direct_ops.size() != 1 ||
 	    !RawWindowKeyIsProjected(facts, output_names, direct_ops.front())) {
 		return false;
 	}
@@ -3250,7 +3250,7 @@ bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<s
 		OPENIVM_DEBUG_PRINT("[WINDOW GROUP SCOPE] declined: %s\n", reason);
 		return false;
 	};
-	if (!facts.root || !facts.first_projection || facts.analysis.found_volatile_expression ||
+	if (!facts.root || !facts.first_projection || !facts.analysis.incremental_compatible ||
 	    !facts.ducklake_table_info.empty() || !facts.comparison_joins.empty() || !facts.outer_joins.empty() ||
 	    !facts.setops_by_index.empty() || !facts.cte_refs_by_table_index.empty() || !facts.cte_defs_by_index.empty() ||
 	    facts.windows.size() != 1 || facts.aggregates.size() != 1 || facts.source_occurrences.size() != 1) {
