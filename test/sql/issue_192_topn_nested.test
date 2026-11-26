@@ -1,6 +1,5 @@
 # name: test/sql/issue_192_topn_nested.test
-# description: Issue #192 review: nested ORDER BY ... LIMIT under insert-only batches, an outer top-k, aggregate
-#              inputs and equality-hiding values, and Spark rendering of the pre-delta bag
+# description: Issue #192 review: nested ORDER BY ... LIMIT with insert-only batches, outer top-k, aggregate input
 # group: [sql]
 
 require openivm
