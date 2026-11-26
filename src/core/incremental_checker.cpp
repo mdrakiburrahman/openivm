@@ -561,10 +561,17 @@ void MergeMaterializedCteBodyAnalysis(PlanAnalysis &result, PlanAnalysis body) {
 		if (body.found_aggregation) {
 			result.found_aggregation = true;
 			result.found_nested_aggregate = true;
-			for (auto fact :
-			     {&PlanAnalysis::found_minmax, &PlanAnalysis::found_list, &PlanAnalysis::found_count_distinct}) {
-				result.*fact = result.*fact || body.*fact;
-			}
+		}
+		// A window body is maintained by partition, as when the CTE is inlined.
+		if (body.found_window) {
+			MergeWindowKeys(result, !result.found_window, std::move(body.window_partition_columns),
+			                std::move(body.window_order_columns), body.window_row_key_compatible);
+		}
+		// found_distinct stays local: a join above the only DISTINCT keeps group recompute
+		// rather than the single-source DISTINCT aux state.
+		for (auto fact : {&PlanAnalysis::found_window, &PlanAnalysis::found_minmax, &PlanAnalysis::found_list,
+		                  &PlanAnalysis::found_count_distinct}) {
+			result.*fact = result.*fact || body.*fact;
 		}
 		return;
 	}

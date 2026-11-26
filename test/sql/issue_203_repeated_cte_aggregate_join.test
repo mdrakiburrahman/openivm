@@ -1,9 +1,8 @@
 # name: test/sql/issue_203_repeated_cte_aggregate_join.test
 # description: A grouped CTE that is referenced several times and joined to itself is a nested aggregate, not a
-# group: [sql]
-
 #              projection (#203). It is maintained by incremental affected-group recompute, including the edge case
 #              of ungrouped scalar aggregates combined by a cross join.
+# group: [sql]
 
 require openivm
 
@@ -151,3 +150,68 @@ SELECT count(*) FROM ((SELECT * FROM c_self EXCEPT ALL SELECT * FROM c_self_expe
     UNION ALL (SELECT * FROM c_self_expected EXCEPT ALL SELECT * FROM c_self));
 ----
 0
+
+# A window in a multi-referenced CTE body under a join is maintained by partition, like its inlined form.
+statement ok
+CREATE TABLE cw(a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO cw VALUES (1, 5), (1, 7), (2, 3), (2, 4), (3, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW c_window AS WITH c AS MATERIALIZED
+(SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) AS rn FROM cw)
+SELECT c1.a, c1.b, c2.rn FROM c c1 JOIN c c2 ON c1.a = c2.a AND c1.b = c2.b;
+
+statement ok
+CREATE MATERIALIZED VIEW c_window_shared AS WITH c AS
+(SELECT a, b, SUM(b) OVER (PARTITION BY a ORDER BY b) AS rs FROM cw)
+SELECT c1.a, c1.b, c1.rs, c2.rs AS rs2 FROM c c1 JOIN c c2 ON c1.a = c2.a AND c1.b = c2.b;
+
+statement ok
+CREATE VIEW c_window_expected AS WITH c AS (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) AS rn FROM cw)
+SELECT c1.a, c1.b, c2.rn FROM c c1 JOIN c c2 ON c1.a = c2.a AND c1.b = c2.b;
+
+statement ok
+CREATE VIEW c_window_shared_expected AS WITH c AS (SELECT a, b, SUM(b) OVER (PARTITION BY a ORDER BY b) AS rs FROM cw)
+SELECT c1.a, c1.b, c1.rs, c2.rs AS rs2 FROM c c1 JOIN c c2 ON c1.a = c2.a AND c1.b = c2.b;
+
+query II
+SELECT view_sql_name, type FROM openivm_views WHERE view_sql_name LIKE 'c_window%' ORDER BY 1;
+----
+c_window	5
+c_window_shared	5
+
+loop round 0 3
+
+statement ok
+INSERT INTO cw VALUES (1, ${round}), (4, 1 + ${round});
+
+statement ok
+DELETE FROM cw WHERE b = 7 OR (a = 3 AND ${round} = 1);
+
+statement ok
+UPDATE cw SET b = b + 10 WHERE a = 2 AND b = 3;
+
+statement ok
+UPDATE cw SET a = 5 WHERE a = 4 AND ${round} = 2;
+
+statement ok
+PRAGMA refresh('c_window');
+
+statement ok
+PRAGMA refresh('c_window_shared');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_window EXCEPT ALL SELECT * FROM c_window_expected)
+    UNION ALL (SELECT * FROM c_window_expected EXCEPT ALL SELECT * FROM c_window));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_window_shared EXCEPT ALL SELECT * FROM c_window_shared_expected)
+    UNION ALL (SELECT * FROM c_window_shared_expected EXCEPT ALL SELECT * FROM c_window_shared));
+----
+0
+
+endloop
