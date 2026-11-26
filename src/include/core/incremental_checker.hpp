@@ -51,6 +51,8 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &analysis);
 /// Merge an already-analyzed materialized CTE body after its outer consumer has been analyzed.
 /// The body supplies the query shape only for a pass-through consumer; otherwise only safety facts propagate.
 void MergeMaterializedCteBodyAnalysis(PlanAnalysis &analysis, PlanAnalysis body_analysis);
+// A TOP_N/LIMIT input's facts that reach the operators above it; its shape does not.
+void MergeTopKInputAnalysis(PlanAnalysis &analysis, const PlanAnalysis &input_analysis);
 
 /// Return whether DuckDB's rebind requirement comes from a query-dependent value rather than a source scan.
 /// The parsed query is needed because DuckDB can fold SQL value functions such as CURRENT_TIMESTAMP before

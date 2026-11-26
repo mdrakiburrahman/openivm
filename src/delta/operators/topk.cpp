@@ -1,6 +1,7 @@
 #include "delta/delta_operator.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_plan_helpers.hpp"
+#include "delta/delta_helpers.hpp"
 #include "delta/operators/join.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -8,6 +9,9 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/planner/operator/logical_cte.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 
@@ -20,57 +24,15 @@ static bool IsTopKSelection(const LogicalOperator &op) {
 	return op.type == LogicalOperatorType::LOGICAL_TOP_N || op.type == LogicalOperatorType::LOGICAL_LIMIT;
 }
 
-// Whether `target` sits on the view's output path, below only projections and ORDER BY/LIMIT/TOP_N. Such a
-// top-k is published by the user-facing view, so the maintained state stays unbounded.
-static bool OnOutputPath(LogicalOperator &node, const LogicalOperator &target) {
-	if (&node == &target) {
-		return true;
-	}
-	if (node.type != LogicalOperatorType::LOGICAL_PROJECTION && node.type != LogicalOperatorType::LOGICAL_ORDER_BY &&
-	    !IsTopKSelection(node)) {
-		return false;
-	}
-	for (auto &child : node.children) {
-		if (OnOutputPath(*child, target)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-// The input of a top-k selection: below TOP_N, or below the ORDER BY that a LIMIT reads (through projections).
-static unique_ptr<LogicalOperator> &TopKInput(unique_ptr<LogicalOperator> &selection) {
-	auto *slot = &selection->children[0];
-	if (selection->type == LogicalOperatorType::LOGICAL_LIMIT) {
-		while ((*slot)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*slot)->children.size() == 1) {
-			slot = &(*slot)->children[0];
-		}
-		if ((*slot)->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
-			return (*slot)->children[0];
-		}
-		return selection->children[0];
-	}
-	return *slot;
-}
-
-// A renumbered copy under an identity projection with a fresh table index, so its outputs are positional.
-static unique_ptr<LogicalOperator> PositionalCopy(ClientContext &context, Binder &binder,
-                                                  const LogicalOperator &subtree) {
-	auto copy = renumber_and_rebind_subtree(subtree.Copy(context), binder).op;
-	copy->ResolveOperatorTypes();
-	auto projection = LogicalProjection::CreateIdentity(binder.GenerateTableIndex(), std::move(copy));
-	projection->ResolveOperatorTypes();
-	return std::move(projection);
-}
-
-// The input's pre-delta bag: current rows minus the input's delta, consolidated per tuple and expanded back to rows.
-static unique_ptr<LogicalOperator> BuildOldInputBag(const DeltaOperatorInput &input, ClientContext &context,
-                                                    Binder &binder, const LogicalOperator &topk_input) {
-	auto current = PositionalCopy(context, binder, topk_input);
-	auto delta_source = PositionalCopy(context, binder, topk_input);
+// The pre-delta bag of a catalog scan: current rows minus the scan's delta, consolidated per tuple (by value
+// identity) and expanded back to rows. It exposes the scan's columns in the scan's order.
+static unique_ptr<LogicalOperator> BuildOldScanBag(const DeltaOperatorInput &input, ClientContext &context,
+                                                   Binder &binder, unique_ptr<LogicalOperator> scan,
+                                                   DeltaSourceCache &source_cache) {
+	auto delta_source = renumber_and_rebind_subtree(scan->Copy(context), binder).op;
 	LogicalOperator *delta_root = delta_source.get();
-	auto delta = input.CompileCopiedSubtree(delta_source, delta_root);
-	auto old_state = CreateRegularOldNode(binder, std::move(current), std::move(delta), input.mul_type);
+	auto delta = CompileRegularLeafDelta(input, context, binder, delta_source, delta_root, source_cache);
+	auto old_state = CreateRegularOldNode(binder, std::move(scan), std::move(delta), input.mul_type);
 	auto compact =
 	    CompactDeltaNode(context, binder, std::move(old_state.op), binder.GenerateTableIndex(), old_state.mul_binding);
 
@@ -97,6 +59,43 @@ static unique_ptr<LogicalOperator> BuildOldInputBag(const DeltaOperatorInput &in
 	return std::move(bag);
 }
 
+// Replace every catalog scan below `node` with its pre-delta bag, so the subtree (aggregates, joins, nested top-k,
+// ...) evaluates over the old state. References above a scan are rebound up to `root`. Table functions and
+// constant relations do not change between refreshes and stay as they are.
+static void ReplaceScansWithOldState(const DeltaOperatorInput &input, ClientContext &context, Binder &binder,
+                                     unique_ptr<LogicalOperator> &node, LogicalOperator &root,
+                                     DeltaSourceCache &source_cache, unordered_set<idx_t> &ctes_in_subtree) {
+	if (node->type == LogicalOperatorType::LOGICAL_GET && node->Cast<LogicalGet>().GetTable().get()) {
+		node->ResolveOperatorTypes();
+		const auto scan_bindings = node->GetColumnBindings();
+		node = BuildOldScanBag(input, context, binder, std::move(node), source_cache);
+		const auto bag_bindings = node->GetColumnBindings();
+		if (scan_bindings.size() != bag_bindings.size()) {
+			throw InternalException("DeltaTopK: pre-delta scan has %llu columns, expected %llu", bag_bindings.size(),
+			                        scan_bindings.size());
+		}
+		// Positions are preserved, so positional join projection maps above the scan stay valid.
+		ColumnBindingReplacer replacer;
+		for (idx_t i = 0; i < scan_bindings.size(); i++) {
+			replacer.replacement_bindings.emplace_back(scan_bindings[i], bag_bindings[i]);
+		}
+		replacer.stop_operator = node.get();
+		replacer.VisitOperator(root);
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		// Its definition is rewritten below too, so references to it read the old state.
+		ctes_in_subtree.insert(node->Cast<LogicalCTE>().table_index.index);
+	} else if (node->type == LogicalOperatorType::LOGICAL_CTE_REF &&
+	           !ctes_in_subtree.count(node->Cast<LogicalCTERef>().cte_index.index)) {
+		// A CTE defined above the top-k would be read in its current state; never pass that off as the old one.
+		throw NotImplementedException("Incremental maintenance of a top-k over a CTE defined outside of it");
+	}
+	for (auto &child : node->children) {
+		ReplaceScansWithOldState(input, context, binder, child, root, source_cache, ctes_in_subtree);
+	}
+}
+
 // The selection's output with a constant multiplicity appended.
 static unique_ptr<LogicalOperator> WeightSelection(Binder &binder, unique_ptr<LogicalOperator> selection,
                                                    int32_t weight) {
@@ -113,35 +112,26 @@ static unique_ptr<LogicalOperator> WeightSelection(Binder &binder, unique_ptr<Lo
 	return std::move(projection);
 }
 
-// ΔTopK(R) = TopK(R_new) - TopK(R_old) as a signed relation. Base scans read R_new; R_old is R_new minus ΔR. CREATE
-// appends every input column to the ORDER BY as a tie-breaker, so both selections pick the same tuples among ties.
-static DeltaPlanFragment CompileNestedTopKDelta(DeltaOperatorInput input) {
+// ΔTopK(R) = TopK(R_new) - TopK(R_old) as a signed relation. R_new reads the current base tables. R_old evaluates
+// the same subtree over each base table's pre-delta state, so it is exact whatever the input computes (an
+// aggregate's delta, for one, is not a row delta of its output). CREATE appends every input column to the ORDER BY
+// as a tie-breaker, so both selections pick the same tuples among ties.
+static DeltaPlanFragment CompileTopKDiff(DeltaOperatorInput input) {
 	ClientContext &context = input.context.input.context;
 	Binder &binder = input.context.input.optimizer.binder;
-	OPENIVM_DEBUG_PRINT("[DeltaTopK] Nested %s: diffing the selection over current and pre-delta input\n",
+	OPENIVM_DEBUG_PRINT("[DeltaTopK] %s: diffing the selection over current and pre-delta base tables\n",
 	                    LogicalOperatorToString(input.plan->type).c_str());
-	// Views created before CREATE totalized nested top-k orders still need both selections to agree on ties.
+	// Views created before CREATE totalized top-k orders still need both selections to agree on ties.
 	TotalizeTopKOrder(*input.plan);
 	input.plan->ResolveOperatorTypes();
 	const auto original_bindings = input.plan->GetColumnBindings();
 	auto types = input.plan->types;
 
-	auto old_bag = BuildOldInputBag(input, context, binder, *TopKInput(input.plan));
 	auto old_selection = renumber_and_rebind_subtree(input.plan->Copy(context), binder).op;
-	auto &old_input = TopKInput(old_selection);
-	const auto replaced_bindings = old_input->GetColumnBindings();
-	const auto bag_bindings = old_bag->GetColumnBindings();
-	if (replaced_bindings.size() != bag_bindings.size()) {
-		throw InternalException("DeltaTopK: pre-delta input has %llu columns, expected %llu", bag_bindings.size(),
-		                        replaced_bindings.size());
-	}
-	old_input = std::move(old_bag);
-	ColumnBindingReplacer replacer;
-	for (idx_t i = 0; i < replaced_bindings.size(); i++) {
-		replacer.replacement_bindings.emplace_back(replaced_bindings[i], bag_bindings[i]);
-	}
-	replacer.stop_operator = old_input.get();
-	replacer.VisitOperator(*old_selection);
+	DeltaSourceCache source_cache;
+	unordered_set<idx_t> ctes_in_subtree;
+	ReplaceScansWithOldState(input, context, binder, old_selection->children[0], *old_selection, source_cache,
+	                         ctes_in_subtree);
 
 	vector<unique_ptr<LogicalOperator>> terms;
 	terms.push_back(WeightSelection(binder, renumber_and_rebind_subtree(input.plan->Copy(context), binder).op, 1));
@@ -160,23 +150,18 @@ static DeltaPlanFragment CompileNestedTopKDelta(DeltaOperatorInput input) {
 } // namespace
 
 DeltaPlanFragment CompileTopKDelta(DeltaOperatorInput input) {
-	// Below another operator (aggregate, filter, join, ...) a top-k is not linear: ΔTopK(R) != TopK(ΔR). A copied
-	// subtree is always a join input, hence nested.
-	if (IsTopKSelection(*input.plan) && (input.copied_subtree || !OnOutputPath(*input.root, *input.plan))) {
+	// A top-k is not linear: ΔTopK(R) != TopK(ΔR). CREATE moves the view's outermost ORDER BY/LIMIT to the
+	// user-facing view, so any TOP_N/LIMIT still in the stored query selects rows for an enclosing operator (or for
+	// a nested top-k), and its selection must be maintained exactly.
+	if (IsTopKSelection(*input.plan)) {
 		LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::TOPK_DIFF);
-		return CompileNestedTopKDelta(std::move(input));
+		return CompileTopKDiff(std::move(input));
 	}
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::TOPK_STRIP);
-	OPENIVM_DEBUG_PRINT("[DeltaTopK] Stripping %s -- top-k is non-linear; delta is computed unbounded\n",
+	// A standalone ORDER BY is stripped: a materialized view is a table, and tables have no inherent order. We
+	// recurse into the only child, take its rewritten plan + multiplicity binding, and return them directly.
+	OPENIVM_DEBUG_PRINT("[DeltaTopK] Stripping %s -- order is not maintained state\n",
 	                    LogicalOperatorToString(input.plan->type).c_str());
-
-	// On the output path, LIMIT, TOP_N, and standalone ORDER BY are stripped from the delta plan:
-	//   - LIMIT/TOP_N: ΔLIMIT(R) != LIMIT(ΔR). The maintained state stays
-	//     unbounded, and the user-facing view applies ORDER BY/LIMIT at read time.
-	//   - ORDER BY: a materialized view is a table; tables have no inherent order.
-	//     The runtime ordering is meaningless for IVM purposes.
-	// We recurse into the only child, take its rewritten plan + multiplicity binding,
-	// and return them directly — the LIMIT/TOP_N/ORDER_BY node is discarded.
 	auto child_mul = input.CompileChild(input.plan->children[0], input.root);
 	return {std::move(child_mul.op), child_mul.mul_binding};
 }

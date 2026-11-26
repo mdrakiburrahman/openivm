@@ -456,22 +456,23 @@ bool TotalizeTopKOrder(LogicalOperator &selection) {
 	return changed;
 }
 
-static void TotalizeNestedTopKOrders(LogicalOperator &node, bool output_path) {
-	output_path =
-	    output_path &&
-	    (node.type == LogicalOperatorType::LOGICAL_PROJECTION || node.type == LogicalOperatorType::LOGICAL_ORDER_BY ||
-	     node.type == LogicalOperatorType::LOGICAL_LIMIT || node.type == LogicalOperatorType::LOGICAL_TOP_N);
-	if (!output_path && TotalizeTopKOrder(node)) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Added tie-breakers to nested %s\n",
-		                    LogicalOperatorToString(node.type).c_str());
+static void TotalizeTopKOrders(LogicalOperator &node, bool &found) {
+	if (node.type == LogicalOperatorType::LOGICAL_TOP_N || node.type == LogicalOperatorType::LOGICAL_LIMIT) {
+		found = true;
+		if (TotalizeTopKOrder(node)) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Added tie-breakers to nested %s\n",
+			                    LogicalOperatorToString(node.type).c_str());
+		}
 	}
 	for (auto &child : node.children) {
-		TotalizeNestedTopKOrders(*child, output_path);
+		TotalizeTopKOrders(*child, found);
 	}
 }
 
-void TotalizeNestedTopKOrders(LogicalOperator &plan) {
-	TotalizeNestedTopKOrders(plan, true);
+bool TotalizeTopKOrders(LogicalOperator &plan) {
+	bool found = false;
+	TotalizeTopKOrders(plan, found);
+	return found;
 }
 
 bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
@@ -1231,6 +1232,12 @@ static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_
 			PlanAnalysis ignored_analysis;
 			collect_child(op->children[i].get(), ignored_analysis, internal_delim_cte);
 		}
+	} else if (op->type == LogicalOperatorType::LOGICAL_TOP_N || op->type == LogicalOperatorType::LOGICAL_LIMIT) {
+		PlanAnalysis input_analysis;
+		for (auto &child : op->children) {
+			collect_child(child.get(), input_analysis, internal_delim_cte);
+		}
+		MergeTopKInputAnalysis(analysis, input_analysis);
 	} else {
 		for (auto &child : op->children) {
 			collect_child(child.get(), analysis, internal_delim_cte);

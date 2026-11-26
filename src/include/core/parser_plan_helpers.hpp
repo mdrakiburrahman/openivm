@@ -113,8 +113,10 @@ void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperato
 // whether keys were added. A nested top-k is maintained by diffing its selection over current and pre-delta input,
 // which is only sound when both pick the same tuples among ties.
 bool TotalizeTopKOrder(LogicalOperator &selection);
-// Totalize every top-k below the output path; the output path's ORDER BY/LIMIT is published by the user view.
-void TotalizeNestedTopKOrders(LogicalOperator &plan);
+// Totalize every top-k left in the stored plan. Call after StripPublicationModifiers: the view's outermost ORDER
+// BY/LIMIT is published by the user view, so every TOP_N/LIMIT still present is maintained by diffing its selection.
+// Returns whether any remains.
+bool TotalizeTopKOrders(LogicalOperator &plan);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 // Qualify an auxiliary-state source by the catalog and schema the view bound it to.

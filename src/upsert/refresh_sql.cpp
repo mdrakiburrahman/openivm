@@ -58,6 +58,39 @@ string SparkPortableRefreshSQL(string sql) {
 	auto tokens = Parser::Tokenize(sql);
 	for (idx_t i = tokens.size(); i > 1; i--) {
 		auto &token = tokens[i - 1];
+		// Plan-level row repetition (top-k pre-delta bags) renders as UNNEST(range(n)), i.e. explode(range(n)).
+		if (i + 2 < tokens.size() &&
+		    StringUtil::CIEquals(SqlUtils::TrimSQLFragment(sql.substr(token.start, tokens[i].start - token.start)),
+		                         "explode") &&
+		    sql[tokens[i].start] == '(' && sql[tokens[i + 2].start] == '(') {
+			auto function =
+			    SqlUtils::TrimSQLFragment(sql.substr(tokens[i + 1].start, tokens[i + 2].start - tokens[i + 1].start));
+			if (StringUtil::CIEquals(function, "range") || StringUtil::CIEquals(function, "\"range\"") ||
+			    StringUtil::CIEquals(function, "`range`")) {
+				idx_t close = i + 3;
+				idx_t depth = 1;
+				bool single_bound = true;
+				for (; close < tokens.size(); close++) {
+					if (tokens[close].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR) {
+						continue;
+					}
+					auto op = sql[tokens[close].start];
+					single_bound = single_bound && !(op == ',' && depth == 1);
+					if (op == '(') {
+						depth++;
+					} else if (op == ')' && --depth == 0) {
+						break;
+					}
+				}
+				if (single_bound && close < tokens.size()) {
+					auto argument_start = tokens[i + 2].start + 1;
+					auto argument = sql.substr(argument_start, tokens[close].start - argument_start);
+					sql.replace(tokens[i + 1].start, tokens[close].start + 1 - tokens[i + 1].start,
+					            SqlUtils::SparkRepetitionArraySQL(argument));
+				}
+				continue;
+			}
+		}
 		// Native old-state reconstruction expands signed weights with a
 		// correlated range. Scope construction still needs DuckDB-parseable
 		// SQL; render the shared per-row generator at this final dialect boundary.
@@ -1023,7 +1056,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool skip_proj_delete = fast_paths.skip_proj_delete;
 	bool minmax_incremental = fast_paths.minmax_incremental;
 	bool running_window_incremental =
-	    (active_facts.running_window_incremental && active_facts.assume_insert_only) ||
+	    (active_facts.running_window_incremental && active_facts.assume_insert_only &&
+	     !fast_paths.retracts_on_insert) ||
 	    (insert_only && SqlUtils::GetBoolSetting(context, "openivm_running_window_incremental", false));
 	refresh_plan.delta_flags = fast_paths;
 	auto agg_types = metadata.GetAggregateTypes(view_name);
@@ -1509,9 +1543,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_cols,
 			                                                 view_query_sql, delta_specs);
 		}
-		const bool has_source_deletes = active_facts.compile_only
-		                                    ? !active_facts.assume_insert_only
-		                                    : !refresh_delta_activity || refresh_delta_activity->any_has_deletes;
+		const bool has_source_deletes =
+		    fast_paths.retracts_on_insert ||
+		    (active_facts.compile_only ? !active_facts.assume_insert_only
+		                               : !refresh_delta_activity || refresh_delta_activity->any_has_deletes);
 		upsert_query = CompileGroupRecompute(*con.context, view_name, view_query_sql, group_cols, delta_specs,
 		                                     internal_catalog_prefix, emit_cascade_delta_for_recompute, affected_mode,
 		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name),
