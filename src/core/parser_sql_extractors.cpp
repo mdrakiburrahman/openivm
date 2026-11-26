@@ -7,6 +7,7 @@
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -433,21 +434,42 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out,
 	}
 	auto original_right_alias = meta.right_alias;
 	meta.right_alias = "openivm_right";
-	if (table_columns) {
+	auto &right_name = right->from_table->Cast<BaseTableRef>().Table();
+	// A CTE named like the subquery table is not that catalog table; its columns are unknown here.
+	if (table_columns && !select->cte_map.map.contains(right_name) && !right->cte_map.map.contains(right_name)) {
 		// A bare subquery column binds to the right table when it has that column and is
 		// correlated otherwise; qualify it so the extracted predicate is not ambiguous.
 		auto right_columns = table_columns(meta.right_table);
 		case_insensitive_set_t right_names(right_columns.begin(), right_columns.end());
-		auto qualify = [&](ColumnRefExpression &column) {
-			if (column.ColumnNames().size() == 1) {
-				auto &owner = right_names.count(column.GetColumnName().GetIdentifierName()) ? original_right_alias
-				                                                                            : meta.left_alias;
-				column.ColumnNamesMutable() = {Identifier(owner), column.GetColumnName()};
+		std::function<void(ParsedExpression &, const case_insensitive_set_t &)> qualify;
+		qualify = [&](ParsedExpression &expression, const case_insensitive_set_t &lambda_params) {
+			if (expression.GetExpressionClass() == ExpressionClass::LAMBDA) {
+				// Lambda parameters shadow columns inside the lambda body.
+				string error;
+				auto &lambda = expression.Cast<LambdaExpression>();
+				auto params = lambda.ExtractColumnRefExpressions(error);
+				if (error.empty()) {
+					auto inner = lambda_params;
+					for (auto &param : params) {
+						inner.insert(param.get().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+					}
+					return qualify(*lambda.RightMutable(), inner);
+				}
+			} else if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				auto &column = expression.Cast<ColumnRefExpression>();
+				auto name = column.GetColumnName().GetIdentifierName();
+				if (column.ColumnNames().size() == 1 && !lambda_params.count(name)) {
+					auto &owner = right_names.count(name) ? original_right_alias : meta.left_alias;
+					column.ColumnNamesMutable() = {Identifier(owner), column.GetColumnName()};
+				}
+				return;
 			}
+			ParsedExpressionIterator::EnumerateChildren(
+			    expression, [&](ParsedExpression &child) { qualify(child, lambda_params); });
 		};
-		ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*right->select_list[0], qualify);
+		qualify(*right->select_list[0], {});
 		if (right->where_clause) {
-			ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*right->where_clause, qualify);
+			qualify(*right->where_clause, {});
 		}
 	}
 	out.left_key_col = "openivm_saj_key";
