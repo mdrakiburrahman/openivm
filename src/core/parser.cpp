@@ -727,14 +727,18 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 
 	auto &semi_anti = semi_anti_extract.meta;
-	auto semi_anti_extracted = analysis.found_semi_anti_join && !analysis.found_aggregation &&
-	                           ExtractSemiAntiQuery(local_view_query, semi_anti_extract);
-	if (semi_anti_extracted) {
-		auto col_result = con.Query("DESCRIBE SELECT * FROM " + semi_anti.left_table);
-		vector<string> base_cols;
-		for (idx_t i = 0; !col_result->HasError() && i < col_result->RowCount(); i++) {
-			base_cols.push_back(col_result->Collection().GetValue(0, i).ToString());
+	auto describe_columns = [&](const string &relation) {
+		vector<string> names;
+		auto described = con.Query("DESCRIBE SELECT * FROM " + relation);
+		for (idx_t i = 0; !described->HasError() && i < described->RowCount(); i++) {
+			names.push_back(described->Collection().GetValue(0, i).ToString());
 		}
+		return names;
+	};
+	auto semi_anti_extracted = analysis.found_semi_anti_join && !analysis.found_aggregation &&
+	                           ExtractSemiAntiQuery(local_view_query, semi_anti_extract, describe_columns);
+	if (semi_anti_extracted) {
+		auto base_cols = describe_columns(semi_anti.left_table);
 		if (semi_anti.output_cols.empty()) {
 			for (auto &name : base_cols) {
 				semi_anti.output_cols.push_back(name);

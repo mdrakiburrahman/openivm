@@ -48,7 +48,9 @@ bool ExtractCountDistinctAggregate(const string &original_sql, const vector<stri
                                    const vector<string> &output_names, CountDistinctExtract &out);
 bool ExtractFilteredGroupCount(const string &original_sql, const vector<string> &output_names,
                                FilteredGroupCountExtract &out);
-bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &out);
+// table_columns returns a source table's column names; it resolves bare IN-subquery columns (#206).
+bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &out,
+                          const std::function<vector<string>(const string &table)> &table_columns = nullptr);
 
 } // namespace duckdb
 

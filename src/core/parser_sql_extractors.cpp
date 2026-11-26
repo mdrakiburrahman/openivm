@@ -347,7 +347,8 @@ bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_n
 	return false;
 }
 
-bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
+bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out,
+                          const std::function<vector<string>(const string &table)> &table_columns) {
 	auto &meta = out.meta;
 	auto statement = SqlUtils::TryParseSelect(sql);
 	auto select = statement ? AsSelect(*statement->node) : nullptr;
@@ -432,6 +433,23 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	}
 	auto original_right_alias = meta.right_alias;
 	meta.right_alias = "openivm_right";
+	if (table_columns) {
+		// A bare subquery column binds to the right table when it has that column and is
+		// correlated otherwise; qualify it so the extracted predicate is not ambiguous.
+		auto right_columns = table_columns(meta.right_table);
+		case_insensitive_set_t right_names(right_columns.begin(), right_columns.end());
+		auto qualify = [&](ColumnRefExpression &column) {
+			if (column.ColumnNames().size() == 1) {
+				auto &owner = right_names.count(column.GetColumnName().GetIdentifierName()) ? original_right_alias
+				                                                                            : meta.left_alias;
+				column.ColumnNamesMutable() = {Identifier(owner), column.GetColumnName()};
+			}
+		};
+		ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*right->select_list[0], qualify);
+		if (right->where_clause) {
+			ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*right->where_clause, qualify);
+		}
+	}
 	out.left_key_col = "openivm_saj_key";
 	out.left_key_expr = simple_left
 	                        ? RenameQualifier(*subquery->GetChild(), meta.left_table, meta.left_alias, meta.left_alias)
