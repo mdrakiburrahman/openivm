@@ -1,0 +1,129 @@
+# name: test/sql/issue_38_ducklake_left_join_insert_only.test
+# description: A DuckLake-resident LEFT JOIN projection MV retracts the NULL-extended row when an insert-only batch on
+# group: [sql]
+
+#              the null-extended side gives a previously unmatched preserved row a match (#38).
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/issue_38_ducklake_left_join.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE dl.o(id INTEGER, cid INTEGER);
+
+statement ok
+CREATE TABLE dl.c(cid INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO dl.o VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, NULL);
+
+statement ok
+INSERT INTO dl.c VALUES (1, 'a');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.lj AS SELECT o.id, c.name FROM dl.o o LEFT JOIN dl.c c ON o.cid = c.cid;
+
+statement ok
+CREATE VIEW dl.lj_expected AS SELECT o.id, c.name FROM dl.o o LEFT JOIN dl.c c ON o.cid = c.cid;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'lj';
+----
+2
+
+# The issue's exact batch: an insert-only batch on the null-extended side matches o.id = 2.
+statement ok
+INSERT INTO dl.c VALUES (2, 'b');
+
+statement ok
+PRAGMA refresh('dl.lj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.lj EXCEPT ALL SELECT * FROM dl.lj_expected)
+    UNION ALL (SELECT * FROM dl.lj_expected EXCEPT ALL SELECT * FROM dl.lj));
+----
+0
+
+query II
+SELECT * FROM dl.lj ORDER BY ALL;
+----
+1	a
+2	b
+3	NULL
+4	NULL
+5	NULL
+
+# Several insert-only statements before one refresh: duplicate matches for one key, a second match for an already
+# matched key, and an unmatched NULL key.
+statement ok
+INSERT INTO dl.c VALUES (3, 'c'), (3, 'c2');
+
+statement ok
+INSERT INTO dl.c VALUES (1, 'a2'), (NULL, 'none');
+
+statement ok
+PRAGMA refresh('dl.lj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.lj EXCEPT ALL SELECT * FROM dl.lj_expected)
+    UNION ALL (SELECT * FROM dl.lj_expected EXCEPT ALL SELECT * FROM dl.lj));
+----
+0
+
+# Insert-only batch on both sides at once.
+statement ok
+INSERT INTO dl.o VALUES (6, 4), (7, 9), (8, 3);
+
+statement ok
+INSERT INTO dl.c VALUES (4, 'd'), (9, 'i');
+
+statement ok
+PRAGMA refresh('dl.lj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.lj EXCEPT ALL SELECT * FROM dl.lj_expected)
+    UNION ALL (SELECT * FROM dl.lj_expected EXCEPT ALL SELECT * FROM dl.lj));
+----
+0
+
+# A mixed conflicting batch afterwards still converges.
+statement ok
+DELETE FROM dl.c WHERE cid = 3 AND name = 'c';
+
+statement ok
+UPDATE dl.o SET cid = 2 WHERE id = 4;
+
+statement ok
+INSERT INTO dl.c VALUES (5, 'e');
+
+statement ok
+DELETE FROM dl.o WHERE id = 1;
+
+statement ok
+UPDATE dl.c SET name = 'bb' WHERE cid = 2;
+
+statement ok
+PRAGMA refresh('dl.lj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.lj EXCEPT ALL SELECT * FROM dl.lj_expected)
+    UNION ALL (SELECT * FROM dl.lj_expected EXCEPT ALL SELECT * FROM dl.lj));
+----
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'lj';
+----
+2
