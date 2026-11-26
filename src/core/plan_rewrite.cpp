@@ -1559,6 +1559,18 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, unique_ptr<Logical
 		return;
 	}
 	auto &agg = spine.bottom->Cast<LogicalAggregate>();
+	// A UNION, DISTINCT or inner aggregate between the join and this aggregate hides the join's
+	// bindings; counting them would count another branch's column or fail to bind (#205, #210).
+	// The classifier recomputes affected groups for a LEFT JOIN aggregate without a match count.
+	auto agg_input = agg.children[0]->GetColumnBindings();
+	auto visible = [&](const ColumnBinding &binding) {
+		return std::find(agg_input.begin(), agg_input.end(), binding) != agg_input.end();
+	};
+	if (!visible(outer_join.null_side_binding) ||
+	    (outer_join.is_full_outer && !visible(outer_join.left_side_binding))) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Outer-join bindings are not visible at the aggregate; no match count\n");
+		return;
+	}
 	// Expose the COUNT through every projection between the aggregate and the root. PIVOT and other
 	// planner rewrites can introduce several projection layers; adding the hidden binding only to the
 	// top projection leaves LPTS with a reference to a column that no child CTE emits.

@@ -566,8 +566,12 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	}
 	BuildGroupColumns(model, facts, output_names, input.visible_output_count);
 
+	// Without the hidden match count (#205, #210) the outer-join MERGE cannot tell a
+	// NULL-padded group from a matched one; HAVING views never carry it.
+	const bool lacks_match_count = !analysis.found_having && std::find(output_names.begin(), output_names.end(),
+	                                                                   openivm::MATCH_COUNT_COL) == output_names.end();
 	if ((analysis.found_left_join || analysis.found_full_outer) && analysis.found_aggregation &&
-	    OuterJoinAggregateNeedsRecompute(facts, analysis.group_index)) {
+	    (lacks_match_count || OuterJoinAggregateNeedsRecompute(facts, analysis.group_index))) {
 		model.has_minmax_metadata = true;
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE);
 		OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper -- "
