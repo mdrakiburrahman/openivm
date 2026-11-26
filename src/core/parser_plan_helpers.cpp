@@ -24,6 +24,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -3156,14 +3157,27 @@ static bool IsReservedMaterializedViewOutputName(const string &name) {
 // Explicit output aliases the column hider would drop (#193). Source columns passed
 // through unaliased (e.g. SELECT *) stay hidden but stored, as before.
 static void ValidateExplicitOutputAliases(const QueryNode &query) {
+	auto check = [](const Identifier &alias) {
+		if (IncrementalTableNames::IsInternalColumn(alias.GetIdentifierName())) {
+			throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'",
+			                      alias.GetIdentifierName());
+		}
+	};
 	if (query.type == QueryNodeType::SET_OPERATION_NODE) {
-		// The first branch names the outputs.
-		ValidateExplicitOutputAliases(*query.Cast<SetOperationNode>().children[0]);
+		// The first branch names the outputs; UNION BY NAME takes names from every branch.
+		auto &setop = query.Cast<SetOperationNode>();
+		for (idx_t i = 0; i < setop.children.size(); i++) {
+			if (i == 0 || setop.setop_type == SetOperationType::UNION_BY_NAME) {
+				ValidateExplicitOutputAliases(*setop.children[i]);
+			}
+		}
 	} else if (query.type == QueryNodeType::SELECT_NODE) {
 		for (auto &expression : query.Cast<SelectNode>().select_list) {
-			auto &alias = expression->GetAlias().GetIdentifierName();
-			if (IncrementalTableNames::IsInternalColumn(alias)) {
-				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", alias);
+			check(expression->GetAlias());
+			if (expression->GetExpressionClass() == ExpressionClass::STAR) {
+				for (auto &rename : expression->Cast<StarExpression>().RenameList()) {
+					check(rename.second);
+				}
 			}
 		}
 	}

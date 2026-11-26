@@ -36,6 +36,17 @@ CREATE MATERIALIZED VIEW ia_union AS SELECT id AS openivm_id FROM ia_src UNION A
 ----
 reserved OpenIVM column 'openivm_id'
 
+# STAR RENAME and UNION BY NAME branches name outputs explicitly too.
+statement error
+CREATE MATERIALIZED VIEW ia_rename AS SELECT * RENAME (x AS openivm_x) FROM ia_src;
+----
+reserved OpenIVM column 'openivm_x'
+
+statement error
+CREATE MATERIALIZED VIEW ia_by_name AS SELECT id, g FROM ia_src UNION ALL BY NAME SELECT id, x AS openivm_x FROM ia_src;
+----
+reserved OpenIVM column 'openivm_x'
+
 query I
 SELECT count(*) FROM openivm_views;
 ----
@@ -47,6 +58,10 @@ CREATE MATERIALIZED VIEW ia_upper AS SELECT g, SUM(x) AS "OPENIVM_total", COUNT(
 
 statement ok
 CREATE MATERIALIZED VIEW ia_renamed AS SELECT id, openivm_raw AS raw FROM ia_src;
+
+# A later positional UNION ALL branch does not name the output.
+statement ok
+CREATE MATERIALIZED VIEW ia_union_later AS SELECT id FROM ia_src UNION ALL SELECT g AS openivm_g FROM ia_src;
 
 # An unaliased source column with the prefix passes through: hidden from the view, kept in the data table.
 statement ok
@@ -83,6 +98,9 @@ PRAGMA refresh('ia_renamed');
 statement ok
 PRAGMA refresh('ia_star');
 
+statement ok
+PRAGMA refresh('ia_union_later');
+
 query I
 SELECT count(*) FROM ((SELECT * FROM ia_upper EXCEPT ALL SELECT g, SUM(x), COUNT(*) FROM ia_src GROUP BY g)
     UNION ALL (SELECT g, SUM(x), COUNT(*) FROM ia_src GROUP BY g EXCEPT ALL SELECT * FROM ia_upper));
@@ -98,5 +116,11 @@ SELECT count(*) FROM ((SELECT * FROM ia_renamed EXCEPT ALL SELECT id, openivm_ra
 query I
 SELECT count(*) FROM ((SELECT * FROM ia_star EXCEPT ALL SELECT id, g, x FROM ia_src)
     UNION ALL (SELECT id, g, x FROM ia_src EXCEPT ALL SELECT * FROM ia_star));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ia_union_later EXCEPT ALL (SELECT id FROM ia_src UNION ALL SELECT g FROM ia_src))
+    UNION ALL ((SELECT id FROM ia_src UNION ALL SELECT g FROM ia_src) EXCEPT ALL SELECT * FROM ia_union_later));
 ----
 0
