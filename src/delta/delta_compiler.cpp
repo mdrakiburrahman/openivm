@@ -18,36 +18,16 @@ static string CurrentCatalog(ClientContext &context) {
 
 } // namespace
 
-DeltaCompileContext::DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
-                                         const DeltaViewModel &model)
-    : input(input), metadata_con(metadata_con), view(view), model(model) {
-}
-
 DeltaCompiler::DeltaCompiler(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
                              const DeltaViewModel &model)
-    : DeltaCompiler(DeltaCompileContext(input, metadata_con, view, model)) {
-}
-
-DeltaCompiler::DeltaCompiler(DeltaCompileContext context) : context(context) {
-	for (idx_t node_id = 0; node_id < context.model.nodes.size(); node_id++) {
-		node_by_plan[context.model.nodes[node_id].plan_node] = node_id;
+    : context {input, metadata_con, view, model} {
+	for (idx_t node_id = 0; node_id < model.nodes.size(); node_id++) {
+		node_by_plan[model.nodes[node_id].plan_node] = node_id;
 	}
 }
 
-const DeltaModelNode *DeltaCompiler::FindNode(LogicalOperator *op) const {
-	if (!op) {
-		return nullptr;
-	}
-	auto entry = node_by_plan.find(op);
-	if (entry == node_by_plan.end()) {
-		return nullptr;
-	}
-	// Model node ids are vector indexes. Use checked access so malformed internal model metadata fails immediately.
-	return &context.model.nodes.at(entry->second);
-}
-
-DeltaPlanFragment DeltaCompiler::CompileInternal(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root,
-                                                 bool copied_subtree) {
+DeltaPlanFragment DeltaCompiler::Compile(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root,
+                                         bool copied_subtree) {
 	DeltaOperatorInput op_input(context, plan, root, this, copied_subtree);
 	if (copied_subtree) {
 		OPENIVM_DEBUG_PRINT("[Delta Compiler] copied subtree %s; using copied-subtree compile\n",
@@ -56,8 +36,8 @@ DeltaPlanFragment DeltaCompiler::CompileInternal(unique_ptr<LogicalOperator> &pl
 		return CompileDeltaOperatorByKind(op_input, NodeKindForOperator(*plan));
 	}
 
-	auto *node = FindNode(plan.get());
-	if (!node) {
+	auto entry = node_by_plan.find(plan.get());
+	if (entry == node_by_plan.end()) {
 		// Only constant leaves (dummy scans, expression/chunk gets) may lack an IR node; they carry a zero delta.
 		if (NodeKindForOperator(*plan) != DeltaModelNodeKind::CONSTANT) {
 			throw InternalException("Delta compiler missing IR node for operator %s",
@@ -68,17 +48,12 @@ DeltaPlanFragment DeltaCompiler::CompileInternal(unique_ptr<LogicalOperator> &pl
 		return CompileDeltaOperatorByKind(op_input, DeltaModelNodeKind::CONSTANT);
 	}
 
-	OPENIVM_DEBUG_PRINT("[Delta Compiler] Visiting %s node for operator %s\n", DeltaModelNodeKindName(node->kind),
+	// Model node ids are vector indexes. Use checked access so malformed internal model metadata fails immediately.
+	auto &node = context.model.nodes.at(entry->second);
+	OPENIVM_DEBUG_PRINT("[Delta Compiler] Visiting %s node for operator %s\n", DeltaModelNodeKindName(node.kind),
 	                    LogicalOperatorToString(plan->type).c_str());
-	return CompileDeltaOperatorByKind(op_input.WithNode(*node), node->kind);
-}
-
-DeltaPlanFragment DeltaCompiler::Compile(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root) {
-	return CompileInternal(plan, root, false);
-}
-
-DeltaPlanFragment DeltaCompiler::CompileCopiedSubtree(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root) {
-	return CompileInternal(plan, root, true);
+	op_input.node = &node;
+	return CompileDeltaOperatorByKind(op_input, node.kind);
 }
 
 DeltaViewModel BuildRefreshDeltaViewModel(OptimizerExtensionInput &input, LogicalOperator *optimized_plan,
@@ -103,12 +78,12 @@ void LogDeltaModelSummary(const DeltaViewModel &model) {
 
 DeltaPlanFragment DeltaOperatorInput::CompileChild(unique_ptr<LogicalOperator> &child,
                                                    LogicalOperator *&child_root) const {
-	return copied_subtree ? compiler->CompileCopiedSubtree(child, child_root) : compiler->Compile(child, child_root);
+	return compiler->Compile(child, child_root, copied_subtree);
 }
 
 DeltaPlanFragment DeltaOperatorInput::CompileCopiedSubtree(unique_ptr<LogicalOperator> &subtree,
                                                            LogicalOperator *&subtree_root) const {
-	return compiler->CompileCopiedSubtree(subtree, subtree_root);
+	return compiler->Compile(subtree, subtree_root, true);
 }
 
 } // namespace duckdb

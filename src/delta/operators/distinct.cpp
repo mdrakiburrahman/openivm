@@ -66,23 +66,16 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	// swap it out for our new aggregate after we return). This prevents the replacer from
 	// descending into the already-rewritten UNION subtree below, where the same bindings
 	// are still valid (they are the UNION's genuine output bindings).
-	ColumnBindingReplacer replacer;
-	idx_t group_position = 0;
-	idx_t original_position = 0;
-	// Every non-multiplicity child output corresponds to exactly one original DISTINCT output.
-	for (idx_t i = 0; i < child_output_count; // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-	     i++) {
-		if (child_bindings[i] == input_mul_binding) {
-			continue; // multiplicity is not in the parent's original bindings
-		}
-		ColumnBinding new_binding {group_index, ProjectionIndex(group_position)};
-		replacer.replacement_bindings.emplace_back(original_bindings[original_position], new_binding);
-		original_position++;
-		group_position++;
-	}
+	//
+	// Every non-multiplicity child output, in order, is a group and corresponds to one original DISTINCT output.
 	// The cardinality contract above guarantees this; retain the check to diagnose future compiler regressions.
-	if (original_position != original_bindings.size()) { // mull-ignore: cxx_ne_to_eq
+	if (agg_node->groups.size() != original_bindings.size() + 1) { // mull-ignore: cxx_ne_to_eq
 		throw InternalException("DeltaDistinct: rewritten child did not expose every original output binding");
+	}
+	ColumnBindingReplacer replacer;
+	for (idx_t i = 0; i < original_bindings.size(); i++) {
+		replacer.replacement_bindings.emplace_back(original_bindings[i],
+		                                           ColumnBinding(group_index, ProjectionIndex(i)));
 	}
 	replacer.stop_operator = input.plan.get();
 	replacer.VisitOperator(*input.root);

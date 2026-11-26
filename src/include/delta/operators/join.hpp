@@ -67,7 +67,8 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
                                                 idx_t original_leaf_width = DConstants::INVALID_INDEX);
 
 // lhs * rhs, bound as DuckDB's multiplication operator.
-unique_ptr<Expression> MultiplyIntegers(Binder &binder, unique_ptr<Expression> lhs, unique_ptr<Expression> rhs);
+unique_ptr<Expression> BindBinaryOperator(Binder &binder, const string &op, unique_ptr<Expression> lhs,
+                                          unique_ptr<Expression> rhs);
 
 // The product of a term's leaf multiplicities, optionally times the Möbius sign (-1)^(k-1).
 unique_ptr<Expression> BuildJoinMultiplicityProduct(Binder &binder, const LogicalType &mul_type,

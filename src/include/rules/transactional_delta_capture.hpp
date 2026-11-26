@@ -9,19 +9,42 @@ class TableCatalogEntry;
 
 enum class DeltaCaptureMode : uint8_t { INSERT, DELETE, UPDATE };
 
-class LogicalSourceLifecycle : public LogicalExtensionOperator {
+// Unserializable extension operator that exposes its single child's bindings and types.
+class LogicalOpenIVMPassThrough : public LogicalExtensionOperator {
 public:
-	LogicalSourceLifecycle(optional_ptr<TableCatalogEntry> old_table, optional_ptr<TableCatalogEntry> delta);
-	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
-	vector<ColumnBinding> GetColumnBindings() override;
-	string GetName() const override;
-	string GetExtensionName() const override;
+	LogicalOpenIVMPassThrough(const char *op_name, const char *op_extension_name,
+	                          vector<unique_ptr<Expression>> expressions = {})
+	    : LogicalExtensionOperator(std::move(expressions)), op_name(op_name), op_extension_name(op_extension_name) {
+	}
+	vector<ColumnBinding> GetColumnBindings() override {
+		D_ASSERT(children.size() == 1);
+		return children[0]->GetColumnBindings();
+	}
+	string GetName() const override {
+		return op_name;
+	}
+	string GetExtensionName() const override {
+		return op_extension_name;
+	}
 	bool SupportSerialization() const override {
 		return false;
 	}
 
 protected:
-	void ResolveTypes() override;
+	void ResolveTypes() override {
+		D_ASSERT(children.size() == 1);
+		types = children[0]->types;
+	}
+
+private:
+	const char *op_name;
+	const char *op_extension_name;
+};
+
+class LogicalSourceLifecycle : public LogicalOpenIVMPassThrough {
+public:
+	LogicalSourceLifecycle(optional_ptr<TableCatalogEntry> old_table, optional_ptr<TableCatalogEntry> delta);
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 
 private:
 	optional_ptr<TableCatalogEntry> old_table;
@@ -30,20 +53,11 @@ private:
 
 // Admission is acquired while optimizing, including for EXPLAIN and PREPARE.
 // This wrapper marks a source write only when the DML plan is executed.
-class LogicalSourceWriteExecution : public LogicalExtensionOperator {
+class LogicalSourceWriteExecution : public LogicalOpenIVMPassThrough {
 public:
 	LogicalSourceWriteExecution(TableCatalogEntry &base_table, optional_ptr<TableCatalogEntry> delta_table);
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
-	vector<ColumnBinding> GetColumnBindings() override;
-	string GetName() const override;
-	string GetExtensionName() const override;
-	bool SupportSerialization() const override {
-		return false;
-	}
-
-protected:
-	void ResolveTypes() override;
 
 private:
 	TableCatalogEntry &base_table;
@@ -52,7 +66,7 @@ private:
 
 // Streaming plan operator that writes the rows affected by a base-table DML statement
 // to its delta table through the caller's transaction before passing the input onward.
-class LogicalTransactionalDeltaCapture : public LogicalExtensionOperator {
+class LogicalTransactionalDeltaCapture : public LogicalOpenIVMPassThrough {
 public:
 	LogicalTransactionalDeltaCapture(TableCatalogEntry &base_table, TableCatalogEntry &delta_table,
 	                                 DeltaCaptureMode mode, vector<unique_ptr<Expression>> update_expressions = {},
@@ -71,11 +85,6 @@ public:
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 	vector<ColumnBinding> GetColumnBindings() override;
-	string GetName() const override;
-	string GetExtensionName() const override;
-	bool SupportSerialization() const override {
-		return false;
-	}
 
 protected:
 	void ResolveTypes() override;
@@ -83,7 +92,7 @@ protected:
 
 // Decorate a native UPDATE sink or MERGE's resolved action sinks. In-place
 // postimages are fetched after the native write, including equality-preserving updates.
-class LogicalTransactionalActionDeltaCapture : public LogicalExtensionOperator {
+class LogicalTransactionalActionDeltaCapture : public LogicalOpenIVMPassThrough {
 public:
 	LogicalTransactionalActionDeltaCapture(TableCatalogEntry &base_table, TableCatalogEntry &delta_table);
 
@@ -91,15 +100,6 @@ public:
 	TableCatalogEntry &delta_table;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
-	vector<ColumnBinding> GetColumnBindings() override;
-	string GetName() const override;
-	string GetExtensionName() const override;
-	bool SupportSerialization() const override {
-		return false;
-	}
-
-protected:
-	void ResolveTypes() override;
 };
 
 // Admit cached source lifecycles before their native sinks run, and acquire the

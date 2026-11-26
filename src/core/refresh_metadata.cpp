@@ -359,10 +359,7 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 		return;
 	}
 	auto run = [&](const string &sql) {
-		auto result = con.Query(sql);
-		if (result->HasError()) {
-			throw CatalogException(result->GetError());
-		}
+		SqlUtils::QueryOrThrow(con, sql, "%s");
 	};
 	OPENIVM_DEBUG_PRINT("[METADATA] Moving metadata of %s from '%s' to '%s'\n", catalog.c_str(), legacy.c_str(),
 	                    configured.c_str());
@@ -798,15 +795,13 @@ Value RefreshMetadata::ReadDeltaValue(const string &view_name, const string &tab
 	if (answered) {
 		return row ? row->at(column) : Value();
 	}
-	auto result =
-	    con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	              " WHERE view_name = " + Value(view_name).ToSQLString() +
-	              " AND table_name = " + Value(table_name).ToSQLString());
-	if (result->HasError()) {
-		throw InvalidInputException(
-		    "Could not read IVM metadata column '%s' for materialized view '%s' and table '%s': %s", column, view_name,
-		    table_name, result->GetError());
-	}
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	        " WHERE view_name = " + Value(view_name).ToSQLString() +
+	        " AND table_name = " + Value(table_name).ToSQLString(),
+	    "Could not read IVM metadata column '%s' for materialized view '%s' and table '%s': %s", column, view_name,
+	    table_name);
 	return result->RowCount() == 0 ? Value() : result->Collection().GetValue(0, 0);
 }
 
@@ -884,13 +879,12 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 		}
 		return tables;
 	}
-	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "' ORDER BY table_name");
+	auto result = SqlUtils::QueryOrThrow<InvalidInputException>(
+	    con,
+	    "SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	        SqlUtils::EscapeValue(view_name) + "' ORDER BY table_name",
+	    "Could not read IVM delta table metadata for materialized view '%s': %s", view_name);
 	vector<string> tables;
-	if (result->HasError()) {
-		throw InvalidInputException("Could not read IVM delta table metadata for materialized view '%s': %s", view_name,
-		                            result->GetError());
-	}
 	for (size_t i = 0; i < result->RowCount(); i++) {
 		tables.push_back(result->Collection().GetValue(0, i).ToString());
 	}
@@ -956,6 +950,12 @@ string RefreshMetadata::SourceDeltaTableName(const string &source_schema, const 
 
 // Legacy rows derive the physical name; new rows store it because a colocated
 // delta may already occupy the preferred name of a moved source.
+static void AssignIfSet(const Value &value, string &target) {
+	if (!value.IsNull()) {
+		target = value.ToString();
+	}
+}
+
 static void SetSourceDelta(const string &delta_key, const string &schema, const string &delta_schema,
                            const string &stored_name, string &delta_schema_name, string &delta_table_name) {
 	delta_schema_name = delta_schema.empty() ? schema : delta_schema;
@@ -1221,10 +1221,7 @@ void RefreshMetadata::InvalidateSourceGeneration(ClientContext &context, const s
 		if (!drop_schema) {
 			query += " AND table_name=" + Value(StringUtil::Lower(table)).ToSQLString();
 		}
-		auto rows = committed.Query(query);
-		if (rows->HasError()) {
-			throw CatalogException(rows->GetError());
-		}
+		auto rows = SqlUtils::QueryOrThrow(committed, query, "%s");
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
 			auto name = rows->Collection().GetValue(0, row).ToString();
 			if (!state.HasInvalidatedSourceGeneration(catalog, schema, name) &&
@@ -1378,18 +1375,10 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 			values[column] = result->Collection().GetValue(column, 0);
 		}
 	}
-	if (!values[0].IsNull()) {
-		loc.catalog_name = values[0].ToString();
-	}
-	if (!values[1].IsNull()) {
-		loc.schema_name = values[1].ToString();
-	}
-	if (!values[2].IsNull()) {
-		delta_schema = values[2].ToString();
-	}
-	if (!values[3].IsNull()) {
-		delta_table_name = values[3].ToString();
-	}
+	AssignIfSet(values[0], loc.catalog_name);
+	AssignIfSet(values[1], loc.schema_name);
+	AssignIfSet(values[2], delta_schema);
+	AssignIfSet(values[3], delta_table_name);
 	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
 	SetSourceDelta(loc.table_name, loc.schema_name, delta_schema, delta_table_name, loc.delta_schema_name,
 	               loc.delta_table_name);
@@ -1427,12 +1416,8 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 			values[column] = result->Collection().GetValue(column, 0);
 		}
 	}
-	if (!values[0].IsNull()) {
-		loc.catalog_name = values[0].ToString();
-	}
-	if (!values[1].IsNull()) {
-		loc.schema_name = values[1].ToString();
-	}
+	AssignIfSet(values[0], loc.catalog_name);
+	AssignIfSet(values[1], loc.schema_name);
 	if (loc.catalog_name.empty()) {
 		loc.catalog_name = SqlUtils::CurrentDatabase(con);
 	}
@@ -1637,15 +1622,9 @@ vector<string> RefreshMetadata::GetTableColumns(const string &catalog_name, cons
 bool RefreshMetadata::TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,
                                         const vector<string> &expected) {
 	auto actual = GetTableColumns(catalog_name, schema_name, table_name);
-	if (actual.size() != expected.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < actual.size(); i++) {
-		if (!StringUtil::CIEquals(actual[i], expected[i])) {
-			return false;
-		}
-	}
-	return true;
+	return actual.size() == expected.size() &&
+	       std::equal(actual.begin(), actual.end(), expected.begin(),
+	                  [](const string &a, const string &b) { return StringUtil::CIEquals(a, b); });
 }
 
 vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {

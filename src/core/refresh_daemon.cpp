@@ -46,10 +46,7 @@ RefreshDaemon::~RefreshDaemon() {
 int64_t RefreshDaemon::GetEffectiveInterval(const string &view_name) const {
 	std::lock_guard<std::mutex> guard(backoff_mutex_);
 	auto it = effective_intervals_.find(view_name);
-	if (it != effective_intervals_.end()) {
-		return it->second;
-	}
-	return -1; // not backed off, use configured interval
+	return it == effective_intervals_.end() ? -1 : it->second; // -1: not backed off, use configured interval
 }
 
 bool RefreshDaemon::IsRefreshing(const string &view_name) const {

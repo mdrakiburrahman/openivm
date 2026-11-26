@@ -60,11 +60,7 @@ DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input) {
 	projection->children.push_back(std::move(input.plan));
 	projection->ResolveOperatorTypes();
 
-	auto projection_bindings = projection->GetColumnBindings();
-	if (projection_bindings.empty()) {
-		throw InternalException("DeltaUnnest: rewritten projection has no multiplicity binding");
-	}
-	auto mul_binding = projection_bindings.back();
+	auto mul_binding = projection->GetColumnBindings().back();
 	OPENIVM_DEBUG_PRINT("[DeltaUnnest] Done, mul_binding: table=%lu col=%lu\n",
 	                    (unsigned long)mul_binding.table_index.index,
 	                    (unsigned long)mul_binding.column_index.GetIndex());

@@ -35,10 +35,7 @@ struct SourceDeltaActivity {
 
 class CompileFacts {
 public:
-	// Bumped when the JSON fact schema changes in a backward-compatible way;
-	// unknown/extra fields are ignored by ParseFactsJson, so older writers work.
-	static constexpr int CURRENT_SCHEMA_VERSION = 2;
-	int schema_version = CURRENT_SCHEMA_VERSION;
+	// ParseFactsJson ignores unknown/extra fields (including schema_version), so older writers work.
 	SqlDialect target_dialect = SqlDialect::DUCKDB; // required when parsed from JSON
 	bool compile_only = false;                      // default false
 	bool force_view_delta_cascade = false;

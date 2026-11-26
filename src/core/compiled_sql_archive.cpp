@@ -89,11 +89,10 @@ static string LatestCompiledVersionSQL(const string &statements, const string &f
 vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const CompiledProgram &program,
                                                  CompiledProgramOutcome outcome, const string &catalog,
                                                  const string &schema) {
-	vector<string> result;
 	if (!CompiledSQLArchiveEnabled(context) || program.statements.empty()) {
-		return result;
+		return {};
 	}
-	result = CompiledSQLArchiveSchemaDDL(catalog, schema);
+	auto result = CompiledSQLArchiveSchemaDDL(catalog, schema);
 	auto programs = ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE);
 	auto statements = ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE);
 	auto literal = [](const string &value) {
@@ -144,22 +143,20 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 	}
 	// Same rules as BuildCompiledSQLArchiveStatements, but with bound parameters: DuckDB
 	// parses long string literals slowly, and refresh programs are several KB each.
-	auto execute = [&](const string &sql, vector<Value> parameters, string &error) {
-		unique_ptr<QueryResult> materialized;
+	string error;
+	auto execute = [&](const string &sql, vector<Value> parameters) -> unique_ptr<QueryResult> {
 		auto prepared = con.Prepare(sql);
 		if (prepared->HasError()) {
 			error = prepared->GetError();
-			return materialized;
+			return nullptr;
 		}
 		auto result = prepared->Execute(parameters);
 		if (result->HasError()) {
 			error = result->GetError();
-			return materialized;
+			return nullptr;
 		}
-		materialized = unique_ptr_cast<QueryResult, QueryResult>(std::move(result));
-		return materialized;
+		return result;
 	};
-	string error;
 	auto programs = ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE);
 	auto statements = ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE);
 	Value view_name(program.view_name);
@@ -167,7 +164,7 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 	const string view_filter = "view_name = $1 AND operation = $2";
 	auto stored = execute("SELECT version, sql FROM " + statements + " WHERE " + view_filter + " AND version = " +
 	                          LatestCompiledVersionSQL(statements, view_filter) + " ORDER BY stmt_order",
-	                      {view_name, operation}, error);
+	                      {view_name, operation});
 	if (!stored) {
 		return error;
 	}
@@ -194,7 +191,7 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 			parameters.push_back(value);
 			return "$" + to_string(parameters.size());
 		});
-		return execute(sql, std::move(parameters), error);
+		return execute(sql, std::move(parameters));
 	};
 	if (changed) {
 		vector<Value> sql_values;
@@ -204,8 +201,7 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 		if (!execute("INSERT INTO " + statements +
 		                 " (view_name, operation, version, stmt_order, sql)"
 		                 " SELECT $1, $2, $3, i::INTEGER, $4[i + 1] FROM range(len($4)) t(i)",
-		             {view_name, operation, Value::INTEGER(version), Value::LIST(LogicalType::VARCHAR, sql_values)},
-		             error) ||
+		             {view_name, operation, Value::INTEGER(version), Value::LIST(LogicalType::VARCHAR, sql_values)}) ||
 		    !describe_version()) {
 			return error;
 		}
@@ -215,7 +211,7 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 		                " SET last_compilation_id = $1, last_outcome = $2, last_outcome_at = " + openivm::UTC_NOW_SQL +
 		                ", committed_count = COALESCE(committed_count, 0) + $3"
 		                " WHERE view_name = $4 AND operation = $5 AND version = $6",
-		            {compilation_id, outcome_name, committed, view_name, operation, Value::INTEGER(version)}, error);
+		            {compilation_id, outcome_name, committed, view_name, operation, Value::INTEGER(version)});
 		if (!updated) {
 			return error;
 		}
@@ -247,10 +243,9 @@ string RecordCompiledProgram(ClientContext &context, const string &view_catalog,
 		// The archive belongs to the view's metadata location (openivm_metadata_catalog/_schema).
 		RefreshMetadata::UseCatalog(context, con, view_catalog);
 		auto location = RefreshMetadata::CurrentLocation(con);
-		string error;
 		// One metadata commit for the whole program, never one per statement.
 		con.BeginTransaction();
-		error = WriteCompiledProgram(context, con, program, outcome, location.catalog, location.schema);
+		auto error = WriteCompiledProgram(context, con, program, outcome, location.catalog, location.schema);
 		if (!error.empty()) {
 			con.Rollback();
 			return error;
