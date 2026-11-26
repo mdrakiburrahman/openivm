@@ -28,14 +28,11 @@ struct IncrementalTableNames {
 		return StringUtil::StartsWith(name, "openivm_");
 	}
 
-	/// Returns true if a table name is an IVM data table.
-	static bool IsDataTable(const std::string &name) {
-		return StringUtil::StartsWith(name, openivm::DATA_TABLE_PREFIX) ||
-		       StringUtil::StartsWith(name, openivm::VISIBLE_TABLE_PREFIX);
-	}
-	/// Tables owned by maintenance rather than user-source change capture.
+	/// Tables owned by maintenance (deltas and MV data tables) rather than user-source change capture.
 	static bool IsMaintenanceTable(const std::string &name) {
-		return StringUtil::StartsWith(name, openivm::DELTA_PREFIX) || IsDataTable(name);
+		return StringUtil::StartsWith(name, openivm::DELTA_PREFIX) ||
+		       StringUtil::StartsWith(name, openivm::DATA_TABLE_PREFIX) ||
+		       StringUtil::StartsWith(name, openivm::VISIBLE_TABLE_PREFIX);
 	}
 };
 

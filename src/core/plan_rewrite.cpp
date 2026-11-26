@@ -5,25 +5,19 @@
 #include "core/parser_plan_helpers.hpp"
 #include "core/plan_rewrite_internal.hpp"
 #include "core/sql_utils.hpp"
-#include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
-#include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/window/rows_functions.hpp"
 #include "duckdb/optimizer/deliminator.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -33,7 +27,6 @@
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -44,11 +37,22 @@
 #include "upsert/refresh_index_regen.hpp"
 #include "lpts_expression_renderer.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <set>
 #include <unordered_set>
 
 namespace duckdb {
+
+// A column reference to each output of op, whose types must already be resolved.
+static vector<unique_ptr<Expression>> OutputColumnRefs(LogicalOperator &op) {
+	auto bindings = op.GetColumnBindings();
+	vector<unique_ptr<Expression>> refs;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		refs.push_back(make_uniq<BoundColumnRefExpression>(op.types[i], bindings[i]));
+	}
+	return refs;
+}
 
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
 /// Returns whether a DISTINCT state aggregate replaced `node` itself.
@@ -81,25 +85,14 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 		child->Cast<LogicalSetOperation>().setop_all = true;
 	}
 	child->ResolveOperatorTypes();
-	auto child_bindings = child->GetColumnBindings();
-	auto child_types = child->types;
-
+	auto groups = OutputColumnRefs(*child);
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(MakeCountStar(openivm::DISTINCT_COUNT_COL));
-	vector<unique_ptr<Expression>> groups;
-	for (idx_t i = 0; i < child_bindings.size(); i++) {
-		groups.push_back(make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]));
-	}
 	auto agg_node = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(child));
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
 	return true;
-}
-
-static bool IsSemiAntiJoinType(JoinType join_type) {
-	return join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::RIGHT_SEMI ||
-	       join_type == JoinType::RIGHT_ANTI;
 }
 
 static idx_t SemiAntiProbeChildIndex(JoinType join_type) {
@@ -120,15 +113,10 @@ static unordered_set<TableIndex> OutputTableIndexes(LogicalOperator &op) {
 	return result;
 }
 
-static unordered_set<TableIndex> ExpressionTableIndexes(const Expression &expr) {
-	unordered_set<TableIndex> result;
-	LogicalJoin::GetExpressionBindings(expr, result);
-	return result;
-}
-
 static bool ExpressionUsesOnly(const Expression &expr, const unordered_set<TableIndex> &table_indexes,
                                bool allow_no_bindings = false) {
-	auto bindings = ExpressionTableIndexes(expr);
+	unordered_set<TableIndex> bindings;
+	LogicalJoin::GetExpressionBindings(expr, bindings);
 	if (bindings.empty()) {
 		return allow_no_bindings;
 	}
@@ -208,11 +196,8 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		return false;
 	}
 	auto &semi_anti = node->Cast<LogicalComparisonJoin>();
-	if (!IsSemiAntiJoinType(semi_anti.join_type) || semi_anti.children.size() != 2) {
-		return false;
-	}
 	const idx_t probe_child_idx = SemiAntiProbeChildIndex(semi_anti.join_type);
-	if (probe_child_idx == DConstants::INVALID_INDEX || probe_child_idx >= semi_anti.children.size()) {
+	if (probe_child_idx == DConstants::INVALID_INDEX || semi_anti.children.size() != 2) {
 		return false;
 	}
 	auto &probe_child = semi_anti.children[probe_child_idx];
@@ -280,13 +265,7 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		projection->children.push_back(std::move(source));
 		projection->ResolveOperatorTypes();
 
-		vector<unique_ptr<Expression>> distinct_targets;
-		auto projection_bindings = projection->GetColumnBindings();
-		for (idx_t i = 0; i < projection_bindings.size(); i++) {
-			distinct_targets.push_back(
-			    make_uniq<BoundColumnRefExpression>(projection->types[i], projection_bindings[i]));
-		}
-		auto distinct = make_uniq<LogicalDistinct>(std::move(distinct_targets), DistinctType::DISTINCT);
+		auto distinct = make_uniq<LogicalDistinct>(OutputColumnRefs(*projection), DistinctType::DISTINCT);
 		distinct->children.push_back(std::move(projection));
 		distinct->ResolveOperatorTypes();
 
@@ -373,15 +352,16 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 	return replace_probe(inner.children[source_child_idx], std::move(source_filters), replacements, source_bindings);
 }
 
-static bool RewriteSemiAntiProbeKeyProjections(unique_ptr<LogicalOperator> &node) {
+// Apply rewrite to every node of the plan, children before their parent.
+static bool RewriteBottomUp(unique_ptr<LogicalOperator> &node, bool (*rewrite)(unique_ptr<LogicalOperator> &)) {
 	if (!node) {
 		return false;
 	}
 	bool rewritten = false;
 	for (auto &child : node->children) {
-		rewritten = RewriteSemiAntiProbeKeyProjections(child) || rewritten;
+		rewritten = RewriteBottomUp(child, rewrite) || rewritten;
 	}
-	return TryRewriteSemiAntiProbeKeyProjection(node) || rewritten;
+	return rewrite(node) || rewritten;
 }
 
 static bool IsMarkColumnRef(const Expression &expr, TableIndex mark_index) {
@@ -441,7 +421,7 @@ static bool IsConvertibleMarkPredicate(const Expression &expr, const unordered_s
 	return false;
 }
 
-static bool RewriteMarkJoinFilters(unique_ptr<LogicalOperator> &node);
+static bool TryRewriteMarkFilter(unique_ptr<LogicalOperator> &node);
 
 static bool TryPushMarkFilterThroughSemiAnti(unique_ptr<LogicalOperator> &node) {
 	if (!node || node->type != LogicalOperatorType::LOGICAL_FILTER || node->children.size() != 1) {
@@ -491,7 +471,7 @@ static bool TryPushMarkFilterThroughSemiAnti(unique_ptr<LogicalOperator> &node) 
 	pushed_filter->children.push_back(std::move(join.children[preserved_child_idx]));
 	pushed_filter->ResolveOperatorTypes();
 	join.children[preserved_child_idx] = std::move(pushed_filter);
-	RewriteMarkJoinFilters(join.children[preserved_child_idx]);
+	RewriteBottomUp(join.children[preserved_child_idx], TryRewriteMarkFilter);
 	join.ResolveOperatorTypes();
 
 	if (remaining_expressions.empty()) {
@@ -521,19 +501,15 @@ static bool TryRewriteMarkFilter(unique_ptr<LogicalOperator> &node) {
 	idx_t mark_filter_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < filter.expressions.size(); i++) {
 		auto &expr = filter.expressions[i];
-		if (!expr) {
+		if (expr && IsMarkColumnRef(*expr, join.mark_index)) {
+			replacement_join_type = JoinType::SEMI;
+		} else if (expr && IsNotMarkColumnRef(*expr, join.mark_index)) {
+			replacement_join_type = JoinType::ANTI;
+		} else {
 			continue;
 		}
-		if (IsMarkColumnRef(*expr, join.mark_index)) {
-			replacement_join_type = JoinType::SEMI;
-			mark_filter_idx = i;
-			break;
-		}
-		if (IsNotMarkColumnRef(*expr, join.mark_index)) {
-			replacement_join_type = JoinType::ANTI;
-			mark_filter_idx = i;
-			break;
-		}
+		mark_filter_idx = i;
+		break;
 	}
 	if (mark_filter_idx == DConstants::INVALID_INDEX) {
 		return false;
@@ -553,17 +529,6 @@ static bool TryRewriteMarkFilter(unique_ptr<LogicalOperator> &node) {
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Rewrote MARK join filter to %s join\n",
 	                    replacement_join_type == JoinType::SEMI ? "SEMI" : "ANTI");
 	return true;
-}
-
-static bool RewriteMarkJoinFilters(unique_ptr<LogicalOperator> &node) {
-	if (!node) {
-		return false;
-	}
-	bool rewritten = false;
-	for (auto &child : node->children) {
-		rewritten = RewriteMarkJoinFilters(child) || rewritten;
-	}
-	return TryRewriteMarkFilter(node) || rewritten;
 }
 
 /// Inline every `LOGICAL_CTE_REF` in the plan with a fresh deep copy of its CTE
@@ -852,14 +817,7 @@ static bool FoldConstantScalarSubqueriesOnce(ClientContext &context, unique_ptr<
 		if (bindings.empty()) {
 			continue; // nothing to project away (bare DUMMY_SCAN) — not a scalar value
 		}
-		bool all_constant = true;
-		for (auto &b : bindings) {
-			if (values.find(b) == values.end()) {
-				all_constant = false;
-				break;
-			}
-		}
-		if (!all_constant) {
+		if (!std::all_of(bindings.begin(), bindings.end(), [&](const ColumnBinding &b) { return values.count(b); })) {
 			continue;
 		}
 		ConstantBindingReplacer replacer(values);
@@ -1222,7 +1180,7 @@ void InjectDerivedAggregateInputs(unique_ptr<LogicalOperator> &plan) {
 /// data table stores only the final AVG and the MERGE computes `v.avg + d.avg`
 /// — wrong for non-summable aggregates. Propagation lets CompileAggregateGroups
 /// see the hidden SUM/COUNT columns and maintain them separately.
-void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
+static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
 		PropagateHiddenAggregateColumns(child);
 	}
@@ -1247,10 +1205,8 @@ void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 	bool added = false;
 	for (idx_t i = 0; i < child_proj.expressions.size(); i++) {
 		const string &child_alias = child_proj.expressions[i]->GetAlias().GetIdentifierName();
+		// A resolved projection has one binding and type per expression.
 		if (!IsHiddenAggregateAlias(child_alias) || already_present.count(child_alias)) {
-			continue;
-		}
-		if (i >= child_bindings.size() || i >= child_types.size()) {
 			continue;
 		}
 		auto bcr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
@@ -1565,13 +1521,7 @@ static void RewriteLeftJoinKey(ClientContext &context, Binder &binder, unique_pt
 		PropagateBindingThroughOperatorPath(context, binder, plan, right_key_binding, right_key_type);
 	}
 
-	auto top_bindings = plan->GetColumnBindings();
-	auto top_types = plan->types;
-
-	vector<unique_ptr<Expression>> proj_exprs;
-	for (idx_t i = 0; i < top_bindings.size(); i++) {
-		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(top_types[i], top_bindings[i]));
-	}
+	auto proj_exprs = OutputColumnRefs(*plan);
 
 	// Always add openivm_left_key as a separate extra column.
 	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(openivm::LEFT_KEY_COL, key_type, key_binding));
@@ -1904,12 +1854,12 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 		     FilterPushdown filter_pushdown(optimizer, false,
 		                                    FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
 		     c.plan = filter_pushdown.Rewrite(std::move(c.plan));
-		     if (RewriteMarkJoinFilters(c.plan)) {
+		     if (RewriteBottomUp(c.plan, TryRewriteMarkFilter)) {
 			     Deliminator deliminator(c.context);
 			     c.plan = deliminator.Optimize(std::move(c.plan));
 		     }
 		     RewriteSafeSemiAntiDelimGets(c.context, c.plan);
-		     RewriteSemiAntiProbeKeyProjections(c.plan);
+		     RewriteBottomUp(c.plan, TryRewriteSemiAntiProbeKeyProjection);
 	     },
 	     &PlanRewriteNeeds::semi_anti_subqueries},
 	    {"running_window_state", RewritePassRunningWindowState, &PlanRewriteNeeds::running_window_state},

@@ -13,10 +13,7 @@ namespace duckdb {
 // generated SQL immediately, so callers may opt in to planning against the current delta statistics.
 // Empty string means "disable nothing". The earlier base-view template stage is always conservative.
 inline string FinalPlanDisabledOptimizers(ClientContext &context, bool cross_system) {
-	if (cross_system) {
-		return openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
-	}
-	if (SqlUtils::GetBoolSetting(context, "openivm_enable_data_dependent_optimizers", false)) {
+	if (!cross_system && SqlUtils::GetBoolSetting(context, "openivm_enable_data_dependent_optimizers", false)) {
 		return "";
 	}
 	return openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;

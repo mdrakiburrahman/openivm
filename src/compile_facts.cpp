@@ -25,23 +25,6 @@ CompileFacts CompileFacts::Default(SqlDialect dialect) {
 	return out;
 }
 
-namespace {
-
-SqlDialect ParseDialectString(const string &s) {
-	// Reuse the lpts helper so dialect names stay in lockstep with the
-	// LPTS pipeline. LPTS throws on unrecognised values which is exactly
-	// the contract we want.
-	try {
-		return ParseSqlDialect(s);
-	} catch (const std::exception &e) {
-		throw InvalidInputException("openivm_compile_with_facts: target_dialect='%s' is not a recognised SQL dialect "
-		                            "(expected 'spark' | 'duckdb' | 'ducklake')",
-		                            s.c_str());
-	}
-}
-
-} // namespace
-
 CompileFacts ParseFactsJson(const string &json) {
 	CompileFacts out;
 
@@ -50,9 +33,15 @@ CompileFacts ParseFactsJson(const string &json) {
 		throw InvalidInputException(
 		    "openivm_compile_with_facts: required field 'target_dialect' missing or not a string");
 	}
-	out.target_dialect = ParseDialectString(dialect_str);
+	// Reuse the lpts helper so dialect names stay in lockstep with the LPTS pipeline.
+	try {
+		out.target_dialect = ParseSqlDialect(dialect_str);
+	} catch (const std::exception &) {
+		throw InvalidInputException("openivm_compile_with_facts: target_dialect='%s' is not a recognised SQL dialect "
+		                            "(expected 'spark' | 'duckdb' | 'ducklake')",
+		                            dialect_str.c_str());
+	}
 
-	MetadataJson::ExtractJsonInt(json, "schema_version", out.schema_version);
 	MetadataJson::ExtractJsonBool(json, "compile_only", out.compile_only);
 	MetadataJson::ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
 	MetadataJson::ExtractJsonBool(json, "assume_insert_only", out.assume_insert_only);
@@ -183,9 +172,7 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 		throw InvalidInputException("openivm_compile_with_facts(view_name, facts_json) requires exactly two arguments");
 	}
 	string view_name = StringValue::Get(input.inputs[0]);
-	string facts_json = StringValue::Get(input.inputs[1]);
-
-	auto facts_owned = make_shared_ptr<CompileFacts>(ParseFactsJson(facts_json));
+	auto facts_owned = make_shared_ptr<CompileFacts>(ParseFactsJson(StringValue::Get(input.inputs[1])));
 
 	Connection con(*context.db.get());
 	auto resolved = ResolveViewCatalogFromContext(context, con, view_name);
@@ -213,16 +200,9 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 	PushBucket(*result, "data", sql);
 	PushBucket(*result, "meta_post", out_post_meta);
 
-	return_types.emplace_back(LogicalType::INTEGER);
-	names.emplace_back("refresh_type");
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("refresh_type_name");
-	return_types.emplace_back(LogicalType::INTEGER);
-	names.emplace_back("stmt_order");
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("stmt_kind");
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("sql");
+	return_types = {LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR};
+	names = {"refresh_type", "refresh_type_name", "stmt_order", "stmt_kind", "sql"};
 
 	return std::move(result);
 }
