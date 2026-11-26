@@ -164,8 +164,8 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);
 vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanFacts &facts);
-void ValidateMaterializedViewOutputNames(const vector<string> &original_names, const vector<string> &output_names,
-                                         idx_t visible_count);
+void ValidateMaterializedViewOutputNames(const QueryNode &query, const vector<string> &original_names,
+                                         const vector<string> &output_names, idx_t visible_count);
 vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names);
 bool IsPacLoaded(ClientContext &context);
 void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con);

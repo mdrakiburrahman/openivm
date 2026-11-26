@@ -495,7 +495,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		InjectSumNonNullCounts(context, select_plan);
 		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
-		ValidateMaterializedViewOutputNames(select_output_names, output_names, visible_output_count);
+		ValidateMaterializedViewOutputNames(*select_statement.node, select_output_names, output_names,
+		                                    visible_output_count);
 
 		select_plan->ResolveOperatorTypes();
 		output_types = select_plan->types;

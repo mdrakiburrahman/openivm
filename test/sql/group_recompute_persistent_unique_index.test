@@ -339,7 +339,7 @@ CREATE VIEW ups_sum_expected AS SELECT a, b, SUM(x) AS s, COUNT(*) AS n FROM ups
 CREATE VIEW ups_min_expected AS SELECT a, b, MIN(x) AS mn, MAX(x) AS mx FROM ups_src GROUP BY a, b;
 CREATE VIEW ups_keys_expected AS SELECT a, b FROM ups_src GROUP BY a, b;
 CREATE VIEW ups_rowid_expected AS SELECT a AS rowid, SUM(x) AS s FROM ups_src GROUP BY a;
-CREATE MATERIALIZED VIEW ups_alias AS SELECT a, MIN(x) AS openivm_target_rowid, COUNT(*) AS c FROM ups_src GROUP BY a;
+CREATE MATERIALIZED VIEW ups_alias AS SELECT a, MIN(x) AS "OPENIVM_TARGET_ROWID", COUNT(*) AS c FROM ups_src GROUP BY a;
 CREATE MATERIALIZED VIEW ups_alias_ci AS SELECT a, SUM(x) AS "OpenIVM_Target_RowID" FROM ups_src GROUP BY a;
 CREATE VIEW ups_alias_ci_expected AS SELECT a, SUM(x) AS "OpenIVM_Target_RowID" FROM ups_src GROUP BY a;
 
@@ -389,12 +389,12 @@ FROM openivm_compile_with_facts('ups_alias', '{"target_dialect":"duckdb","compil
 statement ok
 PRAGMA refresh('ups_alias');
 
-# The alias column is internal-looking and hidden from the view, so check the data table directly.
+# The alias matches the helper name case-insensitively; check the data table directly.
 query I
-SELECT count(*) FROM ((SELECT a, openivm_target_rowid, c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_
+SELECT count(*) FROM ((SELECT a, "OPENIVM_TARGET_ROWID", c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_
         EXCEPT ALL SELECT a, MIN(x), COUNT(*) FROM ups_src GROUP BY a)
     UNION ALL (SELECT a, MIN(x), COUNT(*) FROM ups_src GROUP BY a
-        EXCEPT ALL SELECT a, openivm_target_rowid, c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_));
+        EXCEPT ALL SELECT a, "OPENIVM_TARGET_ROWID", c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_));
 ----
 0
 
@@ -453,10 +453,10 @@ SELECT count(*) FROM ((SELECT * FROM ups_min EXCEPT ALL SELECT * FROM ups_min_ex
 0
 
 query I
-SELECT count(*) FROM ((SELECT a, openivm_target_rowid, c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_
+SELECT count(*) FROM ((SELECT a, "OPENIVM_TARGET_ROWID", c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_
         EXCEPT ALL SELECT a, MIN(x), COUNT(*) FROM ups_src GROUP BY a)
     UNION ALL (SELECT a, MIN(x), COUNT(*) FROM ups_src GROUP BY a
-        EXCEPT ALL SELECT a, openivm_target_rowid, c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_));
+        EXCEPT ALL SELECT a, "OPENIVM_TARGET_ROWID", c FROM openivm_data___openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_7570735f616c696173_));
 ----
 0
 
