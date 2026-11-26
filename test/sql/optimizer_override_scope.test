@@ -157,5 +157,293 @@ SELECT count(*) FROM (
 ----
 0
 
+
+# A user SET while a transaction holds the overrides drops OpenIVM's ownership of them; a later
+# refresh in that transaction must still add back what it needs, and the user's value is kept after.
+statement ok
+SET disabled_optimizers = '';
+
+statement ok
+CREATE TABLE scope_b(k INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO scope_b SELECT i % 5, i FROM range(40) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW scope_join_mv AS
+ SELECT s.k, SUM(b.w) AS sw, COUNT(*) AS c FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k;
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO scope_src VALUES (1, 100), (2, 200);
+
+statement ok con1
+DELETE FROM scope_src WHERE k = 0 AND v < 20;
+
+statement ok con1
+PRAGMA refresh('scope_mv');
+
+query I con1
+SELECT list_sort(string_split(current_setting('disabled_optimizers'), ','));
+----
+[deliminator, join_filter_pushdown]
+
+statement ok con2
+SET disabled_optimizers = 'filter_pushdown';
+
+statement ok con1
+INSERT INTO scope_b VALUES (1, 7), (2, 8), (4, 9);
+
+statement ok con1
+UPDATE scope_b SET w = w + 1 WHERE k = 3;
+
+statement ok con1
+DELETE FROM scope_src WHERE k = 2 AND v = 200;
+
+statement ok con1
+UPDATE scope_src SET v = v - 1 WHERE k = 1;
+
+statement ok con1
+PRAGMA refresh('scope_join_mv');
+
+query I con1
+SELECT list_sort(string_split(current_setting('disabled_optimizers'), ','));
+----
+[deliminator, filter_pushdown, join_filter_pushdown]
+
+query I con1
+SELECT count(*) FROM (
+ (SELECT * FROM scope_join_mv EXCEPT ALL
+  SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k)
+ UNION ALL
+ (SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k
+  EXCEPT ALL SELECT * FROM scope_join_mv)
+);
+----
+0
+
+statement ok con1
+PRAGMA refresh('scope_mv');
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+filter_pushdown
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM scope_join_mv EXCEPT ALL
+  SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k)
+ UNION ALL
+ (SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k
+  EXCEPT ALL SELECT * FROM scope_join_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM scope_mv EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM scope_src GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v), COUNT(*) FROM scope_src GROUP BY k EXCEPT ALL SELECT * FROM scope_mv)
+);
+----
+0
+
+# A user value that already disables an overridden optimizer keeps it, autocommit and in a transaction.
+statement ok
+SET disabled_optimizers = 'join_filter_pushdown,filter_pushdown';
+
+statement ok
+INSERT INTO scope_src VALUES (3, 33), (3, 34);
+
+statement ok
+DELETE FROM scope_b WHERE w = 9;
+
+statement ok
+UPDATE scope_src SET v = v + 2 WHERE k = 4;
+
+statement ok
+PRAGMA refresh('scope_join_mv');
+
+query I
+SELECT list_sort(string_split(current_setting('disabled_optimizers'), ','));
+----
+[filter_pushdown, join_filter_pushdown]
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO scope_b VALUES (3, 3), (0, 1);
+
+statement ok con1
+DELETE FROM scope_src WHERE v = 33;
+
+statement ok con1
+PRAGMA refresh('scope_join_mv');
+
+query I con2
+SELECT list_sort(string_split(current_setting('disabled_optimizers'), ','));
+----
+[deliminator, filter_pushdown, join_filter_pushdown]
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT list_sort(string_split(current_setting('disabled_optimizers'), ','));
+----
+[filter_pushdown, join_filter_pushdown]
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM scope_join_mv EXCEPT ALL
+  SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k)
+ UNION ALL
+ (SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k
+  EXCEPT ALL SELECT * FROM scope_join_mv)
+);
+----
+0
+
+# A RESET while the overrides are held is the user's value after the transaction ends.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO scope_src VALUES (4, 44);
+
+statement ok con1
+UPDATE scope_b SET w = w * 2 WHERE k = 4;
+
+statement ok con1
+PRAGMA refresh('scope_join_mv');
+
+statement ok con2
+RESET disabled_optimizers;
+
+statement ok con1
+ROLLBACK;
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+(empty)
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM scope_join_mv EXCEPT ALL
+  SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k)
+ UNION ALL
+ (SELECT s.k, SUM(b.w), COUNT(*) FROM scope_src s JOIN scope_b b ON s.k = b.k GROUP BY s.k
+  EXCEPT ALL SELECT * FROM scope_join_mv)
+);
+----
+0
+
+# CREATE plans and runs its population query under the overrides, in the default and in another
+# attached catalog (optimizer_override_staged.test covers staged programs). The probe views record
+# the setting the population query was planned with; current_setting makes them full-refresh views,
+# so they are only read, never refreshed.
+statement ok
+SET disabled_optimizers = 'filter_pushdown';
+
+statement ok
+ATTACH '{TEST_DIR}/optimizer_override_scope_other.db' AS scope_other;
+
+statement ok
+CREATE MATERIALIZED VIEW scope_probe AS
+ SELECT k, current_setting('disabled_optimizers') AS d, COUNT(*) AS c FROM scope_src GROUP BY k, d;
+
+query I
+SELECT DISTINCT list_sort(string_split(d, ',')) FROM scope_probe;
+----
+[deliminator, filter_pushdown, join_filter_pushdown]
+
+statement ok
+CREATE MATERIALIZED VIEW scope_other.main.scope_probe_staged AS
+ SELECT k, current_setting('disabled_optimizers') AS d, COUNT(*) AS c FROM memory.main.scope_src GROUP BY k, d;
+
+query I
+SELECT DISTINCT list_sort(string_split(d, ',')) FROM scope_other.main.scope_probe_staged;
+----
+[deliminator, filter_pushdown, join_filter_pushdown]
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+filter_pushdown
+
+statement ok
+DROP MATERIALIZED VIEW scope_probe;
+
+statement ok
+DROP MATERIALIZED VIEW scope_other.main.scope_probe_staged;
+
+# A semi-join view in another catalog: its initial load and refresh are correct and the user's value is kept.
+statement ok
+CREATE MATERIALIZED VIEW scope_other.main.scope_semi AS
+ SELECT k, SUM(v) AS s, COUNT(*) AS c FROM memory.main.scope_src
+ WHERE k IN (SELECT k FROM memory.main.scope_b WHERE w > 10) GROUP BY k;
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+filter_pushdown
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM scope_other.main.scope_semi EXCEPT ALL
+  SELECT k, SUM(v), COUNT(*) FROM scope_src WHERE k IN (SELECT k FROM scope_b WHERE w > 10) GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v), COUNT(*) FROM scope_src WHERE k IN (SELECT k FROM scope_b WHERE w > 10) GROUP BY k
+  EXCEPT ALL SELECT * FROM scope_other.main.scope_semi)
+);
+----
+0
+
+statement ok
+INSERT INTO scope_src VALUES (1, 1000), (4, 4), (12, 12);
+
+statement ok
+DELETE FROM scope_src WHERE v = 2;
+
+statement ok
+INSERT INTO scope_b VALUES (12, 50);
+
+statement ok
+DELETE FROM scope_b WHERE k = 3;
+
+statement ok
+UPDATE scope_src SET v = v + 1 WHERE k = 1;
+
+statement ok
+UPDATE scope_b SET w = 0 WHERE k = 0;
+
+statement ok
+PRAGMA refresh('scope_other.main.scope_semi');
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+filter_pushdown
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM scope_other.main.scope_semi EXCEPT ALL
+  SELECT k, SUM(v), COUNT(*) FROM scope_src WHERE k IN (SELECT k FROM scope_b WHERE w > 10) GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v), COUNT(*) FROM scope_src WHERE k IN (SELECT k FROM scope_b WHERE w > 10) GROUP BY k
+  EXCEPT ALL SELECT * FROM scope_other.main.scope_semi)
+);
+----
+0
+
 statement ok
 SET disabled_optimizers = '';

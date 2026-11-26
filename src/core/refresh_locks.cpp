@@ -673,9 +673,8 @@ RebindQueryInfo TransactionalMVLockState::OnRebindPreparedStatement(ClientContex
 
 void TransactionalMVLockState::DisableRefreshOptimizers(ClientContext &context) {
 	lock_guard<mutex> guard(state_lock);
-	if (!refresh_optimizers) {
-		refresh_optimizers = make_uniq<ScopedDisabledOptimizers>(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
-	}
+	// Replace a held scope rather than keep it: a new scope re-adds overrides a user SET removed.
+	refresh_optimizers = make_uniq<ScopedDisabledOptimizers>(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 }
 
 void TransactionalMVLockState::Release() {

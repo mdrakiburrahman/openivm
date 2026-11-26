@@ -397,6 +397,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	if (ddl.empty()) {
 		return;
 	}
+	// Staged programs plan and run generated SQL too, including CREATE's population query.
+	ScopedDisabledOptimizers program_optimizers(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
 	SqlUtils::CopySessionSetting(context, *conn->context, "TimeZone");

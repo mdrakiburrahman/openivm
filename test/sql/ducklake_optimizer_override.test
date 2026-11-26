@@ -1,0 +1,113 @@
+# name: test/sql/ducklake_optimizer_override.test
+# description: CREATE of a DuckLake-targeted view runs its staged program under the refresh optimizer overrides
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+ATTACH '{TEST_DIR}/ducklake_optimizer_override.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.oo_src(k INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.oo_keys(k INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO dl.oo_src SELECT i % 6, i FROM range(60) t(i);
+
+statement ok
+INSERT INTO dl.oo_keys VALUES (1, 20), (2, 5), (3, 30), (5, 50);
+
+statement ok
+SET disabled_optimizers = 'filter_pushdown';
+
+# The probe records the setting its population query was planned with. current_setting makes it a
+# full-refresh view, so it is only read, never refreshed.
+statement ok
+CREATE MATERIALIZED VIEW dl.oo_probe AS
+ SELECT k, current_setting('disabled_optimizers') AS d, COUNT(*) AS c FROM dl.oo_src GROUP BY k, d;
+
+query I
+SELECT DISTINCT list_sort(string_split(d, ',')) FROM dl.oo_probe;
+----
+[deliminator, filter_pushdown, join_filter_pushdown]
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+filter_pushdown
+
+statement ok
+DROP MATERIALIZED VIEW dl.oo_probe;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.oo_semi AS
+ SELECT k, SUM(v) AS s, COUNT(*) AS c FROM dl.oo_src WHERE k IN (SELECT k FROM dl.oo_keys WHERE w > 10) GROUP BY k;
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+filter_pushdown
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM dl.oo_semi EXCEPT ALL
+  SELECT k, SUM(v), COUNT(*) FROM dl.oo_src WHERE k IN (SELECT k FROM dl.oo_keys WHERE w > 10) GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v), COUNT(*) FROM dl.oo_src WHERE k IN (SELECT k FROM dl.oo_keys WHERE w > 10) GROUP BY k
+  EXCEPT ALL SELECT * FROM dl.oo_semi)
+);
+----
+0
+
+statement ok
+INSERT INTO dl.oo_src VALUES (1, 1000), (4, 4), (2, 2);
+
+statement ok
+DELETE FROM dl.oo_src WHERE v = 3;
+
+statement ok
+UPDATE dl.oo_src SET v = v + 1 WHERE k = 1;
+
+statement ok
+INSERT INTO dl.oo_keys VALUES (4, 40);
+
+statement ok
+UPDATE dl.oo_keys SET w = 0 WHERE k = 1;
+
+statement ok
+DELETE FROM dl.oo_keys WHERE k = 5;
+
+statement ok
+PRAGMA refresh('dl.oo_semi');
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+filter_pushdown
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM dl.oo_semi EXCEPT ALL
+  SELECT k, SUM(v), COUNT(*) FROM dl.oo_src WHERE k IN (SELECT k FROM dl.oo_keys WHERE w > 10) GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v), COUNT(*) FROM dl.oo_src WHERE k IN (SELECT k FROM dl.oo_keys WHERE w > 10) GROUP BY k
+  EXCEPT ALL SELECT * FROM dl.oo_semi)
+);
+----
+0
+
+statement ok
+SET disabled_optimizers = '';

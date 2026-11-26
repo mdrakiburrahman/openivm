@@ -20,10 +20,14 @@ inline string FinalPlanDisabledOptimizers(ClientContext &context, bool cross_sys
 }
 
 // Disables optimizers for the lifetime of the object. The option is database-wide, so concurrent
-// scopes share it: each optimizer is added when the first scope needing it starts and removed when
-// the last one ends, and only if a scope added it. A value set by the user since OpenIVM last wrote
-// it is the user's: scopes then keep their hands off it. All changes happen under one lock and go
-// through DBConfig's locked accessors, which other connections read while planning.
+// scopes share it: a starting scope adds each optimizer it needs that is missing, and the last scope
+// needing one removes it on release, only if a scope added it. A value set by the user since OpenIVM
+// last wrote it is the user's: scopes then keep their hands off what it contains, while each new
+// scope still adds back what it needs. All changes happen under one lock and go through DBConfig's
+// locked accessors, which other connections read while planning.
+// Limitations, as DuckDB has neither a change hook nor a compare-and-set for the option: a SET to
+// exactly the value OpenIVM last wrote looks like no SET, so the last scope's release still removes
+// the optimizers it added; and a SET landing between a scope's read and write of the option is lost.
 class ScopedDisabledOptimizers {
 public:
 	ScopedDisabledOptimizers(ClientContext &context, const string &optimizer_list)
@@ -42,9 +46,12 @@ public:
 		bool changed = false;
 		for (auto type : types) {
 			auto &scope = database.scopes[type];
-			if (scope.count++ == 0) {
-				scope.added = disabled.insert(type).second;
-				changed |= scope.added;
+			scope.count++;
+			// Also when other scopes are live: a SET by the user since then may have dropped the
+			// optimizer, and this scope must still run with it disabled.
+			if (disabled.insert(type).second) {
+				scope.added = true;
+				changed = true;
 			}
 		}
 		if (changed) {
