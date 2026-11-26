@@ -1,9 +1,9 @@
 # name: test/sql/issue_211_left_join_having_minmax.test
-# description: LEFT JOIN + HAVING + MIN/MAX after an insert-only batch into the null-extended side (#211). The insert
+# description: LEFT JOIN + HAVING + MIN/MAX after a null-side insert (#211)
 # group: [sql]
 
-#              must retract the NULL-padded rows; HAVING data has no match count, so those groups are recomputed
-#              incrementally instead of taking the insert-only GREATEST/LEAST MERGE.
+# An insert into the null-extended side must retract NULL-padded rows. HAVING data has no match count, so those
+# groups are recomputed incrementally instead of taking the insert-only GREATEST/LEAST MERGE.
 
 require openivm
 

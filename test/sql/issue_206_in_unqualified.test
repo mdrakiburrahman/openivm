@@ -1,7 +1,9 @@
 # name: test/sql/issue_206_in_unqualified.test
-# description: IN / NOT IN subqueries whose select list or WHERE uses bare column names that also exist in the outer
-#              table (#206). Bare names bind to the subquery table, as in SQL, instead of becoming ambiguous.
+# description: IN / NOT IN subqueries with bare column names (#206)
 # group: [sql]
+
+# Bare names in the subquery bind to the subquery table, as in SQL, instead of becoming ambiguous. Lambda parameters
+# are never qualified.
 
 require openivm
 

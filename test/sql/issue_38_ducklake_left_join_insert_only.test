@@ -1,8 +1,9 @@
 # name: test/sql/issue_38_ducklake_left_join_insert_only.test
-# description: A DuckLake-resident LEFT JOIN projection MV retracts the NULL-extended row when an insert-only batch on
+# description: DuckLake LEFT JOIN insert-only refresh retracts NULL-extended rows (#38)
 # group: [sql]
 
-#              the null-extended side gives a previously unmatched preserved row a match (#38).
+# An insert-only batch on the null-extended side that matches a previously unmatched preserved row must retract the
+# NULL-extended row of a DuckLake-resident LEFT JOIN projection MV.
 
 require openivm
 

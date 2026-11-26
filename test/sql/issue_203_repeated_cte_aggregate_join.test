@@ -1,8 +1,9 @@
 # name: test/sql/issue_203_repeated_cte_aggregate_join.test
-# description: A grouped CTE that is referenced several times and joined to itself is a nested aggregate, not a
-#              projection (#203). It is maintained by incremental affected-group recompute, including the edge case
-#              of ungrouped scalar aggregates combined by a cross join.
+# description: Multi-referenced aggregating or window CTE joined to itself (#203)
 # group: [sql]
+
+# A grouped CTE referenced several times and joined to itself is a nested aggregate, not a projection; a window
+# body is maintained by partition. Includes ungrouped scalar aggregates combined by a cross join.
 
 require openivm
 

@@ -1,9 +1,9 @@
 # name: test/sql/issue_223_delete_indexed_source.test
-# description: Tracked DELETE on PRIMARY KEY / UNIQUE sources (#223). DuckDB binds the row id first and then the
+# description: Tracked DELETE on PRIMARY KEY / UNIQUE sources (#223)
 # group: [sql]
 
-#              unique-index (or RETURNING) columns, so the DELETE carries several expressions. Debug builds asserted
-#              on exactly one.
+# DuckDB binds the row id first and then the unique-index (or RETURNING) columns, so the DELETE carries several
+# expressions. Debug builds asserted on exactly one.
 
 require openivm
 

@@ -1,7 +1,8 @@
 # name: test/sql/issue_29_drop_refresh_history.test
-# description: DROP MATERIALIZED VIEW removes the view's refresh history and profile rows, so a same-name re-create
-#              does not inherit the old view's learned cost history (#29).
+# description: DROP and CREATE OR REPLACE remove refresh history and profiles (#29)
 # group: [sql]
+
+# A same-name re-create, or a replaced view, must not inherit the old view's learned cost history or refresh profiles.
 
 require openivm
 

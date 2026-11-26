@@ -1,8 +1,9 @@
 # name: test/sql/issue_193_internal_output_alias.test
-# description: An explicit output alias with the case-sensitive openivm_ prefix would be hidden from the user-facing
-#              view, so CREATE rejects it instead of silently dropping the column (#193). Other spellings stay
-#              visible, and unaliased source columns named openivm_* keep passing through (hidden but stored).
+# description: Reject explicit openivm_ output aliases the column hider would drop (#193)
 # group: [sql]
+
+# An explicit openivm_ alias (case-sensitive, like the hider) is rejected instead of silently dropped. Other spellings
+# stay visible, and unaliased source columns named openivm_* keep passing through (hidden but stored).
 
 require openivm
 

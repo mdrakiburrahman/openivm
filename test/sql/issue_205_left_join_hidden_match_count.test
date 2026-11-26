@@ -1,10 +1,9 @@
 # name: test/sql/issue_205_left_join_hidden_match_count.test
-# description: LEFT JOIN aggregates whose join is hidden from the aggregate by a UNION ALL (#205, #227) or an inner
+# description: LEFT JOIN aggregate hidden by UNION ALL or inner DISTINCT (#205, #210, #227)
 # group: [sql]
 
-#              DISTINCT (#210). The hidden match count is added only when the null-extended binding is visible at the
-#              aggregate input; otherwise the view recomputes affected groups incrementally. A direct LEFT JOIN
-#              aggregate keeps its match count and the MERGE path.
+# The hidden match count is added only when the null-extended binding is visible at the aggregate input; otherwise
+# the view recomputes affected groups. A direct LEFT JOIN aggregate keeps its match count and the MERGE path.
 
 require openivm
 
