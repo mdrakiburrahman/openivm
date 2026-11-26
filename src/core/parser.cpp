@@ -2139,7 +2139,10 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	for (auto &aux_table : metadata.GetAuxiliaryTables(view_name)) {
 		program += "DROP TABLE IF EXISTS " + internal_prefix + SqlUtils::QuoteIdentifier(aux_table) + ";\n";
 	}
-	program += SqlUtils::DeleteViewRowsSQL(openivm::REFRESH_HOOKS_TABLE, view_name) + ";\n";
+	// A same-name re-create must not inherit this view's learned cost history or profiles.
+	for (auto table : {openivm::REFRESH_HOOKS_TABLE, openivm::HISTORY_TABLE, openivm::PROFILE_TABLE}) {
+		program += SqlUtils::DeleteViewRowsSQL(table, view_name) + ";\n";
+	}
 	program += "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view = '" +
 	           SqlUtils::EscapeValue(view_name) + "' OR child_view = '" + SqlUtils::EscapeValue(view_name) + "';\n";
 	program += SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name) + ";\n";
@@ -2151,8 +2154,8 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 static string QualifyDropMetadata(const string &program, const MetadataLocation &location) {
 	return SqlUtils::RewriteTableReferences(program, [&](const vector<string> &parts) {
 		if (!parts.empty()) {
-			for (auto table : {openivm::REFRESH_HOOKS_TABLE, openivm::MV_DEPS_TABLE, openivm::DELTA_TABLES_TABLE,
-			                   openivm::VIEWS_TABLE}) {
+			for (auto table : {openivm::REFRESH_HOOKS_TABLE, openivm::HISTORY_TABLE, openivm::PROFILE_TABLE,
+			                   openivm::MV_DEPS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::VIEWS_TABLE}) {
 				if (StringUtil::CIEquals(parts.back(), table)) {
 					return location.Table(table);
 				}
