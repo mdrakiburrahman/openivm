@@ -1,0 +1,158 @@
+# name: test/sql/issue_211_left_join_having_minmax.test
+# description: LEFT JOIN + HAVING + MIN/MAX after an insert-only batch into the null-extended side (#211). The insert
+# group: [sql]
+
+#              must retract the NULL-padded rows; HAVING data has no match count, so those groups are recomputed
+#              incrementally instead of taking the insert-only GREATEST/LEAST MERGE.
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE hl(id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE hr(id INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO hl VALUES (1, 0, 10), (2, 0, 20), (3, 1, 5), (4, 2, 7), (5, 3, 1);
+
+statement ok
+INSERT INTO hr VALUES (3, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW h_cnt AS SELECT hl.k, COUNT(*) AS c, MIN(hl.v) AS m
+FROM hl LEFT JOIN hr ON hl.id = hr.id GROUP BY hl.k HAVING COUNT(*) > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW h_ext AS SELECT hl.k, COUNT(*) AS c, COUNT(hr.w) AS cw, MAX(hr.w) AS mx, MIN(hl.v) AS m
+FROM hl LEFT JOIN hr ON hl.id = hr.id GROUP BY hl.k HAVING MIN(hl.v) < 100;
+
+statement ok
+CREATE VIEW h_cnt_expected AS SELECT hl.k, COUNT(*) AS c, MIN(hl.v) AS m
+FROM hl LEFT JOIN hr ON hl.id = hr.id GROUP BY hl.k HAVING COUNT(*) > 0;
+
+statement ok
+CREATE VIEW h_ext_expected AS SELECT hl.k, COUNT(*) AS c, COUNT(hr.w) AS cw, MAX(hr.w) AS mx, MIN(hl.v) AS m
+FROM hl LEFT JOIN hr ON hl.id = hr.id GROUP BY hl.k HAVING MIN(hl.v) < 100;
+
+# Both stay on the incremental HAVING path.
+query II
+SELECT view_sql_name, type FROM openivm_views ORDER BY 1;
+----
+h_cnt	4
+h_ext	4
+
+# Insert-only batch into the null-extended side: matches for previously unmatched rows, a second match for one row.
+statement ok
+INSERT INTO hr VALUES (1, 4), (2, 6), (4, 9), (4, 1);
+
+statement ok
+PRAGMA refresh('h_cnt');
+
+statement ok
+PRAGMA refresh('h_ext');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_cnt EXCEPT ALL SELECT * FROM h_cnt_expected)
+    UNION ALL (SELECT * FROM h_cnt_expected EXCEPT ALL SELECT * FROM h_cnt));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_ext EXCEPT ALL SELECT * FROM h_ext_expected)
+    UNION ALL (SELECT * FROM h_ext_expected EXCEPT ALL SELECT * FROM h_ext));
+----
+0
+
+# Insert-only batch into the preserved side keeps the fast path and stays correct.
+statement ok
+INSERT INTO hl VALUES (6, 0, 2), (7, 4, 3), (8, 1, 0);
+
+statement ok
+PRAGMA refresh('h_cnt');
+
+statement ok
+PRAGMA refresh('h_ext');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_cnt EXCEPT ALL SELECT * FROM h_cnt_expected)
+    UNION ALL (SELECT * FROM h_cnt_expected EXCEPT ALL SELECT * FROM h_cnt));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_ext EXCEPT ALL SELECT * FROM h_ext_expected)
+    UNION ALL (SELECT * FROM h_ext_expected EXCEPT ALL SELECT * FROM h_ext));
+----
+0
+
+# Insert-only batch into both sides at once, including a new key on both sides.
+statement ok
+INSERT INTO hl VALUES (9, 5, 8), (10, 3, -1);
+
+statement ok
+INSERT INTO hr VALUES (9, 2), (5, 5), (6, 7), (6, 8);
+
+statement ok
+PRAGMA refresh('h_cnt');
+
+statement ok
+PRAGMA refresh('h_ext');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_cnt EXCEPT ALL SELECT * FROM h_cnt_expected)
+    UNION ALL (SELECT * FROM h_cnt_expected EXCEPT ALL SELECT * FROM h_cnt));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_ext EXCEPT ALL SELECT * FROM h_ext_expected)
+    UNION ALL (SELECT * FROM h_ext_expected EXCEPT ALL SELECT * FROM h_ext));
+----
+0
+
+# Mixed conflicting batch on both sides before one refresh.
+statement ok
+INSERT INTO hr VALUES (7, 3), (8, 4);
+
+statement ok
+DELETE FROM hr WHERE id = 4 AND w = 9;
+
+statement ok
+UPDATE hr SET w = w + 10 WHERE id IN (1, 7);
+
+statement ok
+UPDATE hl SET v = v - 20 WHERE id IN (2, 7);
+
+statement ok
+DELETE FROM hl WHERE id = 3;
+
+statement ok
+INSERT INTO hl VALUES (3, 1, 50);
+
+statement ok
+PRAGMA refresh('h_cnt');
+
+statement ok
+PRAGMA refresh('h_ext');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_cnt EXCEPT ALL SELECT * FROM h_cnt_expected)
+    UNION ALL (SELECT * FROM h_cnt_expected EXCEPT ALL SELECT * FROM h_cnt));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_ext EXCEPT ALL SELECT * FROM h_ext_expected)
+    UNION ALL (SELECT * FROM h_ext_expected EXCEPT ALL SELECT * FROM h_ext));
+----
+0
+
+query II
+SELECT view_sql_name, type FROM openivm_views ORDER BY 1;
+----
+h_cnt	4
+h_ext	4

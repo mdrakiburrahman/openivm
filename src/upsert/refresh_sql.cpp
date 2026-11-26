@@ -1120,7 +1120,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::AGGREGATE_HAVING: {
 		// Without HAVING MERGE every delta shape recomputes the affected groups.
 		bool having_merge = SqlUtils::GetBoolSetting(context, "openivm_having_merge", true);
-		auto options = aggregate_options(!having_merge || has_minmax, having_merge && aggregate_insert_only);
+		// HAVING data has no match count: an insert into a null-extended side must retract
+		// the NULL-padded rows, so recompute the affected MIN/MAX groups instead (#211).
+		bool having_insert_only =
+		    having_merge && aggregate_insert_only &&
+		    (!source_has_left_join ||
+		     LeftJoinDeltaNullableQuiet(metadata, view_name, fast_paths.active_delta_table_names));
+		auto options = aggregate_options(!having_merge || has_minmax, having_insert_only);
 		options.use_current_diff_affected_keys = has_unstripped_having;
 		upsert_query = CompileAggregateGroups(view_name, column_names, options);
 		break;
