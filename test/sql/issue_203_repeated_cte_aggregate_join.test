@@ -1,0 +1,153 @@
+# name: test/sql/issue_203_repeated_cte_aggregate_join.test
+# description: A grouped CTE that is referenced several times and joined to itself is a nested aggregate, not a
+# group: [sql]
+
+#              projection (#203). It is maintained by incremental affected-group recompute, including the edge case
+#              of ungrouped scalar aggregates combined by a cross join.
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE ct(a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO ct VALUES (1, 1), (2, 3), (3, 4), (3, 6);
+
+statement ok
+CREATE MATERIALIZED VIEW c_self AS WITH c AS MATERIALIZED (SELECT a, SUM(b) AS s FROM ct GROUP BY a)
+SELECT c1.a, c1.s, c2.s AS s2 FROM c c1 JOIN c c2 ON c1.a = c2.a;
+
+statement ok
+CREATE MATERIALIZED VIEW c_shared AS WITH c AS (SELECT a, SUM(b) AS s, COUNT(*) AS n FROM ct GROUP BY a)
+SELECT c1.a, c1.s, c2.n FROM c c1 JOIN c c2 ON c1.a = c2.a;
+
+statement ok
+CREATE MATERIALIZED VIEW c_scalar AS WITH c AS MATERIALIZED (SELECT SUM(b) AS s FROM ct)
+SELECT c1.s, c2.s AS s2 FROM c c1, c c2;
+
+statement ok
+CREATE MATERIALIZED VIEW c_scalar_expr AS WITH c AS MATERIALIZED (SELECT SUM(b) AS s, COUNT(*) AS n FROM ct)
+SELECT c1.s + c2.n AS x FROM c c1 CROSS JOIN c c2;
+
+statement ok
+CREATE MATERIALIZED VIEW c_outer AS WITH c AS MATERIALIZED (SELECT a, SUM(b) AS s FROM ct GROUP BY a)
+SELECT c1.a, SUM(c2.s) AS ss FROM c c1 JOIN c c2 ON c1.a <= c2.a GROUP BY c1.a;
+
+statement ok
+CREATE VIEW c_self_expected AS WITH c AS (SELECT a, SUM(b) AS s FROM ct GROUP BY a)
+SELECT c1.a, c1.s, c2.s AS s2 FROM c c1 JOIN c c2 ON c1.a = c2.a;
+
+statement ok
+CREATE VIEW c_shared_expected AS WITH c AS (SELECT a, SUM(b) AS s, COUNT(*) AS n FROM ct GROUP BY a)
+SELECT c1.a, c1.s, c2.n FROM c c1 JOIN c c2 ON c1.a = c2.a;
+
+statement ok
+CREATE VIEW c_scalar_expected AS WITH c AS (SELECT SUM(b) AS s FROM ct) SELECT c1.s, c2.s AS s2 FROM c c1, c c2;
+
+statement ok
+CREATE VIEW c_scalar_expr_expected AS WITH c AS (SELECT SUM(b) AS s, COUNT(*) AS n FROM ct)
+SELECT c1.s + c2.n AS x FROM c c1 CROSS JOIN c c2;
+
+statement ok
+CREATE VIEW c_outer_expected AS WITH c AS (SELECT a, SUM(b) AS s FROM ct GROUP BY a)
+SELECT c1.a, SUM(c2.s) AS ss FROM c c1 JOIN c c2 ON c1.a <= c2.a GROUP BY c1.a;
+
+# All are incremental group recompute: neither a projection delta nor FULL_REFRESH.
+query II
+SELECT view_sql_name, type FROM openivm_views ORDER BY 1;
+----
+c_outer	6
+c_scalar	6
+c_scalar_expr	6
+c_self	6
+c_shared	6
+
+loop round 0 3
+
+# Conflicting batch: new groups, removed groups, updates moving rows between groups, and re-inserts.
+statement ok
+INSERT INTO ct VALUES (2, 5), (4, 1 + ${round}), (3, -2);
+
+statement ok
+DELETE FROM ct WHERE a = 1 OR (a = 3 AND b = 6);
+
+statement ok
+UPDATE ct SET b = b + 10 WHERE a = 3;
+
+statement ok
+UPDATE ct SET a = a + 1 WHERE a = 4 AND b > 1;
+
+statement ok
+INSERT INTO ct VALUES (1, 7 * ${round});
+
+statement ok
+PRAGMA refresh('c_self');
+
+statement ok
+PRAGMA refresh('c_shared');
+
+statement ok
+PRAGMA refresh('c_scalar');
+
+statement ok
+PRAGMA refresh('c_scalar_expr');
+
+statement ok
+PRAGMA refresh('c_outer');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_self EXCEPT ALL SELECT * FROM c_self_expected)
+    UNION ALL (SELECT * FROM c_self_expected EXCEPT ALL SELECT * FROM c_self));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_shared EXCEPT ALL SELECT * FROM c_shared_expected)
+    UNION ALL (SELECT * FROM c_shared_expected EXCEPT ALL SELECT * FROM c_shared));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_scalar EXCEPT ALL SELECT * FROM c_scalar_expected)
+    UNION ALL (SELECT * FROM c_scalar_expected EXCEPT ALL SELECT * FROM c_scalar));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_scalar_expr EXCEPT ALL SELECT * FROM c_scalar_expr_expected)
+    UNION ALL (SELECT * FROM c_scalar_expr_expected EXCEPT ALL SELECT * FROM c_scalar_expr));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_outer EXCEPT ALL SELECT * FROM c_outer_expected)
+    UNION ALL (SELECT * FROM c_outer_expected EXCEPT ALL SELECT * FROM c_outer));
+----
+0
+
+endloop
+
+# Deleting every row empties the scalar aggregates to NULL.
+statement ok
+DELETE FROM ct;
+
+statement ok
+PRAGMA refresh('c_scalar');
+
+statement ok
+PRAGMA refresh('c_self');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_scalar EXCEPT ALL SELECT * FROM c_scalar_expected)
+    UNION ALL (SELECT * FROM c_scalar_expected EXCEPT ALL SELECT * FROM c_scalar));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM c_self EXCEPT ALL SELECT * FROM c_self_expected)
+    UNION ALL (SELECT * FROM c_self_expected EXCEPT ALL SELECT * FROM c_self));
+----
+0

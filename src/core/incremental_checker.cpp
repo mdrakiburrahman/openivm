@@ -555,6 +555,17 @@ void MergeMaterializedCteBodyAnalysis(PlanAnalysis &result, PlanAnalysis body) {
 		result.*fact = result.*fact || body.*fact;
 	}
 	if (!outer_passthrough) {
+		// An aggregating body under a join or outer aggregate is a nested aggregate even
+		// though the consumer keeps its own group keys: the delta rule cannot treat it
+		// as a projection (#203). The classifier then recomputes affected groups.
+		if (body.found_aggregation) {
+			result.found_aggregation = true;
+			result.found_nested_aggregate = true;
+			for (auto fact :
+			     {&PlanAnalysis::found_minmax, &PlanAnalysis::found_list, &PlanAnalysis::found_count_distinct}) {
+				result.*fact = result.*fact || body.*fact;
+			}
+		}
 		return;
 	}
 	if (body.found_window) {
