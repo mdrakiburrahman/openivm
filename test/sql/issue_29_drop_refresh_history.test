@@ -1,8 +1,7 @@
 # name: test/sql/issue_29_drop_refresh_history.test
 # description: DROP MATERIALIZED VIEW removes the view's refresh history and profile rows, so a same-name re-create
-# group: [sql]
-
 #              does not inherit the old view's learned cost history (#29).
+# group: [sql]
 
 require openivm
 
@@ -113,3 +112,49 @@ query I
 SELECT count(*) FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv';
 ----
 1
+
+# CREATE OR REPLACE also starts the replaced view without the old history and refresh profiles.
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+INSERT INTO h_src VALUES (7, 7);
+
+statement ok
+PRAGMA refresh('h_mv');
+
+statement ok
+CREATE TABLE h_profile_before AS SELECT p.refresh_id FROM openivm_refresh_profile p JOIN h_ids i USING (view_name)
+WHERE i.view_sql_name = 'h_mv';
+
+query I
+SELECT count(*) > 0 FROM h_profile_before;
+----
+true
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW h_mv AS SELECT a, SUM(b) AS s, COUNT(*) AS n FROM h_src GROUP BY a;
+
+query II
+SELECT (SELECT count(*) FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv'),
+       (SELECT count(*) FROM openivm_refresh_profile WHERE refresh_id IN (SELECT refresh_id FROM h_profile_before));
+----
+0	0
+
+statement ok
+UPDATE h_src SET b = b + 1 WHERE a = 7;
+
+statement ok
+DELETE FROM h_src WHERE a = 5;
+
+statement ok
+INSERT INTO h_src VALUES (8, 1), (7, 2);
+
+statement ok
+PRAGMA refresh('h_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_mv EXCEPT ALL SELECT a, SUM(b), COUNT(*) FROM h_src GROUP BY a)
+    UNION ALL (SELECT a, SUM(b), COUNT(*) FROM h_src GROUP BY a EXCEPT ALL SELECT * FROM h_mv));
+----
+0

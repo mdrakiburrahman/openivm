@@ -1867,6 +1867,9 @@ statement ok
 CREATE MATERIALIZED VIEW host_mv AS SELECT * FROM source;
 
 statement ok
+CREATE TEMP TABLE replaced_mv_profiles AS SELECT refresh_id FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+
+statement ok
 CREATE OR REPLACE MATERIALIZED VIEW "profile.target"."observation.data".mv AS SELECT i FROM "profile.target"."observation.data".source WHERE i>0;
 
 query I
@@ -1874,10 +1877,13 @@ SELECT count(*) FROM main.openivm_refresh_profile p WHERE NOT EXISTS (SELECT 1 F
 ----
 0
 
-query I
-SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+# REPLACE removes the replaced view's profiles (#29); the remaining create profile is the replacement's,
+# written to the target catalog rather than the caller's profile table.
+query II
+SELECT count(*), count(*) FILTER (WHERE refresh_id NOT IN (SELECT refresh_id FROM replaced_mv_profiles))
+FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
 ----
-2
+1	1
 
 statement ok
 BEGIN;
@@ -1888,7 +1894,7 @@ CREATE MATERIALIZED VIEW "profile.target"."observation.data".rolled_back AS SELE
 query I
 SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
 ----
-3
+2
 
 statement ok
 ROLLBACK;
@@ -1896,7 +1902,7 @@ ROLLBACK;
 query I
 SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
 ----
-2
+1
 
 query I
 SELECT count(*) FROM "profile.target".main.openivm_views WHERE view_sql_name='rolled_back';

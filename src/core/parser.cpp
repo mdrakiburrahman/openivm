@@ -1215,6 +1215,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name));
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::HISTORY_TABLE, view_name));
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::PROFILE_TABLE, view_name));
 	}
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
@@ -1836,6 +1837,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (staged_cross_catalog_replace) {
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name));
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::HISTORY_TABLE, view_name));
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::PROFILE_TABLE, view_name));
 	}
 	ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
 	ddl.insert(ddl.end(), native_watermark_ddl.begin(), native_watermark_ddl.end());
