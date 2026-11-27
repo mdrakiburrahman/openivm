@@ -90,6 +90,8 @@ void SqlUtils::CopySessionSetting(ClientContext &from, ClientContext &to, const 
 struct SourceRefVisitor {
 	const std::function<void(unique_ptr<TableRef> &)> &callback;
 	case_insensitive_set_t cte_names;
+	// Optionally called for every query node, including CTE bodies, set-operation arms and subqueries.
+	const std::function<void(QueryNode &)> *node_callback = nullptr;
 };
 
 static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor);
@@ -168,8 +170,11 @@ static void SourceVisitTableRef(unique_ptr<TableRef> &ref, const SourceRefVisito
 }
 
 static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor) {
+	if (visitor.node_callback) {
+		(*visitor.node_callback)(node);
+	}
 	// Each CTE body sees preceding siblings, but not its own name.
-	SourceRefVisitor scoped {visitor.callback, visitor.cte_names};
+	SourceRefVisitor scoped {visitor.callback, visitor.cte_names, visitor.node_callback};
 	for (auto &cte : node.cte_map.map) {
 		if (cte.second->query_node && cte.second->query_node) {
 			SourceVisitQueryNode(*cte.second->query_node, scoped);
@@ -209,7 +214,7 @@ static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visito
 	}
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &recursive_cte = node.Cast<RecursiveCTENode>();
-		SourceRefVisitor recursive_scope {visitor.callback, scoped.cte_names};
+		SourceRefVisitor recursive_scope {visitor.callback, scoped.cte_names, visitor.node_callback};
 		recursive_scope.cte_names.insert(recursive_cte.ctename.GetIdentifierName());
 		if (recursive_cte.left) {
 			SourceVisitQueryNode(*recursive_cte.left, recursive_scope);
@@ -225,7 +230,7 @@ static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visito
 			SourceVisitQueryNode(*cte.query, scoped);
 		}
 		if (cte.child) {
-			SourceRefVisitor child_scope {visitor.callback, scoped.cte_names};
+			SourceRefVisitor child_scope {visitor.callback, scoped.cte_names, visitor.node_callback};
 			child_scope.cte_names.insert(cte.ctename.GetIdentifierName());
 			SourceVisitQueryNode(*cte.child, child_scope);
 		}
@@ -279,6 +284,26 @@ void SqlUtils::RewriteSourceReferences(SQLStatement &statement,
 
 void SqlUtils::VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback) {
 	RewriteSourceReferences(statement, [&](unique_ptr<TableRef> &ref) { callback(ref->Cast<BaseTableRef>()); });
+}
+
+bool SqlUtils::HasRowLimit(const string &query_sql) {
+	auto statement = TryParseSelect(query_sql);
+	if (!statement) {
+		// Unknown shape: report a limit, which only disables optimizations.
+		return true;
+	}
+	bool found = false;
+	const std::function<void(unique_ptr<TableRef> &)> ignore_refs = [](unique_ptr<TableRef> &) {
+	};
+	const std::function<void(QueryNode &)> find_limit = [&](QueryNode &node) {
+		for (auto &modifier : node.modifiers) {
+			found = found || modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+			        modifier->type == ResultModifierType::LEGACY_LIMIT_PERCENT_MODIFIER;
+		}
+	};
+	SourceRefVisitor visitor {ignore_refs, {}, &find_limit};
+	SourceVisitStatement(*statement, visitor);
+	return found;
 }
 
 static constexpr const char *CAST_EXPRESSION_PREFIX = "openivm_expr:";
@@ -767,11 +792,15 @@ string SqlUtils::BuildRowRepetitionSQL(const string &count, const string &alias,
 	auto quoted_alias = DialectQuoteIdent(alias, dialect);
 	auto bound = "CAST(" + count + " AS BIGINT)";
 	if (dialect == SqlDialect::SPARK) {
-		// sequence(1, 0) descends instead of returning an empty array.
-		return " LATERAL VIEW explode(CASE WHEN " + bound + " > 0 THEN sequence(CAST(1 AS BIGINT), " + bound +
-		       ") ELSE array() END) " + quoted_alias + " AS `range`";
+		return " LATERAL VIEW explode(" + SparkRepetitionArraySQL(count) + ") " + quoted_alias + " AS `range`";
 	}
 	return " CROSS JOIN range(" + bound + ") " + quoted_alias;
+}
+
+string SqlUtils::SparkRepetitionArraySQL(const string &count) {
+	auto bound = "CAST(" + count + " AS BIGINT)";
+	// sequence(1, 0) descends instead of returning an empty array.
+	return "CASE WHEN " + bound + " > 0 THEN sequence(CAST(1 AS BIGINT), " + bound + ") ELSE array() END";
 }
 
 string SqlUtils::BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter,

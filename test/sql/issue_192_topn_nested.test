@@ -1,0 +1,463 @@
+# name: test/sql/issue_192_topn_nested.test
+# description: Issue #192 review: nested ORDER BY ... LIMIT with insert-only batches, outer top-k, aggregate input
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='{TEST_DIR}';
+
+statement ok
+CREATE TABLE ins_t(id INT, y INT);
+
+statement ok
+INSERT INTO ins_t VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+statement ok
+CREATE TABLE grp_t(id INT, y INT, g INT);
+
+statement ok
+INSERT INTO grp_t VALUES (1, 10, 1), (2, 20, 2), (3, 30, 1), (4, 40, 2);
+
+statement ok
+CREATE TABLE tt_t(id INT, x INT);
+
+statement ok
+INSERT INTO tt_t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+statement ok
+CREATE TABLE agg_t(g INT, x INT);
+
+statement ok
+INSERT INTO agg_t VALUES (1, 10), (2, 20), (3, 30), (4, 5);
+
+statement ok
+CREATE TABLE coll_t(k INT, s VARCHAR COLLATE NOCASE, iv INTERVAL);
+
+statement ok
+INSERT INTO coll_t VALUES (1, 'a', INTERVAL '1 month'), (2, 'A', INTERVAL '30 days'), (3, 'b', INTERVAL '1 day'), (4, 'c', INTERVAL '2 days');
+
+# Insert-only sources can still retract rows through a nested top-k: no insert-only fast path may apply.
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_group AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q GROUP BY y;
+
+statement ok
+CREATE VIEW expected_topk_ins_group AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q GROUP BY y;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_minmax AS SELECT MIN(y) AS mn, MAX(y) AS mx FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE VIEW expected_topk_ins_minmax AS SELECT MIN(y) AS mn, MAX(y) AS mx FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_group_max AS SELECT y % 20 AS g, MAX(y) AS mx FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q GROUP BY 1;
+
+statement ok
+CREATE VIEW expected_topk_ins_group_max AS SELECT y % 20 AS g, MAX(y) AS mx FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q GROUP BY 1;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_proj AS SELECT id, y FROM (SELECT id, y FROM ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+statement ok
+CREATE VIEW expected_topk_ins_proj AS SELECT id, y FROM (SELECT id, y FROM ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_sum AS SELECT SUM(y) AS s, COUNT(*) AS c FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE VIEW expected_topk_ins_sum AS SELECT SUM(y) AS s, COUNT(*) AS c FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_count_distinct AS SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE VIEW expected_topk_ins_count_distinct AS SELECT COUNT(DISTINCT y) AS c FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_distinct AS SELECT DISTINCT y FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+statement ok
+CREATE VIEW expected_topk_ins_distinct AS SELECT DISTINCT y FROM (SELECT y FROM ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_ins_having AS SELECT y, SUM(id) AS s FROM (SELECT y, id FROM ins_t ORDER BY id LIMIT 2) q GROUP BY y HAVING SUM(id) > 0;
+
+statement ok
+CREATE VIEW expected_topk_ins_having AS SELECT y, SUM(id) AS s FROM (SELECT y, id FROM ins_t ORDER BY id LIMIT 2) q GROUP BY y HAVING SUM(id) > 0;
+
+# An evicted row's group is named by no source delta row, so affected groups come from the current state.
+statement ok
+CREATE MATERIALIZED VIEW topk_grp_arg_max AS SELECT g, arg_max(id, y) AS a, COUNT(*) AS c FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q GROUP BY g;
+
+statement ok
+CREATE VIEW expected_topk_grp_arg_max AS SELECT g, arg_max(id, y) AS a, COUNT(*) AS c FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_grp_count_distinct AS SELECT g, COUNT(DISTINCT y) AS c FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q GROUP BY g;
+
+statement ok
+CREATE VIEW expected_topk_grp_count_distinct AS SELECT g, COUNT(DISTINCT y) AS c FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_grp_having_max AS SELECT g, MAX(y) AS m FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q GROUP BY g HAVING MAX(y) > 0;
+
+statement ok
+CREATE VIEW expected_topk_grp_having_max AS SELECT g, MAX(y) AS m FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q GROUP BY g HAVING MAX(y) > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_grp_distinct_sum AS SELECT g, SUM(y) AS s FROM (SELECT DISTINCT g, y FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q) z GROUP BY g;
+
+statement ok
+CREATE VIEW expected_topk_grp_distinct_sum AS SELECT g, SUM(y) AS s FROM (SELECT DISTINCT g, y FROM (SELECT id, y, g FROM grp_t ORDER BY id LIMIT 3) q) z GROUP BY g;
+
+# A window or DISTINCT below a top-k is evaluated inside both selections.
+statement ok
+CREATE MATERIALIZED VIEW topk_window_in AS SELECT id, w FROM (SELECT id, SUM(y) OVER (PARTITION BY g) AS w FROM grp_t ORDER BY id LIMIT 3) q WHERE w > 0;
+
+statement ok
+CREATE VIEW expected_topk_window_in AS SELECT id, w FROM (SELECT id, SUM(y) OVER (PARTITION BY g) AS w FROM grp_t ORDER BY id LIMIT 3) q WHERE w > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_window_in_sum AS SELECT COUNT(*) AS n, SUM(w) AS s FROM (SELECT id, SUM(y) OVER (PARTITION BY g) AS w FROM grp_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE VIEW expected_topk_window_in_sum AS SELECT COUNT(*) AS n, SUM(w) AS s FROM (SELECT id, SUM(y) OVER (PARTITION BY g) AS w FROM grp_t ORDER BY id LIMIT 3) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_distinct_in AS SELECT v FROM (SELECT DISTINCT y % 20 AS v FROM grp_t ORDER BY v DESC LIMIT 1) q WHERE v >= 0;
+
+statement ok
+CREATE VIEW expected_topk_distinct_in AS SELECT v FROM (SELECT DISTINCT y % 20 AS v FROM grp_t ORDER BY v DESC LIMIT 1) q WHERE v >= 0;
+
+# A top-k directly below the published ORDER BY/LIMIT is still nested and maintained exactly.
+statement ok
+CREATE MATERIALIZED VIEW topk_outer_inner AS SELECT id, x FROM (SELECT id, x FROM tt_t ORDER BY id LIMIT 3) q ORDER BY x DESC LIMIT 2;
+
+statement ok
+CREATE VIEW expected_topk_outer_inner AS SELECT id, x FROM (SELECT id, x FROM tt_t ORDER BY id LIMIT 3) q ORDER BY x DESC LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_outer_inner_offset AS SELECT id, x FROM (SELECT id, x FROM tt_t ORDER BY x DESC LIMIT 4) q ORDER BY id LIMIT 2 OFFSET 1;
+
+statement ok
+CREATE VIEW expected_topk_outer_inner_offset AS SELECT id, x FROM (SELECT id, x FROM tt_t ORDER BY x DESC LIMIT 4) q ORDER BY id LIMIT 2 OFFSET 1;
+
+# Top-k over an aggregate: the pre-delta selection is evaluated over the pre-delta base table. Ties on s are broken by g, as the view does.
+statement ok
+CREATE MATERIALIZED VIEW topk_agg_filter AS SELECT g, s FROM (SELECT g, SUM(x) AS s FROM agg_t GROUP BY g ORDER BY s DESC LIMIT 2) q WHERE s > 0;
+
+statement ok
+CREATE VIEW expected_topk_agg_filter AS SELECT g, s FROM (SELECT g, SUM(x) AS s FROM agg_t GROUP BY g ORDER BY s DESC, g LIMIT 2) q WHERE s > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_agg_count AS SELECT COUNT(*) AS n, SUM(s) AS ss FROM (SELECT g, SUM(x) AS s FROM agg_t GROUP BY g ORDER BY s DESC LIMIT 2) q;
+
+statement ok
+CREATE VIEW expected_topk_agg_count AS SELECT COUNT(*) AS n, SUM(s) AS ss FROM (SELECT g, SUM(x) AS s FROM agg_t GROUP BY g ORDER BY s DESC, g LIMIT 2) q;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_agg_group AS SELECT s % 2 AS p, COUNT(*) AS n FROM (SELECT g, SUM(x) AS s FROM agg_t GROUP BY g ORDER BY s DESC LIMIT 2) q GROUP BY 1;
+
+statement ok
+CREATE VIEW expected_topk_agg_group AS SELECT s % 2 AS p, COUNT(*) AS n FROM (SELECT g, SUM(x) AS s FROM agg_t GROUP BY g ORDER BY s DESC, g LIMIT 2) q GROUP BY 1;
+
+# Values that compare equal ('a'/'A' under NOCASE, '1 month'/'30 days') stay distinct in pre-delta state.
+statement ok
+CREATE MATERIALIZED VIEW topk_collate AS SELECT k, s::BLOB AS b, iv::VARCHAR AS ivs FROM (SELECT k, s, iv FROM coll_t ORDER BY k LIMIT 3) q WHERE k > 0;
+
+statement ok
+CREATE VIEW expected_topk_collate AS SELECT k, s::BLOB AS b, iv::VARCHAR AS ivs FROM (SELECT k, s, iv FROM coll_t ORDER BY k LIMIT 3) q WHERE k > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW topk_collate_group AS SELECT s::BLOB AS b, COUNT(*) AS c FROM (SELECT k, s, iv FROM coll_t ORDER BY k LIMIT 3) q GROUP BY 1;
+
+statement ok
+CREATE VIEW expected_topk_collate_group AS SELECT s::BLOB AS b, COUNT(*) AS c FROM (SELECT k, s, iv FROM coll_t ORDER BY k LIMIT 3) q GROUP BY 1;
+
+# Delta compaction keeps them distinct too: an update from 'a' to 'A' is not cancelled out.
+statement ok
+CREATE MATERIALIZED VIEW collate_plain AS SELECT k, s::BLOB AS b, iv::VARCHAR AS ivs FROM coll_t WHERE k > 0;
+
+statement ok
+CREATE VIEW expected_collate_plain AS SELECT k, s::BLOB AS b, iv::VARCHAR AS ivs FROM coll_t WHERE k > 0;
+
+# Every shape stays incremental; none is demoted to FULL_REFRESH (3).
+query II
+SELECT view_sql_name, type FROM openivm_views WHERE view_sql_name LIKE 'topk_%' OR view_sql_name = 'collate_plain' ORDER BY view_sql_name;
+----
+collate_plain	2
+topk_agg_count	1
+topk_agg_filter	2
+topk_agg_group	0
+topk_collate	2
+topk_collate_group	0
+topk_distinct_in	6
+topk_grp_arg_max	0
+topk_grp_count_distinct	6
+topk_grp_distinct_sum	6
+topk_grp_having_max	4
+topk_ins_count_distinct	1
+topk_ins_distinct	0
+topk_ins_group	0
+topk_ins_group_max	0
+topk_ins_having	4
+topk_ins_minmax	1
+topk_ins_proj	2
+topk_ins_sum	1
+topk_outer_inner	2
+topk_outer_inner_offset	2
+topk_window_in	2
+topk_window_in_sum	1
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE type = 3;
+----
+0
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 1, insert-only: new rows rank first and evict selected rows (one per group), an aggregate group grows past the boundary, and collated/interval twins enter.
+statement ok
+INSERT INTO ins_t VALUES (0, 5), (-1, 10), (-1, 10);
+
+statement ok
+INSERT INTO grp_t VALUES (0, 5, 3), (-1, 50, 2);
+
+statement ok
+INSERT INTO tt_t VALUES (0, 60), (-1, 5);
+
+statement ok
+INSERT INTO agg_t VALUES (1, 100), (4, 1), (5, 7);
+
+statement ok
+INSERT INTO coll_t VALUES (0, 'B', INTERVAL '2 days'), (6, 'a', INTERVAL '1 month');
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+statement ok
+PRAGMA refresh('{mv}');
+
+endloop
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 2: conflicting INSERT, UPDATE and DELETE on the same rows; ORDER BY keys move rows in and out, a transient row is inserted and deleted, and a collated value changes case only.
+statement ok
+INSERT INTO ins_t VALUES (-5, 99);
+
+statement ok
+UPDATE ins_t SET id = 10 WHERE id = -1;
+
+statement ok
+DELETE FROM ins_t WHERE id = -5;
+
+statement ok
+UPDATE ins_t SET y = y + 1 WHERE id IN (0, 1);
+
+statement ok
+DELETE FROM grp_t WHERE id = 0;
+
+statement ok
+UPDATE grp_t SET id = 9 WHERE id = -1;
+
+statement ok
+UPDATE grp_t SET g = 3 WHERE id = 2;
+
+statement ok
+INSERT INTO tt_t VALUES (-2, 70);
+
+statement ok
+UPDATE tt_t SET x = 1 WHERE id = -2;
+
+statement ok
+DELETE FROM tt_t WHERE id = 1;
+
+statement ok
+UPDATE agg_t SET x = x + 200 WHERE g = 2;
+
+statement ok
+DELETE FROM agg_t WHERE g = 1;
+
+statement ok
+INSERT INTO agg_t VALUES (3, -30);
+
+statement ok
+UPDATE coll_t SET s = 'A' WHERE s = 'a' AND k = 1;
+
+statement ok
+DELETE FROM coll_t WHERE k = 2 AND s = 'A';
+
+statement ok
+INSERT INTO coll_t VALUES (2, 'A', INTERVAL '30 days');
+
+statement ok
+UPDATE coll_t SET k = 5 WHERE k = 0;
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+statement ok
+PRAGMA refresh('{mv}');
+
+endloop
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 3: the sources are emptied and refilled with duplicates in one batch.
+statement ok
+DELETE FROM ins_t;
+
+statement ok
+INSERT INTO ins_t VALUES (3, 3), (3, 3), (1, 7), (2, NULL);
+
+statement ok
+UPDATE ins_t SET id = 0 WHERE y = 7;
+
+statement ok
+DELETE FROM grp_t;
+
+statement ok
+INSERT INTO grp_t VALUES (1, 1, 1), (2, 1, 1), (3, 2, 2);
+
+statement ok
+DELETE FROM tt_t;
+
+statement ok
+INSERT INTO tt_t VALUES (1, 1), (2, 2);
+
+statement ok
+DELETE FROM agg_t;
+
+statement ok
+INSERT INTO agg_t VALUES (1, 1), (1, 1), (2, 3);
+
+statement ok
+DELETE FROM coll_t WHERE k > 1;
+
+statement ok
+INSERT INTO coll_t VALUES (2, 'b', INTERVAL '1 month'), (3, 'B', INTERVAL '30 days');
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+statement ok
+PRAGMA refresh('{mv}');
+
+endloop
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 4, insert-only again: every new row outranks the current selection.
+statement ok
+INSERT INTO ins_t VALUES (-10, 1), (-9, 2);
+
+statement ok
+INSERT INTO grp_t VALUES (-10, 9, 4), (-9, 8, 1);
+
+statement ok
+INSERT INTO tt_t VALUES (-10, 100), (-9, 90), (-8, 80);
+
+statement ok
+INSERT INTO agg_t VALUES (7, 1000), (8, 900);
+
+statement ok
+INSERT INTO coll_t VALUES (-1, 'C', INTERVAL '3 days'), (-2, 'c', INTERVAL '72 hours');
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+statement ok
+PRAGMA refresh('{mv}');
+
+endloop
+
+foreach mv topk_ins_group topk_ins_minmax topk_ins_group_max topk_ins_proj topk_ins_sum topk_ins_count_distinct topk_ins_distinct topk_ins_having topk_grp_arg_max topk_grp_count_distinct topk_grp_having_max topk_grp_distinct_sum topk_window_in topk_window_in_sum topk_distinct_in topk_outer_inner topk_outer_inner_offset topk_agg_filter topk_agg_count topk_agg_group topk_collate topk_collate_group collate_plain
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Finding 6: the pre-delta bag repeats tuples by weight; Spark has no scalar range(), so the program must use
+# sequence() and keep the native value-identity key out.
+statement ok
+CREATE TABLE spark_t(id INT, y INT, iv INTERVAL);
+
+statement ok
+INSERT INTO spark_t VALUES (1, 1, INTERVAL '1 day'), (2, 2, INTERVAL '1 month'), (3, 2, INTERVAL '30 days');
+
+statement ok
+CREATE MATERIALIZED VIEW spark_topk_mv AS SELECT y, COUNT(*) AS c FROM (SELECT y, iv FROM spark_t ORDER BY id LIMIT 2) q GROUP BY y;
+
+statement ok
+INSERT INTO spark_t VALUES (0, 5, INTERVAL '2 days');
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%explode(CASE WHEN %sequence(CAST(1 AS BIGINT)%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%range(%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_internal_value_key%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('spark_topk_mv', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+PRAGMA refresh('spark_topk_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM spark_topk_mv EXCEPT ALL SELECT y, COUNT(*) FROM (SELECT y, iv FROM spark_t ORDER BY id LIMIT 2) q GROUP BY y)
+    UNION ALL
+    (SELECT y, COUNT(*) FROM (SELECT y, iv FROM spark_t ORDER BY id LIMIT 2) q GROUP BY y EXCEPT ALL SELECT * FROM spark_topk_mv)
+);
+----
+0

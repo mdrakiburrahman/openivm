@@ -1,0 +1,175 @@
+# name: test/sql/ducklake_topn_nested.test
+# description: Issue #192 review: nested ORDER BY ... LIMIT over DuckLake sources, including insert-only snapshots
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/ducklake_topn_nested.db' AS dl (DATA_PATH '{TEST_DIR}/ducklake_topn_nested_files');
+
+statement ok
+CREATE TABLE dl.ins_t(id INT, y INT);
+
+statement ok
+INSERT INTO dl.ins_t VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+CREATE TABLE dl.agg_t(g INT, x INT);
+
+statement ok
+INSERT INTO dl.agg_t VALUES (1, 10), (2, 20), (3, 30);
+
+# Insert-only DuckLake snapshots can still retract rows through a nested top-k.
+statement ok
+CREATE MATERIALIZED VIEW dl_topk_group AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM dl.ins_t ORDER BY id LIMIT 2) q GROUP BY y;
+
+statement ok
+CREATE VIEW expected_dl_topk_group AS SELECT y, COUNT(*) AS c FROM (SELECT y FROM dl.ins_t ORDER BY id LIMIT 2) q GROUP BY y;
+
+statement ok
+CREATE MATERIALIZED VIEW dl_topk_minmax AS SELECT MIN(y) AS mn, MAX(y) AS mx FROM (SELECT y FROM dl.ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE VIEW expected_dl_topk_minmax AS SELECT MIN(y) AS mn, MAX(y) AS mx FROM (SELECT y FROM dl.ins_t ORDER BY id LIMIT 2) q;
+
+statement ok
+CREATE MATERIALIZED VIEW dl_topk_proj AS SELECT id, y FROM (SELECT id, y FROM dl.ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+statement ok
+CREATE VIEW expected_dl_topk_proj AS SELECT id, y FROM (SELECT id, y FROM dl.ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW dl_topk_distinct AS SELECT DISTINCT y FROM (SELECT y FROM dl.ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+statement ok
+CREATE VIEW expected_dl_topk_distinct AS SELECT DISTINCT y FROM (SELECT y FROM dl.ins_t ORDER BY id LIMIT 2) q WHERE y > 0;
+
+# Top-k over an aggregate, evaluated over the pre-delta DuckLake snapshot.
+statement ok
+CREATE MATERIALIZED VIEW dl_topk_agg_filter AS SELECT g, s FROM (SELECT g, SUM(x) AS s FROM dl.agg_t GROUP BY g ORDER BY s DESC, g LIMIT 2) q WHERE s > 0;
+
+statement ok
+CREATE VIEW expected_dl_topk_agg_filter AS SELECT g, s FROM (SELECT g, SUM(x) AS s FROM dl.agg_t GROUP BY g ORDER BY s DESC, g LIMIT 2) q WHERE s > 0;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE type = 3;
+----
+0
+
+foreach mv dl_topk_group dl_topk_minmax dl_topk_proj dl_topk_distinct dl_topk_agg_filter
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 1, insert-only: a new row ranks first and evicts a selected row; an aggregate group overtakes another.
+statement ok
+INSERT INTO dl.ins_t VALUES (0, 5);
+
+statement ok
+INSERT INTO dl.agg_t VALUES (1, 100);
+
+foreach mv dl_topk_group dl_topk_minmax dl_topk_proj dl_topk_distinct dl_topk_agg_filter
+
+statement ok
+PRAGMA refresh('{mv}');
+
+endloop
+
+foreach mv dl_topk_group dl_topk_minmax dl_topk_proj dl_topk_distinct dl_topk_agg_filter
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 2: conflicting INSERT, UPDATE and DELETE on the same rows.
+statement ok
+INSERT INTO dl.ins_t VALUES (-1, 7), (-2, 8);
+
+statement ok
+UPDATE dl.ins_t SET id = 10 WHERE id = -1;
+
+statement ok
+DELETE FROM dl.ins_t WHERE id = 0;
+
+statement ok
+UPDATE dl.ins_t SET y = y + 1 WHERE id = -2;
+
+statement ok
+DELETE FROM dl.agg_t WHERE g = 1;
+
+statement ok
+INSERT INTO dl.agg_t VALUES (2, 1), (4, 25);
+
+statement ok
+UPDATE dl.agg_t SET x = 0 WHERE g = 3;
+
+foreach mv dl_topk_group dl_topk_minmax dl_topk_proj dl_topk_distinct dl_topk_agg_filter
+
+statement ok
+PRAGMA refresh('{mv}');
+
+endloop
+
+foreach mv dl_topk_group dl_topk_minmax dl_topk_proj dl_topk_distinct dl_topk_agg_filter
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Round 3, insert-only again.
+statement ok
+INSERT INTO dl.ins_t VALUES (-10, 1), (-9, 1);
+
+statement ok
+INSERT INTO dl.agg_t VALUES (9, 500);
+
+foreach mv dl_topk_group dl_topk_minmax dl_topk_proj dl_topk_distinct dl_topk_agg_filter
+
+statement ok
+PRAGMA refresh('{mv}');
+
+endloop
+
+foreach mv dl_topk_group dl_topk_minmax dl_topk_proj dl_topk_distinct dl_topk_agg_filter
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+

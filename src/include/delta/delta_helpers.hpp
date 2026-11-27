@@ -9,6 +9,8 @@
 
 namespace duckdb {
 
+class Optimizer;
+
 // One source's delta metadata for the view being compiled, read once per compile.
 struct DeltaSourceState {
 	bool watermark_loaded = false;
@@ -29,6 +31,16 @@ DeltaSourceState &LoadDeltaWatermark(Connection &con, const string &view_name, T
 
 // An empty relation of `types`, whose last column is the multiplicity.
 DeltaPlanFragment EmptyDeltaResult(Binder &binder, const vector<LogicalType> &types);
+
+// A grouping key that separates values SQL equality merges but projections can observe (signed zeros, collated
+// strings, interval components, nested floats), or nullptr when equality is already identity.
+unique_ptr<Expression> MakeValueIdentityExpression(ClientContext &context, Optimizer &optimizer,
+                                                   unique_ptr<Expression> value);
+
+// Consolidate a signed relation (multiplicity last) to one row per distinct tuple, by value identity, with its net
+// non-zero weight, projected under output_table_index with the INTEGER weight last.
+DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
+                                   TableIndex output_table_index, ColumnBinding mul_binding);
 
 // Restore the SQL arguments that DuckLake plan serialization omits.
 void PopulateDuckLakeChangeScanParameters(LogicalGet &get);

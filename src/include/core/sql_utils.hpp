@@ -42,6 +42,8 @@ public:
 	static void VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback);
 	static void RewriteSourceReferences(SQLStatement &statement,
 	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
+	// Whether any query node of the SELECT has a LIMIT, OFFSET or LIMIT PERCENT; true when it does not parse.
+	static bool HasRowLimit(const string &query_sql);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string EscapeSingleQuotes(const string &input);
 	// Null for a parse error, multiple statements, or a statement other than SELECT.
@@ -124,6 +126,8 @@ public:
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
 	// Repeat each input row count times, preserving an empty result for nonpositive counts.
 	static string BuildRowRepetitionSQL(const string &count, const string &alias, SqlDialect dialect);
+	// A Spark array with max(count, 0) elements, for explode(); Spark has no scalar range().
+	static string SparkRepetitionArraySQL(const string &count);
 	// Reconstruct a previous native bag, optionally projecting and restricting all inputs before subtraction.
 	static string BuildPreviousSourceRowsSQL(const string &current, const string &delta, const string &delta_ts_filter,
 	                                         const vector<string> &columns = {}, const string &candidate_join = "");
