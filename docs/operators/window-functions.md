@@ -78,6 +78,38 @@ window recompute is kept. All of the following must hold:
 
 `HAVING` is applied to the visible view and its delta as usual; the backing table keeps every group.
 
+### Partition keys through subqueries, CTEs and `UNION ALL`
+
+Partition recompute needs to know which output column carries the partition key. OpenIVM follows
+the key by column binding, not by name, so these shapes keep partition-scoped refresh:
+
+- **Renamed keys.** `PARTITION BY k` over `SELECT a AS k FROM t` (in a subquery or CTE) is scoped
+  by the changed values of `t.a`. The key must reach the output as the raw column, possibly under
+  another alias. An output expression that only shares the key's name (for example
+  `lower(k) AS k`) is not treated as the key.
+- **Window over `UNION ALL`.** `ROW_NUMBER() OVER (PARTITION BY k ...)` over a `UNION ALL` of
+  filtered projections of base tables is scoped by evaluating the view query over each source's
+  delta rows (old and new images), which yields every partition whose input changed. This
+  requires a single plain-column partition key that the view outputs unchanged, an `ORDER BY` of
+  deterministic row-local expressions, no frame, and only projections and filters that always keep
+  row 1 of a partition (such as `rn = 1` or `rn <= 3`) above the window. Below the window, each
+  arm may only project and filter its source table (no joins or aggregates), and every source
+  must be covered.
+- **Latest row per key with a normalized lookup.** A `ROW_NUMBER ... WHERE rn = 1` view
+  `LEFT JOIN`ed to one lookup table on a normalized key (for example
+  `SELECT DISTINCT NULLIF(TRIM(raw), '') AS tag FROM seed`) is scoped by partition when either
+  table changes, as long as the window is on the preserved side and its partition key is a raw
+  column.
+
+Otherwise OpenIVM falls back to recomputing the whole view; the result is the same.
+
+### `ROW_NUMBER` only
+
+The scoped shapes above, [rank per child, aggregate per parent](#rank-per-child-aggregate-per-parent)
+and the late-append trim below all require a single `ROW_NUMBER` window. Views of the same shape
+that use `RANK`, `DENSE_RANK` or other window functions are still maintained correctly, but by
+recomputing the whole view.
+
 ## Running aggregates (opt-in)
 
 With `SET openivm_running_window_incremental = true` (default `false`), insert-only refreshes of
@@ -110,7 +142,10 @@ one large partition or nearly all partitions, since the extra publication and de
 Window functions work with other operators:
 
 - **Window over JOIN:** `SELECT ..., ROW_NUMBER() OVER (...) FROM t1 JOIN t2 ON ...` —
-  uses partition recompute when OpenIVM can derive affected partition values from source lineage. Other join shapes use full recompute.
+  uses partition recompute when OpenIVM can derive affected partition values from source lineage,
+  including the normalized `LEFT JOIN` lookup described in
+  [Partition keys through subqueries, CTEs and `UNION ALL`](#partition-keys-through-subqueries-ctes-and-union-all).
+  Other join shapes use full recompute.
 - **Latest row per key with a lookup (opt-in):** with `SET openivm_late_append_window_trim = true`,
   for `ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC, ...)`
   filtered to `rn = 1` and `LEFT JOIN`ed to one lookup table, a key is not recomputed when every

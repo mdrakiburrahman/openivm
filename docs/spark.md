@@ -104,6 +104,34 @@ Semantics, from `src/upsert/refresh_sql.cpp`:
 - The only hint verified by tests is `/*+ BROADCAST(...) */`, for a two-table inner-join view whose refresh SQL reads a delta table (`openivm_delta_<table>`). The test checks that the hint and the delta table both appear. It does not pin down which relation is broadcast. Which other hints LPTS emits is decided inside LPTS and is not covered here or by an OpenIVM test, so do not rely on any others.
 - Hints are optimizer advice for Spark. They do not change query results.
 
+## Opaque Spark expressions (`__openivm_spark_expression`)
+
+Some Spark expressions have no DuckDB equivalent. A front end that compiles Spark views through
+OpenIVM can stand them in with a marker call, so OpenIVM can still classify and incrementalize the
+rest of the view:
+
+```sql
+SET openivm_spark_expression_markers = true;  -- session or global; default false
+
+CREATE MATERIALIZED VIEW tagged AS
+    SELECT id, __openivm_spark_expression('rlike_marker', NULL::BOOLEAN, txt, '(?i)ä') AS hit
+    FROM events;
+
+SELECT sql FROM openivm_compile_with_facts('tagged', '{"target_dialect":"spark","compile_only":true}');
+```
+
+- Arguments: a name for the caller to identify the expression, a typed `NULL` that sets the
+  result type, then the expression's inputs.
+- The marker is kept as-is in the compiled Spark SQL, for the caller to replace. DuckDB never
+  evaluates it: executing it fails (`Spark expression marker cannot be evaluated by OpenIVM`), and
+  so do `CREATE MATERIALIZED VIEW` over a non-empty source (the initial population runs the
+  query) and a native `PRAGMA refresh` of a marker view. Use markers only with compile-only output.
+- With the setting off, binding a marker fails with
+  `Spark expression markers are restricted to compiler-only use`.
+- For classification the marker counts as deterministic. Views that use it in projections,
+  filters, `HAVING`, or window partition and order keys keep the same refresh type they would
+  have with an ordinary deterministic expression in that position.
+
 ## `add_months(DATE, INTEGER)`
 
 Loading the extension registers the scalar `add_months(DATE, INTEGER)`, implemented in LPTS (`spark_scalar_functions`). It lets Spark-style view bodies that call `add_months` resolve in DuckDB and be maintained incrementally.
