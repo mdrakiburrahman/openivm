@@ -447,6 +447,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           Connection *metadata_connection, ProjectionDeleteRetryPlan *delete_retry_plan,
                           bool write_query_file, vector<string> *deferred_cleanup,
                           shared_ptr<const RefreshMetadata::ViewRecord> view_record) {
+	// Cross-system programs journal refresh_in_progress only through these outputs.
+	if (cross_system && (!out_pre_meta || !out_post_meta)) {
+		throw InternalException("OpenIVM cross-system refresh compilation requires pre/post metadata outputs");
+	}
 	// Generated refresh plans are deep; plan them with the refresh optimizer overrides.
 	ScopedDisabledOptimizers refresh_optimizers(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 	if (delete_retry_plan) {
