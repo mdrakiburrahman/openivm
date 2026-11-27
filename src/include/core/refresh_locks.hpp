@@ -32,8 +32,9 @@ public:
 	}
 
 	// A capture lock admits tracked DML only; every other lock may change source
-	// delta ownership.
-	void Lock(const void *owner, bool capture = false);
+	// delta ownership. A waiter with an interrupt_context stops waiting and throws
+	// InterruptException once that context is interrupted.
+	void Lock(const void *owner, bool capture = false, ClientContext *interrupt_context = nullptr);
 	bool TryLock(const void *owner);
 	void Unlock(const void *owner);
 
@@ -107,9 +108,10 @@ class MutationLockGuard {
 public:
 	explicit MutationLockGuard(ClientContext &owner_p);
 
-	MutationLockGuard(DatabaseInstance &db_p, const void *owner_p, bool capture = false)
+	MutationLockGuard(DatabaseInstance &db_p, const void *owner_p, bool capture = false,
+	                  ClientContext *interrupt_context = nullptr)
 	    : gate(RefreshLocks::AcquireGate(db_p)), owner(owner_p) {
-		gate->Lock(owner, capture);
+		gate->Lock(owner, capture, interrupt_context);
 	}
 	~MutationLockGuard() {
 		gate->Unlock(owner);

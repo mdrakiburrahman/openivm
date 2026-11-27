@@ -9,17 +9,19 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 
+#include <chrono>
 #include <cstdio>
 
 namespace duckdb {
 
-void MutationGate::Lock(const void *owner, bool capture) {
+void MutationGate::Lock(const void *owner, bool capture, ClientContext *interrupt_context) {
 	std::unique_lock<mutex> guard(lock);
 	if (active_owner == owner) {
 		depth++;
@@ -36,7 +38,16 @@ void MutationGate::Lock(const void *owner, bool capture) {
 		throw TransactionException("OpenIVM lifecycle conflicts with pending source writes; retry the transaction");
 	}
 	waiting_owners++;
-	condition.wait(guard, [&]() { return active_owner == nullptr; });
+	// The holder may keep the gate until its transaction ends. Wake periodically so the
+	// waiting query can still be interrupted.
+	while (active_owner != nullptr) {
+		if (interrupt_context && interrupt_context->IsInterrupted()) {
+			waiting_owners--;
+			OPENIVM_DEBUG_PRINT("[LOCK] mutation gate wait interrupted owner=%p\n", owner);
+			throw InterruptException();
+		}
+		condition.wait_for(guard, std::chrono::milliseconds(100));
+	}
 	waiting_owners--;
 	active_owner = owner;
 	depth = 1;
@@ -247,7 +258,7 @@ shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
 
 MutationLockGuard::MutationLockGuard(ClientContext &context)
     : MutationLockGuard(DatabaseInstance::GetDatabase(context),
-                        TransactionalMVLockState::Get(context).GetMutationOwner()) {
+                        TransactionalMVLockState::Get(context).GetMutationOwner(), false, &context) {
 }
 
 SourceAdmissionGuard::SourceAdmissionGuard(DatabaseInstance &db, const void *owner_p, Catalog &catalog, string source_p,
@@ -314,7 +325,8 @@ void TransactionalMVLockState::AcquireMutationLock(bool capture) {
 	// Parallel delta-capture workers share this state. Losing a guard here leaks its gate depth.
 	lock_guard<mutex> guard(state_lock);
 	if (!mutation_guard) {
-		mutation_guard = make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner, capture);
+		mutation_guard =
+		    make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner, capture, &owner);
 		OPENIVM_DEBUG_PRINT("[LOCK] acquired database mutation lock owner=%p capture=%d\n", static_cast<void *>(&owner),
 		                    capture ? 1 : 0);
 	} else if (!capture) {

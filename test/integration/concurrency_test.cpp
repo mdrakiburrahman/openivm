@@ -101,6 +101,47 @@ static void TestRefreshRollback(const string &path) {
 	CheckBag(waiter, "mv", "SELECT * FROM source");
 }
 
+// Issue #90: a query waiting on the mutation gate must stay interruptible while
+// another transaction holds the gate, and the interrupt must not leak the gate.
+static void TestInterruptedWait(const string &path, bool refresh) {
+	std::cerr << "CASE interrupt blocked " << (refresh ? "refresh" : "tracked write") << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), waiter(db);
+	Configure(owner, path);
+	Execute(owner, "CREATE TABLE a(id INTEGER); CREATE TABLE b(id INTEGER); "
+	               "INSERT INTO a VALUES (1); INSERT INTO b VALUES (1); "
+	               "CREATE MATERIALIZED VIEW mv_a AS SELECT * FROM a; "
+	               "CREATE MATERIALIZED VIEW mv_b AS SELECT * FROM b; INSERT INTO b VALUES (2);");
+	Execute(owner, "BEGIN; INSERT INTO a VALUES (2);");
+	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*owner.context));
+	auto competing = std::async(std::launch::async, [&]() {
+		return waiter.Query(refresh ? "PRAGMA refresh('mv_b');" : "INSERT INTO b VALUES (3);");
+	});
+	try {
+		MutationGateTestAccess::WaitForBlockedOwner(*gate);
+		waiter.Interrupt();
+		if (competing.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+			throw InvalidInputException("Interrupted mutation gate waiter did not return");
+		}
+	} catch (const std::exception &) {
+		owner.Query("ROLLBACK;");
+		throw;
+	}
+	auto result = competing.get();
+	if (!result->HasError() || result->GetErrorType() != ExceptionType::INTERRUPT) {
+		owner.Query("ROLLBACK;");
+		throw InvalidInputException("Blocked mutation was not interrupted: %s",
+		                            result->HasError() ? result->GetError() : string("succeeded"));
+	}
+	// The holder keeps the gate and commits; the waiter then gets it.
+	Execute(owner, "INSERT INTO a VALUES (3); DELETE FROM a WHERE id = 1; COMMIT;");
+	Execute(waiter, "DELETE FROM b WHERE id = 1; INSERT INTO b VALUES (4), (1); UPDATE b SET id = 5 WHERE id = 2;");
+	Execute(waiter, "PRAGMA refresh('mv_a');");
+	Execute(waiter, "PRAGMA refresh('mv_b');");
+	CheckBag(waiter, "mv_a", "SELECT * FROM a");
+	CheckBag(waiter, "mv_b", "SELECT * FROM b");
+}
+
 static void TestParentPublication(const string &path) {
 	std::cerr << "CASE child waits for parent refresh publication" << std::endl;
 	DuckDB db(nullptr);
@@ -175,6 +216,8 @@ int main(int argc, char **argv) {
 		TestWriterRefresh(argv[1], true);
 		TestWriterExpansion(argv[1], false);
 		TestRefreshRollback(argv[1]);
+		TestInterruptedWait(argv[1], true);
+		TestInterruptedWait(argv[1], false);
 		TestDaemonHook(argv[1]);
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &ex) {
