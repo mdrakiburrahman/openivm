@@ -76,6 +76,14 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
   [FK-aware pruning](optimizations/fk-aware-pruning.md) is not available.
 - **No ART indexes.** DuckLake does not support DuckDB-native index types.
   Group column identification uses metadata instead.
+- **No MV over a DuckLake table created in the same open transaction.** Inside an explicit
+  transaction, `CREATE TABLE dl.s ...; CREATE MATERIALIZED VIEW dl.mv AS ... FROM dl.s` fails
+  with `Failed to execute IVM DDL: ... Table with name s does not exist`. The CREATE program of
+  a DuckLake view does not run in the caller's transaction: it runs on a fresh connection
+  (`ExecuteDDL`), which cannot see the caller's uncommitted DuckLake table. Native views run in
+  the caller's transaction and are not affected. Workaround: commit the DuckLake source table
+  first; creating the MV inside a later transaction then works.
+  ([#36](https://github.com/openivm/openivm/issues/36))
 
 ## Supported aggregates and their maintenance strategy
 
