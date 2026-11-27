@@ -21,6 +21,19 @@
 
 namespace duckdb {
 
+// A holder can keep a gate until its transaction ends. Wait in short slices so the
+// waiting query still honours interrupts and max_execution_time.
+template <class READY>
+static void WaitInterruptibly(std::condition_variable &condition, std::unique_lock<mutex> &guard,
+                              ClientContext *interrupt_context, READY ready) {
+	while (!ready()) {
+		if (interrupt_context) {
+			interrupt_context->BlockingInterruptCheck();
+		}
+		condition.wait_for(guard, std::chrono::milliseconds(100));
+	}
+}
+
 void MutationGate::Lock(const void *owner, bool capture, ClientContext *interrupt_context) {
 	std::unique_lock<mutex> guard(lock);
 	if (active_owner == owner) {
@@ -38,15 +51,12 @@ void MutationGate::Lock(const void *owner, bool capture, ClientContext *interrup
 		throw TransactionException("OpenIVM lifecycle conflicts with pending source writes; retry the transaction");
 	}
 	waiting_owners++;
-	// The holder may keep the gate until its transaction ends. Wake periodically so the
-	// waiting query can still be interrupted.
-	while (active_owner != nullptr) {
-		if (interrupt_context && interrupt_context->IsInterrupted()) {
-			waiting_owners--;
-			OPENIVM_DEBUG_PRINT("[LOCK] mutation gate wait interrupted owner=%p\n", owner);
-			throw InterruptException();
-		}
-		condition.wait_for(guard, std::chrono::milliseconds(100));
+	try {
+		WaitInterruptibly(condition, guard, interrupt_context, [&]() { return active_owner == nullptr; });
+	} catch (...) {
+		waiting_owners--;
+		OPENIVM_DEBUG_PRINT("[LOCK] mutation gate wait interrupted owner=%p\n", owner);
+		throw;
 	}
 	waiting_owners--;
 	active_owner = owner;
@@ -152,7 +162,8 @@ void MutationGate::CacheSourceDelta(const string &key, idx_t epoch, CachedSource
 	source_deltas[key] = std::move(entry);
 }
 
-void MutationGate::LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication) {
+void MutationGate::LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
+                              ClientContext *interrupt_context) {
 	std::unique_lock<mutex> guard(lock);
 	auto &entry = sources[catalog_oid][source];
 	if (!entry) {
@@ -170,7 +181,15 @@ void MutationGate::LockSource(const void *owner, const string &source, idx_t cat
 			       (admission.readers.empty() || (admission.readers.size() == 1 && admission.readers.count(owner)));
 		};
 		admission.waiting_publishers++;
-		condition.wait(guard, ready);
+		try {
+			WaitInterruptibly(condition, guard, interrupt_context, ready);
+		} catch (...) {
+			admission.waiting_publishers--;
+			// Readers held back by this waiting publisher may proceed.
+			condition.notify_all();
+			OPENIVM_DEBUG_PRINT("[LOCK] source publication wait interrupted %s owner=%p\n", source.c_str(), owner);
+			throw;
+		}
 		admission.waiting_publishers--;
 		admission.publisher = owner;
 		admission.publication_depth = 1;
@@ -186,7 +205,14 @@ void MutationGate::LockSource(const void *owner, const string &source, idx_t cat
 		throw TransactionException("OpenIVM source publication conflicts with pending writes; retry the transaction");
 	}
 	admission.waiting_readers++;
-	condition.wait(guard, ready);
+	try {
+		WaitInterruptibly(condition, guard, interrupt_context, ready);
+	} catch (...) {
+		admission.waiting_readers--;
+		condition.notify_all();
+		OPENIVM_DEBUG_PRINT("[LOCK] source write admission wait interrupted %s owner=%p\n", source.c_str(), owner);
+		throw;
+	}
 	admission.waiting_readers--;
 	admission.readers[owner]++;
 	admitted_writers[owner]++;
@@ -262,10 +288,10 @@ MutationLockGuard::MutationLockGuard(ClientContext &context)
 }
 
 SourceAdmissionGuard::SourceAdmissionGuard(DatabaseInstance &db, const void *owner_p, Catalog &catalog, string source_p,
-                                           bool publication_p)
+                                           bool publication_p, ClientContext *interrupt_context)
     : gate(RefreshLocks::AcquireGate(db)), owner(owner_p), source(std::move(source_p)), publication(publication_p),
       source_database(catalog.GetAttached().shared_from_this()) {
-	gate->LockSource(owner, source, catalog.GetOid(), publication);
+	gate->LockSource(owner, source, catalog.GetOid(), publication, interrupt_context);
 }
 
 SourceAdmissionGuard::~SourceAdmissionGuard() {
@@ -408,7 +434,8 @@ unique_ptr<SourceAdmissionGuard> TransactionalMVLockState::AcquireSourceWriteAdm
 		return nullptr;
 	}
 	return make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
-	                                       Catalog::GetCatalog(owner, Identifier(catalog)), std::move(source), false);
+	                                       Catalog::GetCatalog(owner, Identifier(catalog)), std::move(source), false,
+	                                       &owner);
 }
 
 void TransactionalMVLockState::RetainSourceWriteAdmission(unique_ptr<SourceAdmissionGuard> admission) {
@@ -498,8 +525,9 @@ void TransactionalMVLockState::AcquireSourcePublicationLock(const string &catalo
 	if (source_publication_locks.count(source)) {
 		return;
 	}
-	auto admission = make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
-	                                                 Catalog::GetCatalog(owner, Identifier(catalog)), source, true);
+	auto admission =
+	    make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
+	                                    Catalog::GetCatalog(owner, Identifier(catalog)), source, true, &owner);
 	OPENIVM_DEBUG_PRINT("[LOCK] acquired source publication lock %s owner=%p\n", source.c_str(), mutation_owner);
 	source_publication_locks.emplace(std::move(source), std::move(admission));
 }

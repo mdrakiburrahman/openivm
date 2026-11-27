@@ -101,10 +101,45 @@ static void TestRefreshRollback(const string &path) {
 	CheckBag(waiter, "mv", "SELECT * FROM source");
 }
 
-// Issue #90: a query waiting on the mutation gate must stay interruptible while
-// another transaction holds the gate, and the interrupt must not leak the gate.
-static void TestInterruptedWait(const string &path, bool refresh) {
-	std::cerr << "CASE interrupt blocked " << (refresh ? "refresh" : "tracked write") << std::endl;
+// Issue #90: a query blocked on the mutation gate or a source admission must end
+// on an interrupt or on max_execution_time, without leaking what it waited for.
+// The holder's transaction stays open throughout and is rolled back on failure.
+static void StopBlockedWaiter(Connection &owner, Connection &waiter, const string &sql, bool timeout,
+                              const string &source = "", bool publication = false) {
+	if (timeout) {
+		Execute(waiter, "SET max_execution_time = 500;");
+	}
+	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*owner.context));
+	auto competing = std::async(std::launch::async, [&]() { return waiter.Query(sql); });
+	try {
+		MutationGateTestAccess::WaitForBlockedOwner(*gate, source, publication);
+		if (!timeout) {
+			waiter.Interrupt();
+		}
+		if (competing.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+			throw InvalidInputException("Blocked waiter did not return after %s",
+			                            timeout ? "its timeout" : "interrupt");
+		}
+	} catch (const std::exception &) {
+		owner.Query("ROLLBACK;");
+		throw;
+	}
+	auto result = competing.get();
+	bool stopped = result->HasError() && result->GetErrorType() == ExceptionType::INTERRUPT &&
+	               (!timeout || StringUtil::Contains(result->GetError(), "maximum execution time"));
+	if (!stopped) {
+		owner.Query("ROLLBACK;");
+		throw InvalidInputException("Blocked waiter was not stopped by %s: %s", timeout ? "its timeout" : "interrupt",
+		                            result->HasError() ? result->GetError() : string("succeeded"));
+	}
+	if (timeout) {
+		Execute(waiter, "SET max_execution_time = 0;");
+	}
+}
+
+static void TestInterruptedWait(const string &path, bool refresh, bool timeout) {
+	std::cerr << "CASE " << (timeout ? "timeout" : "interrupt") << " blocked "
+	          << (refresh ? "refresh" : "tracked write") << std::endl;
 	DuckDB db(nullptr);
 	Connection owner(db), waiter(db);
 	Configure(owner, path);
@@ -113,26 +148,7 @@ static void TestInterruptedWait(const string &path, bool refresh) {
 	               "CREATE MATERIALIZED VIEW mv_a AS SELECT * FROM a; "
 	               "CREATE MATERIALIZED VIEW mv_b AS SELECT * FROM b; INSERT INTO b VALUES (2);");
 	Execute(owner, "BEGIN; INSERT INTO a VALUES (2);");
-	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*owner.context));
-	auto competing = std::async(std::launch::async, [&]() {
-		return waiter.Query(refresh ? "PRAGMA refresh('mv_b');" : "INSERT INTO b VALUES (3);");
-	});
-	try {
-		MutationGateTestAccess::WaitForBlockedOwner(*gate);
-		waiter.Interrupt();
-		if (competing.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-			throw InvalidInputException("Interrupted mutation gate waiter did not return");
-		}
-	} catch (const std::exception &) {
-		owner.Query("ROLLBACK;");
-		throw;
-	}
-	auto result = competing.get();
-	if (!result->HasError() || result->GetErrorType() != ExceptionType::INTERRUPT) {
-		owner.Query("ROLLBACK;");
-		throw InvalidInputException("Blocked mutation was not interrupted: %s",
-		                            result->HasError() ? result->GetError() : string("succeeded"));
-	}
+	StopBlockedWaiter(owner, waiter, refresh ? "PRAGMA refresh('mv_b');" : "INSERT INTO b VALUES (3);", timeout);
 	// The holder keeps the gate and commits; the waiter then gets it.
 	Execute(owner, "INSERT INTO a VALUES (3); DELETE FROM a WHERE id = 1; COMMIT;");
 	Execute(waiter, "DELETE FROM b WHERE id = 1; INSERT INTO b VALUES (4), (1); UPDATE b SET id = 5 WHERE id = 2;");
@@ -140,6 +156,32 @@ static void TestInterruptedWait(const string &path, bool refresh) {
 	Execute(waiter, "PRAGMA refresh('mv_b');");
 	CheckBag(waiter, "mv_a", "SELECT * FROM a");
 	CheckBag(waiter, "mv_b", "SELECT * FROM b");
+}
+
+// A CREATE publishes its untracked source while holding the global gate, so an open
+// untracked write to that source blocks it. Stopping the CREATE must release both.
+static void TestInterruptedPublication(const string &path, bool timeout) {
+	std::cerr << "CASE " << (timeout ? "timeout" : "interrupt") << " blocked CREATE publication" << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), waiter(db);
+	Configure(owner, path);
+	Execute(owner, "CREATE TABLE src(id INTEGER, v INTEGER); CREATE TABLE other(id INTEGER); "
+	               "INSERT INTO src VALUES (1,10),(2,20),(2,21); INSERT INTO other VALUES (1);");
+	Execute(owner, "BEGIN; INSERT INTO src VALUES (3,30);");
+	const string view = "SELECT id, SUM(v) AS s, COUNT(*) AS c FROM src GROUP BY id";
+	StopBlockedWaiter(owner, waiter, "CREATE MATERIALIZED VIEW mv_src AS " + view + ";", timeout,
+	                  SqlUtils::FullName("memory", "main", "src"), true);
+	// Nothing leaked: another CREATE and its refresh run while the writer is still open.
+	Execute(waiter, "CREATE MATERIALIZED VIEW mv_other AS SELECT id, COUNT(*) AS c FROM other GROUP BY id;");
+	Execute(waiter, "INSERT INTO other VALUES (1),(2); DELETE FROM other WHERE id = 1; UPDATE other SET id = 3;");
+	Execute(waiter, "PRAGMA refresh('mv_other');");
+	CheckBag(waiter, "mv_other", "SELECT id, COUNT(*) FROM other GROUP BY id");
+	Execute(owner, "UPDATE src SET v = v + 1 WHERE id = 2; COMMIT;");
+	Execute(waiter, "CREATE MATERIALIZED VIEW mv_src AS " + view + ";");
+	Execute(waiter, "INSERT INTO src VALUES (4,40),(1,11); DELETE FROM src WHERE id = 2 AND v = 21; "
+	                "UPDATE src SET v = v * 2 WHERE id IN (1,3); DELETE FROM src WHERE id = 4;");
+	Execute(waiter, "PRAGMA refresh('mv_src');");
+	CheckBag(waiter, "mv_src", view);
 }
 
 static void TestParentPublication(const string &path) {
@@ -216,8 +258,13 @@ int main(int argc, char **argv) {
 		TestWriterRefresh(argv[1], true);
 		TestWriterExpansion(argv[1], false);
 		TestRefreshRollback(argv[1]);
-		TestInterruptedWait(argv[1], true);
-		TestInterruptedWait(argv[1], false);
+		// PRAGMA refresh waits while DuckDB expands the pragma, before the query deadline
+		// exists (#35, #134), so only an interrupt can end its wait.
+		TestInterruptedWait(argv[1], true, false);
+		for (bool timeout : {false, true}) {
+			TestInterruptedWait(argv[1], false, timeout);
+			TestInterruptedPublication(argv[1], timeout);
+		}
 		TestDaemonHook(argv[1]);
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &ex) {

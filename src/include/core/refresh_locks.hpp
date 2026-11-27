@@ -33,7 +33,7 @@ public:
 
 	// A capture lock admits tracked DML only; every other lock may change source
 	// delta ownership. A waiter with an interrupt_context stops waiting and throws
-	// InterruptException once that context is interrupted.
+	// InterruptException once that context is interrupted or exceeds max_execution_time.
 	void Lock(const void *owner, bool capture = false, ClientContext *interrupt_context = nullptr);
 	bool TryLock(const void *owner);
 	void Unlock(const void *owner);
@@ -75,7 +75,8 @@ private:
 		idx_t waiting_readers = 0;
 		idx_t waiting_publishers = 0;
 	};
-	void LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication);
+	void LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
+	                ClientContext *interrupt_context);
 	void UnlockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
 	                  VisibilityBound oldest_snapshot);
 	void RecordSourceCommit(const string &source, idx_t catalog_oid, transaction_t commit_id);
@@ -124,7 +125,8 @@ public:
 
 class SourceAdmissionGuard {
 public:
-	SourceAdmissionGuard(DatabaseInstance &db, const void *owner, Catalog &catalog, string source, bool publication);
+	SourceAdmissionGuard(DatabaseInstance &db, const void *owner, Catalog &catalog, string source, bool publication,
+	                     ClientContext *interrupt_context = nullptr);
 	~SourceAdmissionGuard();
 	SourceAdmissionGuard(const SourceAdmissionGuard &) = delete;
 	SourceAdmissionGuard &operator=(const SourceAdmissionGuard &) = delete;
