@@ -3,6 +3,7 @@
 
 #include "duckdb.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
@@ -174,6 +175,9 @@ public:
 	vector<unique_ptr<SourceAdmissionGuard>> TakeSourcePublicationLocks();
 	void RestoreSourcePublicationLocks(vector<unique_ptr<SourceAdmissionGuard>> locks);
 	void DeferDeltaCleanup(vector<string> statements);
+	//! A refresh program returned to the caller's transaction runs after the refresh pragma returns. Keep
+	//! the refresh optimizer overrides until that transaction ends.
+	void DisableRefreshOptimizers(ClientContext &context);
 	void DeferUnusedSourceDeltaCleanup(const RefreshMetadata::DeltaSource &source);
 	// Helper-committed allocations must be reclaimed if the caller fails to publish ownership.
 	void RecordSourceDeltaAllocation(const RefreshMetadata::DeltaSource &source);
@@ -221,6 +225,7 @@ private:
 	ClientContext &owner;
 	const void *mutation_owner;
 	vector<string> deferred_delta_cleanup;
+	unique_ptr<ScopedDisabledOptimizers> refresh_optimizers;
 	vector<RefreshMetadata::DeltaSource> deferred_source_delta_cleanup;
 	vector<RefreshMetadata::DeltaSource> allocated_source_deltas;
 	unordered_set<string> dropped_source_deltas;

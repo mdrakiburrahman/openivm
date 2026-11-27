@@ -1101,11 +1101,76 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			    "CASE WHEN d." + match_count_col + " > 0 THEN " + matched_insert + " ELSE " + null_val + " END";
 		}
 	}
+	// Delete empty groups — a group is empty iff its row count is 0. We can only detect
+	// this when the MV has a COUNT-type aggregate (either an explicit COUNT(*) / COUNT(x),
+	// or a hidden count from AVG/STDDEV decomposition). For MVs with only SUM-style
+	// aggregates, `SUM=0` does NOT mean the group is empty — e.g.
+	//   SUM(CASE WHEN C_BALANCE < 0 THEN C_YTD_PAYMENT ELSE 0 END)
+	// legitimately returns 0 for every row when C_YTD_PAYMENT is always 0. Skip the
+	// cleanup in that case to avoid deleting valid rows.
+	// Also skip when insert_only (groups can't reach zero from inserts alone).
+	//
+	// LEFT JOIN views (openivm_match_count present): a preserved-side row with no match legitimately has
+	// inner-side COUNT = 0 and would look "empty", so inner-side counts alone cannot decide emptiness;
+	// skipping these views would leave genuinely emptied groups behind as zeroed rows. The discriminator
+	// is the OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
+	// preserved-side rows left has count_star = 0. Since the predicate ANDs every count column, the
+	// NULL-padded case is preserved as long as count_star is among them -- so LEFT JOIN views are
+	// included when a count_star-type column anchors the predicate, and skipped otherwise.
+	// This relies on count_star actually counting NULL-padded output rows, which requires the
+	// secondary delta to emit the reappearance row at EVERY level including a single LEFT JOIN.
+	vector<string> count_cols;
+	string count_star_anchor;
+	if (!insert_only) {
+		// Find COUNT-type columns. aggregate_types is parallel to the user-facing aggregate
+		// list; col_agg_type maps column name -> aggregate function. Also consider hidden
+		// openivm_count_<N> columns from AVG/STDDEV decomposition.
+		for (auto &entry : col_agg_type) {
+			if (entry.second == "count" || entry.second == "count_star") {
+				count_cols.push_back(entry.first);
+			}
+		}
+		for (auto &column : aggregates) {
+			if (column.rfind(openivm::COUNT_COL_PREFIX, 0) == 0 || column == openivm::COUNT_STAR_COL ||
+			    column == openivm::DISTINCT_COUNT_COL) {
+				count_cols.push_back(column);
+			}
+		}
+		// LEFT JOIN views may only be cleaned up when an output-row count anchors the predicate.
+		for (auto &c : count_cols) {
+			auto it = col_agg_type.find(c);
+			if (c == string(openivm::COUNT_STAR_COL) || (it != col_agg_type.end() && it->second == "count_star")) {
+				count_star_anchor = c;
+				break;
+			}
+		}
+		if (has_match_count && count_star_anchor.empty()) {
+			count_cols.clear();
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] LEFT JOIN view without a count_star anchor — skipping "
+			                    "empty-group cleanup so NULL-padded groups are not deleted\n");
+		}
+	}
+	auto empty_group = [&](const std::function<string(const string &)> &count) {
+		return StringUtil::Join(count_cols, count_cols.size(), " and ",
+		                        [&](const string &col) { return "COALESCE(" + count(col) + ", 0) = 0"; });
+	};
+	// Without LEFT JOIN gating every count column takes its plain updated value, so the MERGE itself
+	// removes emptied groups and skips empty new ones instead of a later scan of the whole data table.
+	// Every other count counts a subset of COUNT(*)'s rows, so COUNT(*) alone decides emptiness; one
+	// short condition keeps the MERGE as cheap to plan as the statement it replaces.
+	bool merge_removes_empty_groups = options.multi_action_merge && !count_star_anchor.empty() && !has_match_count;
+	string delete_empty_groups, insert_condition;
+	if (merge_removes_empty_groups) {
+		delete_empty_groups = "\nWHEN MATCHED AND COALESCE(v." + count_star_anchor + ", 0) + COALESCE(d." +
+		                      count_star_anchor + ", 0) = 0 THEN DELETE";
+		insert_condition = " AND COALESCE(d." + count_star_anchor + ", 0) <> 0";
+	}
 	string key_insert_values = SqlUtils::JoinQualifiedQuotedColumns(keys, "d");
 	string merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table + " v USING " +
-	                     merge_source + " d\nON " + on_clause + "\nWHEN MATCHED THEN UPDATE SET " + update_set +
-	                     "\nWHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (" + key_insert_values + ", " +
-	                     insert_vals + ");\n" + sign_fixup;
+	                     merge_source + " d\nON " + on_clause + delete_empty_groups +
+	                     "\nWHEN MATCHED THEN UPDATE SET " + update_set + "\nWHEN NOT MATCHED" + insert_condition +
+	                     " THEN INSERT (" + insert_cols + ") VALUES (" + key_insert_values + ", " + insert_vals +
+	                     ");\n" + sign_fixup;
 
 	string upsert_query = merge_query + "\n";
 	bool rowid_available = std::none_of(column_names.begin(), column_names.end(), [](const string &column) {
@@ -1142,62 +1207,10 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 		               merge_query + "\n" + signed_delta.publish;
 	}
 
-	// Delete empty groups — a group is empty iff its row count is 0. We can only detect
-	// this when the MV has a COUNT-type aggregate (either an explicit COUNT(*) / COUNT(x),
-	// or a hidden count from AVG/STDDEV decomposition). For MVs with only SUM-style
-	// aggregates, `SUM=0` does NOT mean the group is empty — e.g.
-	//   SUM(CASE WHEN C_BALANCE < 0 THEN C_YTD_PAYMENT ELSE 0 END)
-	// legitimately returns 0 for every row when C_YTD_PAYMENT is always 0. Skip the
-	// cleanup in that case to avoid deleting valid rows.
-	// Also skip when insert_only (groups can't reach zero from inserts alone).
-	//
-	// LEFT JOIN views (openivm_match_count present): a preserved-side row with no match legitimately has
-	// inner-side COUNT = 0 and would look "empty", so inner-side counts alone cannot decide emptiness;
-	// skipping these views would leave genuinely emptied groups behind as zeroed rows. The discriminator
-	// is the OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
-	// preserved-side rows left has count_star = 0. Since the predicate ANDs every count column, the
-	// NULL-padded case is preserved as long as count_star is among them -- so LEFT JOIN views are
-	// included when a count_star-type column anchors the predicate, and skipped otherwise.
-	// This relies on count_star actually counting NULL-padded output rows, which requires the
-	// secondary delta to emit the reappearance row at EVERY level including a single LEFT JOIN.
-	if (!insert_only) {
-		// Find COUNT-type columns. aggregate_types is parallel to the user-facing aggregate
-		// list; col_agg_type maps column name -> aggregate function. Also consider hidden
-		// openivm_count_<N> columns from AVG/STDDEV decomposition.
-		vector<string> count_cols;
-		for (auto &entry : col_agg_type) {
-			if (entry.second == "count" || entry.second == "count_star") {
-				count_cols.push_back(entry.first);
-			}
-		}
-		for (auto &column : aggregates) {
-			if (column.rfind(openivm::COUNT_COL_PREFIX, 0) == 0 || column == openivm::COUNT_STAR_COL ||
-			    column == openivm::DISTINCT_COUNT_COL) {
-				count_cols.push_back(column);
-			}
-		}
-		// LEFT JOIN views may only be cleaned up when an output-row count anchors the predicate.
-		bool has_count_star_anchor = false;
-		for (auto &c : count_cols) {
-			auto it = col_agg_type.find(c);
-			if (c == string(openivm::COUNT_STAR_COL) || (it != col_agg_type.end() && it->second == "count_star")) {
-				has_count_star_anchor = true;
-				break;
-			}
-		}
-		if (has_match_count && !has_count_star_anchor) {
-			count_cols.clear();
-			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] LEFT JOIN view without a count_star anchor — skipping "
-			                    "empty-group cleanup so NULL-padded groups are not deleted\n");
-		}
-		if (!count_cols.empty()) {
-			upsert_query += "\ndelete from " + data_table + " where " +
-			                StringUtil::Join(count_cols, count_cols.size(), " and ",
-			                                 [](const string &col) { return "COALESCE(" + col + ", 0) = 0"; }) +
-			                ";\n";
-		}
+	if (!count_cols.empty() && !merge_removes_empty_groups) {
+		upsert_query +=
+		    "\ndelete from " + data_table + " where " + empty_group([](const string &col) { return col; }) + ";\n";
 	}
-
 	return upsert_query;
 }
 

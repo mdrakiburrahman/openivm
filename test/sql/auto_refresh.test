@@ -975,20 +975,20 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d6
 ----
 3
 
-# 15 profiled statements per refresh: the seven maintenance statements below
-# plus eight visible-publication statements (stage the new rows and signed diff,
-# publish the delta, apply changed bags, and clean up the stages/delta).
-#   1. SET refresh_in_progress = true
-#   2. INSERT INTO openivm_delta_<view> (delta computation)
-#   3. MERGE INTO openivm_data_<view> (applies delta via CTE from the delta view)
-#   4. DELETE FROM openivm_delta_<view> (view delta cleanup)
+# 10 profiled statements per refresh: the five maintenance statements below
+# plus five visible-publication statements (stage the new rows and signed diff,
+# apply changed bags, and clear the unconsumed visible delta). A native refresh
+# runs in one transaction on a private connection, so it sets no interruption
+# marker and its stages disappear with the connection.
+#   1. INSERT INTO openivm_delta_<view> (delta computation)
+#   2. MERGE INTO openivm_data_<view> (applies delta via CTE from the delta view)
+#   3. DELETE FROM openivm_delta_<view> (view delta cleanup)
+#   4. UPDATE openivm_delta_tables SET last_update (metadata timestamp)
 #   5. DELETE FROM openivm_delta_<source> (source delta cleanup)
-#   6. UPDATE openivm_delta_tables SET last_update (metadata timestamp)
-#   7. SET refresh_in_progress = false
 query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_' AND step_name = 'execute_refresh_sql_stmt';
 ----
-15
+10
 
 # Re-enable adaptive refresh so subsequent refreshes record history for Test 20.
 statement ok
