@@ -107,13 +107,17 @@ static void TestRefreshRollback(const string &path) {
 static void StopBlockedWaiter(Connection &owner, Connection &waiter, const string &sql, bool timeout,
                               const string &source = "", bool publication = false) {
 	if (timeout) {
-		Execute(waiter, "SET max_execution_time = 500;");
+		Execute(waiter, "SET max_execution_time = 2000;");
 	}
 	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*owner.context));
+	auto started_waits = MutationGateTestAccess::StartedWaits(*gate);
 	auto competing = std::async(std::launch::async, [&]() { return waiter.Query(sql); });
 	try {
-		MutationGateTestAccess::WaitForBlockedOwner(*gate, source, publication);
-		if (!timeout) {
+		if (timeout) {
+			// The deadline may already have ended the wait; only its start is observable.
+			MutationGateTestAccess::WaitForStartedWait(*gate, started_waits);
+		} else {
+			MutationGateTestAccess::WaitForBlockedOwner(*gate, source, publication);
 			waiter.Interrupt();
 		}
 		if (competing.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {

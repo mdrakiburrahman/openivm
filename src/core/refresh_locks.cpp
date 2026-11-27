@@ -25,13 +25,17 @@ namespace duckdb {
 // waiting query still honours interrupts and max_execution_time.
 template <class READY>
 static void WaitInterruptibly(std::condition_variable &condition, std::unique_lock<mutex> &guard,
-                              ClientContext *interrupt_context, READY ready) {
-	while (!ready()) {
+                              ClientContext *interrupt_context, idx_t &started_waits, READY ready) {
+	if (ready()) {
+		return;
+	}
+	started_waits++;
+	do {
 		if (interrupt_context) {
 			interrupt_context->BlockingInterruptCheck();
 		}
 		condition.wait_for(guard, std::chrono::milliseconds(100));
-	}
+	} while (!ready());
 }
 
 void MutationGate::Lock(const void *owner, bool capture, ClientContext *interrupt_context) {
@@ -52,7 +56,8 @@ void MutationGate::Lock(const void *owner, bool capture, ClientContext *interrup
 	}
 	waiting_owners++;
 	try {
-		WaitInterruptibly(condition, guard, interrupt_context, [&]() { return active_owner == nullptr; });
+		WaitInterruptibly(condition, guard, interrupt_context, started_waits,
+		                  [&]() { return active_owner == nullptr; });
 	} catch (...) {
 		waiting_owners--;
 		OPENIVM_DEBUG_PRINT("[LOCK] mutation gate wait interrupted owner=%p\n", owner);
@@ -182,9 +187,10 @@ void MutationGate::LockSource(const void *owner, const string &source, idx_t cat
 		};
 		admission.waiting_publishers++;
 		try {
-			WaitInterruptibly(condition, guard, interrupt_context, ready);
+			WaitInterruptibly(condition, guard, interrupt_context, started_waits, ready);
 		} catch (...) {
 			admission.waiting_publishers--;
+			EraseIdleSourceAdmission(source, catalog_oid);
 			// Readers held back by this waiting publisher may proceed.
 			condition.notify_all();
 			OPENIVM_DEBUG_PRINT("[LOCK] source publication wait interrupted %s owner=%p\n", source.c_str(), owner);
@@ -206,9 +212,10 @@ void MutationGate::LockSource(const void *owner, const string &source, idx_t cat
 	}
 	admission.waiting_readers++;
 	try {
-		WaitInterruptibly(condition, guard, interrupt_context, ready);
+		WaitInterruptibly(condition, guard, interrupt_context, started_waits, ready);
 	} catch (...) {
 		admission.waiting_readers--;
+		EraseIdleSourceAdmission(source, catalog_oid);
 		condition.notify_all();
 		OPENIVM_DEBUG_PRINT("[LOCK] source write admission wait interrupted %s owner=%p\n", source.c_str(), owner);
 		throw;
@@ -216,6 +223,28 @@ void MutationGate::LockSource(const void *owner, const string &source, idx_t cat
 	admission.waiting_readers--;
 	admission.readers[owner]++;
 	admitted_writers[owner]++;
+}
+
+// Called with the gate's lock held. A committed write keeps its entry: later
+// snapshots still need last_write_commit, and UnlockSource retires it.
+void MutationGate::EraseIdleSourceAdmission(const string &source, idx_t catalog_oid) {
+	auto catalog_it = sources.find(catalog_oid);
+	if (catalog_it == sources.end()) {
+		return;
+	}
+	auto source_it = catalog_it->second.find(source);
+	if (source_it == catalog_it->second.end()) {
+		return;
+	}
+	auto &admission = *source_it->second;
+	if (admission.publisher || !admission.readers.empty() || admission.waiting_readers ||
+	    admission.waiting_publishers || admission.last_write_commit != 0) {
+		return;
+	}
+	catalog_it->second.erase(source_it);
+	if (catalog_it->second.empty()) {
+		sources.erase(catalog_it);
+	}
 }
 
 void MutationGate::RecordSourceCommit(const string &source, idx_t catalog_oid, transaction_t commit_id) {

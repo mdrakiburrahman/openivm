@@ -34,6 +34,10 @@ public:
 	// A capture lock admits tracked DML only; every other lock may change source
 	// delta ownership. A waiter with an interrupt_context stops waiting and throws
 	// InterruptException once that context is interrupted or exceeds max_execution_time.
+	// PRAGMA refresh and transactional refresh waits run while DuckDB expands the
+	// pragma, before the query deadline is set, so only an interrupt ends them.
+	// Waits on helper connections (ShareMutationOwner) check the helper's own context,
+	// which the caller's interrupt or deadline does not reach.
 	void Lock(const void *owner, bool capture = false, ClientContext *interrupt_context = nullptr);
 	bool TryLock(const void *owner);
 	void Unlock(const void *owner);
@@ -79,6 +83,8 @@ private:
 	                ClientContext *interrupt_context);
 	void UnlockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
 	                  VisibilityBound oldest_snapshot);
+	// Drop an admission entry that a stopped wait left with no holders or waiters.
+	void EraseIdleSourceAdmission(const string &source, idx_t catalog_oid);
 	void RecordSourceCommit(const string &source, idx_t catalog_oid, transaction_t commit_id);
 	bool HasSourceCommitAfter(const string &source, idx_t catalog_oid, VisibilityBound snapshot);
 	mutex lock;
@@ -87,6 +93,8 @@ private:
 	idx_t depth = 0;
 	// Integration tests synchronize on an actual wait without timing the caller.
 	idx_t waiting_owners = 0;
+	// Waits started on the gate or a source admission, including ones that ended at once.
+	idx_t started_waits = 0;
 	bool capture_only_hold = false;
 	idx_t ownership_epoch = 0;
 	idx_t ownership_writers = 0;
@@ -196,7 +204,8 @@ public:
 	// Reused replay helpers may reassert the same owner while their guard is held.
 	void SetMutationOwner(const void *owner_token);
 	const void *GetMutationOwner();
-	// Let a helper connection act under the caller's mutation ownership.
+	// Let a helper connection act under the caller's mutation ownership. Only the owner
+	// token is shared: the helper's waits are not interruptible from the caller.
 	static void ShareMutationOwner(ClientContext &from, ClientContext &to) {
 		Get(to).SetMutationOwner(Get(from).GetMutationOwner());
 	}
