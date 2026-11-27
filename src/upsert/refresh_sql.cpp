@@ -447,6 +447,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           Connection *metadata_connection, ProjectionDeleteRetryPlan *delete_retry_plan,
                           bool write_query_file, vector<string> *deferred_cleanup,
                           shared_ptr<const RefreshMetadata::ViewRecord> view_record) {
+	// Generated refresh plans are deep; plan them with the refresh optimizer overrides.
+	ScopedDisabledOptimizers refresh_optimizers(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 	if (delete_retry_plan) {
 		*delete_retry_plan = {};
 	}
@@ -598,6 +600,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                            attached_db_catalog_name, attached_db_schema_name);
 	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
 	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
+	// A direct native refresh executes this program at once, under the mutation gate and in one
+	// transaction. Publication consumers can then be read now, and the interruption marker is
+	// never visible to anyone. Reusable programs keep the runtime check and the marker.
+	bool direct_native_refresh = !facts_in && owned_connection && !active_facts.compile_only && !cross_system &&
+	                             !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB;
 	string publication_sql;
 	vector<string> publication_columns;
 	vector<LogicalType> publication_types;
@@ -613,7 +620,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		throw NotImplementedException("Snapshot publication is only supported by "
 		                              "the native DuckLake executor");
 	}
+	bool publication_consumers_absent = false;
 	if (!snapshot_publication && !published_query.IsNull()) {
+		publication_consumers_absent =
+		    direct_native_refresh && !PublishedDeltaHasConsumers(con, view_name, publication_prefix,
+		                                                         delta_metadata_table, delta_metadata_tables);
 		auto record_column = [&](const ColumnDefinition &column) {
 			publication_columns.push_back(column.Name().GetIdentifierName());
 			publication_types.push_back(column.Type());
@@ -656,10 +667,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                     DialectQuoteIdent(internal_schema_name, SqlDialect::SPARK) + ".";
 			}
 		}
-		publication_sql =
-		    BuildPublishViewSQL(view_name, publication_prefix, publication_source_query, publication_columns,
-		                        publication_types, target_is_ducklake, delta_metadata_table, {}, "",
-		                        active_facts.target_dialect, "", "", delta_metadata_tables);
+		publication_sql = BuildPublishViewSQL(
+		    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
+		    target_is_ducklake, delta_metadata_table, {}, "", active_facts.target_dialect, "", "",
+		    delta_metadata_tables, publication_consumers_absent, direct_native_refresh);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -1105,6 +1116,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		options.use_ducklake_rowid_upsert = target_is_ducklake && insert_only && !source_has_full_outer &&
 		                                    dispatch_refresh_type == RefreshType::AGGREGATE_GROUP &&
 		                                    active_facts.target_dialect == SqlDialect::DUCKDB;
+		options.multi_action_merge = direct_native_refresh;
 		options.aggregate_types = agg_types;
 		options.aggregate_inputs = derived_output_info.inputs;
 		options.derived_output_expressions = derived_output_expressions;
@@ -1814,7 +1826,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 		}
 		delete_from_view_query = RefreshMetadata::BuildDeltaCleanupSQL(
-		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, delta_metadata_tables);
+		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, delta_metadata_tables, "", "", "",
+		    !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB);
 	} else {
 		delete_from_view_query = inline_mv_delta          ? ""
 		                         : use_transient_mv_delta ? "DROP TABLE IF EXISTS " + transient_delta_name + ";"
@@ -1863,7 +1876,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (!cross_system || split_native_metadata || deferred_cleanup) {
 			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
 			    resolved, dt, delta_metadata_table, deferred_cleanup, delta_metadata_tables, catalog_name, schema_name,
-			    cleanup_data_catalog);
+			    cleanup_data_catalog, active_facts.target_dialect == SqlDialect::DUCKDB);
 		}
 	}
 	if (!publication_query.empty()) {
@@ -1934,17 +1947,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			publication_sql = BuildPublishViewSQL(
 			    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
 			    target_is_ducklake, delta_metadata_table, scope_columns, "", active_facts.target_dialect,
-			    appended_projection_rows, retained_publication_scope.rows, delta_metadata_tables);
+			    appended_projection_rows, retained_publication_scope.rows, delta_metadata_tables,
+			    publication_consumers_absent, direct_native_refresh);
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}
-	string meta_pre_sql = in_progress_sql(true);
+	string meta_pre_sql = direct_native_refresh ? "" : in_progress_sql(true);
 	// Source cleanup reads the minimum watermark of every consumer. Advance this
 	// consumer first, while its source rows still exist for MAX(timestamp), then
 	// remove only rows consumed by all views. Cross-catalog cleanup remains deferred
 	// until commit by BuildDeltaCleanupSQL.
-	string meta_post_sql =
-	    update_timestamp_query + snapshot_update_query + "\n" + delete_from_delta_table_query + in_progress_sql(false);
+	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + delete_from_delta_table_query +
+	                       (direct_native_refresh ? "" : in_progress_sql(false));
 	OPENIVM_DEBUG_PRINT("[UPSERT] Source delta cleanup follows consumer watermark updates for '%s'\n",
 	                    view_name.c_str());
 	if (active_facts.target_dialect == SqlDialect::SPARK) {

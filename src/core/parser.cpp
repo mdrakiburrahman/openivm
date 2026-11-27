@@ -28,6 +28,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -422,6 +423,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// transaction are visible. The helper connection remains for committed
 	// metadata probes and cross-catalog DDL preparation only.
 	con.BeginTransaction();
+	// Plan with the optimizers refresh disables: the semi/anti subquery rewrite expects
+	// DELIM joins, which the deliminator would otherwise replace before it runs.
+	auto compile_optimizers = make_uniq<ScopedDisabledOptimizers>(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 	// Peel time-travel pins the catalog cannot bind before anything plans this statement, keeping
 	// each pin keyed by its relation so it can be re-attached to the generated SQL below.
 	auto time_travel_pins = openivm::TimeTravelPins::Peel(context, *statement);
@@ -591,6 +595,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                            "; query_bytes=" + to_string(view_query.size()));
 	}
 	con.Rollback();
+	compile_optimizers.reset();
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View name: %s\n", view_name.c_str());
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());

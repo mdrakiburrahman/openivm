@@ -1,4 +1,5 @@
 #include "upsert/refresh_cost_model.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include <cmath>
 #include "core/ivm_delta_model.hpp"
 #include "core/ivm_view_classifier.hpp"
@@ -724,6 +725,8 @@ RefreshCostEstimate EstimateViewRefreshCost(ClientContext &context, const string
 	if (parser.statements.empty()) {
 		throw ParserException("View '" + view_name + "' has an empty IVM metadata query");
 	}
+	// The stored view query is generated SQL; plan it as refresh does.
+	ScopedDisabledOptimizers refresh_optimizers(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 	Planner planner(context);
 	openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
 	planner.CreatePlan(std::move(parser.statements[0]));
