@@ -31,7 +31,7 @@ INSERT INTO uks_west VALUES
 statement ok
 CREATE MATERIALIZED VIEW uks_mv AS
 WITH pooled AS (
-    SELECT ent AS entity, src AS origin, ts, val FROM uks_east WHERE active >= 0
+    SELECT ent AS entity, uks_east.src AS origin, ts, val FROM uks_east WHERE active >= 0 AND ent <> 'uks_east'
     UNION ALL
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west WHERE w_active < 100
 ), keyed AS (
@@ -44,7 +44,7 @@ SELECT obs_key, entity, origin, ts, val FROM ranked WHERE rn = 1;
 statement ok
 CREATE VIEW uks_expected AS
 WITH pooled AS (
-    SELECT ent AS entity, src AS origin, ts, val FROM uks_east WHERE active >= 0
+    SELECT ent AS entity, uks_east.src AS origin, ts, val FROM uks_east WHERE active >= 0 AND ent <> 'uks_east'
     UNION ALL
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west WHERE w_active < 100
 ), keyed AS (

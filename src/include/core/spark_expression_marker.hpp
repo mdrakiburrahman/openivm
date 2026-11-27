@@ -1,9 +1,11 @@
 #pragma once
 
-#include "duckdb/function/scalar_function.hpp"
-
 namespace duckdb {
 
-void SparkExpressionMarker(DataChunk &args, ExpressionState &state, Vector &result);
+class BoundFunctionExpression;
+class ExtensionLoader;
+
+bool IsSparkExpressionMarker(const BoundFunctionExpression &expr);
+void RegisterSparkExpressionMarker(ExtensionLoader &loader);
 
 } // namespace duckdb

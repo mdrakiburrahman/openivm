@@ -6,6 +6,9 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
@@ -202,52 +205,28 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 
 enum class LineageAffectedKeysResult : uint8_t { UNAVAILABLE, AVAILABLE, UNSAFE };
 
-static bool ContainsIdentifierToken(const string &sql, const string &token) {
-	if (token.empty()) {
-		return false;
-	}
-	auto haystack = StringUtil::Lower(sql);
-	auto needle = StringUtil::Lower(token);
-	auto is_identifier_char = [](char c) {
-		return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-	};
-	for (auto pos = haystack.find(needle); pos != string::npos; pos = haystack.find(needle, pos + 1)) {
-		auto end = pos + needle.size();
-		if ((pos == 0 || !is_identifier_char(haystack[pos - 1])) &&
-		    (end >= haystack.size() || !is_identifier_char(haystack[end]))) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static string UnquotedLastIdentifier(const string &table_sql) {
-	auto name = SqlUtils::LastIdentifierPart(table_sql);
-	if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-		name = name.substr(1, name.size() - 2);
-	}
-	return name;
-}
-
 // The plan below the window is linear (projections, filters, UNION ALL over scans), so evaluating
 // the view query with every source occurrence replaced by that source's delta rows (both images)
 // yields every partition key whose input rows changed. Any base reference left behind would
 // evaluate an arm over current rows only and miss deleted keys, so it falls back instead.
 static LineageAffectedKeysResult
-BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
-                           const vector<string> &delta_table_names,
+BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, ClientContext &context, const string &view_name,
+                           const string &view_query_sql, const vector<string> &delta_table_names,
                            const vector<RefreshMetadata::WindowPartitionLineageOp> &key_ops, const string &key_col,
                            const string &delta_ts_filter, const string &view_catalog_name,
                            const string &view_schema_name, const string &attached_db_catalog_name,
                            const string &attached_db_schema_name, string &affected_keys_sql) {
+	auto decline = [&view_name](LineageAffectedKeysResult result, const char *reason) {
+		OPENIVM_DEBUG_PRINT("[LINEAR WINDOW] affected keys declined for '%s': %s\n", view_name.c_str(), reason);
+		return result;
+	};
 	string scoped = view_query_sql;
-	vector<string> replaced_tables;
-	vector<std::pair<string, string>> implicit_aliases;
+	case_insensitive_map_t<string> replaced_tables;
 	unordered_set<string> seen_sources;
 	unordered_set<string> covered_sources;
 	for (auto &op : key_ops) {
 		if (op.kind != WindowLineageKind::LINEAR) {
-			return LineageAffectedKeysResult::UNSAFE;
+			return decline(LineageAffectedKeysResult::UNSAFE, "mixed lineage kinds");
 		}
 		if (!seen_sources.insert(StringUtil::Lower(op.source)).second) {
 			continue;
@@ -259,36 +238,58 @@ BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name, c
 		                                                   /*delta_table=*/false, view_catalog_name, view_schema_name,
 		                                                   attached_db_catalog_name, attached_db_schema_name);
 		if (delta_table.empty() || base_table.empty()) {
-			return LineageAffectedKeysResult::UNSAFE;
+			return decline(LineageAffectedKeysResult::UNSAFE, "could not resolve tracked base or delta table");
 		}
 		string base_ref = SqlUtils::FindTableReference(scoped, base_table);
 		if (base_ref.empty()) {
-			return LineageAffectedKeysResult::UNSAFE;
+			return decline(LineageAffectedKeysResult::UNSAFE, "could not locate base table reference");
 		}
 		auto delta_rows = BuildStandardDeltaRowsSQL(delta_table, "", delta_ts_filter);
 		scoped = SqlUtils::ReplaceTableReferences(scoped, base_ref, delta_rows);
-		replaced_tables.push_back(UnquotedLastIdentifier(base_table));
-		// ReplaceTableReferences keeps an unaliased table's implicit alias on the replacement.
-		implicit_aliases.emplace_back(delta_rows + " AS " + SqlUtils::QuoteIdentifier(UnquotedLastIdentifier(base_ref)),
-		                              delta_rows);
+		auto base_name = QualifiedName::Parse(base_table).Name().GetIdentifierName();
+		auto delta_name = QualifiedName::Parse(delta_table).Name().GetIdentifierName();
+		if (!replaced_tables.emplace(std::move(base_name), std::move(delta_name)).second) {
+			return decline(LineageAffectedKeysResult::UNSAFE, "ambiguous source table names");
+		}
 		covered_sources.insert(ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names));
 	}
-	string residual = scoped;
-	for (auto &alias : implicit_aliases) {
-		residual = StringUtil::Replace(residual, alias.first, alias.second);
+	auto count_sources = [&](const string &sql, case_insensitive_map_t<idx_t> &counts) {
+		Parser parser(context);
+		try {
+			parser.ParseQuery(sql);
+		} catch (const ParserException &ex) {
+			OPENIVM_DEBUG_PRINT("[LINEAR WINDOW] could not parse scope: %s\n", ex.what());
+			return false;
+		}
+		if (parser.statements.size() != 1 || parser.statements.front()->type != StatementType::SELECT_STATEMENT) {
+			return false;
+		}
+		SqlUtils::VisitSourceReferences(*parser.statements.front(),
+		                                [&](BaseTableRef &ref) { counts[ref.Table().GetIdentifierName()]++; });
+		return true;
+	};
+	case_insensitive_map_t<idx_t> original_sources;
+	case_insensitive_map_t<idx_t> scoped_sources;
+	if (!count_sources(view_query_sql, original_sources) || !count_sources(scoped, scoped_sources)) {
+		return decline(LineageAffectedKeysResult::UNSAFE, "expected one parseable SELECT per scope");
 	}
-	for (auto &table : replaced_tables) {
-		if (ContainsIdentifierToken(residual, table)) {
-			return LineageAffectedKeysResult::UNSAFE;
+	for (auto &entry : replaced_tables) {
+		if (scoped_sources.count(entry.first)) {
+			return decline(LineageAffectedKeysResult::UNSAFE,
+			               "a base table reference remains after delta substitution");
+		}
+		if (original_sources[entry.first] == 0 || original_sources[entry.first] != scoped_sources[entry.second]) {
+			return decline(LineageAffectedKeysResult::UNSAFE,
+			               "delta substitution did not cover exactly the base references");
 		}
 	}
 	for (auto &dt : delta_table_names) {
 		if (!covered_sources.count(dt)) {
-			return LineageAffectedKeysResult::UNAVAILABLE;
+			return decline(LineageAffectedKeysResult::UNAVAILABLE, "a tracked source has no lineage coverage");
 		}
 	}
 	if (covered_sources.empty()) {
-		return LineageAffectedKeysResult::UNAVAILABLE;
+		return decline(LineageAffectedKeysResult::UNAVAILABLE, "no covered sources");
 	}
 	affected_keys_sql =
 	    "SELECT DISTINCT " + SqlUtils::QuoteIdentifier(key_col) + " FROM (" + scoped + ") openivm_changed_partitions";
@@ -357,8 +358,8 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
 		}
 	}
 	if (has_linear) {
-		return BuildLinearAffectedKeysSQL(metadata, view_name, view_query_sql, delta_table_names, key_ops, output_col,
-		                                  delta_ts_filter, view_catalog_name, view_schema_name,
+		return BuildLinearAffectedKeysSQL(metadata, *con.context, view_name, view_query_sql, delta_table_names, key_ops,
+		                                  output_col, delta_ts_filter, view_catalog_name, view_schema_name,
 		                                  attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
 	}
 	const auto trim_data_table =

@@ -30,6 +30,7 @@ set(EXTENSION_SOURCES
     src/core/refresh_metadata.cpp
     src/core/published_view.cpp
     src/core/incremental_checker.cpp
+    src/core/spark_expression_marker.cpp
     src/core/plan_rewrite.cpp
     src/core/plan_rewrite_aggregates.cpp
     src/delta/delta_compiler.cpp

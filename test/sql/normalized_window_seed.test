@@ -23,6 +23,13 @@ seed AS (SELECT DISTINCT nullif(trim(raw),'') AS tag FROM nws_seed WHERE active)
 SELECT ranked.k, ranked.ts, seed.tag IS NOT NULL AS hit
 FROM ranked LEFT JOIN seed ON ranked.tag=seed.tag WHERE rn=1;
 
+statement ok
+CREATE VIEW nws_ref AS
+WITH ranked AS (SELECT *, row_number() OVER (PARTITION BY k ORDER BY ts DESC) AS rn FROM nws_events),
+seed AS (SELECT DISTINCT nullif(trim(raw),'') AS tag FROM nws_seed WHERE active)
+SELECT ranked.k, ranked.ts, seed.tag IS NOT NULL AS hit
+FROM ranked LEFT JOIN seed ON ranked.tag=seed.tag WHERE rn=1;
+
 query I
 SELECT count(*) FROM openivm_compile_with_facts('nws_latest','{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
 WHERE stmt_order=1 AND lower(sql) LIKE '%openivm_affected_%' AND lower(sql) LIKE '%openivm_delta_nws_seed%';
@@ -34,6 +41,16 @@ DELETE FROM nws_seed WHERE raw='a';
 
 statement ok
 PRAGMA refresh('nws_latest');
+
+query I
+SELECT count(*) FROM (SELECT * FROM nws_latest EXCEPT ALL SELECT * FROM nws_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM nws_ref EXCEPT ALL SELECT * FROM nws_latest);
+----
+0
 
 query III rowsort
 SELECT k,ts,hit::INT FROM nws_latest;
@@ -51,6 +68,16 @@ UPDATE nws_events SET k=5 WHERE k=1 AND ts=2;
 
 statement ok
 PRAGMA refresh('nws_latest');
+
+query I
+SELECT count(*) FROM (SELECT * FROM nws_latest EXCEPT ALL SELECT * FROM nws_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM nws_ref EXCEPT ALL SELECT * FROM nws_latest);
+----
+0
 
 query III rowsort
 SELECT k,ts,hit::INT FROM nws_latest;

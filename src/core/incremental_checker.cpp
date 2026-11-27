@@ -252,21 +252,18 @@ static bool AnyExpression(vector<unique_ptr<Expression>> &expressions,
 	return false;
 }
 
-static bool IsVolatileExpression(const Expression &expr) {
+bool IsVolatileExpression(const Expression &expr) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
-	auto &name = expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
+	auto &bound = expr.Cast<BoundFunctionExpression>();
+	auto &function = bound.Function();
+	auto &name = function.GetName().GetIdentifierName();
 	if (StringUtil::StartsWith(name, "__internal_compress") || StringUtil::StartsWith(name, "__internal_decompress") ||
 	    name == "error") {
 		return false;
 	}
-	const auto &function = expr.Cast<BoundFunctionExpression>().Function();
-	using ScalarCallback = void (*)(DataChunk &, ExpressionState &, Vector &);
-	const auto callback_fn = function.GetFunctionCallback();
-	const auto callback = callback_fn.target<ScalarCallback>();
-	return function.GetStability() != FunctionStability::CONSISTENT &&
-	       (!callback || *callback != SparkExpressionMarker);
+	return function.GetStability() != FunctionStability::CONSISTENT && !IsSparkExpressionMarker(bound);
 }
 
 static bool IsNonFoldableUnnestExpression(const Expression &expr) {

@@ -84,6 +84,16 @@ DELETE FROM wgs_obs WHERE child = 4;
 statement ok
 PRAGMA refresh('wgs_totals');
 
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
+
 query IIII rowsort
 SELECT * FROM wgs_totals;
 ----
@@ -96,6 +106,16 @@ DELETE FROM wgs_obs WHERE child = 2;
 
 statement ok
 PRAGMA refresh('wgs_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_totals EXCEPT ALL SELECT * FROM wgs_ref);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM wgs_ref EXCEPT ALL SELECT * FROM wgs_totals);
+----
+0
 
 query IIII rowsort
 SELECT * FROM wgs_totals;

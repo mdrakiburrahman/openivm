@@ -10,7 +10,7 @@ SELECT __openivm_spark_expression('disabled', NULL::INTEGER, 1);
 restricted to compiler-only use
 
 statement ok
-SET GLOBAL openivm_spark_expression_markers = true;
+SET SESSION openivm_spark_expression_markers = true;
 
 statement error
 SELECT __openivm_spark_expression('never_execute', NULL::INTEGER, 1);
@@ -72,6 +72,36 @@ WHERE refresh_type_name = 'WINDOW_PARTITION' AND contains(sql, 'window_marker');
 1
 
 statement ok
+CREATE TABLE marker_other (id INTEGER, txt VARCHAR);
+
+statement ok
+CREATE MATERIALIZED VIEW marker_union_window AS
+WITH pooled AS (
+    SELECT id, txt FROM marker_source
+    WHERE __openivm_spark_expression('union_filter_marker', NULL::BOOLEAN, txt)
+    UNION ALL
+    SELECT id, txt FROM marker_other
+), keyed AS (
+    SELECT id, __openivm_spark_expression('union_key_marker', NULL::VARCHAR, txt) AS partition_key FROM pooled
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY partition_key
+        ORDER BY __openivm_spark_expression('union_order_marker', NULL::INTEGER, id) DESC) AS rn FROM keyed
+)
+SELECT partition_key, id FROM ranked WHERE rn = 1;
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts('marker_union_window',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}')
+WHERE refresh_type_name = 'WINDOW_PARTITION' AND stmt_order = 1
+    AND contains(lower(sql), 'openivm_affected_')
+    AND contains(lower(sql), 'openivm_delta_marker_source')
+    AND contains(lower(sql), 'openivm_delta_marker_other')
+    AND contains(sql, 'union_filter_marker') AND contains(sql, 'union_key_marker')
+    AND contains(sql, 'union_order_marker');
+----
+1
+
+statement ok
 CREATE MATERIALIZED VIEW marker_volatile AS
 SELECT __openivm_spark_expression('volatile_marker', NULL::VARCHAR, random()) r FROM marker_source;
 
@@ -82,4 +112,4 @@ WHERE refresh_type_name != 'FULL_REFRESH';
 0
 
 statement ok
-SET GLOBAL openivm_spark_expression_markers = false;
+SET SESSION openivm_spark_expression_markers = false;

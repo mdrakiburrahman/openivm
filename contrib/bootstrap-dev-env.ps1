@@ -1,7 +1,8 @@
 <#
 
 .SYNOPSIS
-  Recreates the WSL distro and clones this checkout's branch and commit into it.
+  WARNING: Permanently deletes the selected WSL distro and all data in it.
+  Recreates it and clones this checkout's branch and commit into it.
 
 .NOTES
 
