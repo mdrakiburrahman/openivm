@@ -812,8 +812,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (cross_system && out_pre_meta && out_post_meta) {
 			*out_pre_meta = in_progress_sql(true);
 			*out_post_meta += in_progress_sql(false);
-		} else if (recovering && cross_system) {
-			metadata.SetRefreshInProgress(view_name, false);
 		} else if (recovering) {
 			query += "\n" + in_progress_sql(false);
 		}

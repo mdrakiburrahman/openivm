@@ -280,9 +280,6 @@ public:
 	};
 	vector<ScheduledView> GetScheduledViews();
 
-	// Set/clear the refresh_in_progress flag for crash safety.
-	void SetRefreshInProgress(const string &view_name, bool in_progress);
-
 	// Watermarks of every consumer of this physical delta, across metadata locations.
 	// Publication and cleanup must use the same qualified source identity and inventory.
 	static string BuildDeltaConsumersSQL(const string &target, const string &metadata_key,

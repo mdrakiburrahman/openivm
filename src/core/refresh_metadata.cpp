@@ -1975,12 +1975,6 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 	return views;
 }
 
-void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_progress) {
-	// refresh_in_progress is volatile: a ViewRecord never serves it, so the record stays valid.
-	con.Query("UPDATE " + string(openivm::VIEWS_TABLE) + " SET refresh_in_progress = " +
-	          (in_progress ? "true" : "false") + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-}
-
 string RefreshMetadata::BuildDeltaConsumersSQL(const string &target, const string &metadata_key,
                                                const string &delta_metadata_table,
                                                const vector<string> &delta_metadata_tables,
