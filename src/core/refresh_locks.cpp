@@ -9,17 +9,36 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 
+#include <chrono>
 #include <cstdio>
 
 namespace duckdb {
 
-void MutationGate::Lock(const void *owner, bool capture) {
+// A holder can keep a gate until its transaction ends. Wait in short slices so the
+// waiting query still honours interrupts and max_execution_time.
+template <class READY>
+static void WaitInterruptibly(std::condition_variable &condition, std::unique_lock<mutex> &guard,
+                              ClientContext *interrupt_context, idx_t &started_waits, READY ready) {
+	if (ready()) {
+		return;
+	}
+	started_waits++;
+	do {
+		if (interrupt_context) {
+			interrupt_context->BlockingInterruptCheck();
+		}
+		condition.wait_for(guard, std::chrono::milliseconds(100));
+	} while (!ready());
+}
+
+void MutationGate::Lock(const void *owner, bool capture, ClientContext *interrupt_context) {
 	std::unique_lock<mutex> guard(lock);
 	if (active_owner == owner) {
 		depth++;
@@ -36,7 +55,14 @@ void MutationGate::Lock(const void *owner, bool capture) {
 		throw TransactionException("OpenIVM lifecycle conflicts with pending source writes; retry the transaction");
 	}
 	waiting_owners++;
-	condition.wait(guard, [&]() { return active_owner == nullptr; });
+	try {
+		WaitInterruptibly(condition, guard, interrupt_context, started_waits,
+		                  [&]() { return active_owner == nullptr; });
+	} catch (...) {
+		waiting_owners--;
+		OPENIVM_DEBUG_PRINT("[LOCK] mutation gate wait interrupted owner=%p\n", owner);
+		throw;
+	}
 	waiting_owners--;
 	active_owner = owner;
 	depth = 1;
@@ -141,7 +167,8 @@ void MutationGate::CacheSourceDelta(const string &key, idx_t epoch, CachedSource
 	source_deltas[key] = std::move(entry);
 }
 
-void MutationGate::LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication) {
+void MutationGate::LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
+                              ClientContext *interrupt_context) {
 	std::unique_lock<mutex> guard(lock);
 	auto &entry = sources[catalog_oid][source];
 	if (!entry) {
@@ -159,7 +186,16 @@ void MutationGate::LockSource(const void *owner, const string &source, idx_t cat
 			       (admission.readers.empty() || (admission.readers.size() == 1 && admission.readers.count(owner)));
 		};
 		admission.waiting_publishers++;
-		condition.wait(guard, ready);
+		try {
+			WaitInterruptibly(condition, guard, interrupt_context, started_waits, ready);
+		} catch (...) {
+			admission.waiting_publishers--;
+			EraseIdleSourceAdmission(source, catalog_oid);
+			// Readers held back by this waiting publisher may proceed.
+			condition.notify_all();
+			OPENIVM_DEBUG_PRINT("[LOCK] source publication wait interrupted %s owner=%p\n", source.c_str(), owner);
+			throw;
+		}
 		admission.waiting_publishers--;
 		admission.publisher = owner;
 		admission.publication_depth = 1;
@@ -175,10 +211,40 @@ void MutationGate::LockSource(const void *owner, const string &source, idx_t cat
 		throw TransactionException("OpenIVM source publication conflicts with pending writes; retry the transaction");
 	}
 	admission.waiting_readers++;
-	condition.wait(guard, ready);
+	try {
+		WaitInterruptibly(condition, guard, interrupt_context, started_waits, ready);
+	} catch (...) {
+		admission.waiting_readers--;
+		EraseIdleSourceAdmission(source, catalog_oid);
+		condition.notify_all();
+		OPENIVM_DEBUG_PRINT("[LOCK] source write admission wait interrupted %s owner=%p\n", source.c_str(), owner);
+		throw;
+	}
 	admission.waiting_readers--;
 	admission.readers[owner]++;
 	admitted_writers[owner]++;
+}
+
+// Called with the gate's lock held. A committed write keeps its entry: later
+// snapshots still need last_write_commit, and UnlockSource retires it.
+void MutationGate::EraseIdleSourceAdmission(const string &source, idx_t catalog_oid) {
+	auto catalog_it = sources.find(catalog_oid);
+	if (catalog_it == sources.end()) {
+		return;
+	}
+	auto source_it = catalog_it->second.find(source);
+	if (source_it == catalog_it->second.end()) {
+		return;
+	}
+	auto &admission = *source_it->second;
+	if (admission.publisher || !admission.readers.empty() || admission.waiting_readers ||
+	    admission.waiting_publishers || admission.last_write_commit != 0) {
+		return;
+	}
+	catalog_it->second.erase(source_it);
+	if (catalog_it->second.empty()) {
+		sources.erase(catalog_it);
+	}
 }
 
 void MutationGate::RecordSourceCommit(const string &source, idx_t catalog_oid, transaction_t commit_id) {
@@ -247,14 +313,14 @@ shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
 
 MutationLockGuard::MutationLockGuard(ClientContext &context)
     : MutationLockGuard(DatabaseInstance::GetDatabase(context),
-                        TransactionalMVLockState::Get(context).GetMutationOwner()) {
+                        TransactionalMVLockState::Get(context).GetMutationOwner(), false, &context) {
 }
 
 SourceAdmissionGuard::SourceAdmissionGuard(DatabaseInstance &db, const void *owner_p, Catalog &catalog, string source_p,
-                                           bool publication_p)
+                                           bool publication_p, ClientContext *interrupt_context)
     : gate(RefreshLocks::AcquireGate(db)), owner(owner_p), source(std::move(source_p)), publication(publication_p),
       source_database(catalog.GetAttached().shared_from_this()) {
-	gate->LockSource(owner, source, catalog.GetOid(), publication);
+	gate->LockSource(owner, source, catalog.GetOid(), publication, interrupt_context);
 }
 
 SourceAdmissionGuard::~SourceAdmissionGuard() {
@@ -314,7 +380,8 @@ void TransactionalMVLockState::AcquireMutationLock(bool capture) {
 	// Parallel delta-capture workers share this state. Losing a guard here leaks its gate depth.
 	lock_guard<mutex> guard(state_lock);
 	if (!mutation_guard) {
-		mutation_guard = make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner, capture);
+		mutation_guard =
+		    make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner, capture, &owner);
 		OPENIVM_DEBUG_PRINT("[LOCK] acquired database mutation lock owner=%p capture=%d\n", static_cast<void *>(&owner),
 		                    capture ? 1 : 0);
 	} else if (!capture) {
@@ -396,7 +463,8 @@ unique_ptr<SourceAdmissionGuard> TransactionalMVLockState::AcquireSourceWriteAdm
 		return nullptr;
 	}
 	return make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
-	                                       Catalog::GetCatalog(owner, Identifier(catalog)), std::move(source), false);
+	                                       Catalog::GetCatalog(owner, Identifier(catalog)), std::move(source), false,
+	                                       &owner);
 }
 
 void TransactionalMVLockState::RetainSourceWriteAdmission(unique_ptr<SourceAdmissionGuard> admission) {
@@ -486,8 +554,9 @@ void TransactionalMVLockState::AcquireSourcePublicationLock(const string &catalo
 	if (source_publication_locks.count(source)) {
 		return;
 	}
-	auto admission = make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
-	                                                 Catalog::GetCatalog(owner, Identifier(catalog)), source, true);
+	auto admission =
+	    make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
+	                                    Catalog::GetCatalog(owner, Identifier(catalog)), source, true, &owner);
 	OPENIVM_DEBUG_PRINT("[LOCK] acquired source publication lock %s owner=%p\n", source.c_str(), mutation_owner);
 	source_publication_locks.emplace(std::move(source), std::move(admission));
 }

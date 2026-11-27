@@ -447,3 +447,67 @@ SELECT count(*) FROM (
 
 statement ok
 SET disabled_optimizers = '';
+
+# Issue #219: a window MV refreshed inside the transaction that wrote a mixed DML batch to its
+# source crashed intermittently (join filter pushdown over RowIdColumnData). The refresh optimizer
+# override must stay in place until the transaction ends. Repeated on fresh views because the
+# crash was flaky.
+statement ok
+SET threads = 2;
+
+loop i 0 10
+
+statement ok
+CREATE TABLE win_src_${i} (id INT, k INT, v VARCHAR);
+
+statement ok
+INSERT INTO win_src_${i} VALUES (1,1,'A'), (2,1,'B'), (3,3,'C');
+
+statement ok
+CREATE MATERIALIZED VIEW win_mv_${i} AS
+SELECT id, k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+FROM (SELECT * FROM win_src_${i} ORDER BY id LIMIT 10) input;
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM win_src_${i} WHERE id = 1;
+
+statement ok
+INSERT INTO win_src_${i} VALUES (1,1,'a'), (4,3,'Q');
+
+statement ok
+UPDATE win_src_${i} SET v = 'F' WHERE id = 4;
+
+statement ok
+DELETE FROM win_src_${i} WHERE id = 4;
+
+statement ok
+PRAGMA refresh('win_mv_${i}');
+
+statement ok
+COMMIT;
+
+query I
+SELECT current_setting('disabled_optimizers');
+----
+(empty)
+
+query I
+WITH expected AS (
+ SELECT id, k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+ FROM (SELECT * FROM win_src_${i} ORDER BY id LIMIT 10) input
+)
+SELECT count(*) FROM (
+ (SELECT * FROM win_mv_${i} EXCEPT ALL SELECT * FROM expected)
+ UNION ALL
+ (SELECT * FROM expected EXCEPT ALL SELECT * FROM win_mv_${i})
+);
+----
+0
+
+endloop
+
+statement ok
+RESET threads;
