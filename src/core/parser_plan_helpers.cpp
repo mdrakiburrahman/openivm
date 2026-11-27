@@ -52,7 +52,12 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
@@ -1892,34 +1897,79 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 	return group_names;
 }
 
-static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const CreateMVPlanFacts &facts) {
-	TableIndex table_index = bcr->Binding().table_index;
-	ProjectionIndex column_index = bcr->Binding().column_index;
-	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = facts.gets_by_index.find(table_index);
-		if (get_it != facts.gets_by_index.end()) {
-			auto *get = get_it->second;
-			string column;
-			return GetLogicalGetColumnName(*get, column_index, column) ? column : "";
-		}
-		auto proj_it = facts.projections_by_index.find(table_index);
-		if (proj_it == facts.projections_by_index.end()) {
-			return "";
-		}
-		auto *proj = proj_it->second;
-		if (column_index >= proj->expressions.size()) {
-			return "";
-		}
-		auto &expr = proj->expressions[column_index];
-		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
-			return expr->GetAlias().empty() ? expr->GetName().GetIdentifierName()
-			                                : expr->GetAlias().GetIdentifierName();
-		}
-		auto &next = expr->Cast<BoundColumnRefExpression>();
-		table_index = next.Binding().table_index;
-		column_index = next.Binding().column_index;
+static constexpr idx_t BASE_BINDING_DEPTH = 16;
+static constexpr idx_t LINEAR_BINDING_DEPTH = 64;
+
+static BoundColumnRefExpression *GetLocalIdentityRef(Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
 	}
-	return "";
+	auto &ref = expr.Cast<BoundColumnRefExpression>();
+	return ref.Depth() == 0 ? &ref : nullptr;
+}
+
+// Stop at a non-projection binding or at the expression that actually defines the value.
+static bool ChaseProjectionBinding(ColumnBinding &binding, const CreateMVPlanFacts &facts, idx_t depth_limit,
+                                   Expression *&definition,
+                                   const std::function<BoundColumnRefExpression *(Expression &)> &next_ref) {
+	definition = nullptr;
+	for (idx_t depth = 0; depth < depth_limit; depth++) {
+		if (!binding.table_index.IsValid() || !binding.column_index.IsValid()) {
+			return false;
+		}
+		auto proj = facts.projections_by_index.find(binding.table_index);
+		if (proj == facts.projections_by_index.end()) {
+			return true;
+		}
+		if (binding.column_index >= proj->second->expressions.size()) {
+			return false;
+		}
+		auto &expr = *proj->second->expressions[binding.column_index];
+		auto *next = next_ref(expr);
+		if (!next || next->Depth() != 0) {
+			definition = &expr;
+			return true;
+		}
+		binding = next->Binding();
+	}
+	return false;
+}
+
+static bool ChaseIdentityBinding(ColumnBinding &binding, const CreateMVPlanFacts &facts, idx_t depth_limit) {
+	Expression *definition;
+	return ChaseProjectionBinding(binding, facts, depth_limit, definition, GetLocalIdentityRef);
+}
+
+static bool ResolveBareBindingToGet(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
+                                    ProjectionIndex &column_index) {
+	if (!ChaseIdentityBinding(binding, facts, BASE_BINDING_DEPTH)) {
+		return false;
+	}
+	auto it = facts.gets_by_index.find(binding.table_index);
+	if (it == facts.gets_by_index.end()) {
+		return false;
+	}
+	get = it->second;
+	column_index = binding.column_index;
+	return true;
+}
+
+static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const CreateMVPlanFacts &facts) {
+	auto binding = bcr->Binding();
+	Expression *definition;
+	if (bcr->Depth() != 0 ||
+	    !ChaseProjectionBinding(binding, facts, BASE_BINDING_DEPTH, definition, GetLocalIdentityRef)) {
+		return "";
+	}
+	if (definition) {
+		return definition->GetAlias().empty() ? definition->GetName().GetIdentifierName()
+		                                      : definition->GetAlias().GetIdentifierName();
+	}
+	auto it = facts.gets_by_index.find(binding.table_index);
+	string column;
+	return it != facts.gets_by_index.end() && GetLogicalGetColumnName(*it->second, binding.column_index, column)
+	           ? column
+	           : "";
 }
 
 using ProjectionLineageStep = RefreshMetadata::ProjectionKeyLineageStep;
@@ -2105,35 +2155,36 @@ string DeriveDirectSourceGroupKey(const CreateMVPlanFacts &facts, const vector<s
 	return "";
 }
 
+static BoundColumnRefExpression *NullableTrimLookupRef(Expression &expr, string &spec);
+
+// allow_seed_normalization also follows NULLIF(TRIM(col), '') projections (requires cast_type).
 static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
                                       string &column, ProjectionIndex *base_column = nullptr,
-                                      string *cast_type = nullptr) {
-	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = facts.gets_by_index.find(binding.table_index);
-		if (get_it != facts.gets_by_index.end()) {
-			get = get_it->second;
-			if (base_column) {
-				*base_column = binding.column_index;
-			}
-			return GetLogicalGetColumnName(*get, binding.column_index, column);
-		}
-		auto proj_it = facts.projections_by_index.find(binding.table_index);
-		if (proj_it == facts.projections_by_index.end() ||
-		    binding.column_index >= proj_it->second->expressions.size()) {
-			return false;
-		}
+                                      string *cast_type = nullptr, bool allow_seed_normalization = false) {
+	auto next_ref = [&](Expression &expr) {
 		string projection_cast;
-		auto *next = GetColumnRefThroughCasts(proj_it->second->expressions[binding.column_index].get(),
-		                                      cast_type ? &projection_cast : nullptr);
-		if (!next) {
-			return false;
+		auto *next = GetColumnRefThroughCasts(&expr, cast_type ? &projection_cast : nullptr);
+		if (!next && allow_seed_normalization && cast_type) {
+			next = NullableTrimLookupRef(expr, projection_cast);
 		}
-		if (cast_type && !projection_cast.empty()) {
+		if (next && cast_type && !projection_cast.empty()) {
 			*cast_type = SqlUtils::ComposeCastSpecs(*cast_type, projection_cast);
 		}
-		binding = next->Binding();
+		return next;
+	};
+	Expression *definition;
+	if (!ChaseProjectionBinding(binding, facts, BASE_BINDING_DEPTH, definition, next_ref) || definition) {
+		return false;
 	}
-	return false;
+	auto it = facts.gets_by_index.find(binding.table_index);
+	if (it == facts.gets_by_index.end()) {
+		return false;
+	}
+	get = it->second;
+	if (base_column) {
+		*base_column = binding.column_index;
+	}
+	return GetLogicalGetColumnName(*get, binding.column_index, column);
 }
 
 static bool SetOccurrenceRef(LogicalGet &get, const CreateMVPlanFacts &facts, OccurrenceColumnRef &out) {
@@ -2152,12 +2203,67 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVP
 	return ResolveBindingToGetColumn(binding, facts, get, out.column) && SetOccurrenceRef(*get, facts, out);
 }
 
+static bool IsStringSentinel(const Expression &expr, bool null_sentinel) {
+	if (expr.GetReturnType() != LogicalType::VARCHAR) {
+		return false;
+	}
+	auto *value = &expr;
+	if (BoundCastExpression::IsCast(*value)) {
+		value = &BoundCastExpression::Child(value->Cast<BoundFunctionExpression>());
+	}
+	if (value->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &constant = value->Cast<BoundConstantExpression>().GetValue();
+	return null_sentinel ? constant.IsNull()
+	                     : (!constant.IsNull() && constant.type().id() == LogicalTypeId::VARCHAR &&
+	                        StringValue::Get(constant).empty());
+}
+
+// NULLIF(TRIM(x), '') binds to CASE WHEN TRIM(x) = '' THEN NULL ELSE TRIM(x) END.
+// Preserve the transform on the seed delta, not on the fact's partition key.
+static BoundColumnRefExpression *NullableTrimLookupRef(Expression &expr, string &spec) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CASE || expr.GetReturnType() != LogicalType::VARCHAR) {
+		return nullptr;
+	}
+	auto &branch = expr.Cast<BoundCaseExpression>();
+	if (branch.CaseChecks().size() != 1 ||
+	    branch.ElseMutable()->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return nullptr;
+	}
+	auto &check = branch.CaseChecks().front();
+	if (check.when_expr->GetExpressionType() != ExpressionType::COMPARE_EQUAL ||
+	    !IsStringSentinel(*check.then_expr, true)) {
+		return nullptr;
+	}
+	auto &eq = check.when_expr->Cast<BoundFunctionExpression>();
+	if (!BoundComparisonExpression::Left(eq).Equals(*branch.ElseMutable()) ||
+	    !IsStringSentinel(BoundComparisonExpression::Right(eq), false)) {
+		return nullptr;
+	}
+	auto &trim = branch.ElseMutable()->Cast<BoundFunctionExpression>();
+	if (trim.Function().GetName().GetIdentifierName() != "trim" || trim.GetChildrenMutable().size() != 1 ||
+	    trim.GetChildrenMutable()[0]->GetReturnType() != LogicalType::VARCHAR ||
+	    trim.Function().GetCatalogName().GetIdentifierName() != SYSTEM_CATALOG ||
+	    trim.Function().GetSchemaName().GetIdentifierName() != DEFAULT_SCHEMA) {
+		return nullptr;
+	}
+	string casts;
+	auto *ref = GetColumnRefThroughCasts(trim.GetChildrenMutable()[0].get(), &casts);
+	if (ref) {
+		spec = SqlUtils::ComposeCastSpecs("openivm_expr:NULLIF(TRIM({openivm_column}), '')", casts);
+	}
+	return ref;
+}
+
 static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                                   OccurrenceColumnRef &out, string &cast_type,
-                                                  const LogicalType &expression_type) {
+                                                  const LogicalType &expression_type,
+                                                  bool allow_seed_normalization = false) {
 	LogicalGet *get = nullptr;
 	ProjectionIndex base_column;
-	if (!ResolveBindingToGetColumn(binding, facts, get, out.column, &base_column, &cast_type) ||
+	if (!ResolveBindingToGetColumn(binding, facts, get, out.column, &base_column, &cast_type,
+	                               allow_seed_normalization) ||
 	    !SetOccurrenceRef(*get, facts, out)) {
 		return false;
 	}
@@ -2628,7 +2734,7 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 
 static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
                                    vector<WindowEquivalenceEdge> &equivalence_edges,
-                                   vector<WindowLookupEdge> &lookup_edges) {
+                                   vector<WindowLookupEdge> &lookup_edges, bool allow_seed_normalization) {
 	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
 	    join.type != LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		return;
@@ -2656,7 +2762,8 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		if (!ResolveBindingToOccurrenceRefWithCast(left->Binding(), facts, left_ref, left_cast,
 		                                           left->GetReturnType()) ||
 		    !ResolveBindingToOccurrenceRefWithCast(right->Binding(), facts, right_ref, right_cast,
-		                                           right->GetReturnType())) {
+		                                           right->GetReturnType(),
+		                                           allow_seed_normalization && join.join_type == JoinType::LEFT)) {
 			continue;
 		}
 		switch (join.join_type) {
@@ -2769,7 +2876,265 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 	return metadata_op;
 }
 
+static bool IsRawWindowKey(const Expression &expr, const CreateMVPlanFacts &facts, const WindowLineageOp &key) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &ref = expr.Cast<BoundColumnRefExpression>();
+	LogicalGet *get = nullptr;
+	ProjectionIndex column_index;
+	if (ref.Depth() != 0 || !ResolveBareBindingToGet(ref.Binding(), facts, get, column_index)) {
+		return false;
+	}
+	string column;
+	auto occ = facts.occurrence_by_index.find(get->table_index);
+	return occ != facts.occurrence_by_index.end() && occ->second.table == key.source_table &&
+	       occ->second.occurrence == key.source_occurrence && GetLogicalGetColumnName(*get, column_index, column) &&
+	       StringUtil::CIEquals(column, key.source_col);
+}
+
+static bool RawWindowKeyIsProjected(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                    const WindowLineageOp &key) {
+	if (!facts.first_projection || !key.source_cast.empty()) {
+		return false;
+	}
+	auto &exprs = facts.first_projection->expressions;
+	for (idx_t i = 0; i < exprs.size() && i < output_names.size(); ++i) {
+		if (StringUtil::CIEquals(output_names[i], key.output_col) && IsRawWindowKey(*exprs[i], facts, key)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static const BoundWindowExpression *GetSingleRowNumber(const LogicalWindow &window) {
+	if (window.expressions.size() != 1 ||
+	    window.expressions.front()->GetExpressionClass() != ExpressionClass::BOUND_WINDOW ||
+	    window.expressions.front()->GetExpressionType() != ExpressionType::WINDOW_ROW_NUMBER) {
+		return nullptr;
+	}
+	return &window.expressions.front()->Cast<BoundWindowExpression>();
+}
+
+static bool HasSinglePartitionRowNumber(const BoundWindowExpression &row_number) {
+	return row_number.Partitions().size() == 1 && row_number.GetChildren().empty() && row_number.ArgOrders().empty() &&
+	       !row_number.Filter();
+}
+
+static bool IsOrderedPartitionRowNumber(const BoundWindowExpression &row_number) {
+	return HasSinglePartitionRowNumber(row_number) && !row_number.OrderBy().empty() && !row_number.IgnoreNulls() &&
+	       !row_number.Distinct();
+}
+
+static bool IsNormalizedSeedLookup(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                   const vector<WindowLineageOp> &direct_ops) {
+	if (facts.comparison_joins.size() != 1 || facts.comparison_joins.front()->conditions.size() != 1 ||
+	    facts.windows.size() != 1 || !GetSingleRowNumber(*facts.windows.front()) ||
+	    facts.source_occurrences.size() != 2 ||
+	    facts.source_occurrences[0].table == facts.source_occurrences[1].table ||
+	    !facts.analysis.incremental_compatible || direct_ops.size() != 1 ||
+	    !RawWindowKeyIsProjected(facts, output_names, direct_ops.front())) {
+		return false;
+	}
+	// Only the preserved side may supply the partition: an unmatched LEFT JOIN
+	// row can appear or disappear without bearing the changed right-side key.
+	auto &join = *facts.comparison_joins.front();
+	if (join.join_type != JoinType::LEFT || join.children.size() != 2) {
+		return false;
+	}
+	auto *left = join.children[0].get();
+	while (
+	    (left->type == LogicalOperatorType::LOGICAL_PROJECTION || left->type == LogicalOperatorType::LOGICAL_FILTER) &&
+	    left->children.size() == 1) {
+		left = left->children[0].get();
+	}
+	auto &window = *facts.windows.front();
+	auto &partitions = GetSingleRowNumber(window)->Partitions();
+	if (left != &window || partitions.size() != 1 || !IsRawWindowKey(*partitions.front(), facts, direct_ops.front())) {
+		return false;
+	}
+	for (const auto &node : facts.plan_nodes_post_order) {
+		switch (node.plan_node->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_WINDOW:
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_DISTINCT:
+		case LogicalOperatorType::LOGICAL_GET:
+			break;
+		default:
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool CollectOperatorAncestors(LogicalOperator &op, const LogicalWindow &window,
+                                     vector<LogicalOperator *> &ancestors) {
+	if (&op == &window) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (CollectOperatorAncestors(*child, window, ancestors)) {
+			ancestors.push_back(&op);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsWindowOrderTrimType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool IsConstantOne(const Expression &expr) {
+	auto *current = &expr;
+	while (BoundCastExpression::IsCast(*current)) {
+		current = &BoundCastExpression::Child(current->Cast<BoundFunctionExpression>());
+	}
+	if (current->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &value = current->Cast<BoundConstantExpression>().GetValue();
+	switch (value.type().id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+		return !value.IsNull() && value.GetValue<int64_t>() == 1;
+	default:
+		return false;
+	}
+}
+
+static bool IsWindowOutputRef(const Expression &expr, const CreateMVPlanFacts &facts, const LogicalWindow &window) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &ref = expr.Cast<BoundColumnRefExpression>();
+	auto binding = ref.Binding();
+	return ref.Depth() == 0 && ChaseIdentityBinding(binding, facts, BASE_BINDING_DEPTH) &&
+	       binding == ColumnBinding(window.window_index, ProjectionIndex(0));
+}
+
+static bool IsRankEqualsOne(const Expression &expr, const CreateMVPlanFacts &facts, const LogicalWindow &window) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			if (IsRankEqualsOne(*child, facts, window)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (expr.GetExpressionType() != ExpressionType::COMPARE_EQUAL || !BoundComparisonExpression::IsComparison(expr)) {
+		return false;
+	}
+	auto &comparison = expr.Cast<BoundFunctionExpression>();
+	auto &left = BoundComparisonExpression::Left(comparison);
+	auto &right = BoundComparisonExpression::Right(comparison);
+	return (IsWindowOutputRef(left, facts, window) && IsConstantOne(right)) ||
+	       (IsConstantOne(left) && IsWindowOutputRef(right, facts, window));
+}
+
+// A key whose pending rows all sort strictly after its materialized rank-1 row leaves that row on top, so it
+// can be left out of the affected keys. Needs a leading DESC order column of the partition's source, exposed
+// bare by the output, with rank = 1 selected. A NULL order value never qualifies a key for the trim.
+static bool BuildWindowOrderTrim(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                 const WindowLineageOp &direct, string &order_col, string &order_out) {
+	auto decline = [](const char *reason) {
+		OPENIVM_DEBUG_PRINT("[WINDOW ORDER TRIM] declined: %s\n", reason);
+		return false;
+	};
+	if (!facts.root || !facts.first_projection || facts.windows.size() != 1) {
+		return decline("unsupported plan shape");
+	}
+	auto &window = *facts.windows.front();
+	auto *row_number_expr = GetSingleRowNumber(window);
+	if (!row_number_expr) {
+		return decline("window is not a single ROW_NUMBER");
+	}
+	auto &row_number = *row_number_expr;
+	if (!IsOrderedPartitionRowNumber(row_number)) {
+		return decline("unsupported ROW_NUMBER specification");
+	}
+	auto &leading = row_number.OrderBy().front();
+	if (leading.type != OrderType::DESCENDING ||
+	    leading.expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return decline("leading ORDER BY key is not a plain descending column");
+	}
+	LogicalGet *get = nullptr;
+	ProjectionIndex column_index;
+	string name;
+	LogicalType type;
+	if (!ResolveBareBindingToGet(leading.expression->Cast<BoundColumnRefExpression>().Binding(), facts, get,
+	                             column_index) ||
+	    !GetLogicalGetColumnName(*get, column_index, name) || !GetLogicalGetColumnType(*get, column_index, type) ||
+	    !IsWindowOrderTrimType(type)) {
+		return decline("leading ORDER BY key is not a supported plain source column");
+	}
+	auto occurrence = facts.occurrence_by_index.find(get->table_index);
+	if (occurrence == facts.occurrence_by_index.end() || occurrence->second.table != direct.source_table ||
+	    occurrence->second.occurrence != direct.source_occurrence) {
+		return decline("leading ORDER BY key is not read from the partition source");
+	}
+	vector<LogicalOperator *> ancestors;
+	if (!CollectOperatorAncestors(*facts.root, window, ancestors)) {
+		return decline("window is not under the plan root");
+	}
+	bool selects_rank_one = false;
+	for (auto *ancestor : ancestors) {
+		switch (ancestor->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+			break;
+		case LogicalOperatorType::LOGICAL_FILTER:
+			for (auto &expr : ancestor->expressions) {
+				selects_rank_one = selects_rank_one || IsRankEqualsOne(*expr, facts, window);
+			}
+			break;
+		default:
+			return decline("unsupported operator above the window");
+		}
+	}
+	if (!selects_rank_one) {
+		return decline("rank 1 is not selected");
+	}
+	WindowLineageOp order_key = direct;
+	order_key.source_col = name;
+	order_key.source_cast.clear();
+	auto &exprs = facts.first_projection->expressions;
+	for (idx_t i = 0; i < exprs.size() && i < output_names.size(); ++i) {
+		if (!IncrementalTableNames::IsInternalColumn(output_names[i]) && IsRawWindowKey(*exprs[i], facts, order_key)) {
+			order_col = name;
+			order_out = output_names[i];
+			return true;
+		}
+	}
+	return decline("leading ORDER BY key is not exposed by the output");
+}
+
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                    const vector<string> &output_names,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
 	out.clear();
@@ -2798,8 +3163,10 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 
 	vector<WindowEquivalenceEdge> edges;
 	vector<WindowLookupEdge> lookup_edges;
+	const bool normalized_seed =
+	    partition_columns.size() == 1 && IsNormalizedSeedLookup(facts, output_names, direct_ops);
 	for (auto *join : facts.comparison_joins) {
-		CollectWindowJoinEdges(*join, facts, edges, lookup_edges);
+		CollectWindowJoinEdges(*join, facts, edges, lookup_edges, normalized_seed);
 	}
 
 	vector<WindowLineageOp> partition_ops;
@@ -2879,8 +3246,598 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 	}
 
+	bool has_lookup = false;
 	for (auto &op : ops) {
-		out.push_back(ToMetadataWindowLineageOp(op));
+		has_lookup = has_lookup || op.kind == WindowLineageKind::LOOKUP;
+	}
+	string order_col, order_out;
+	const bool order_trim = normalized_seed && has_lookup &&
+	                        BuildWindowOrderTrim(facts, output_names, direct_ops.front(), order_col, order_out);
+	for (auto &op : ops) {
+		auto metadata_op = ToMetadataWindowLineageOp(op);
+		if (order_trim && op.kind == WindowLineageKind::DIRECT && op.source_table == direct_ops.front().source_table &&
+		    op.source_occurrence == direct_ops.front().source_occurrence &&
+		    StringUtil::CIEquals(op.source_col, direct_ops.front().source_col) &&
+		    StringUtil::CIEquals(op.output_col, direct_ops.front().output_col)) {
+			metadata_op.order_col = order_col;
+			metadata_op.order_out = order_out;
+		}
+		out.push_back(std::move(metadata_op));
+	}
+	return !out.empty();
+}
+
+static bool IsGroupScopeTieSafeType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::UUID:
+		return true;
+	case LogicalTypeId::VARCHAR:
+		return StringType::GetCollation(type).empty();
+	default:
+		return false;
+	}
+}
+
+static bool CollectGroupScopeColumnRefs(Expression &expr, vector<BoundColumnRefExpression *> &refs) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY ||
+	    expr.GetExpressionClass() == ExpressionClass::BOUND_WINDOW ||
+	    expr.GetReturnType().id() == LogicalTypeId::FLOAT || expr.GetReturnType().id() == LogicalTypeId::DOUBLE) {
+		return false;
+	}
+	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+		auto &ref = expr.Cast<BoundColumnRefExpression>();
+		if (ref.Depth() != 0) {
+			return false;
+		}
+		refs.push_back(&ref);
+		return true;
+	}
+	bool ok = true;
+	ExpressionIterator::EnumerateChildren(
+	    expr, [&](Expression &child) { ok = ok && CollectGroupScopeColumnRefs(child, refs); });
+	return ok;
+}
+
+bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                  vector<string> &partition_columns,
+                                  vector<RefreshMetadata::WindowPartitionLineageOp> &ops) {
+	partition_columns.clear();
+	ops.clear();
+	auto decline = [](const char *reason) {
+		OPENIVM_DEBUG_PRINT("[WINDOW GROUP SCOPE] declined: %s\n", reason);
+		return false;
+	};
+	if (!facts.root || !facts.first_projection || !facts.analysis.incremental_compatible ||
+	    !facts.ducklake_table_info.empty() || !facts.comparison_joins.empty() || !facts.outer_joins.empty() ||
+	    !facts.setops_by_index.empty() || !facts.cte_refs_by_table_index.empty() || !facts.cte_defs_by_index.empty() ||
+	    facts.windows.size() != 1 || facts.aggregates.size() != 1 || facts.source_occurrences.size() != 1) {
+		return decline("unsupported plan shape");
+	}
+	for (const auto &node : facts.plan_nodes_post_order) {
+		switch (node.plan_node->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_WINDOW:
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		case LogicalOperatorType::LOGICAL_GET:
+			break;
+		default:
+			return decline("unsupported plan node");
+		}
+	}
+
+	auto &window = *facts.windows.front();
+	auto &aggregate = *facts.aggregates.front();
+	auto *row_number_expr = GetSingleRowNumber(window);
+	if (!row_number_expr) {
+		return decline("window is not a single ROW_NUMBER");
+	}
+	auto &row_number = *row_number_expr;
+	if (!IsOrderedPartitionRowNumber(row_number)) {
+		return decline("unsupported ROW_NUMBER specification");
+	}
+
+	// Rows tied on the ORDER BY keys must also agree on every column read above the
+	// window; otherwise the unspecified tie-break could move a different row to rank 1.
+	std::set<string> ranking_columns;
+	LogicalGet *partition_get = nullptr;
+	ProjectionIndex partition_column_index;
+	string partition_name;
+	auto add_ranking_column = [&](Expression &expr, bool is_partition) {
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		LogicalGet *get = nullptr;
+		ProjectionIndex column_index;
+		string name;
+		if (!ResolveBareBindingToGet(expr.Cast<BoundColumnRefExpression>().Binding(), facts, get, column_index) ||
+		    !GetLogicalGetColumnName(*get, column_index, name)) {
+			return false;
+		}
+		if (is_partition) {
+			partition_get = get;
+			partition_column_index = column_index;
+			partition_name = name;
+		}
+		ranking_columns.insert(std::to_string(get->table_index.index) + ":" + StringUtil::Lower(name));
+		return true;
+	};
+	if (!add_ranking_column(*row_number.Partitions().front(), true)) {
+		return decline("partition key is not a plain source column");
+	}
+	for (auto &order : row_number.OrderBy()) {
+		if (!add_ranking_column(*order.expression, false)) {
+			return decline("ORDER BY key is not a plain source column");
+		}
+	}
+
+	vector<LogicalOperator *> ancestors;
+	if (!CollectOperatorAncestors(*facts.root, window, ancestors)) {
+		return decline("window is not under the plan root");
+	}
+	bool aggregate_above_window = false;
+	vector<Expression *> consumers;
+	for (auto *ancestor : ancestors) {
+		switch (ancestor->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+			break;
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+			if (ancestor == facts.first_projection) {
+				for (auto &expr : ancestor->expressions) {
+					consumers.push_back(expr.get());
+				}
+			}
+			break;
+		case LogicalOperatorType::LOGICAL_FILTER:
+			for (auto &expr : ancestor->expressions) {
+				consumers.push_back(expr.get());
+			}
+			break;
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+			if (ancestor != &aggregate || aggregate_above_window) {
+				return decline("unsupported aggregate placement");
+			}
+			aggregate_above_window = true;
+			for (auto &expr : aggregate.groups) {
+				consumers.push_back(expr.get());
+			}
+			for (auto &expr : aggregate.expressions) {
+				consumers.push_back(expr.get());
+			}
+			break;
+		default:
+			return decline("unsupported node above window");
+		}
+	}
+	if (!aggregate_above_window || aggregate.groups.size() != 1 || aggregate.grouping_sets.size() > 1 ||
+	    !aggregate.grouping_functions.empty()) {
+		return decline("expected a single plain GROUP BY above the window");
+	}
+	static const std::set<string> allowed_aggregates = {"sum", "count",   "count_star", "min",
+	                                                    "max", "bool_or", "bool_and"};
+	for (auto &expr : aggregate.expressions) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			return decline("unsupported aggregate expression");
+		}
+		auto &call = expr->Cast<BoundAggregateExpression>();
+		if (call.IsDistinct() || call.GetOrderBys() ||
+		    !allowed_aggregates.count(call.Function().GetName().GetIdentifierName())) {
+			return decline("unsupported aggregate function");
+		}
+	}
+
+	std::set<string> consumed;
+	bool consumed_ok = true;
+	std::function<void(ColumnBinding, idx_t)> consume = [&](ColumnBinding binding, idx_t depth) {
+		if (!consumed_ok) {
+			return;
+		}
+		if (depth >= 16) {
+			consumed_ok = false;
+			return;
+		}
+		if (binding.table_index == window.window_index || binding.table_index == aggregate.group_index ||
+		    binding.table_index == aggregate.aggregate_index || binding.table_index == aggregate.groupings_index) {
+			return;
+		}
+		auto get_it = facts.gets_by_index.find(binding.table_index);
+		if (get_it != facts.gets_by_index.end()) {
+			string name;
+			LogicalType type;
+			if (!GetLogicalGetColumnName(*get_it->second, binding.column_index, name) ||
+			    !GetLogicalGetColumnType(*get_it->second, binding.column_index, type) ||
+			    !IsGroupScopeTieSafeType(type)) {
+				consumed_ok = false;
+				return;
+			}
+			consumed.insert(std::to_string(binding.table_index.index) + ":" + StringUtil::Lower(name));
+			return;
+		}
+		auto proj_it = facts.projections_by_index.find(binding.table_index);
+		if (proj_it == facts.projections_by_index.end() ||
+		    binding.column_index.GetIndex() >= proj_it->second->expressions.size()) {
+			consumed_ok = false;
+			return;
+		}
+		vector<BoundColumnRefExpression *> refs;
+		if (!CollectGroupScopeColumnRefs(*proj_it->second->expressions[binding.column_index.GetIndex()], refs)) {
+			consumed_ok = false;
+			return;
+		}
+		for (auto *ref : refs) {
+			consume(ref->Binding(), depth + 1);
+		}
+	};
+	for (auto *consumer : consumers) {
+		vector<BoundColumnRefExpression *> refs;
+		if (!CollectGroupScopeColumnRefs(*consumer, refs)) {
+			return decline("unsupported expression above window");
+		}
+		for (auto *ref : refs) {
+			consume(ref->Binding(), 0);
+		}
+	}
+	if (!consumed_ok) {
+		return decline("column read above the window is unresolved or not tie-safe");
+	}
+	LogicalType partition_type;
+	if (!GetLogicalGetColumnType(*partition_get, partition_column_index, partition_type) ||
+	    !IsGroupScopeTieSafeType(partition_type)) {
+		return decline("partition key type is not tie-safe");
+	}
+	for (auto &column : consumed) {
+		if (!ranking_columns.count(column)) {
+			return decline("column read above the window is not covered by the ranking keys");
+		}
+	}
+
+	if (aggregate.groups.front()->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return decline("group key is not a plain column");
+	}
+	LogicalGet *group_get = nullptr;
+	ProjectionIndex group_column_index;
+	string group_name;
+	if (!ResolveBareBindingToGet(aggregate.groups.front()->Cast<BoundColumnRefExpression>().Binding(), facts, group_get,
+	                             group_column_index) ||
+	    group_get != partition_get || !GetLogicalGetColumnName(*group_get, group_column_index, group_name)) {
+		return decline("group key does not resolve to the ranked source");
+	}
+	if (group_column_index == partition_column_index) {
+		return decline("group key is the window partition key");
+	}
+	auto occurrence_it = facts.occurrence_by_index.find(partition_get->table_index);
+	if (occurrence_it == facts.occurrence_by_index.end()) {
+		return decline("source occurrence not found");
+	}
+
+	string output_name;
+	idx_t visible_matches = 0;
+	auto &top_expressions = facts.first_projection->expressions;
+	for (idx_t i = 0; i < top_expressions.size(); ++i) {
+		if (top_expressions[i]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto &ref = top_expressions[i]->Cast<BoundColumnRefExpression>();
+		if (ResolvesToOutputBinding(ref.Binding().table_index, ref.Binding().column_index, aggregate.group_index, 1,
+		                            facts, false)) {
+			output_name = ProjectionOutputName(*facts.first_projection, i, facts, output_names, ref);
+			visible_matches++;
+		}
+	}
+	if (visible_matches != 1 || output_name.empty() || IncrementalTableNames::IsInternalColumn(output_name)) {
+		return decline("group key is not exposed exactly once");
+	}
+
+	const auto &table = occurrence_it->second.table;
+	RefreshMetadata::WindowPartitionLineageOp direct;
+	direct.kind = WindowLineageKind::DIRECT;
+	direct.output_col = output_name;
+	direct.source = table;
+	direct.source_col = group_name;
+	ops.push_back(direct);
+	// Parents of every current row of a changed child cover the new winner and any
+	// surviving old winner; deleted old rows are covered by the direct arm.
+	RefreshMetadata::WindowPartitionLineageOp lookup;
+	lookup.kind = WindowLineageKind::LOOKUP;
+	lookup.output_col = output_name;
+	lookup.source = table;
+	lookup.source_col = partition_name;
+	lookup.lookup = table;
+	lookup.lookup_col = partition_name;
+	lookup.lookup_out = group_name;
+	lookup.null_safe = true;
+	ops.push_back(lookup);
+	partition_columns.push_back(output_name + "=" + group_name);
+	return true;
+}
+
+static bool IsRowLocalDeterministicExpression(const Expression &expr) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_AGGREGATE:
+	case ExpressionClass::BOUND_WINDOW:
+	case ExpressionClass::BOUND_SUBQUERY:
+	case ExpressionClass::BOUND_UNNEST:
+		return false;
+	case ExpressionClass::BOUND_COLUMN_REF:
+		if (expr.Cast<BoundColumnRefExpression>().Depth() != 0) {
+			return false;
+		}
+		break;
+	case ExpressionClass::BOUND_FUNCTION:
+		if (IsVolatileExpression(expr)) {
+			return false;
+		}
+		break;
+	default:
+		break;
+	}
+	bool supported = true;
+	ExpressionIterator::EnumerateChildren(
+	    expr, [&](const Expression &child) { supported = supported && IsRowLocalDeterministicExpression(child); });
+	return supported;
+}
+
+static bool AllRowLocalDeterministic(const vector<unique_ptr<Expression>> &expressions) {
+	for (auto &expr : expressions) {
+		if (!expr || !IsRowLocalDeterministicExpression(*expr)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// True when the predicate is a bound on the row number that row 1 always satisfies, so every
+// non-empty partition keeps at least one output row.
+static bool KeepsFirstRowNumber(const Expression &expr, const ColumnBinding &row_number,
+                                const CreateMVPlanFacts &facts) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND &&
+	    expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+		auto &children = expr.Cast<BoundConjunctionExpression>().GetChildren();
+		for (auto &child : children) {
+			if (!child || !KeepsFirstRowNumber(*child, row_number, facts)) {
+				return false;
+			}
+		}
+		return !children.empty();
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+	    !BoundComparisonExpression::IsComparison(expr)) {
+		return false;
+	}
+	auto &comparison = expr.Cast<BoundFunctionExpression>();
+	auto comparison_type = comparison.GetExpressionType();
+	const Expression *column = &BoundComparisonExpression::Left(comparison);
+	const Expression *constant = &BoundComparisonExpression::Right(comparison);
+	if (column->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		std::swap(column, constant);
+		comparison_type = FlipComparisonExpression(comparison_type);
+	}
+	if (column->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &column_ref = column->Cast<BoundColumnRefExpression>();
+	auto binding = column_ref.Binding();
+	if (column_ref.Depth() != 0 || !ChaseIdentityBinding(binding, facts, LINEAR_BINDING_DEPTH) ||
+	    binding != row_number) {
+		return false;
+	}
+	if (BoundCastExpression::IsCast(*constant)) {
+		auto &cast = constant->Cast<BoundFunctionExpression>();
+		if (!BoundCastExpression::TargetType(cast).IsIntegral()) {
+			return false;
+		}
+		constant = &BoundCastExpression::Child(cast);
+	}
+	if (constant->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &value = constant->Cast<BoundConstantExpression>().GetValue();
+	if (value.IsNull() || !value.type().IsIntegral()) {
+		return false;
+	}
+	auto limit_value = value.DefaultTryCastAs(LogicalType::BIGINT, nullptr, true);
+	if (!limit_value) {
+		return false;
+	}
+	auto limit = limit_value->GetValue<int64_t>();
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		return limit == 1;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return limit >= 1;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return limit >= 2;
+	default:
+		return false;
+	}
+}
+
+static bool IsLinearWindowInput(LogicalOperator &node, const CreateMVPlanFacts &facts,
+                                unordered_set<TableIndex> &table_indexes, idx_t &scans, idx_t depth) {
+	if (depth > 256) {
+		return false;
+	}
+	switch (node.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto &projection = node.Cast<LogicalProjection>();
+		auto it = facts.projections_by_index.find(projection.table_index);
+		if (it == facts.projections_by_index.end() || it->second != &projection ||
+		    !table_indexes.insert(projection.table_index).second || !AllRowLocalDeterministic(projection.expressions)) {
+			return false;
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_FILTER:
+		if (!AllRowLocalDeterministic(node.expressions)) {
+			return false;
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_UNION: {
+		auto &setop = node.Cast<LogicalSetOperation>();
+		if (!setop.setop_all || node.children.size() < 2 || !table_indexes.insert(setop.table_index).second) {
+			return false;
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = node.Cast<LogicalGet>();
+		auto it = facts.gets_by_index.find(get.table_index);
+		if (!node.children.empty() || !node.expressions.empty() || it == facts.gets_by_index.end() ||
+		    it->second != &get || !facts.occurrence_by_index.count(get.table_index) ||
+		    !table_indexes.insert(get.table_index).second) {
+			return false;
+		}
+		scans++;
+		return true;
+	}
+	default:
+		return false;
+	}
+	if (node.type != LogicalOperatorType::LOGICAL_UNION && node.children.size() != 1) {
+		return false;
+	}
+	for (auto &child : node.children) {
+		if (!IsLinearWindowInput(*child, facts, table_indexes, scans, depth + 1)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool BuildLinearWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                          const vector<string> &output_names,
+                                          vector<RefreshMetadata::WindowPartitionLineageOp> &out) {
+	auto decline = [](const char *reason) {
+		OPENIVM_DEBUG_PRINT("[LINEAR WINDOW] lineage declined: %s\n", reason);
+		return false;
+	};
+	out.clear();
+	if (!facts.root || !facts.first_projection || partition_columns.size() != 1 || facts.windows.size() != 1 ||
+	    facts.source_occurrences.empty() || !facts.comparison_joins.empty() || !facts.outer_joins.empty() ||
+	    !facts.aggregates.empty()) {
+		return decline("unsupported plan shape");
+	}
+	auto &window = *facts.windows[0];
+	auto *row_number_expr = GetSingleRowNumber(window);
+	if (!row_number_expr) {
+		return decline("window is not a single ROW_NUMBER");
+	}
+	auto &row_number = *row_number_expr;
+	if (!HasSinglePartitionRowNumber(row_number) || row_number.StartExpr() || row_number.EndExpr() ||
+	    row_number.Partitions()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return decline("unsupported ROW_NUMBER specification");
+	}
+	for (auto &order : row_number.OrderBy()) {
+		if (!order.expression || !IsRowLocalDeterministicExpression(*order.expression)) {
+			return decline("ORDER BY is not row-local and deterministic");
+		}
+	}
+	auto &partition_ref = row_number.Partitions()[0]->Cast<BoundColumnRefExpression>();
+	auto partition_binding = partition_ref.Binding();
+	if (partition_ref.Depth() != 0 || !ChaseIdentityBinding(partition_binding, facts, LINEAR_BINDING_DEPTH)) {
+		return decline("cannot resolve partition binding");
+	}
+
+	auto &spec = partition_columns[0];
+	auto pos = spec.find('=');
+	string output_col = pos == string::npos ? spec : spec.substr(0, pos);
+	if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
+		return decline("partition key is not visible");
+	}
+	// The visible key must be the partition value itself, proven by column binding rather than by name.
+	idx_t output_index = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < output_names.size(); i++) {
+		if (StringUtil::CIEquals(output_names[i], output_col)) {
+			if (output_index != DConstants::INVALID_INDEX) {
+				return decline("partition output name is ambiguous");
+			}
+			output_index = i;
+		}
+	}
+	auto &top_expressions = facts.first_projection->expressions;
+	if (output_index == DConstants::INVALID_INDEX || output_index >= top_expressions.size() ||
+	    top_expressions[output_index]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return decline("partition output is not a column reference");
+	}
+	auto &output_ref = top_expressions[output_index]->Cast<BoundColumnRefExpression>();
+	auto output_binding = output_ref.Binding();
+	if (output_ref.Depth() != 0 || !ChaseIdentityBinding(output_binding, facts, LINEAR_BINDING_DEPTH) ||
+	    output_binding != partition_binding) {
+		return decline("partition output does not preserve the partition binding");
+	}
+
+	unordered_set<TableIndex> table_indexes;
+	LogicalOperator *node = facts.root;
+	if (node->type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
+		if (node->children.size() != 1) {
+			return decline("CREATE has no unique input");
+		}
+		node = node->children[0].get();
+	}
+	if (node != facts.first_projection) {
+		return decline("root does not expose the top projection");
+	}
+	ColumnBinding row_number_binding(window.window_index, ProjectionIndex(0));
+	while (node != &window) {
+		if (node->children.size() != 1) {
+			return decline("non-unary operator above the window");
+		}
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = node->Cast<LogicalProjection>();
+			auto it = facts.projections_by_index.find(projection.table_index);
+			if (it == facts.projections_by_index.end() || it->second != &projection ||
+			    !table_indexes.insert(projection.table_index).second ||
+			    !AllRowLocalDeterministic(projection.expressions)) {
+				return decline("invalid or non-deterministic projection above the window");
+			}
+		} else if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
+			for (auto &expression : node->expressions) {
+				if (!expression || !KeepsFirstRowNumber(*expression, row_number_binding, facts)) {
+					return decline("filter can exclude row 1 of a partition");
+				}
+			}
+		} else {
+			return decline("unsupported operator above the window");
+		}
+		node = node->children[0].get();
+	}
+	idx_t scans = 0;
+	if (!table_indexes.insert(window.window_index).second || window.children.size() != 1 ||
+	    !IsLinearWindowInput(*window.children[0], facts, table_indexes, scans, 0) ||
+	    scans != facts.source_occurrences.size()) {
+		return decline("window input is not linear over all source occurrences");
+	}
+
+	case_insensitive_set_t emitted;
+	for (auto &occurrence : facts.source_occurrences) {
+		if (!emitted.insert(occurrence.table).second) {
+			continue;
+		}
+		RefreshMetadata::WindowPartitionLineageOp op;
+		op.kind = WindowLineageKind::LINEAR;
+		op.output_col = output_col;
+		op.source = occurrence.table;
+		out.push_back(std::move(op));
 	}
 	return !out.empty();
 }
@@ -2906,8 +3863,12 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 				continue;
 			}
 			string base_col = ResolveBindingToBaseColumn(bcr, facts);
-			if (!StringUtil::CIEquals(base_col, partition_column) &&
-			    !StringUtil::CIEquals(bcr->GetName().GetIdentifierName(), partition_column)) {
+			// The reference's own name is the output alias, so it only identifies the key when the base column
+			// cannot be resolved; otherwise `other AS key` would be mistaken for the partition key.
+			bool same_key = base_col.empty()
+			                    ? StringUtil::CIEquals(bcr->GetName().GetIdentifierName(), partition_column)
+			                    : StringUtil::CIEquals(base_col, partition_column);
+			if (!same_key) {
 				continue;
 			}
 			string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);

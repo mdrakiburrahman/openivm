@@ -1,4 +1,5 @@
 #include "core/incremental_checker.hpp"
+#include "core/spark_expression_marker.hpp"
 #include "core/vector_utils.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
@@ -237,16 +238,18 @@ static bool AnyExpression(vector<unique_ptr<Expression>> &expressions,
 	return false;
 }
 
-static bool IsVolatileExpression(const Expression &expr) {
+bool IsVolatileExpression(const Expression &expr) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
-	auto &name = expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
+	auto &bound = expr.Cast<BoundFunctionExpression>();
+	auto &function = bound.Function();
+	auto &name = function.GetName().GetIdentifierName();
 	if (StringUtil::StartsWith(name, "__internal_compress") || StringUtil::StartsWith(name, "__internal_decompress") ||
 	    name == "error") {
 		return false;
 	}
-	return expr.Cast<BoundFunctionExpression>().Function().GetStability() != FunctionStability::CONSISTENT;
+	return function.GetStability() != FunctionStability::CONSISTENT && !IsSparkExpressionMarker(bound);
 }
 
 static bool IsNonFoldableUnnestExpression(const Expression &expr) {

@@ -6,6 +6,9 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
@@ -137,12 +140,24 @@ static string BuildStandardChangedValuesSQL(RefreshMetadata &metadata, const str
                                             const string &output_col, const string &delta_ts_filter,
                                             const string &view_catalog_name, const string &view_schema_name,
                                             const string &attached_db_catalog_name,
-                                            const string &attached_db_schema_name) {
+                                            const string &attached_db_schema_name, const string &data_table,
+                                            const string &order_col, const string &order_out) {
 	string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, table_name,
 	                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
 	                                                    attached_db_catalog_name, attached_db_schema_name);
 	if (delta_table.empty()) {
 		return "";
+	}
+	if (!data_table.empty() && !order_col.empty() && !order_out.empty() && source_cast.empty()) {
+		// A key whose pending rows all sort strictly after its materialized rank-1 row keeps that row.
+		string changed_key = BuildLineageColumnExpr(source_col, "", "openivm_chg");
+		string changed_order = BuildLineageColumnExpr(order_col, "", "openivm_chg");
+		string current_key = BuildLineageColumnExpr(output_col, "", "openivm_cur");
+		string current_order = BuildLineageColumnExpr(order_out, "", "openivm_cur");
+		return "SELECT DISTINCT " + changed_key + " AS " + SqlUtils::QuoteIdentifier(output_col) + " FROM " +
+		       delta_table + " AS openivm_chg WHERE " + (delta_ts_filter.empty() ? "" : delta_ts_filter + " AND ") +
+		       "NOT EXISTS (SELECT 1 FROM " + data_table + " AS openivm_cur WHERE " + current_key +
+		       " IS NOT DISTINCT FROM " + changed_key + " AND " + changed_order + " < " + current_order + ")";
 	}
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	return "SELECT DISTINCT " + BuildLineageColumnExpr(source_col, source_cast) + " AS " +
@@ -176,11 +191,110 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast);
 	string qoutput_col = SqlUtils::QuoteIdentifier(op.output_col);
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	if (op.null_safe) {
+		string null_safe_lookup_expr = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast, "openivm_lookup");
+		string null_safe_lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast, "openivm_lookup");
+		return "SELECT DISTINCT " + null_safe_lookup_out + " AS " + qoutput_col + " FROM " + lookup_table +
+		       " AS openivm_lookup JOIN (SELECT DISTINCT " + source_expr + " AS openivm_join_key FROM " + delta_table +
+		       filter + ") openivm_changed ON " + null_safe_lookup_expr +
+		       " IS NOT DISTINCT FROM openivm_changed.openivm_join_key";
+	}
 	return "SELECT DISTINCT " + lookup_out + " AS " + qoutput_col + " FROM " + lookup_table + " WHERE " + lookup_expr +
 	       " IN (SELECT DISTINCT " + source_expr + " FROM " + delta_table + filter + ")";
 }
 
 enum class LineageAffectedKeysResult : uint8_t { UNAVAILABLE, AVAILABLE, UNSAFE };
+
+// The plan below the window is linear (projections, filters, UNION ALL over scans), so evaluating
+// the view query with every source occurrence replaced by that source's delta rows (both images)
+// yields every partition key whose input rows changed. Any base reference left behind would
+// evaluate an arm over current rows only and miss deleted keys, so it falls back instead.
+static LineageAffectedKeysResult
+BuildLinearAffectedKeysSQL(RefreshMetadata &metadata, ClientContext &context, const string &view_name,
+                           const string &view_query_sql, const vector<string> &delta_table_names,
+                           const vector<RefreshMetadata::WindowPartitionLineageOp> &key_ops, const string &key_col,
+                           const string &delta_ts_filter, const string &view_catalog_name,
+                           const string &view_schema_name, const string &attached_db_catalog_name,
+                           const string &attached_db_schema_name, string &affected_keys_sql) {
+	auto decline = [&view_name](LineageAffectedKeysResult result, const char *reason) {
+		OPENIVM_DEBUG_PRINT("[LINEAR WINDOW] affected keys declined for '%s': %s\n", view_name.c_str(), reason);
+		return result;
+	};
+	string scoped = view_query_sql;
+	case_insensitive_map_t<string> replaced_tables;
+	unordered_set<string> seen_sources;
+	unordered_set<string> covered_sources;
+	for (auto &op : key_ops) {
+		if (op.kind != WindowLineageKind::LINEAR) {
+			return decline(LineageAffectedKeysResult::UNSAFE, "mixed lineage kinds");
+		}
+		if (!seen_sources.insert(StringUtil::Lower(op.source)).second) {
+			continue;
+		}
+		string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, op.source,
+		                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
+		                                                    attached_db_catalog_name, attached_db_schema_name);
+		string base_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, op.source,
+		                                                   /*delta_table=*/false, view_catalog_name, view_schema_name,
+		                                                   attached_db_catalog_name, attached_db_schema_name);
+		if (delta_table.empty() || base_table.empty()) {
+			return decline(LineageAffectedKeysResult::UNSAFE, "could not resolve tracked base or delta table");
+		}
+		string base_ref = SqlUtils::FindTableReference(scoped, base_table);
+		if (base_ref.empty()) {
+			return decline(LineageAffectedKeysResult::UNSAFE, "could not locate base table reference");
+		}
+		auto delta_rows = BuildStandardDeltaRowsSQL(delta_table, "", delta_ts_filter);
+		scoped = SqlUtils::ReplaceTableReferences(scoped, base_ref, delta_rows);
+		auto base_name = QualifiedName::Parse(base_table).Name().GetIdentifierName();
+		auto delta_name = QualifiedName::Parse(delta_table).Name().GetIdentifierName();
+		if (!replaced_tables.emplace(std::move(base_name), std::move(delta_name)).second) {
+			return decline(LineageAffectedKeysResult::UNSAFE, "ambiguous source table names");
+		}
+		covered_sources.insert(ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names));
+	}
+	auto count_sources = [&](const string &sql, case_insensitive_map_t<idx_t> &counts) {
+		Parser parser(context);
+		try {
+			parser.ParseQuery(sql);
+		} catch (const ParserException &ex) {
+			OPENIVM_DEBUG_PRINT("[LINEAR WINDOW] could not parse scope: %s\n", ex.what());
+			return false;
+		}
+		if (parser.statements.size() != 1 || parser.statements.front()->type != StatementType::SELECT_STATEMENT) {
+			return false;
+		}
+		SqlUtils::VisitSourceReferences(*parser.statements.front(),
+		                                [&](BaseTableRef &ref) { counts[ref.Table().GetIdentifierName()]++; });
+		return true;
+	};
+	case_insensitive_map_t<idx_t> original_sources;
+	case_insensitive_map_t<idx_t> scoped_sources;
+	if (!count_sources(view_query_sql, original_sources) || !count_sources(scoped, scoped_sources)) {
+		return decline(LineageAffectedKeysResult::UNSAFE, "expected one parseable SELECT per scope");
+	}
+	for (auto &entry : replaced_tables) {
+		if (scoped_sources.count(entry.first)) {
+			return decline(LineageAffectedKeysResult::UNSAFE,
+			               "a base table reference remains after delta substitution");
+		}
+		if (original_sources[entry.first] == 0 || original_sources[entry.first] != scoped_sources[entry.second]) {
+			return decline(LineageAffectedKeysResult::UNSAFE,
+			               "delta substitution did not cover exactly the base references");
+		}
+	}
+	for (auto &dt : delta_table_names) {
+		if (!covered_sources.count(dt)) {
+			return decline(LineageAffectedKeysResult::UNAVAILABLE, "a tracked source has no lineage coverage");
+		}
+	}
+	if (covered_sources.empty()) {
+		return decline(LineageAffectedKeysResult::UNAVAILABLE, "no covered sources");
+	}
+	affected_keys_sql =
+	    "SELECT DISTINCT " + SqlUtils::QuoteIdentifier(key_col) + " FROM (" + scoped + ") openivm_changed_partitions";
+	return LineageAffectedKeysResult::AVAILABLE;
+}
 
 // Changed keys of the single partition column from the lineage ops that produce it. build_arm returns
 // AVAILABLE with one arm and its covered source, UNAVAILABLE to skip the op, or UNSAFE to give up.
@@ -225,17 +339,37 @@ static LineageAffectedKeysResult BuildLineageAffectedKeysSQL(
 	return LineageAffectedKeysResult::AVAILABLE;
 }
 
-static LineageAffectedKeysResult
-BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                    const vector<string> &delta_table_names, const vector<string> &partition_cols,
-                                    const string &delta_ts_filter, const string &view_catalog_name,
-                                    const string &view_schema_name, const string &attached_db_catalog_name,
-                                    const string &attached_db_schema_name, string &affected_keys_sql) {
+static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
+    RefreshMetadata &metadata, Connection &con, const string &view_name, const string &view_query_sql,
+    const vector<string> &delta_table_names, const vector<string> &partition_cols, const string &delta_ts_filter,
+    const string &view_catalog_name, const string &view_schema_name, const string &attached_db_catalog_name,
+    const string &attached_db_schema_name, const string &data_table, string &affected_keys_sql) {
+	vector<RefreshMetadata::WindowPartitionLineageOp> lineage_ops;
+	if (partition_cols.size() != 1 || !metadata.GetWindowPartitionLineage(view_name, lineage_ops)) {
+		return LineageAffectedKeysResult::UNAVAILABLE;
+	}
+	auto output_col = SplitPartitionSpec(partition_cols[0]).first;
+	vector<RefreshMetadata::WindowPartitionLineageOp> key_ops;
+	bool has_linear = false;
+	for (auto &op : lineage_ops) {
+		if (StringUtil::CIEquals(op.output_col, output_col)) {
+			has_linear |= op.kind == WindowLineageKind::LINEAR;
+			key_ops.push_back(op);
+		}
+	}
+	if (has_linear) {
+		return BuildLinearAffectedKeysSQL(metadata, *con.context, view_name, view_query_sql, delta_table_names, key_ops,
+		                                  output_col, delta_ts_filter, view_catalog_name, view_schema_name,
+		                                  attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
+	}
+	const auto trim_data_table =
+	    SqlUtils::GetBoolSetting(*con.context, "openivm_late_append_window_trim", false) ? data_table : "";
 	auto build_arm = [&](const RefreshMetadata::WindowPartitionLineageOp &op, string &arm, string &source) {
 		if (op.kind == WindowLineageKind::DIRECT) {
 			arm = BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
 			                                    op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
-			                                    view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			                                    view_schema_name, attached_db_catalog_name, attached_db_schema_name,
+			                                    trim_data_table, op.order_col, op.order_out);
 		} else if (op.kind == WindowLineageKind::LOOKUP) {
 			arm = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op, delta_ts_filter,
 			                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
@@ -275,12 +409,13 @@ static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeSourceSpec &source
 	string lookup_col = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast, "l");
 	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast, "l");
 	string output_col = SqlUtils::QuoteIdentifier(op.output_col);
+	string join_operator = op.null_safe ? " IS NOT DISTINCT FROM " : " = ";
 	string current_lookup = "SELECT " + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " +
 	                        lookup_table + " AS l AT (VERSION => " + to_string(lookup_spec.current_snap) + ") ON " +
-	                        lookup_col + " = c.openivm_join_key";
+	                        lookup_col + join_operator + "c.openivm_join_key";
 	string old_lookup = "SELECT " + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " + lookup_table +
 	                    " AS l AT (VERSION => " + to_string(lookup_spec.old_snap) + ") ON " + lookup_col +
-	                    " = c.openivm_join_key";
+	                    join_operator + "c.openivm_join_key";
 	return "(" + current_lookup + " UNION ALL " + old_lookup + ")";
 }
 
@@ -547,8 +682,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols);
 	string affected_keys_sql;
 	auto lineage_result = BuildLineageStandardAffectedKeysSQL(
-	    metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
-	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
+	    metadata, con, view_name, view_query_sql, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
+	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, data_table, affected_keys_sql);
 	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",
 		                    view_name.c_str());

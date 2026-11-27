@@ -6,6 +6,8 @@
 
 namespace duckdb {
 
+bool IsVolatileExpression(const Expression &expr);
+
 class Binder;
 class QueryNode;
 

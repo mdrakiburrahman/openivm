@@ -165,6 +165,8 @@ MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fas
 | `openivm_left_join_merge` | BOOLEAN | `true` | Use incremental MERGE for LEFT JOIN aggregates instead of group-recompute |
 | `openivm_full_outer_merge` | BOOLEAN | `true` | Use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) instead of group-recompute |
 | `openivm_distinct_aux_state` | BOOLEAN | `false` | Use aux-state DISTINCT maintenance for supported single-source inner DISTINCT under aggregate |
+| `openivm_late_append_window_trim` | BOOLEAN | `false` | Skip recomputing a latest-row-per-key (`ROW_NUMBER ... rn = 1`) key when every changed row is older than its stored row. Read at refresh compile time. See `docs/operators/window-functions.md` |
+| `openivm_spark_expression_markers` | BOOLEAN | `false` | Allow compile-only `__openivm_spark_expression(name, type, args...)` markers for Spark expressions DuckDB cannot evaluate. See `docs/spark.md` |
 | `openivm_enable_data_dependent_optimizers` | BOOLEAN | `true` | Optimize the finished native incremental plan using current delta statistics. The reusable base-view template remains data-independent; cross-system compilation always disables this optimization |
 | `openivm_enable_view_matching` | BOOLEAN | `false` | Enable query-time view matching master flag; implementation is still scaffolded |
 | `openivm_predicate_oracle` | VARCHAR | `"interval"` | Predicate oracle mode for matching: `"syntactic"`, `"interval"`, or `"sat"` stub |

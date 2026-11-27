@@ -201,8 +201,10 @@ public:
 	void Objects(const char *key, const vector<string> &objects) {
 		Raw(key, "[" + StringUtil::Join(objects, ",") + "]");
 	}
-	void Bool(const char *key, const bool &val, Presence = Presence::REQUIRED) {
-		Str(key, val ? "true" : "false");
+	void Bool(const char *key, const bool &val, Presence presence = Presence::REQUIRED) {
+		if (presence != Presence::OMIT_EMPTY || val) {
+			Str(key, val ? "true" : "false");
+		}
 	}
 	void Index(const char *key, const idx_t &val, Presence = Presence::REQUIRED) {
 		Str(key, to_string(val));
