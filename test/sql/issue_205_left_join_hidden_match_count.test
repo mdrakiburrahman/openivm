@@ -1,0 +1,196 @@
+# name: test/sql/issue_205_left_join_hidden_match_count.test
+# description: LEFT JOIN aggregate hidden by UNION ALL or inner DISTINCT (#205, #210, #227)
+# group: [sql]
+
+# The hidden match count is added only when the null-extended binding is visible at the aggregate input; otherwise
+# the view recomputes affected groups. A direct LEFT JOIN aggregate keeps its match count and the MERGE path.
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE lt(a INTEGER);
+
+statement ok
+CREATE TABLE lu(a INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO lt VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO lu VALUES (1, 10), (5, 50);
+
+statement ok
+CREATE TABLE la(k1 INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE lb(id INTEGER);
+
+statement ok
+INSERT INTO la VALUES (1, 1), (1, 2), (2, 2), (3, 3);
+
+statement ok
+INSERT INTO lb VALUES (1), (1), (2);
+
+# #205: LEFT JOIN in the first UNION ALL branch failed to bind at CREATE.
+statement ok
+CREATE MATERIALIZED VIEW lj_union_first AS SELECT a, COUNT(x) AS nx
+FROM (SELECT lt.a, lu.x FROM lt LEFT JOIN lu ON lt.a = lu.a UNION ALL SELECT a, x FROM lu) q GROUP BY a;
+
+# #227: in the swapped order the hidden match count counted the preserved-side key.
+statement ok
+CREATE MATERIALIZED VIEW lj_union_second AS SELECT a, COUNT(x) AS nx
+FROM (SELECT a, x FROM lu UNION ALL SELECT lt.a, lu.x FROM lt LEFT JOIN lu ON lt.a = lu.a) q GROUP BY a;
+
+statement ok
+CREATE MATERIALIZED VIEW lj_union_scalar AS SELECT COUNT(x) AS nx
+FROM (SELECT a, x FROM lu UNION ALL SELECT lt.a, lu.x FROM lt LEFT JOIN lu ON lt.a = lu.a) q;
+
+# #210: LEFT JOIN under an inner DISTINCT failed to bind at CREATE.
+statement ok
+CREATE MATERIALIZED VIEW lj_distinct AS SELECT k1, COUNT(*) AS n
+FROM (SELECT DISTINCT la.k1, la.v FROM la LEFT JOIN lb ON la.k1 = lb.id) d GROUP BY k1;
+
+statement ok
+CREATE MATERIALIZED VIEW lj_direct AS SELECT lt.a, COUNT(lu.x) AS nx, SUM(lu.x) AS sx
+FROM lt LEFT JOIN lu ON lt.a = lu.a GROUP BY lt.a;
+
+statement ok
+CREATE VIEW lj_union_first_expected AS SELECT a, COUNT(x) AS nx
+FROM (SELECT lt.a, lu.x FROM lt LEFT JOIN lu ON lt.a = lu.a UNION ALL SELECT a, x FROM lu) q GROUP BY a;
+
+statement ok
+CREATE VIEW lj_union_second_expected AS SELECT a, COUNT(x) AS nx
+FROM (SELECT a, x FROM lu UNION ALL SELECT lt.a, lu.x FROM lt LEFT JOIN lu ON lt.a = lu.a) q GROUP BY a;
+
+statement ok
+CREATE VIEW lj_union_scalar_expected AS SELECT COUNT(x) AS nx
+FROM (SELECT a, x FROM lu UNION ALL SELECT lt.a, lu.x FROM lt LEFT JOIN lu ON lt.a = lu.a) q;
+
+statement ok
+CREATE VIEW lj_distinct_expected AS SELECT k1, COUNT(*) AS n
+FROM (SELECT DISTINCT la.k1, la.v FROM la LEFT JOIN lb ON la.k1 = lb.id) d GROUP BY k1;
+
+statement ok
+CREATE VIEW lj_direct_expected AS SELECT lt.a, COUNT(lu.x) AS nx, SUM(lu.x) AS sx
+FROM lt LEFT JOIN lu ON lt.a = lu.a GROUP BY lt.a;
+
+query II
+SELECT view_sql_name, type FROM openivm_views ORDER BY 1;
+----
+lj_direct	0
+lj_distinct	6
+lj_union_first	6
+lj_union_scalar	6
+lj_union_second	6
+
+# Only the direct LEFT JOIN aggregate stores a match count; the UNION views must not count another branch's column.
+query II
+SELECT v.view_sql_name, count(c.column_name) FROM openivm_views v
+LEFT JOIN duckdb_columns() c ON c.table_name = 'openivm_data_' || v.view_name AND c.column_name = 'openivm_match_count'
+GROUP BY ALL ORDER BY 1;
+----
+lj_direct	1
+lj_distinct	0
+lj_union_first	0
+lj_union_scalar	0
+lj_union_second	0
+
+# The direct view's match count is the number of matching null-side rows per group.
+query I
+SELECT count(*) FROM ((SELECT a, openivm_match_count FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6c6a5f646972656374_
+        EXCEPT ALL SELECT lt.a, COUNT(lu.a) FROM lt LEFT JOIN lu ON lt.a = lu.a GROUP BY lt.a)
+    UNION ALL (SELECT lt.a, COUNT(lu.a) FROM lt LEFT JOIN lu ON lt.a = lu.a GROUP BY lt.a
+        EXCEPT ALL SELECT a, openivm_match_count FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6c6a5f646972656374_));
+----
+0
+
+loop round 0 2
+
+# Conflicting batch on both sides of both joins before one refresh.
+statement ok
+INSERT INTO lu VALUES (2, 20 + ${round}), (3, NULL);
+
+statement ok
+DELETE FROM lu WHERE a = 1;
+
+statement ok
+INSERT INTO lt VALUES (5), (1);
+
+statement ok
+UPDATE lu SET x = x + 1;
+
+statement ok
+DELETE FROM lt WHERE a = 3 AND ${round} = 1;
+
+statement ok
+INSERT INTO lu VALUES (1, ${round});
+
+statement ok
+INSERT INTO lb VALUES (3);
+
+statement ok
+DELETE FROM lb WHERE id = 2;
+
+statement ok
+INSERT INTO la VALUES (2, 9 + ${round});
+
+statement ok
+UPDATE la SET v = v + 10 WHERE k1 = 1;
+
+statement ok
+PRAGMA refresh('lj_union_first');
+
+statement ok
+PRAGMA refresh('lj_union_second');
+
+statement ok
+PRAGMA refresh('lj_union_scalar');
+
+statement ok
+PRAGMA refresh('lj_distinct');
+
+statement ok
+PRAGMA refresh('lj_direct');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lj_union_first EXCEPT ALL SELECT * FROM lj_union_first_expected)
+    UNION ALL (SELECT * FROM lj_union_first_expected EXCEPT ALL SELECT * FROM lj_union_first));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lj_union_second EXCEPT ALL SELECT * FROM lj_union_second_expected)
+    UNION ALL (SELECT * FROM lj_union_second_expected EXCEPT ALL SELECT * FROM lj_union_second));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lj_union_scalar EXCEPT ALL SELECT * FROM lj_union_scalar_expected)
+    UNION ALL (SELECT * FROM lj_union_scalar_expected EXCEPT ALL SELECT * FROM lj_union_scalar));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lj_distinct EXCEPT ALL SELECT * FROM lj_distinct_expected)
+    UNION ALL (SELECT * FROM lj_distinct_expected EXCEPT ALL SELECT * FROM lj_distinct));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lj_direct EXCEPT ALL SELECT * FROM lj_direct_expected)
+    UNION ALL (SELECT * FROM lj_direct_expected EXCEPT ALL SELECT * FROM lj_direct));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT a, openivm_match_count FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6c6a5f646972656374_
+        EXCEPT ALL SELECT lt.a, COUNT(lu.a) FROM lt LEFT JOIN lu ON lt.a = lu.a GROUP BY lt.a)
+    UNION ALL (SELECT lt.a, COUNT(lu.a) FROM lt LEFT JOIN lu ON lt.a = lu.a GROUP BY lt.a
+        EXCEPT ALL SELECT a, openivm_match_count FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6c6a5f646972656374_));
+----
+0
+
+endloop

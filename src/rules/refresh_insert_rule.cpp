@@ -701,7 +701,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		}
 		case LogicalOperatorType::LOGICAL_DELETE: {
 			auto &delete_op = dml->Cast<LogicalDelete>();
-			D_ASSERT(delete_op.expressions.size() == 1);
+			// DuckDB binds the row id first for native tables; unique-index and
+			// RETURNING columns follow it.
+			D_ASSERT(!delete_op.expressions.empty());
 			auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
 			CaptureScannedPreimages(WrapOperator(
 			    delete_op.children[0],

@@ -220,6 +220,9 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
                            const vector<string> &delta_metadata_tables = {}, const string &data_catalog = "");
 
+// True when no active delta touches a LEFT/FULL OUTER JOIN null-extended source.
+bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
+                                const vector<string> &active_delta_table_names);
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,
                                           const string &data_table, const string &view_query_sql,

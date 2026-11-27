@@ -24,6 +24,9 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/settings.hpp"
@@ -3216,8 +3219,38 @@ static bool IsReservedMaterializedViewOutputName(const string &name) {
 	       StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX);
 }
 
-void ValidateMaterializedViewOutputNames(const vector<string> &original_names, const vector<string> &output_names,
-                                         idx_t visible_count) {
+// Explicit output aliases the column hider would drop (#193). Source columns passed
+// through unaliased (e.g. SELECT *) stay hidden but stored, as before.
+static void ValidateExplicitOutputAliases(const QueryNode &query) {
+	auto check = [](const Identifier &alias) {
+		if (IncrementalTableNames::IsInternalColumn(alias.GetIdentifierName())) {
+			throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'",
+			                      alias.GetIdentifierName());
+		}
+	};
+	if (query.type == QueryNodeType::SET_OPERATION_NODE) {
+		// The first branch names the outputs; UNION BY NAME takes names from every branch.
+		auto &setop = query.Cast<SetOperationNode>();
+		for (idx_t i = 0; i < setop.children.size(); i++) {
+			if (i == 0 || setop.setop_type == SetOperationType::UNION_BY_NAME) {
+				ValidateExplicitOutputAliases(*setop.children[i]);
+			}
+		}
+	} else if (query.type == QueryNodeType::SELECT_NODE) {
+		for (auto &expression : query.Cast<SelectNode>().select_list) {
+			check(expression->GetAlias());
+			if (expression->GetExpressionClass() == ExpressionClass::STAR) {
+				for (auto &rename : expression->Cast<StarExpression>().RenameList()) {
+					check(rename.second);
+				}
+			}
+		}
+	}
+}
+
+void ValidateMaterializedViewOutputNames(const QueryNode &query, const vector<string> &original_names,
+                                         const vector<string> &output_names, idx_t visible_count) {
+	ValidateExplicitOutputAliases(query);
 	case_insensitive_set_t helper_names;
 	for (idx_t i = visible_count; i < output_names.size(); i++) {
 		helper_names.insert(output_names[i]);

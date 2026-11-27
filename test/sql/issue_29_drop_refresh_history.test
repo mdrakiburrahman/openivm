@@ -1,0 +1,161 @@
+# name: test/sql/issue_29_drop_refresh_history.test
+# description: DROP and CREATE OR REPLACE remove refresh history and profiles (#29)
+# group: [sql]
+
+# A same-name re-create, or a replaced view, must not inherit the old view's learned cost history or refresh profiles.
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+SET openivm_adaptive_refresh = true;
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+CREATE TABLE h_src(a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO h_src VALUES (1, 1), (2, 2), (3, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW h_mv AS SELECT a, SUM(b) AS s FROM h_src GROUP BY a;
+
+statement ok
+CREATE MATERIALIZED VIEW h_keep AS SELECT a, COUNT(*) AS n FROM h_src GROUP BY a;
+
+statement ok
+INSERT INTO h_src VALUES (1, 5), (4, 4);
+
+statement ok
+DELETE FROM h_src WHERE a = 2;
+
+statement ok
+UPDATE h_src SET b = b + 1 WHERE a = 3;
+
+statement ok
+PRAGMA refresh('h_mv');
+
+statement ok
+PRAGMA refresh('h_keep');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_mv EXCEPT ALL SELECT a, SUM(b) FROM h_src GROUP BY a)
+    UNION ALL (SELECT a, SUM(b) FROM h_src GROUP BY a EXCEPT ALL SELECT * FROM h_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_keep EXCEPT ALL SELECT a, COUNT(*) FROM h_src GROUP BY a)
+    UNION ALL (SELECT a, COUNT(*) FROM h_src GROUP BY a EXCEPT ALL SELECT * FROM h_keep));
+----
+0
+
+statement ok
+CREATE TABLE h_ids AS SELECT view_sql_name, view_name FROM openivm_views;
+
+query II
+SELECT (SELECT count(*) > 0 FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv'),
+       (SELECT count(*) > 0 FROM openivm_refresh_profile p JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv');
+----
+true	true
+
+statement ok
+DROP MATERIALIZED VIEW h_mv;
+
+query II
+SELECT (SELECT count(*) FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv'),
+       (SELECT count(*) FROM openivm_refresh_profile p JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv');
+----
+0	0
+
+# The other view keeps its own history and profiles.
+query II
+SELECT (SELECT count(*) > 0 FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_keep'),
+       (SELECT count(*) > 0 FROM openivm_refresh_profile p JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_keep');
+----
+true	true
+
+# A same-name re-create starts without the dropped view's history.
+statement ok
+SET openivm_profile_refresh = false;
+
+statement ok
+CREATE MATERIALIZED VIEW h_mv AS SELECT a, SUM(b) AS s FROM h_src GROUP BY a;
+
+query I
+SELECT count(*) FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv';
+----
+0
+
+statement ok
+INSERT INTO h_src VALUES (5, 5), (1, -1);
+
+statement ok
+DELETE FROM h_src WHERE a = 4;
+
+statement ok
+UPDATE h_src SET b = b * 2 WHERE a = 1;
+
+statement ok
+PRAGMA refresh('h_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_mv EXCEPT ALL SELECT a, SUM(b) FROM h_src GROUP BY a)
+    UNION ALL (SELECT a, SUM(b) FROM h_src GROUP BY a EXCEPT ALL SELECT * FROM h_mv));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv';
+----
+1
+
+# CREATE OR REPLACE also starts the replaced view without the old history and refresh profiles.
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+INSERT INTO h_src VALUES (7, 7);
+
+statement ok
+PRAGMA refresh('h_mv');
+
+statement ok
+CREATE TABLE h_profile_before AS SELECT p.refresh_id FROM openivm_refresh_profile p JOIN h_ids i USING (view_name)
+WHERE i.view_sql_name = 'h_mv';
+
+query I
+SELECT count(*) > 0 FROM h_profile_before;
+----
+true
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW h_mv AS SELECT a, SUM(b) AS s, COUNT(*) AS n FROM h_src GROUP BY a;
+
+query II
+SELECT (SELECT count(*) FROM openivm_refresh_history r JOIN h_ids i USING (view_name) WHERE i.view_sql_name = 'h_mv'),
+       (SELECT count(*) FROM openivm_refresh_profile WHERE refresh_id IN (SELECT refresh_id FROM h_profile_before));
+----
+0	0
+
+statement ok
+UPDATE h_src SET b = b + 1 WHERE a = 7;
+
+statement ok
+DELETE FROM h_src WHERE a = 5;
+
+statement ok
+INSERT INTO h_src VALUES (8, 1), (7, 2);
+
+statement ok
+PRAGMA refresh('h_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM h_mv EXCEPT ALL SELECT a, SUM(b), COUNT(*) FROM h_src GROUP BY a)
+    UNION ALL (SELECT a, SUM(b), COUNT(*) FROM h_src GROUP BY a EXCEPT ALL SELECT * FROM h_mv));
+----
+0

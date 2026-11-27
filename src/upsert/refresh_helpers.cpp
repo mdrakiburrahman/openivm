@@ -1546,8 +1546,8 @@ static string NormalizeTableToken(string token) {
 	return StringUtil::Lower(BaseTableNameFromDeltaKey(StripOpenIVMDataPrefix(token)));
 }
 
-static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
-                                       const vector<string> &active_delta_table_names) {
+bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
+                                const vector<string> &active_delta_table_names) {
 	if (active_delta_table_names.empty()) {
 		return false;
 	}

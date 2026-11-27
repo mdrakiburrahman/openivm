@@ -501,7 +501,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		InjectSumNonNullCounts(context, select_plan);
 		InjectGroupSignCounts(context, *select_planner.binder, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
-		ValidateMaterializedViewOutputNames(select_output_names, output_names, visible_output_count);
+		ValidateMaterializedViewOutputNames(*select_statement.node, select_output_names, output_names,
+		                                    visible_output_count);
 
 		select_plan->ResolveOperatorTypes();
 		output_types = select_plan->types;
@@ -736,14 +737,18 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 
 	auto &semi_anti = semi_anti_extract.meta;
-	auto semi_anti_extracted = analysis.found_semi_anti_join && !analysis.found_aggregation &&
-	                           ExtractSemiAntiQuery(local_view_query, semi_anti_extract);
-	if (semi_anti_extracted) {
-		auto col_result = con.Query("DESCRIBE SELECT * FROM " + semi_anti.left_table);
-		vector<string> base_cols;
-		for (idx_t i = 0; !col_result->HasError() && i < col_result->RowCount(); i++) {
-			base_cols.push_back(col_result->Collection().GetValue(0, i).ToString());
+	auto describe_columns = [&](const string &relation) {
+		vector<string> names;
+		auto described = con.Query("DESCRIBE SELECT * FROM " + relation);
+		for (idx_t i = 0; !described->HasError() && i < described->RowCount(); i++) {
+			names.push_back(described->Collection().GetValue(0, i).ToString());
 		}
+		return names;
+	};
+	auto semi_anti_extracted = analysis.found_semi_anti_join && !analysis.found_aggregation &&
+	                           ExtractSemiAntiQuery(local_view_query, semi_anti_extract, describe_columns);
+	if (semi_anti_extracted) {
+		auto base_cols = describe_columns(semi_anti.left_table);
 		if (semi_anti.output_cols.empty()) {
 			for (auto &name : base_cols) {
 				semi_anti.output_cols.push_back(name);
@@ -1219,6 +1224,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name));
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::HISTORY_TABLE, view_name));
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::PROFILE_TABLE, view_name));
 	}
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
@@ -1840,6 +1846,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (staged_cross_catalog_replace) {
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name));
 		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::HISTORY_TABLE, view_name));
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::PROFILE_TABLE, view_name));
 	}
 	ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
 	ddl.insert(ddl.end(), native_watermark_ddl.begin(), native_watermark_ddl.end());
@@ -2148,7 +2155,10 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	for (auto &aux_table : metadata.GetAuxiliaryTables(view_name)) {
 		program += "DROP TABLE IF EXISTS " + internal_prefix + SqlUtils::QuoteIdentifier(aux_table) + ";\n";
 	}
-	program += SqlUtils::DeleteViewRowsSQL(openivm::REFRESH_HOOKS_TABLE, view_name) + ";\n";
+	// A same-name re-create must not inherit this view's learned cost history or profiles.
+	for (auto table : {openivm::REFRESH_HOOKS_TABLE, openivm::HISTORY_TABLE, openivm::PROFILE_TABLE}) {
+		program += SqlUtils::DeleteViewRowsSQL(table, view_name) + ";\n";
+	}
 	program += "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view = '" +
 	           SqlUtils::EscapeValue(view_name) + "' OR child_view = '" + SqlUtils::EscapeValue(view_name) + "';\n";
 	program += SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name) + ";\n";
@@ -2160,8 +2170,8 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 static string QualifyDropMetadata(const string &program, const MetadataLocation &location) {
 	return SqlUtils::RewriteTableReferences(program, [&](const vector<string> &parts) {
 		if (!parts.empty()) {
-			for (auto table : {openivm::REFRESH_HOOKS_TABLE, openivm::MV_DEPS_TABLE, openivm::DELTA_TABLES_TABLE,
-			                   openivm::VIEWS_TABLE}) {
+			for (auto table : {openivm::REFRESH_HOOKS_TABLE, openivm::HISTORY_TABLE, openivm::PROFILE_TABLE,
+			                   openivm::MV_DEPS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::VIEWS_TABLE}) {
 				if (StringUtil::CIEquals(parts.back(), table)) {
 					return location.Table(table);
 				}
