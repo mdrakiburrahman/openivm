@@ -8,7 +8,7 @@ statement ok
 SET openivm_files_path='__TEST_DIR__';
 
 statement ok
-CREATE TABLE uks_east (ent VARCHAR, src VARCHAR, ts INT, val INT, active INT);
+CREATE TABLE uks_east (uks_east VARCHAR, src VARCHAR, ts INT, val INT, active INT);
 
 statement ok
 CREATE TABLE uks_west (w_ent VARCHAR, w_src VARCHAR, w_ts INT, w_val INT, w_active INT);
@@ -31,7 +31,8 @@ INSERT INTO uks_west VALUES
 statement ok
 CREATE MATERIALIZED VIEW uks_mv AS
 WITH pooled AS (
-    SELECT ent AS entity, uks_east.src AS origin, ts, val FROM uks_east WHERE active >= 0 AND ent <> 'uks_east'
+    SELECT uks_east.uks_east AS entity, uks_east.src AS origin, ts, val
+    FROM uks_east WHERE active >= 0 AND uks_east.uks_east <> 'uks_east'
     UNION ALL
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west WHERE w_active < 100
 ), keyed AS (
@@ -44,7 +45,8 @@ SELECT obs_key, entity, origin, ts, val FROM ranked WHERE rn = 1;
 statement ok
 CREATE VIEW uks_expected AS
 WITH pooled AS (
-    SELECT ent AS entity, uks_east.src AS origin, ts, val FROM uks_east WHERE active >= 0 AND ent <> 'uks_east'
+    SELECT uks_east.uks_east AS entity, uks_east.src AS origin, ts, val
+    FROM uks_east WHERE active >= 0 AND uks_east.uks_east <> 'uks_east'
     UNION ALL
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west WHERE w_active < 100
 ), keyed AS (
@@ -112,7 +114,7 @@ SELECT d FROM uks_diff;
 # Removing the last row of a key deletes its output row.
 
 statement ok
-DELETE FROM uks_east WHERE ent = 'b';
+DELETE FROM uks_east WHERE uks_east = 'b';
 
 statement ok
 PRAGMA refresh('uks_mv');
@@ -125,7 +127,7 @@ SELECT d FROM uks_diff;
 # Rekeying a row affects both its old and new key.
 
 statement ok
-UPDATE uks_east SET src = 'q' WHERE ent = 'a' AND ts = 2;
+UPDATE uks_east SET src = 'q' WHERE uks_east = 'a' AND ts = 2;
 
 statement ok
 PRAGMA refresh('uks_mv');
@@ -138,10 +140,10 @@ SELECT d FROM uks_diff;
 # Rows leaving and entering an arm's filter in the same refresh.
 
 statement ok
-UPDATE uks_east SET active = -1 WHERE ent = 'c';
+UPDATE uks_east SET active = -1 WHERE uks_east = 'c';
 
 statement ok
-UPDATE uks_east SET active = 1 WHERE ent = 'd';
+UPDATE uks_east SET active = 1 WHERE uks_east = 'd';
 
 statement ok
 PRAGMA refresh('uks_mv');
@@ -170,7 +172,7 @@ statement ok
 UPDATE uks_west SET w_src = NULL WHERE w_ent = 'e';
 
 statement ok
-UPDATE uks_east SET active = 1 WHERE ent = 'c';
+UPDATE uks_east SET active = 1 WHERE uks_east = 'c';
 
 statement ok
 PRAGMA refresh('uks_mv');
@@ -240,7 +242,7 @@ SELECT d FROM uks_diff;
 statement ok
 CREATE MATERIALIZED VIEW uks_neg_distinct AS
 WITH pooled AS (
-    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    SELECT uks_east AS entity, src AS origin, ts, val FROM uks_east
     UNION
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
 ), ranked AS (
@@ -251,7 +253,7 @@ SELECT entity, origin, ts, val FROM ranked WHERE rn = 1;
 statement ok
 CREATE MATERIALIZED VIEW uks_neg_transformed AS
 WITH pooled AS (
-    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    SELECT uks_east AS entity, src AS origin, ts, val FROM uks_east
     UNION ALL
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
 ), ranked AS (
@@ -262,7 +264,7 @@ SELECT entity || '#' AS entity, origin, ts, val FROM ranked WHERE rn = 1;
 statement ok
 CREATE MATERIALIZED VIEW uks_neg_hidden AS
 WITH pooled AS (
-    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    SELECT uks_east AS entity, src AS origin, ts, val FROM uks_east
     UNION ALL
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
 ), ranked AS (
@@ -273,7 +275,7 @@ SELECT origin, ts, val FROM ranked WHERE rn = 1;
 statement ok
 CREATE MATERIALIZED VIEW uks_neg_filter AS
 WITH pooled AS (
-    SELECT ent AS entity, src AS origin, ts, val FROM uks_east
+    SELECT uks_east AS entity, src AS origin, ts, val FROM uks_east
     UNION ALL
     SELECT w_ent AS entity, w_src AS origin, w_ts AS ts, w_val AS val FROM uks_west
 ), ranked AS (
