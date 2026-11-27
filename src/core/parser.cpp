@@ -28,6 +28,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -422,6 +423,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// transaction are visible. The helper connection remains for committed
 	// metadata probes and cross-catalog DDL preparation only.
 	con.BeginTransaction();
+	// Plan with the optimizers refresh disables: the semi/anti subquery rewrite expects
+	// DELIM joins, which the deliminator would otherwise replace before it runs.
+	auto compile_optimizers = make_uniq<ScopedDisabledOptimizers>(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 	// Peel time-travel pins the catalog cannot bind before anything plans this statement, keeping
 	// each pin keyed by its relation so it can be re-attached to the generated SQL below.
 	auto time_travel_pins = openivm::TimeTravelPins::Peel(context, *statement);
@@ -446,8 +450,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	unique_ptr<AstNode> initial_load_ast;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	string group_recompute_affected_query;
-	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
-	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
+	string having_predicate;             // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
+	bool lpts_fallback = false;          // set when LPTS can't serialize the plan and we fall back to SQL
+	bool stored_query_has_top_k = false; // a TOP_N/LIMIT remains below the published ORDER BY/LIMIT
 	bool stored_query_has_aggregate_filter = false;
 	bool pre_rewrite_has_aggregate_filter = false;
 	bool has_hidden_minmax_having = false;
@@ -484,6 +489,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Hidden sort outputs need the same aggregate state as visible outputs.
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 		StripPublicationModifiers(context, select_plan, output_names, top_k_suffix, top_k_order_suffix);
+		stored_query_has_top_k = TotalizeTopKOrders(*select_plan);
 		RewriteNonFiniteSumInputs(context, *select_planner.binder, select_plan);
 		// HAVING must reuse these state bindings without replacing their semantic aliases.
 		InjectDerivedAggregateInputs(select_plan);
@@ -592,6 +598,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                            "; query_bytes=" + to_string(view_query.size()));
 	}
 	con.Rollback();
+	compile_optimizers.reset();
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View name: %s\n", view_name.c_str());
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
@@ -670,6 +677,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	bool stored_query_retains_having = !having_predicate.empty() && lpts_fallback;
 	bool stored_query_retains_top_k = !top_k_suffix.empty() && lpts_fallback;
+	// A row the stored query's top-k evicts belongs to a group no source delta row names.
+	stored_query_has_top_k = stored_query_has_top_k || stored_query_retains_top_k;
 	// A parent publication's historical scan is an implementation boundary, not
 	// a user pin. Keep the live publication reference in a child's stored query
 	// so its next refresh binds the parent's newly published snapshot.
@@ -694,7 +703,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	    stored_query_has_aggregate_filter || pre_rewrite_has_aggregate_filter || stored_query_retains_having;
 	model_input.stored_query_retains_aggregate_filter =
 	    stored_query_has_aggregate_filter || stored_query_retains_having;
-	model_input.stored_query_has_top_k = stored_query_retains_top_k;
+	model_input.stored_query_has_top_k = stored_query_has_top_k;
 	model_input.has_hidden_minmax_having = has_hidden_minmax_having;
 	model_input.has_computed_minmax_aggregate_projection = has_computed_minmax_aggregate_projection;
 	model_input.has_computed_sum_aggregate_projection = has_computed_sum_aggregate_projection;

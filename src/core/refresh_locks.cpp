@@ -671,9 +671,16 @@ RebindQueryInfo TransactionalMVLockState::OnRebindPreparedStatement(ClientContex
 	return RebindQueryInfo::DO_NOT_REBIND;
 }
 
+void TransactionalMVLockState::DisableRefreshOptimizers(ClientContext &context) {
+	lock_guard<mutex> guard(state_lock);
+	// Replace a held scope rather than keep it: a new scope re-adds overrides a user SET removed.
+	refresh_optimizers = make_uniq<ScopedDisabledOptimizers>(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
+}
+
 void TransactionalMVLockState::Release() {
 	lock_guard<mutex> guard(state_lock);
 	OPENIVM_DEBUG_PRINT("[LOCK] release database mutation lock owner=%p\n", static_cast<void *>(&owner));
+	refresh_optimizers.reset();
 	deferred_delta_cleanup.clear();
 	deferred_source_delta_cleanup.clear();
 	allocated_source_deltas.clear();

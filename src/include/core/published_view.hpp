@@ -20,6 +20,10 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
                            const string &metadata_table, const vector<string> &scope_columns = {},
                            const string &timestamp_sql = "", SqlDialect dialect = SqlDialect::DUCKDB,
                            const string &appended_rows = "", const string &scope_rows = "",
-                           const vector<string> &delta_metadata_tables = {});
+                           const vector<string> &delta_metadata_tables = {}, bool consumers_absent = false,
+                           bool private_connection = false);
+// Whether any view consumes the visible delta, read with the predicate the publication SQL embeds.
+bool PublishedDeltaHasConsumers(Connection &con, const string &view_name, const string &prefix,
+                                const string &metadata_table, const vector<string> &delta_metadata_tables);
 
 } // namespace duckdb

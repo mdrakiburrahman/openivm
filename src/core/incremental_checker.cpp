@@ -548,6 +548,31 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	}
 }
 
+// Facts of aggregates and windows below a top-k. The delta rule diffs the whole selection over current and pre-delta
+// base tables, so the operators above consume a row delta: these must not choose the view's refresh type, and the
+// aggregate or window metadata above must not be replaced by theirs.
+static bool PlanAnalysis::*const TOPK_INPUT_LOCAL_FACTS[] = {
+    &PlanAnalysis::found_aggregation,     &PlanAnalysis::found_having,
+    &PlanAnalysis::found_minmax,          &PlanAnalysis::found_list,
+    &PlanAnalysis::found_window,          &PlanAnalysis::found_retained_aggregate_filter,
+    &PlanAnalysis::found_count_distinct,  &PlanAnalysis::found_grouping_sets,
+    &PlanAnalysis::found_nested_aggregate};
+
+void MergeTopKInputAnalysis(PlanAnalysis &result, const PlanAnalysis &input) {
+	// DISTINCT and join facts still reach the view: maintained DISTINCT selections (DISTINCT_INCREMENTAL) and join
+	// metadata depend on them. Unsupported constructs still make the view non-incremental.
+	result.incremental_compatible = result.incremental_compatible && input.incremental_compatible;
+	for (auto fact : NON_LOCAL_FACTS) {
+		result.*fact = result.*fact || input.*fact;
+	}
+	for (auto fact : SHAPE_FACTS) {
+		if (std::find(std::begin(TOPK_INPUT_LOCAL_FACTS), std::end(TOPK_INPUT_LOCAL_FACTS), fact) ==
+		    std::end(TOPK_INPUT_LOCAL_FACTS)) {
+			result.*fact = result.*fact || input.*fact;
+		}
+	}
+}
+
 void MergeMaterializedCteBodyAnalysis(PlanAnalysis &result, PlanAnalysis body) {
 	const bool outer_passthrough = !result.found_aggregation && !result.found_distinct && !result.found_join;
 	result.incremental_compatible = result.incremental_compatible && body.incremental_compatible;

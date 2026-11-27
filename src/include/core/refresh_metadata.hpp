@@ -298,12 +298,13 @@ public:
 	// delta_metadata_tables: qualified openivm_delta_tables of every native metadata location.
 	// source_catalog/source_schema identify the source when the target is an internal-schema
 	// delta whose physical location differs from its source.
+	// join_consumers reads the consumers once through DELETE ... USING (DuckDB syntax only).
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
 	                                   const string &delta_metadata_table = "",
 	                                   vector<string> *deferred_cleanup = nullptr,
 	                                   const vector<string> &delta_metadata_tables = {},
 	                                   const string &source_catalog = "", const string &source_schema = "",
-	                                   const string &data_catalog = "");
+	                                   const string &data_catalog = "", bool join_consumers = false);
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	static string SerializeViewList(const vector<string> &values);

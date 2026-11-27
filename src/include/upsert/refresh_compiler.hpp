@@ -49,6 +49,8 @@ struct AggregateGroupsOptions {
 	bool insert_only = false;
 	bool spark_merge_actions = false;
 	bool use_ducklake_rowid_upsert = false;
+	//! The target accepts a MERGE with several WHEN MATCHED actions (native DuckDB; DuckLake does not).
+	bool multi_action_merge = false;
 	vector<string> aggregate_types;
 	vector<AggregateInput> aggregate_inputs;
 	vector<LogicalType> column_types;

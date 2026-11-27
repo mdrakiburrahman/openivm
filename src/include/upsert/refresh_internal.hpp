@@ -67,6 +67,8 @@ string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const strin
 
 struct DeltaFastPathFlags {
 	bool insert_only = false;
+	// Set when insert-only sources can still retract view rows (a top-k evicts them); clears insert_only.
+	bool retracts_on_insert = false;
 	bool skip_agg_delete = false;
 	bool skip_proj_delete = false;
 	bool minmax_incremental = false;

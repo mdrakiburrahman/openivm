@@ -656,7 +656,10 @@ public:
 		ColumnFetchState fetch_state;
 		auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 		idx_t count = 0;
-		for (auto row_id : state.captured_row_ids) {
+		// Fetch in storage order: hash-set order pins and unpins a segment for nearly every row.
+		vector<row_t> captured_row_ids(state.captured_row_ids.begin(), state.captured_row_ids.end());
+		std::sort(captured_row_ids.begin(), captured_row_ids.end());
+		for (auto row_id : captured_row_ids) {
 			if (!row_fetcher.CanFetch(context, row_id)) {
 				continue;
 			}

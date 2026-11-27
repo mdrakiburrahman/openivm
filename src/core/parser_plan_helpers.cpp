@@ -419,6 +419,65 @@ void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperato
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Extracted publication modifiers: %s\n", suffix.c_str());
 }
 
+bool TotalizeTopKOrder(LogicalOperator &selection) {
+	vector<BoundOrderByNode> *orders = nullptr;
+	LogicalOperator *input = nullptr;
+	if (selection.type == LogicalOperatorType::LOGICAL_TOP_N) {
+		orders = &selection.Cast<LogicalTopN>().orders;
+		input = selection.children[0].get();
+	} else if (selection.type == LogicalOperatorType::LOGICAL_LIMIT) {
+		auto *node = selection.children[0].get();
+		while (node->type == LogicalOperatorType::LOGICAL_PROJECTION && node->children.size() == 1) {
+			node = node->children[0].get();
+		}
+		if (node->type != LogicalOperatorType::LOGICAL_ORDER_BY) {
+			return false;
+		}
+		orders = &node->Cast<LogicalOrder>().orders;
+		input = node->children[0].get();
+	} else {
+		return false;
+	}
+	// Rank tuples that tie on the user's keys by every remaining input column, so the selected bag no longer
+	// depends on scan order. Tuples that tie on all columns are interchangeable.
+	input->ResolveOperatorTypes();
+	auto bindings = input->GetColumnBindings();
+	column_binding_set_t ordered;
+	for (auto &order : *orders) {
+		if (order.expression->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			ordered.insert(order.expression->Cast<BoundColumnRefExpression>().Binding());
+		}
+	}
+	bool changed = false;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		if (ordered.insert(bindings[i]).second) {
+			orders->emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+			                     make_uniq<BoundColumnRefExpression>(input->types[i], bindings[i]));
+			changed = true;
+		}
+	}
+	return changed;
+}
+
+static void TotalizeTopKOrders(LogicalOperator &node, bool &found) {
+	if (node.type == LogicalOperatorType::LOGICAL_TOP_N || node.type == LogicalOperatorType::LOGICAL_LIMIT) {
+		found = true;
+		if (TotalizeTopKOrder(node)) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Added tie-breakers to nested %s\n",
+			                    LogicalOperatorToString(node.type).c_str());
+		}
+	}
+	for (auto &child : node.children) {
+		TotalizeTopKOrders(*child, found);
+	}
+}
+
+bool TotalizeTopKOrders(LogicalOperator &plan) {
+	bool found = false;
+	TotalizeTopKOrders(plan, found);
+	return found;
+}
+
 bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
 	const auto &name = aggregate.Function().GetName().GetIdentifierName();
 	return name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" || name == "variance" ||
@@ -1176,6 +1235,12 @@ static void CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_
 			PlanAnalysis ignored_analysis;
 			collect_child(op->children[i].get(), ignored_analysis, internal_delim_cte);
 		}
+	} else if (op->type == LogicalOperatorType::LOGICAL_TOP_N || op->type == LogicalOperatorType::LOGICAL_LIMIT) {
+		PlanAnalysis input_analysis;
+		for (auto &child : op->children) {
+			collect_child(child.get(), input_analysis, internal_delim_cte);
+		}
+		MergeTopKInputAnalysis(analysis, input_analysis);
 	} else {
 		for (auto &child : op->children) {
 			collect_child(child.get(), analysis, internal_delim_cte);

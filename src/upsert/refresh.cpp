@@ -180,8 +180,10 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	Connection probe_con(*context.db.get());
 	auto metadata_location = RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
-	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
-	MetadataLocator::RequireWritable(metadata_location, "refresh materialized view '" + display_name + "'");
+	if (metadata_location.read_only) {
+		MetadataLocator::RequireWritable(
+		    metadata_location, "refresh materialized view '" + DisplayViewName(probe_meta, view_schema_name, vn) + "'");
+	}
 	// Metadata stored outside the MV's database cannot commit with its data. The split
 	// protocol commits (1) the interruption marker, (2) the MV data, (3) the watermarks
 	// with the marker cleared. A failure at any point leaves the marker set, so the next
@@ -194,6 +196,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// It follows the lease: until then another client sharing remote metadata may refresh or replace
 	// the view (cascaded nodes reach this point without a lease from RefreshNodeWithHooks).
 	auto view_record = probe_meta.LoadView(vn);
+	// Served from the record rather than another metadata read.
+	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
 	// Before anything reads source deltas, including the empty-delta shortcut below.
 	auto source_pins = PinDuckLakeSources(probe_con, probe_meta, vn, view_catalog_name, view_schema_name,
 	                                      attached_db_catalog_name, attached_db_schema_name);
@@ -377,7 +381,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
 		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
 		// overflow in the optimizer before the refresh query runs.
-		exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
+		// disabled_optimizers is a global option: scope it to this refresh instead of a SET, which
+		// would leave it disabled for every later query of the database.
+		ScopedDisabledOptimizers disabled_optimizers(context, openivm::REFRESH_DISABLED_OPTIMIZERS);
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
@@ -1016,7 +1022,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
                                  const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                  bool strict_hooks) {
 	RefreshMetadata metadata(con);
-	const string display_name = DisplayViewName(metadata, view_schema_name, view_name);
+	// Only hook paths and their errors name the view; plain refreshes skip the metadata read.
+	auto display_name = [&]() {
+		return DisplayViewName(metadata, view_schema_name, view_name);
+	};
 	// Hooks and the refresh they wrap share one lease on remote metadata.
 	Connection lease_con(*context.db);
 	RefreshLease lease(context, MetadataLocator::Resolve(context, lease_con, view_catalog_name), view_name);
@@ -1033,7 +1042,7 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		auto pending = SqlUtils::QueryOrThrow(con,
 		                                      "SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
 		                                          SqlUtils::EscapeValue(view_name) + "'",
-		                                      "Cannot read pending after-hook for '%s': %s", display_name);
+		                                      "Cannot read pending after-hook for '%s': %s", display_name());
 		pending_after_hook = pending->RowCount() && !pending->Collection().GetValue(0, 0).IsNull() &&
 		                     pending->Collection().GetValue(0, 0).GetValue<bool>();
 		// A repaired hook can change its target catalog while a committed
@@ -1046,13 +1055,13 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		SqlUtils::QueryOrThrow(con,
 		                       "UPDATE openivm_views SET pending_after_hook = " + string(pending ? "true" : "false") +
 		                           " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'",
-		                       "Cannot record after-hook state for '%s': %s", display_name);
+		                       "Cannot record after-hook state for '%s': %s", display_name());
 	};
 
 	// Hook-bearing refreshes keep the old pre-hook empty skip semantics. Hook-free refreshes
 	// compute the same delta activity under the view lock and reuse it during SQL generation.
 	if (has_refresh_hook && !pending_after_hook) {
-		lease.Require(display_name);
+		lease.Require(display_name());
 	}
 	bool skip_current_node = has_refresh_hook && !pending_after_hook &&
 	                         TrySkipEmptyRefresh(context, metadata, con, view_catalog_name, view_schema_name, view_name,
@@ -1062,10 +1071,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 			auto hr = con.Query(hook_sql);
 			if (hr->HasError()) {
 				if (strict_hooks) {
-					throw InvalidInputException("refresh_pipeline: before-hook for '%s' failed: %s", display_name,
+					throw InvalidInputException("refresh_pipeline: before-hook for '%s' failed: %s", display_name(),
 					                            hr->GetError());
 				}
-				Printer::Print("Warning: before-hook for '" + display_name + "' failed: " + hr->GetError());
+				Printer::Print("Warning: before-hook for '" + display_name() + "' failed: " + hr->GetError());
 			}
 		}
 
@@ -1084,9 +1093,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 			if (hr->HasError()) {
 				if (strict_hooks) {
 					throw InvalidInputException("refresh_pipeline: %s-hook for '%s' failed: %s", hook_mode,
-					                            display_name, hr->GetError());
+					                            display_name(), hr->GetError());
 				}
-				Printer::Print("Warning: " + hook_mode + "-hook for '" + display_name + "' failed: " + hr->GetError());
+				Printer::Print("Warning: " + hook_mode + "-hook for '" + display_name() +
+				               "' failed: " + hr->GetError());
 			}
 			if (!hr->HasError() && staged_after_hook) {
 				mark_after_hook(false);
@@ -1350,6 +1360,8 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 	// path. Cross-system refresh delegates to a helper that acquires its own view
 	// lock; retaining that non-recursive view lock here would self-deadlock.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
+	// The returned program runs in the caller's transaction, outside RefreshViewAttempt's scope.
+	TransactionalMVLockState::Get(context).DisableRefreshOptimizers(context);
 	if (target.cross_system) {
 		// DuckDB cannot commit writes to the native metadata catalog and an
 		// attached external catalog in one transaction. Keep the staged path for

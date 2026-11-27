@@ -271,6 +271,16 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 		flags.insert_only = IsInsertOnlyDeltaSummary(summary, delta_table_names);
 		flags.active_delta_table_names = summary.active_delta_table_names;
 	}
+	if (flags.insert_only || (facts && facts->assume_insert_only)) {
+		// A top-k in the stored query evicts a selected row when a better one is inserted, so the view's delta
+		// retracts rows even when every source delta is insert-only.
+		flags.retracts_on_insert = SqlUtils::HasRowLimit(metadata.GetViewQuery(view_name));
+		if (flags.retracts_on_insert) {
+			OPENIVM_DEBUG_PRINT("[UPSERT] Stored query of %s has a top-k: insert-only fast paths disabled\n",
+			                    view_name.c_str());
+			flags.insert_only = false;
+		}
+	}
 	// Each insert-only fast path has its own kill switch.
 	flags.skip_agg_delete =
 	    flags.insert_only && SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true);

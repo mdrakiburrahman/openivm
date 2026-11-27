@@ -1499,8 +1499,8 @@ static bool SupportsRegularNtermLeaf(const JoinLeafInfo &leaf) {
 	return leaf.node->type == LogicalOperatorType::LOGICAL_PROJECTION && !leaf.node->expressions.empty();
 }
 
-static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<LogicalOperator> current_node,
-                                              DeltaPlanFragment delta, const LogicalType &mul_type) {
+DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<LogicalOperator> current_node,
+                                       DeltaPlanFragment delta, const LogicalType &mul_type) {
 	// Supported leaves (scans and projections) expose a single table index.
 	auto current_bindings = current_node->GetColumnBindings();
 	if (current_bindings.empty()) {

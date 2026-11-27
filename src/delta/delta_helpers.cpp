@@ -1,6 +1,7 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "delta/delta_helpers.hpp"
 
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/plan_rewrite_internal.hpp"
@@ -9,6 +10,8 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -107,9 +110,28 @@ static void CopyTableFilters(const LogicalGet &source, LogicalGet &target) {
 	}
 }
 
-static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder,
-                                          unique_ptr<LogicalOperator> delta_node, TableIndex output_table_index,
-                                          ColumnBinding mul_binding) {
+unique_ptr<Expression> MakeValueIdentityExpression(ClientContext &context, Optimizer &optimizer,
+                                                   unique_ptr<Expression> value) {
+	// Bound form of SqlUtils::ValueIdentitySQL.
+	auto type = value->GetReturnType();
+	if (type.IsFloating()) {
+		return MakeNegativeZeroExpression(context, optimizer, std::move(value));
+	}
+	if (type.id() == LogicalTypeId::VARCHAR &&
+	    (!StringType::GetCollation(type).empty() || !Settings::Get<DefaultCollationSetting>(context).empty())) {
+		return optimizer.BindScalarFunction(Identifier("unhex"),
+		                                    optimizer.BindScalarFunction(Identifier("hex"), std::move(value)));
+	}
+	// The serialized value key is a native DuckDB function; other dialects keep SQL equality.
+	if (SqlUtils::EqualityCanHideValueIdentity(type) &&
+	    openivm::CompileFactsContextSlot::Get(context).target_dialect == SqlDialect::DUCKDB) {
+		return optimizer.BindScalarFunction(Identifier("openivm_internal_value_key"), std::move(value));
+	}
+	return nullptr;
+}
+
+DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
+                                   TableIndex output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
 	auto input_types = delta_node->types;
 	if (input_bindings.empty() || input_bindings.size() != input_types.size()) {
@@ -126,13 +148,15 @@ static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder
 	for (idx_t i = 0; i < base_col_count; i++) { // mull-ignore: cxx_lt_to_le
 		groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
 	}
-	// SQL equality merges signed zeros, but scalar projections and zero-sign
-	// support counts can observe them. Retain their signs through compaction.
+	// SQL equality merges values that projections can still tell apart: signed zeros, collated strings ('a' and 'A'
+	// under NOCASE), interval components ('1 month' and '30 days') and such values nested in composite types. Group
+	// by their identity too, so compaction never cancels a delete of one against an insert of the other.
 	Optimizer optimizer(binder, context);
 	for (idx_t i = 0; i < base_col_count; i++) {
-		if (input_types[i].IsFloating()) {
-			groups.push_back(MakeNegativeZeroExpression(
-			    context, optimizer, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i])));
+		auto identity = MakeValueIdentityExpression(
+		    context, optimizer, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
+		if (identity) {
+			groups.push_back(std::move(identity));
 		}
 	}
 	auto aggregate = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(delta_node));
